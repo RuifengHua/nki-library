@@ -14,21 +14,21 @@
 
 """Integration tests for the LayerNorm TKG kernel with various LNC configurations and batch sizes."""
 
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.coverage_parametrized_tests import FilterResult, assert_negative_test_case
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.subkernels.layernorm_tkg import layernorm_tkg
 from nkilib_src.nkilib.core.subkernels.layernorm_torch import (
     layernorm_tkg_torch_ref,
     layernorm_tkg_torch_ref_lnc1,
 )
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.coverage_parametrized_tests import FilterResult, assert_negative_test_case
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def generate_inputs(batch: int, seqlen: int, hidden: int, shard_on_h: bool, dtype: np.dtype) -> dict:
@@ -95,6 +95,7 @@ LAYERNORM_TKG_TEST_CASES = [
 
 def _run_layernorm_tkg_test(
     test_manager: Orchestrator,
+    platform_target: Platforms,
     lnc_degree: int,
     batch: int,
     seqlen: int,
@@ -123,7 +124,7 @@ def _run_layernorm_tkg_test(
     )
     framework.run_test(
         test_config=None,
-        compiler_args=CompilerArgs(logical_nc_config=lnc_degree),
+        compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target),
         rtol=2e-2,
         atol=1e-5,
         is_negative_test=is_negative_test,
@@ -144,10 +145,8 @@ def filter_layernorm_tkg_combinations(lnc_degree, batch=None, seqlen=None, hidde
     return FilterResult.VALID
 
 
-@pytest_test_metadata(
-    name="LayerNorm TKG",
-    pytest_marks=["layernorm", "tkg"],
-)
+@pytest_test_metadata(name="LayerNorm TKG")
+@pytest_marks(["layernorm", "tkg"])
 class TestLayerNormTKGKernel:
     """Test class for LayerNorm TKG kernel using UnitTestFramework."""
 
@@ -156,6 +155,7 @@ class TestLayerNormTKGKernel:
     def test_layernorm_tkg_unit(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         batch: int,
         seqlen: int,
@@ -164,7 +164,7 @@ class TestLayerNormTKGKernel:
         dtype,
     ):
         """Test layernorm_tkg using UnitTestFramework."""
-        _run_layernorm_tkg_test(test_manager, lnc_degree, batch, seqlen, hidden, shard_on_h, dtype)
+        _run_layernorm_tkg_test(test_manager, platform_target, lnc_degree, batch, seqlen, hidden, shard_on_h, dtype)
 
     @pytest.mark.coverage_parametrize(
         lnc_degree=[1, 2],
@@ -181,6 +181,7 @@ class TestLayerNormTKGKernel:
     def test_layernorm_tkg_sweep(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         batch: int,
         seqlen: int,
@@ -193,6 +194,7 @@ class TestLayerNormTKGKernel:
         with assert_negative_test_case(is_negative_test_case):
             _run_layernorm_tkg_test(
                 test_manager,
+                platform_target,
                 lnc_degree,
                 batch,
                 seqlen,
@@ -217,6 +219,7 @@ class TestLayerNormTKGKernel:
     def test_layernorm_tkg_sweep_large_batch(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         batch: int,
         seqlen: int,
@@ -229,6 +232,7 @@ class TestLayerNormTKGKernel:
         with assert_negative_test_case(is_negative_test_case):
             _run_layernorm_tkg_test(
                 test_manager,
+                platform_target,
                 lnc_degree,
                 batch,
                 seqlen,
@@ -253,6 +257,7 @@ class TestLayerNormTKGKernel:
     def test_layernorm_tkg_sweep_shard_on_h(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         batch: int,
         seqlen: int,
@@ -265,6 +270,7 @@ class TestLayerNormTKGKernel:
         with assert_negative_test_case(is_negative_test_case):
             _run_layernorm_tkg_test(
                 test_manager,
+                platform_target,
                 lnc_degree,
                 batch,
                 seqlen,

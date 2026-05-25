@@ -16,10 +16,11 @@
 
 import hashlib
 import math
-from test.integration.nkilib.utils.test_kernel_common import gelu_apprx_sigmoid, gelu_apprx_sigmoid_dx, silu
 
 import numpy as np
 import torch
+from scipy.special import expit
+
 from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ActFnType,
     AffinityOption,
@@ -28,7 +29,7 @@ from nkilib_src.nkilib.experimental.moe.bwd.moe_bwd_parameters import (
     ShardOption,
     SkipMode,
 )
-from scipy.special import expit
+from test.integration.nkilib.utils.test_kernel_common import gelu_apprx_sigmoid, gelu_apprx_sigmoid_dx, silu
 
 
 def map_skip_mode(skip_mode: int) -> SkipMode:
@@ -208,6 +209,7 @@ def _generate_bwd_golden(
     clamp_limits,
     gate_up_bias,
     down_bias,
+    affinity_option=AffinityOption.AFFINITY_ON_H,
 ):
     E, I, H = down_weight.shape
     T, _ = hidden_states.shape
@@ -228,16 +230,13 @@ def _generate_bwd_golden(
     gate_up_bias_grad = np.zeros_like(gate_up_bias) if gate_up_bias is not None else None
     block_to_token_indices = block_to_token_indices.reshape(N, B)
 
+    is_affinity_i = affinity_option == AffinityOption.AFFINITY_ON_I
+
     for block_idx in range(N):
         token_position_to_id = block_to_token_indices[block_idx]
         block_expert_idx = block_to_expert[block_idx]
         block_hidden_states = hidden_states[token_position_to_id]
         block_grad = grad_output[token_position_to_id]
-        down_activation = down_activations[block_idx]
-
-        mul = block_grad.astype(np.float32) * down_activation.astype(np.float32)
-        affinities_grad[token_position_to_id, block_expert_idx] = np.sum(mul, axis=1)
-        down_out_grad = block_grad * expert_affinities_masked[token_position_to_id, block_expert_idx][:, np.newaxis]
 
         gate_up_activation_T = gate_up_activations_T[block_idx]
         gate_activation_T, up_activation_T = np.split(gate_up_activation_T, 2, axis=0)
@@ -249,7 +248,18 @@ def _generate_bwd_golden(
             silu_activation = gelu_apprx_sigmoid(gate_activation)
 
         first_dot_activation = silu_activation * up_activation
-        block_down_weight_grad = first_dot_activation.T @ down_out_grad
+        ea = expert_affinities_masked[token_position_to_id, block_expert_idx][:, np.newaxis]
+
+        if is_affinity_i:
+            down_out_grad = block_grad
+            scaled_first_dot_activation = first_dot_activation * ea
+            block_down_weight_grad = scaled_first_dot_activation.T @ down_out_grad
+        else:
+            down_activation = down_activations[block_idx]
+            mul = block_grad.astype(np.float32) * down_activation.astype(np.float32)
+            affinities_grad[token_position_to_id, block_expert_idx] = np.sum(mul, axis=1)
+            down_out_grad = block_grad * ea
+            block_down_weight_grad = first_dot_activation.T @ down_out_grad
 
         if down_bias_grad is not None:
             block_down_bias_grad = np.sum(down_out_grad.astype(np.float32), axis=0)
@@ -257,6 +267,13 @@ def _generate_bwd_golden(
 
         down_weight_grad[block_expert_idx] += block_down_weight_grad
         first_dot_grad = down_out_grad @ down_weight[block_expert_idx].T
+
+        if is_affinity_i:
+            affinities_grad[token_position_to_id, block_expert_idx] = np.sum(
+                first_dot_grad.astype(np.float32) * first_dot_activation.astype(np.float32), axis=1
+            )
+            first_dot_grad = first_dot_grad * ea
+
         silu_grad = first_dot_grad * up_activation
 
         if (
@@ -335,7 +352,20 @@ def _generate_bwd_golden(
 
 
 def build_bwmm_bwd_inputs(
-    tokens, hidden, intermediate, expert, block_size, top_k, dtype, dma_skip, bias_flag, clamp_limits, activation_type
+    tokens,
+    hidden,
+    intermediate,
+    expert,
+    block_size,
+    top_k,
+    dtype,
+    dma_skip,
+    bias_flag,
+    clamp_limits,
+    activation_type,
+    affinity_option=AffinityOption.AFFINITY_ON_H,
+    blocking_params=None,
+    shard_option=ShardOption.SHARD_ON_FREE,
 ):
     """Build kernel inputs and return (inputs_dict, gate_up_proj_bias, down_proj_bias)."""
     N = get_n_blocks(tokens, top_k, expert, block_size)
@@ -407,7 +437,13 @@ def build_bwmm_bwd_inputs(
         "clamp_limits": clamp_limits,
         "bias": bias_flag,
         "activation_type": activation_type,
+        "affinity_option": affinity_option,
+        "blocking_params": blocking_params,
+        "shard_option": shard_option,
     }
+
+    if affinity_option == AffinityOption.AFFINITY_ON_I:
+        inputs["down_proj_act_checkpoint"] = None
 
     return inputs, gate_up_proj_bias, down_proj_bias
 
@@ -426,13 +462,15 @@ def blockwise_mm_bwd_torch_ref(
     skip_dma: SkipMode = None,
     compute_dtype=None,
     is_tensor_update_accumulating: bool = True,
-    shard_option: ShardOption = ShardOption.SHARD_ON_HIDDEN,
+    skip_grad_initialization: bool = False,
+    shard_option: ShardOption = ShardOption.SHARD_ON_FREE,
     affinity_option: AffinityOption = AffinityOption.AFFINITY_ON_H,
     kernel_type_option: KernelTypeOption = KernelTypeOption.DROPLESS,
     clamp_limits: ClampLimits = None,
     bias: bool = False,
     activation_type: ActFnType = ActFnType.SiLU,
     block_tile_size: int = None,
+    blocking_params=None,
 ) -> dict:
     """Torch reference for blockwise_mm_bwd. Converts to numpy, runs golden, returns dict of torch tensors."""
     if skip_dma is None:
@@ -446,7 +484,7 @@ def blockwise_mm_bwd_torch_ref(
     gate_up_w_np = gate_up_proj_weight.numpy()
     down_w_np = down_proj_weight.numpy()
     gate_up_act_np = gate_up_proj_act_checkpoint_T.numpy()
-    down_act_np = down_proj_act_checkpoint.numpy()
+    down_act_np = down_proj_act_checkpoint.numpy() if down_proj_act_checkpoint is not None else None
     tok_pos_np = token_position_to_id.numpy()
     blk_exp_np = block_to_expert.numpy()
     grad_out_np = output_hidden_states_grad.numpy()
@@ -481,6 +519,7 @@ def blockwise_mm_bwd_torch_ref(
         clamp_limits=clamp_limits,
         gate_up_bias=gate_up_bias,
         down_bias=down_bias,
+        affinity_option=affinity_option,
     )
 
     result = {

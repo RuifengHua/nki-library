@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import os as _os
+if _os.environ.get("SKIP_MODEL_TESTS"):
+    raise ImportError("Model tests skipped via SKIP_MODEL_TESTS")
+
 """
 Attention TKG model configuration data
 

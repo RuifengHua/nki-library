@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nki_library"
-dynamic = ["version"]
+dynamic = ["version", "entry-points"]
 description = "NeuronKernelInterfaceLibrary"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,7 @@ test = [
     "pytest-xdist",
     "pytest-metadata",
     "pytest-html",
-    "ruff==0.4.0",
+    "ruff==0.14.13",
     "pre-commit",
     "debugpy",
     "pytest-cov",
@@ -42,15 +42,9 @@ test = [
 [tool.setuptools]
 zip-safe = true
 include-package-data = true
-package-dir = {"" = "src"}
 
 [tool.setuptools.dynamic]
 version = {attr = "nkilib_src.nkilib.version.__version__"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-# Remove test exclusion to bundle tests in wheel
-# exclude = ["test"]
 
 [tool.setuptools.package-data]
 nkilib_src = ["py.typed"]
@@ -80,7 +74,7 @@ max-line-length = 120
 [tool.ruff]
 indent-width = 4
 line-length = 120
-extend-exclude = ["*model_config.py", "configuration/"]
+extend-exclude = ["*model_config.py", "configuration/", "skills"]
 
 [tool.ruff.format]
 quote-style = "preserve"

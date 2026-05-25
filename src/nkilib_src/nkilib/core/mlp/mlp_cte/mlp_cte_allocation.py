@@ -16,7 +16,7 @@
 
 import nki.language as nl
 
-from ...utils.allocator import SbufManager
+from ...utils.allocator import SbufManager, sizeinbytes
 from ..mlp_parameters import MLPParameters, mlpp_input_has_packed_scale
 from .mlp_cte_constants import MLPCTEConstants
 from .mlp_cte_tile_info import MlpBxsIndices, MLPCTETileInfo
@@ -105,6 +105,54 @@ def allocate_intermediate_tensor_tile(
             name=indices.get_tensor_name(name, f'subbxs{bxs_subtile_idx}'),
         )
         intermediate_tensor_sbuf_list.append(intermediate_tensor)
+
+
+def allocate_src_projection_weights(
+    mlp_params: MLPParameters,
+    tile_info: MLPCTETileInfo,
+    constants: MLPCTEConstants,
+    indices: MlpBxsIndices,
+    src_proj_weights_sbuf_list: list,
+    sbm: SbufManager,
+):
+    heap_alloc = sbm.alloc_heap if sbm else nl.ndarray
+
+    weights_tensor_shape = (
+        (
+            tile_info.mx_src_proj_hidden_dim_tile.subtile_dim_info.tile_count,  # 128
+            tile_info.mx_intermediate_dim_tile.tile_count,  # I/512
+            tile_info.mx_intermediate_dim_tile.subtile_dim_info.tile_size,  # 4
+            tile_info.mx_intermediate_dim_tile.subtile_dim_info.tile_count,  # 128
+            tile_info.mx_src_proj_hidden_dim_tile.subtile_dim_info.tile_size,  # 4
+        )
+        if mlp_params.quant_params.is_quant_static_mx()
+        else (
+            tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_size,
+            tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_count,
+            mlp_params.intermediate_size,
+        )
+    )
+    weights_tensor_dtype = (
+        constants.src_proj_quant_data_type if mlp_params.quant_params.is_quant() else constants.compute_data_type
+    )
+    if sbm != None:
+        weights_tensor_size = sizeinbytes(weights_tensor_dtype)
+        for dim_size in weights_tensor_shape[1:]:
+            weights_tensor_size *= dim_size
+        actual_src_proj_weights_buffer_count = min(
+            sbm.get_free_space() // weights_tensor_size,
+            constants.src_proj_weights_max_buffer_count,
+        )
+    else:
+        actual_src_proj_weights_buffer_count = constants.src_proj_weights_max_buffer_count
+    for weight_buffer_idx in range(actual_src_proj_weights_buffer_count):
+        weights_tensor = heap_alloc(
+            weights_tensor_shape,
+            dtype=weights_tensor_dtype,
+            buffer=nl.sbuf,
+            name=indices.get_tensor_name("weights_tensor", f"buf{weight_buffer_idx}"),
+        )
+        src_proj_weights_sbuf_list.append(weights_tensor)
 
 
 def allocate_down_projection_weights(

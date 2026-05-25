@@ -37,6 +37,7 @@ QOR_METRICS = [
     "ActiveInferenceTime",
     "SeparatedComputeTime",
     "SeparatedMemoryTime",
+    "ExplorerProfileURL",
 ]
 
 # Dimension fields to include in CSV

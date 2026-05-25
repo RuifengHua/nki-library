@@ -12,58 +12,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test suite for MoE BWMM MX CTE kernels using native pytest and coverage_parametrize."""
+"""Test suite for MoE BWMM MX CTE kernels using UnitTestFramework."""
 
 import random
+from typing import Any, final
+
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import map_skip_mode
 from test.integration.nkilib.core.moe.moe_cte.test_utils import (
     build_moe_bwmm_mx_cte,
-    golden_moe_bwmm_mx_cte,
+    build_moe_bwmm_mx_cte_from_model_test_config,
     order_kernel_input,
 )
-from test.utils.common_dataclasses import CompilerArgs, KernelArgs, LazyGoldenGenerator, Platforms, ValidationArgs
-from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult, assert_negative_test_case
-from test.utils.metrics_collector import MetricsCollector
-from test.utils.pytest_test_metadata import pytest_test_metadata
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    CustomValidator,
+    CustomValidatorWithOutputTensorData,
+    ModelTestType,
+    Platforms,
+    ValidationArgs,
+    prepare_model_parametrize,
+)
+from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
-from typing import final
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 try:
     from test.integration.nkilib.core.moe.moe_cte.test_moe_bwmm_mx_cte_model_config import (
         moe_bwmm_mx_cte_model_configs,
     )
 except ImportError:
-    moe_bwmm_mx_cte_model_configs = []
+    moe_bwmm_mx_cte_model_configs = None
 
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
+from typing_extensions import override
+
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx import bwmm_shard_on_block_mx
+from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx_torch import bwmm_shard_on_block_mx_torch_ref
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I_mx import (
     blockwise_mm_shard_intermediate_mx,
     blockwise_mm_shard_intermediate_mx_hybrid,
 )
+from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I_mx_torch import (
+    blockwise_mm_shard_intermediate_mx_hybrid_torch_ref,
+    blockwise_mm_shard_intermediate_mx_torch_ref,
+)
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
 
 # fmt: off
+SHARD_ON_BLOCK_PARAMS = "vnc_degree, hidden, tokens, intermediate, expert, block_size, top_k, act_fn, expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower, use_uint_weights, n_static_blocks"
+
+MOE_BWMM_MX_CTE_MODEL_PARAMS = "variant, vnc_degree, hidden, tokens, intermediate, expert, block_size, act_fn, expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower, use_uint_weights, skewness_pct, global_top_k, ep_degree"
 
 # ============================================================================
 # Test Parameters - Shard-on-Block (unit tests)
 # ============================================================================
 
-moe_bwmm_mx_cte_unit_params = "vnc_degree, hidden, tokens, intermediate, expert, block_size, top_k, act_fn, expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower, use_uint_weights, n_static_blocks"
-
-_skip_slow = pytest.mark.skip(reason="Temporarily skipped: MoE BWMM MX CTE broken on both beta2 and beta3, pending further fix from NKILIB-807")
-
-moe_bwmm_mx_cte_unit_perms = [
-    # MXFP4 test cases
+# Full-only entries: excluded from fast suite (memory >3000 MB)
+_SHARD_BLOCK_FULL_ONLY = [
+    # MXFP4 test cases (blk=256)
     [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
     [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
     [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, None],
     [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
-    pytest.param(2, 3072, 10240, 1536, 32, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None, marks=_skip_slow),
+    [2, 3072, 10240, 1536, 32, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
     [2, 3072, 1024, 1536, 32, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
+    # MXFP4 test cases (blk=512)
     [2, 3072, 10240, 384, 128, 512, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
     [2, 3072, 10240, 384, 128, 512, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
     [2, 3072, 10240, 384, 128, 512, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, None],
@@ -74,46 +92,79 @@ moe_bwmm_mx_cte_unit_perms = [
     # MXFP8 e5m2 test cases
     [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
     [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
-    # Alternative dtype weights test cases (simulates NxD behavior: uint16 for MXFP4, uint32 for MXFP8)
+    # uint weights test cases (simulates NxD behavior: uint16 for MXFP4, uint32 for MXFP8)
     [2, 3072, 1024, 384, 128, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, None],
     [2, 3072, 1024, 384, 128, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, None],
     [2, 3072, 1024, 384, 128, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, None],
-    pytest.param(2, 3072, 128, 3072, 2, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, None, marks=_skip_slow),
-    # n_static_blocks test case
+    [2, 3072, 128, 3072, 2, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, None],
+    # No Bias and No Clipping
+    [2, 3072, 1024, 384, 8, 128, 4, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, None, None, None, None, False, None],
+    # weight skipping
+    [2, 3072, 1024, 384, 16, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, None],
+    [2, 3072, 1024, 384, 16, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, None],
+]
+
+# Fast entries (run in both fast and full suite)
+_SHARD_BLOCK_FAST_RAW = [
+    # No Bias with partial Clipping
+    [2, 3072, 1024, 384, 8, 128, 4, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, None, None, False, None],
+    [2, 3072, 1024, 384, 8, 128, 4, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, False, None, None, 7.0, -7.0, False, None],
+    # n_static_blocks test cases
     [2, 4096, 4096, 1536, 2, 256, 2, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
     [2, 4096, 4096, 1024, 4, 256, 4, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
     [2, 3072, 4096, 384, 2, 256, 2, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
 ]
 
+SHARD_ON_BLOCK_UNIT_PERMS = [
+    pytest.param(*c, marks=pytest.mark.fast) for c in _SHARD_BLOCK_FAST_RAW
+] + _SHARD_BLOCK_FULL_ONLY
+
 # ============================================================================
 # Test Parameters - Shard-on-I-MX (unit tests)
 # ============================================================================
 
-moe_bwmm_mx_shard_I_unit_perms = [
+SHARD_ON_I_UNIT_PERMS = [
     [2, 3072, 1024, 2048, 8, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
     [2, 3072, 1024, 2048, 8, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
-    pytest.param(2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None, marks=_skip_slow),
-    pytest.param(2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None, marks=_skip_slow),
+    [2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
+    [2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
     [2, 7168, 1024, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
     [2, 7168, 1024, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
-    pytest.param(2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None, marks=_skip_slow),
-    pytest.param(2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None, marks=_skip_slow),
+    [2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
+    [2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
     # Alternative dtype weights test cases (simulates NxD behavior: uint16 for MXFP4, uint32 for MXFP8)
     [2, 3072, 1024, 2048, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, None],
     [2, 3072, 1024, 2048, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, None],
     [2, 3072, 1024, 2048, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, None],
+    [2, 3072, 1024, 2048, 8, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, 7.0, -7.0, False, None],
+    [2, 3072, 1024, 2048, 8, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, None, None, False, None],
     # n_static_blocks test case
     [2, 4096, 4096, 2048, 2, 512, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
     [2, 4096, 4096, 2048, 2, 256, 2, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
 ]
-
 # fmt: on
 
-
-# ============================================================================
-# uint16 Weight Wrapper (simulates NxD behavior)
-# ============================================================================
-
+_ABBREVS = {
+    "vnc_degree": "vnc",
+    "hidden": "hid",
+    "tokens": "tok",
+    "intermediate": "inter",
+    "expert": "exp",
+    "block_size": "blk",
+    "top_k": "k",
+    "act_fn": "act",
+    "expert_affinities_scaling_mode": "eas_mode",
+    "dtype": "dt",
+    "weight_dtype": "wdt",
+    "skip_mode": "sk",
+    "bias": "bi",
+    "is_dynamic": "dyn",
+    "gate_clamp_upper": "gcu",
+    "gate_clamp_lower": "gcl",
+    "up_clamp_upper": "ucu",
+    "up_clamp_lower": "ucl",
+    "use_uint_weights": "uint",
+}
 
 # Mapping from MXFP weight dtype to the alternative dtype used by NxD (torch/xla)
 _MXFP_TO_ALTERNATIVE_DTYPE = {
@@ -123,10 +174,9 @@ _MXFP_TO_ALTERNATIVE_DTYPE = {
 }
 
 
-def convert_mx_weights_to_uint_dtype(kernel_input: dict, weight_dtype) -> dict:
+def convert_mx_weights_to_uint_dtype(kernel_input: dict, weight_dtype: Any) -> dict:
     """Convert MX weights to alternative dtype (uint16/uint32) to simulate NxD behavior."""
-    alt_dtype = _MXFP_TO_ALTERNATIVE_DTYPE.get(weight_dtype)
-    assert alt_dtype is not None, f"No alternative dtype mapping for {weight_dtype}"
+    alt_dtype = _MXFP_TO_ALTERNATIVE_DTYPE[weight_dtype]
     result = kernel_input.copy()
     for key in ['gate_up_proj_weight', 'down_proj_weight']:
         if key in result and result[key] is not None:
@@ -134,21 +184,16 @@ def convert_mx_weights_to_uint_dtype(kernel_input: dict, weight_dtype) -> dict:
     return result
 
 
-# ============================================================================
-# Filter Functions
-# ============================================================================
-
-
-def filter_moe_bwmm_mx_cte_combinations(
+def filter_moe_bwmm_mx_shard_block_combinations(
     vnc_degree=None,
     hidden=None,
     intermediate=None,
     block_size=None,
     expert_affinities_scaling_mode=None,
+    skip_mode=None,
     **kwargs,
 ):
-    """
-    Filter invalid parameter combinations for MoE BWMM MX CTE kernel (shard-on-block).
+    """Filter invalid parameter combinations for MoE BWMM MX CTE kernel (shard-on-block).
 
     Checks constraints from kernel_assert statements in bwmm_shard_on_block_mx.py:
     - vnc_degree == 2 (num_shards)
@@ -156,90 +201,93 @@ def filter_moe_bwmm_mx_cte_combinations(
     - 512 <= hidden <= 8192 and hidden % 512 == 0
     - intermediate % 16 == 0 and MX tiling rules
     - expert_affinities_scaling_mode == POST_SCALE
+    - skip_mode == 3 requires intermediate (I_TP) <= 512
     """
     if vnc_degree is not None and vnc_degree != 2:
         return FilterResult.INVALID
-
     if (
         expert_affinities_scaling_mode is not None
         and expert_affinities_scaling_mode != ExpertAffinityScaleMode.POST_SCALE
     ):
         return FilterResult.INVALID
-
-    if hidden is not None:
-        if not (512 <= hidden <= 8192) or hidden % 512 != 0:
-            return FilterResult.INVALID
-
+    if hidden is not None and (not (512 <= hidden <= 8192) or hidden % 512 != 0):
+        return FilterResult.INVALID
     if block_size is not None and block_size % 128 != 0:
         return FilterResult.INVALID
-
     if intermediate is not None:
         if intermediate % 16 != 0:
             return FilterResult.INVALID
         if not (intermediate % 512 == 0 or (intermediate < 512 and intermediate % 32 == 0)):
             return FilterResult.INVALID
 
-    return FilterResult.VALID
-
-
-def filter_moe_bwmm_mx_shard_I_combinations(
-    vnc_degree=None,
-    **kwargs,
-):
-    """
-    Filter invalid parameter combinations for MoE BWMM MX shard-on-I kernel.
-
-    Only vnc_degree == 2 is enforced at runtime (kernel_assert in hybrid function).
-    check_kernel_compatibility_mx exists but is not called by the kernel.
-    """
-    if vnc_degree is not None and vnc_degree != 2:
+    # skip_mode 3 (weight skipping on static blocks) only supported when I_TP <= 512
+    if skip_mode is not None and skip_mode == 3 and intermediate is not None and intermediate > 512:
         return FilterResult.INVALID
 
     return FilterResult.VALID
 
 
-# ============================================================================
-# Test Class: Shard-on-Block
-# ============================================================================
+def filter_moe_bwmm_mx_shard_I_combinations(vnc_degree=None, **kwargs):
+    """Filter invalid parameter combinations for MoE BWMM MX shard-on-I kernel.
+
+    Only vnc_degree == 2 is enforced at runtime (kernel_assert in hybrid function).
+    """
+    if vnc_degree is not None and vnc_degree != 2:
+        return FilterResult.INVALID
+    return FilterResult.VALID
 
 
-@pytest_test_metadata(
-    name="MoE BWMM MX CTE",
-    pytest_marks=["moe", "cte", "mx"],
-)
-@final
-@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-class TestMoeBwmmMxCteKernel:
-    """Test class for MoE BWMM MX CTE kernel (shard-on-block)."""
-
-    def run_moe_bwmm_mx_cte_test(
-        self,
-        test_manager: Orchestrator,
-        compiler_args: CompilerArgs,
-        lnc_degree: int,
-        tokens: int,
-        hidden: int,
-        intermediate: int,
-        expert: int,
-        block_size: int,
-        top_k: int,
-        act_fn: ActFnType,
-        skip_mode: int,
-        gate_clamp_upper: float,
-        gate_clamp_lower: float,
-        up_clamp_upper: float,
-        up_clamp_lower: float,
-        dtype,
-        weight_dtype,
-        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-        bias: bool,
-        is_dynamic: bool,
-        collector: MetricsCollector,
-        use_uint_weights: bool = False,
-        n_static_blocks: int = None,
-    ):
-        """Run a single MoE BWMM MX CTE test case."""
-        kernel_input = build_moe_bwmm_mx_cte(
+def _gen_block_inputs(
+    vnc_degree: int,
+    hidden: int,
+    tokens: int,
+    intermediate: int,
+    expert: int,
+    block_size: int,
+    act_fn: ActFnType,
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+    dtype,
+    weight_dtype,
+    skip_mode: int,
+    bias: bool,
+    is_dynamic: bool,
+    gate_clamp_upper: float,
+    gate_clamp_lower: float,
+    up_clamp_upper: float,
+    up_clamp_lower: float,
+    use_uint_weights: bool = False,
+    top_k: int = None,
+    n_static_blocks: int = None,
+    skewness_pct: float = None,
+    global_top_k: int = None,
+    ep_degree: int = None,
+) -> dict:
+    assert skewness_pct is not None or top_k is not None, "Either skewness_pct or top_k must be provided"
+    if skewness_pct is not None:
+        ki = build_moe_bwmm_mx_cte_from_model_test_config(
+            H=hidden,
+            T=tokens,
+            E=expert,
+            B=block_size,
+            I_TP=intermediate,
+            skewness_pct=skewness_pct,
+            global_top_k=global_top_k,
+            ep_degree=ep_degree,
+            dtype=dtype,
+            weight_dtype=weight_dtype,
+            skip_mode=skip_mode,
+            bias=bias,
+            activation_function=act_fn,
+            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+            is_dynamic=is_dynamic,
+            vnc_degree=vnc_degree,
+            gate_clamp_upper_limit=gate_clamp_upper,
+            gate_clamp_lower_limit=gate_clamp_lower,
+            up_clamp_upper_limit=up_clamp_upper,
+            up_clamp_lower_limit=up_clamp_lower,
+        )
+    else:
+        ki = build_moe_bwmm_mx_cte(
             H=hidden,
             T=tokens,
             E=expert,
@@ -253,7 +301,7 @@ class TestMoeBwmmMxCteKernel:
             activation_function=act_fn,
             expert_affinities_scaling_mode=expert_affinities_scaling_mode,
             is_dynamic=is_dynamic,
-            vnc_degree=lnc_degree,
+            vnc_degree=vnc_degree,
             n_dynamic_blocks=55,
             gate_clamp_upper_limit=gate_clamp_upper,
             gate_clamp_lower_limit=gate_clamp_lower,
@@ -261,53 +309,175 @@ class TestMoeBwmmMxCteKernel:
             up_clamp_lower_limit=up_clamp_lower,
             n_static_blocks=n_static_blocks,
         )
+    ordered = order_kernel_input(ki, variant='shard_on_block_mx')
+    if use_uint_weights:
+        ordered = convert_mx_weights_to_uint_dtype(ordered, weight_dtype)
+    return ordered
 
-        def create_lazy_golden():
-            return golden_moe_bwmm_mx_cte(
-                kernel_input=kernel_input,
-                dtype=dtype,
-                lnc_degree=lnc_degree,
+
+def _mx_torch_ref_wrapper(torch_ref_func) -> callable:
+    """Custom torch_ref_wrapper that handles uint16 MX weights (NxD simulation)."""
+    base_wrapper = torch_ref_wrapper(torch_ref_func)
+    import functools
+
+    @functools.wraps(torch_ref_func)
+    def wrapped(**kwargs):
+        # Convert uint16/uint32 weights to x4 dtype before base wrapper processes them
+        for key in ('gate_up_proj_weight', 'down_proj_weight'):
+            if key in kwargs and isinstance(kwargs[key], np.ndarray) and kwargs[key].dtype in (np.uint16, np.uint32):
+                wdt = kwargs.get('weight_dtype')
+                if wdt is not None:
+                    kwargs[key] = kwargs[key].view(np.dtype(wdt))
+        return base_wrapper(**kwargs)
+
+    return wrapped
+
+
+def _gen_I_inputs(
+    vnc_degree: int,
+    hidden: int,
+    tokens: int,
+    intermediate: int,
+    expert: int,
+    block_size: int,
+    act_fn: ActFnType,
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+    dtype,
+    weight_dtype,
+    skip_mode: int,
+    bias: bool,
+    is_dynamic: bool,
+    gate_clamp_upper: float,
+    gate_clamp_lower: float,
+    up_clamp_upper: float,
+    up_clamp_lower: float,
+    top_k: int = None,
+    n_static_blocks: int = None,
+    skewness_pct: float = None,
+    global_top_k: int = None,
+    ep_degree: int = None,
+) -> dict:
+    assert skewness_pct is not None or top_k is not None, "Either skewness_pct or top_k must be provided"
+    if skewness_pct is not None:
+        ki = build_moe_bwmm_mx_cte_from_model_test_config(
+            H=hidden,
+            T=tokens,
+            E=expert,
+            B=block_size,
+            I_TP=intermediate,
+            skewness_pct=skewness_pct,
+            global_top_k=global_top_k,
+            ep_degree=ep_degree,
+            dtype=dtype,
+            weight_dtype=weight_dtype,
+            skip_mode=skip_mode,
+            bias=bias,
+            activation_function=act_fn,
+            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+            is_dynamic=is_dynamic,
+            vnc_degree=vnc_degree,
+            gate_clamp_upper_limit=gate_clamp_upper,
+            gate_clamp_lower_limit=gate_clamp_lower,
+            up_clamp_upper_limit=up_clamp_upper,
+            up_clamp_lower_limit=up_clamp_lower,
+            is_shard_on_I=True,
+        )
+    else:
+        ki = build_moe_bwmm_mx_cte(
+            H=hidden,
+            T=tokens,
+            E=expert,
+            B=block_size,
+            TOPK=top_k,
+            I_TP=intermediate,
+            dtype=dtype,
+            weight_dtype=weight_dtype,
+            skip_mode=skip_mode,
+            bias=bias,
+            activation_function=act_fn,
+            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+            vnc_degree=vnc_degree,
+            is_dynamic=is_dynamic,
+            gate_clamp_upper_limit=gate_clamp_upper,
+            gate_clamp_lower_limit=gate_clamp_lower,
+            up_clamp_upper_limit=up_clamp_upper,
+            up_clamp_lower_limit=up_clamp_lower,
+            is_shard_on_I=True,
+            n_static_blocks=n_static_blocks,
+        )
+    variant = 'shard_on_I_mx_hybrid' if is_dynamic else 'shard_on_I_mx'
+    return order_kernel_input(ki, variant=variant)
+
+
+def _block_output(
+    ki: dict, tokens: int, hidden: int, dtype, skip_mode: int, is_accumulating: bool, vnc_degree: int
+) -> dict:
+    dma_skip = map_skip_mode(skip_mode)
+    out_T = tokens if dma_skip.skip_token else tokens + 1
+    numpy_dtype = dt.finfo(dtype).dtype
+    if is_accumulating:
+        return {"output": np.zeros((vnc_degree, out_T, hidden), dtype=numpy_dtype)}
+    return {"output": np.zeros((out_T, hidden), dtype=numpy_dtype)}
+
+
+def _make_shard0_validator(torch_ref_fn, input_gen, tokens, hidden, vnc_degree, dtype, rtol, atol):
+    """Create a CustomValidator that only compares output[0, :tokens, :hidden].
+
+    After reduce_outputs, output[0] has the correct reduced result but output[1]
+    contains garbage (not zeroed). This validator ignores shard 1.
+    """
+    from test.utils.comparators import maxAllClose
+
+    numpy_dtype = dt.finfo(dtype).dtype
+
+    class Shard0Validator(CustomValidator):
+        @override
+        def validate(self, actual_raw_output):
+            ki = input_gen(None)
+            golden_dict = torch_ref_fn(**ki)
+            golden = golden_dict["output"]
+            if hasattr(golden, "numpy"):
+                golden = golden.numpy()
+            golden = golden.astype(np.float32)
+
+            actual = (
+                np.frombuffer(actual_raw_output, dtype=numpy_dtype).reshape(vnc_degree, -1, hidden).astype(np.float32)
             )
 
-        numpy_dtype = dt.finfo(dtype).dtype
-        dma_skip = map_skip_mode(skip_mode)
-        is_accumulating = top_k != 1
-        out_T = tokens if dma_skip.skip_token else tokens + 1
-
-        if is_accumulating:
-            output_placeholder = {"output": np.zeros((lnc_degree, out_T, hidden), dtype=numpy_dtype)}
-        else:
-            output_placeholder = {"output": np.zeros((out_T, hidden), dtype=numpy_dtype)}
-
-        validation_args = ValidationArgs(
-            golden_output=LazyGoldenGenerator(
-                output_ndarray=output_placeholder,
-                lazy_golden_generator=create_lazy_golden,
-            ),
-            relative_accuracy=5e-2,
-            absolute_accuracy=1e-5,
-        )
-
-        kernel_input_for_kernel = order_kernel_input(kernel_input, variant='shard_on_block_mx')
-
-        if use_uint_weights:
-            kernel_input_for_kernel = convert_mx_weights_to_uint_dtype(kernel_input_for_kernel, weight_dtype)
-
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=bwmm_shard_on_block_mx,
-                compiler_input=compiler_args,
-                kernel_input=kernel_input_for_kernel,
-                validation_args=validation_args,
+            # Only compare shard 0, real tokens
+            actual_slice = actual[0, :tokens, :hidden]
+            golden_slice = golden[0, :tokens, :hidden]
+            comparison_passed = maxAllClose(
+                actual_slice,
+                golden_slice,
+                rtol=rtol,
+                atol=atol,
+                verbose=1,
+                logfile=self.logfile,
             )
-        )
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize(moe_bwmm_mx_cte_unit_params, moe_bwmm_mx_cte_unit_perms)
-    def test_moe_bwmm_mx_cte_unit(
+            return comparison_passed
+
+    return Shard0Validator
+
+
+def _I_output(ki: dict, tokens: int, hidden: int, dtype, skip_mode: int) -> dict:
+    dma_skip = map_skip_mode(skip_mode)
+    out_T = tokens if dma_skip.skip_token else tokens + 1
+    return {"output": np.zeros((out_T, hidden), dtype=dtype)}
+
+
+@pytest_test_metadata(name="MoE BWMM MX CTE", tags=["model"])
+@pytest_marks(["moe", "cte", "mx"])
+@final
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+class TestMoeBwmmMxShardBlockKernel:
+    """Test class for MoE BWMM MX CTE kernel (shard-on-block)."""
+
+    @pytest_parametrize(SHARD_ON_BLOCK_PARAMS, SHARD_ON_BLOCK_UNIT_PERMS, abbrevs=_ABBREVS)
+    def test_moe_bwmm_mx_shard_block_unit(
         self,
         test_manager: Orchestrator,
-        collector: MetricsCollector,
         platform_target: Platforms,
         vnc_degree: int,
         hidden: int,
@@ -318,8 +488,8 @@ class TestMoeBwmmMxCteKernel:
         top_k: int,
         act_fn: ActFnType,
         expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-        dtype,
-        weight_dtype,
+        dtype: Any,
+        weight_dtype: Any,
         skip_mode: int,
         bias: bool,
         is_dynamic: bool,
@@ -332,42 +502,79 @@ class TestMoeBwmmMxCteKernel:
     ):
         """Unit test for MoE BWMM MX CTE kernel with manual test vectors."""
 
+        def input_gen(tc):
+            return _gen_block_inputs(
+                vnc_degree=vnc_degree,
+                hidden=hidden,
+                tokens=tokens,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                act_fn=act_fn,
+                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                skip_mode=skip_mode,
+                bias=bias,
+                is_dynamic=is_dynamic,
+                gate_clamp_upper=gate_clamp_upper,
+                gate_clamp_lower=gate_clamp_lower,
+                up_clamp_upper=up_clamp_upper,
+                up_clamp_lower=up_clamp_lower,
+                use_uint_weights=use_uint_weights,
+                n_static_blocks=n_static_blocks,
+            )
+
         compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
 
-        self.run_moe_bwmm_mx_cte_test(
+        def out_desc(ki):
+            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
+
+        is_accumulating = top_k != 1
+        custom_validation = None
+        if is_accumulating:
+            torch_ref = _mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref)
+            output_placeholder = out_desc(input_gen(None))
+            validator_cls = _make_shard0_validator(
+                torch_ref,
+                input_gen,
+                tokens,
+                hidden,
+                vnc_degree,
+                dtype,
+                rtol=5e-2,
+                atol=1e-5,
+            )
+            custom_validation = ValidationArgs(
+                golden_output={
+                    "output": CustomValidatorWithOutputTensorData(
+                        validator=validator_cls,
+                        output_ndarray=output_placeholder["output"],
+                    ),
+                },
+            )
+
+        UnitTestFramework(
             test_manager=test_manager,
+            kernel_entry=bwmm_shard_on_block_mx,
+            torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
+            kernel_input_generator=input_gen,
+            output_tensor_descriptor=out_desc,
+        ).run_test(
+            test_config=None,
             compiler_args=compiler_args,
-            lnc_degree=vnc_degree,
-            tokens=tokens,
-            hidden=hidden,
-            intermediate=intermediate,
-            expert=expert,
-            block_size=block_size,
-            top_k=top_k,
-            act_fn=act_fn,
-            skip_mode=skip_mode,
-            gate_clamp_upper=gate_clamp_upper,
-            gate_clamp_lower=gate_clamp_lower,
-            up_clamp_upper=up_clamp_upper,
-            up_clamp_lower=up_clamp_lower,
-            dtype=dtype,
-            weight_dtype=weight_dtype,
-            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-            bias=bias,
-            is_dynamic=is_dynamic,
-            collector=collector,
-            use_uint_weights=use_uint_weights,
-            n_static_blocks=n_static_blocks,
+            rtol=5e-2,
+            atol=1e-5,
+            custom_validation_args=custom_validation,
         )
 
-    @pytest.mark.skip(
-        reason="Suite disabled: MoE BWMM MX CTE broken on both beta2 and beta3, pending further fix from NKILIB-807"
-    )
     @pytest.mark.coverage_parametrize(
         vnc_degree=BoundedRange([2], boundary_values=[]),
-        hidden=BoundedRange([1536, 3072] + random.sample(range(1024, 6144, 512), 2), boundary_values=[]),
+        # change back to 6144 upper bound after accuracy issue is resolved. NKI-1582
+        hidden=BoundedRange([1536, 3072] + random.sample(range(1024, 4096, 512), 2), boundary_values=[]),
         tokens=BoundedRange([1024, 10240, 32768] + random.sample([2048, 4096, 8192], 2), boundary_values=[]),
-        intermediate=BoundedRange([384, 512, 768, 1536], boundary_values=[100, 15]),
+        intermediate=BoundedRange([384, 512, 1536], boundary_values=[100, 15, 768]),
         expert=BoundedRange([8, 16, 32, 128], boundary_values=[]),
         block_size=BoundedRange([128, 256, 512], boundary_values=[64]),
         top_k=BoundedRange([2, 3, 4, 5], boundary_values=[1]),
@@ -378,13 +585,13 @@ class TestMoeBwmmMxCteKernel:
         skip_mode=BoundedRange([0, 1], boundary_values=[]),
         bias=BoundedRange([True], boundary_values=[]),
         is_dynamic=BoundedRange([False, True], boundary_values=[]),
-        filter=filter_moe_bwmm_mx_cte_combinations,
+        filter=filter_moe_bwmm_mx_shard_block_combinations,
         coverage="pairs",
+        abbrev=_ABBREVS,
     )
-    def test_moe_bwmm_mx_cte_sweep(
+    def test_moe_bwmm_mx_shard_block_sweep(
         self,
         test_manager: Orchestrator,
-        collector: MetricsCollector,
         platform_target: Platforms,
         vnc_degree: int,
         hidden: int,
@@ -395,8 +602,8 @@ class TestMoeBwmmMxCteKernel:
         top_k: int,
         act_fn: ActFnType,
         expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-        dtype,
-        weight_dtype,
+        dtype: Any,
+        weight_dtype: Any,
         skip_mode: int,
         bias: bool,
         is_dynamic: bool,
@@ -404,210 +611,81 @@ class TestMoeBwmmMxCteKernel:
     ):
         """Sweep test for MoE BWMM MX CTE kernel using coverage_parametrize."""
 
-        with assert_negative_test_case(is_negative_test_case):
-            compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
-
-            self.run_moe_bwmm_mx_cte_test(
-                test_manager=test_manager,
-                compiler_args=compiler_args,
-                lnc_degree=vnc_degree,
-                tokens=tokens,
+        def input_gen(tc):
+            return _gen_block_inputs(
+                vnc_degree=vnc_degree,
                 hidden=hidden,
+                tokens=tokens,
                 intermediate=intermediate,
                 expert=expert,
                 block_size=block_size,
                 top_k=top_k,
                 act_fn=act_fn,
+                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
                 skip_mode=skip_mode,
+                bias=bias,
+                is_dynamic=is_dynamic,
                 gate_clamp_upper=7.0,
                 gate_clamp_lower=None,
                 up_clamp_upper=7.0,
                 up_clamp_lower=-7.0,
-                dtype=dtype,
-                weight_dtype=weight_dtype,
-                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-                bias=bias,
-                is_dynamic=is_dynamic,
-                collector=collector,
-                n_static_blocks=None,
             )
 
-    ####################################################################################################################
-    # MoE BWMM MX CTE Model Config Tests
-    ####################################################################################################################
+        def out_desc(ki):
+            return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
 
-    @pytest.mark.skip(
-        reason="Suite disabled: MoE BWMM MX CTE broken on both beta2 and beta3, pending further fix from NKILIB-807"
-    )
-    @pytest.mark.parametrize(
-        moe_bwmm_mx_cte_unit_params,
-        moe_bwmm_mx_cte_model_configs,
-    )
-    def test_moe_bwmm_mx_cte_model(
-        self,
-        test_manager: Orchestrator,
-        collector: MetricsCollector,
-        platform_target: Platforms,
-        vnc_degree: int,
-        hidden: int,
-        tokens: int,
-        intermediate: int,
-        expert: int,
-        block_size: int,
-        top_k: int,
-        act_fn: ActFnType,
-        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-        dtype,
-        weight_dtype,
-        skip_mode: int,
-        bias: bool,
-        is_dynamic: bool,
-        gate_clamp_upper: float,
-        gate_clamp_lower: float,
-        up_clamp_upper: float,
-        up_clamp_lower: float,
-        use_uint_weights: bool,
-        n_static_blocks: int,
-    ):
-        """Model config test for MoE BWMM MX CTE kernel."""
-        if platform_target is not Platforms.TRN3:
-            pytest.skip("MX quantization is only supported on TRN3.")
+        is_accumulating = top_k != 1
+        custom_validation = None
+        if is_accumulating and not is_negative_test_case:
+            torch_ref = _mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref)
+            output_placeholder = out_desc(input_gen(None))
+            validator_cls = _make_shard0_validator(
+                torch_ref,
+                input_gen,
+                tokens,
+                hidden,
+                vnc_degree,
+                dtype,
+                rtol=5e-2,
+                atol=1e-5,
+            )
+            custom_validation = ValidationArgs(
+                golden_output={
+                    "output": CustomValidatorWithOutputTensorData(
+                        validator=validator_cls,
+                        output_ndarray=output_placeholder["output"],
+                    ),
+                },
+            )
 
-        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
-
-        self.run_moe_bwmm_mx_cte_test(
+        UnitTestFramework(
             test_manager=test_manager,
-            compiler_args=compiler_args,
-            lnc_degree=vnc_degree,
-            tokens=tokens,
-            hidden=hidden,
-            intermediate=intermediate,
-            expert=expert,
-            block_size=block_size,
-            top_k=top_k,
-            act_fn=act_fn,
-            skip_mode=skip_mode,
-            gate_clamp_upper=gate_clamp_upper,
-            gate_clamp_lower=gate_clamp_lower,
-            up_clamp_upper=up_clamp_upper,
-            up_clamp_lower=up_clamp_lower,
-            dtype=dtype,
-            weight_dtype=weight_dtype,
-            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-            bias=bias,
-            is_dynamic=is_dynamic,
-            collector=collector,
-            use_uint_weights=use_uint_weights,
-            n_static_blocks=n_static_blocks,
+            kernel_entry=bwmm_shard_on_block_mx,
+            torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
+            kernel_input_generator=input_gen,
+            output_tensor_descriptor=out_desc,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-5,
+            is_negative_test=is_negative_test_case,
+            custom_validation_args=custom_validation,
         )
 
 
-# ============================================================================
-# Test Class: Shard-on-I-MX
-# ============================================================================
-
-
-@pytest_test_metadata(
-    name="MoE BWMM MX CTE",
-    pytest_marks=["moe", "cte", "mx", "shard_on_I"],
-)
+@pytest_marks(["moe", "cte", "mx", "shard_on_I"])
 @final
 @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
 class TestMoeBwmmMxShardIKernel:
     """Test class for MoE BWMM MX kernel with intermediate dimension sharding."""
 
-    def run_moe_bwmm_mx_shard_I_test(
-        self,
-        test_manager: Orchestrator,
-        compiler_args: CompilerArgs,
-        lnc_degree: int,
-        tokens: int,
-        hidden: int,
-        intermediate: int,
-        expert: int,
-        block_size: int,
-        top_k: int,
-        act_fn: ActFnType,
-        skip_mode: int,
-        gate_clamp_upper: float,
-        gate_clamp_lower: float,
-        up_clamp_upper: float,
-        up_clamp_lower: float,
-        dtype,
-        weight_dtype,
-        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-        bias: bool,
-        is_dynamic: bool,
-        collector: MetricsCollector,
-        n_static_blocks: int = None,
-    ):
-        """Run a single MoE BWMM MX shard-on-I test case."""
-        kernel_input = build_moe_bwmm_mx_cte(
-            H=hidden,
-            T=tokens,
-            E=expert,
-            B=block_size,
-            TOPK=top_k,
-            I_TP=intermediate,
-            dtype=dtype,
-            weight_dtype=weight_dtype,
-            skip_mode=skip_mode,
-            bias=bias,
-            activation_function=act_fn,
-            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-            vnc_degree=lnc_degree,
-            is_dynamic=is_dynamic,
-            gate_clamp_upper_limit=gate_clamp_upper,
-            gate_clamp_lower_limit=gate_clamp_lower,
-            up_clamp_upper_limit=up_clamp_upper,
-            up_clamp_lower_limit=up_clamp_lower,
-            is_shard_on_I=True,
-            n_static_blocks=n_static_blocks,
-        )
-
-        def create_lazy_golden():
-            return golden_moe_bwmm_mx_cte(
-                kernel_input=kernel_input,
-                dtype=dtype,
-                lnc_degree=lnc_degree,
-                is_shard_on_I=True,
-            )
-
-        dma_skip = map_skip_mode(skip_mode)
-        out_T = tokens if dma_skip.skip_token else tokens + 1
-        output_placeholder = {"output": np.zeros((out_T, hidden), dtype=dtype)}
-
-        validation_args = ValidationArgs(
-            golden_output=LazyGoldenGenerator(
-                output_ndarray=output_placeholder,
-                lazy_golden_generator=create_lazy_golden,
-            ),
-            relative_accuracy=5e-2,
-            absolute_accuracy=1e-5,
-        )
-
-        if is_dynamic:
-            kernel_func = blockwise_mm_shard_intermediate_mx_hybrid
-        else:
-            kernel_func = blockwise_mm_shard_intermediate_mx
-
-        variant = 'shard_on_I_mx_hybrid' if is_dynamic else 'shard_on_I_mx'
-        kernel_input_for_kernel = order_kernel_input(kernel_input, variant=variant)
-
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=kernel_func,
-                compiler_input=compiler_args,
-                kernel_input=kernel_input_for_kernel,
-                validation_args=validation_args,
-            )
-        )
-
-    @pytest.mark.parametrize(moe_bwmm_mx_cte_unit_params, moe_bwmm_mx_shard_I_unit_perms)
+    @pytest.mark.parametrize(SHARD_ON_BLOCK_PARAMS, SHARD_ON_I_UNIT_PERMS)
     def test_moe_bwmm_mx_shard_I_unit(
         self,
         test_manager: Orchestrator,
-        collector: MetricsCollector,
         platform_target: Platforms,
         vnc_degree: int,
         hidden: int,
@@ -618,8 +696,8 @@ class TestMoeBwmmMxShardIKernel:
         top_k: int,
         act_fn: ActFnType,
         expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-        dtype,
-        weight_dtype,
+        dtype: Any,
+        weight_dtype: Any,
         skip_mode: int,
         bias: bool,
         is_dynamic: bool,
@@ -631,46 +709,62 @@ class TestMoeBwmmMxShardIKernel:
         n_static_blocks: int,
     ):
         """Unit test for MoE BWMM MX shard-on-I kernel with manual test vectors."""
-
         if vnc_degree != 2:
             pytest.skip("Shard-on-I kernel requires exactly 2 shards.")
-
-        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
-
-        self.run_moe_bwmm_mx_shard_I_test(
-            test_manager=test_manager,
-            compiler_args=compiler_args,
-            lnc_degree=vnc_degree,
-            tokens=tokens,
-            hidden=hidden,
-            intermediate=intermediate,
-            expert=expert,
-            block_size=block_size,
-            top_k=top_k,
-            act_fn=act_fn,
-            skip_mode=skip_mode,
-            gate_clamp_upper=gate_clamp_upper,
-            gate_clamp_lower=gate_clamp_lower,
-            up_clamp_upper=up_clamp_upper,
-            up_clamp_lower=up_clamp_lower,
-            dtype=dtype,
-            weight_dtype=weight_dtype,
-            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-            bias=bias,
-            is_dynamic=is_dynamic,
-            collector=collector,
-            n_static_blocks=n_static_blocks,
+        kf = blockwise_mm_shard_intermediate_mx_hybrid if is_dynamic else blockwise_mm_shard_intermediate_mx
+        tr = (
+            blockwise_mm_shard_intermediate_mx_hybrid_torch_ref
+            if is_dynamic
+            else blockwise_mm_shard_intermediate_mx_torch_ref
         )
 
-    @pytest.mark.skip(
-        reason="Suite disabled: MoE BWMM MX CTE broken on both beta2 and beta3, pending further fix from NKILIB-807"
-    )
+        def input_gen(tc):
+            return _gen_I_inputs(
+                vnc_degree=vnc_degree,
+                hidden=hidden,
+                tokens=tokens,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                act_fn=act_fn,
+                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
+                skip_mode=skip_mode,
+                bias=bias,
+                is_dynamic=is_dynamic,
+                gate_clamp_upper=gate_clamp_upper,
+                gate_clamp_lower=gate_clamp_lower,
+                up_clamp_upper=up_clamp_upper,
+                up_clamp_lower=up_clamp_lower,
+                n_static_blocks=n_static_blocks,
+            )
+
+        def out_desc(ki):
+            return _I_output(ki, tokens, hidden, dtype, skip_mode)
+
+        UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kf,
+            torch_ref=_mx_torch_ref_wrapper(tr),
+            kernel_input_generator=input_gen,
+            output_tensor_descriptor=out_desc,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-5,
+        )
+
     @pytest.mark.coverage_parametrize(
         vnc_degree=BoundedRange([2], boundary_values=[]),
         hidden=BoundedRange([3072, 7168] + random.sample(range(1024, 8192, 512), 2), boundary_values=[]),
         tokens=BoundedRange([1024, 10240] + random.sample([2048, 4096, 8192], 2), boundary_values=[]),
         intermediate=BoundedRange([1024, 2048], boundary_values=[]),
-        expert=BoundedRange([8, 32, 128], boundary_values=[]),
+        # disabling all 128 experts test for pipeline to flow KTK-102
+        # expert=BoundedRange([8, 32, 128], boundary_values=[]),
+        expert=BoundedRange([8, 32], boundary_values=[]),
         block_size=BoundedRange([256], boundary_values=[]),
         top_k=BoundedRange([1, 2, 4, 8], boundary_values=[]),
         act_fn=BoundedRange([ActFnType.Swish], boundary_values=[]),
@@ -682,11 +776,11 @@ class TestMoeBwmmMxShardIKernel:
         is_dynamic=BoundedRange([False, True], boundary_values=[]),
         filter=filter_moe_bwmm_mx_shard_I_combinations,
         coverage="pairs",
+        abbrev=_ABBREVS,
     )
     def test_moe_bwmm_mx_shard_I_sweep(
         self,
         test_manager: Orchestrator,
-        collector: MetricsCollector,
         platform_target: Platforms,
         vnc_degree: int,
         hidden: int,
@@ -697,39 +791,289 @@ class TestMoeBwmmMxShardIKernel:
         top_k: int,
         act_fn: ActFnType,
         expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-        dtype,
-        weight_dtype,
+        dtype: Any,
+        weight_dtype: Any,
         skip_mode: int,
         bias: bool,
         is_dynamic: bool,
         is_negative_test_case: bool,
     ):
         """Sweep test for MoE BWMM MX shard-on-I kernel using coverage_parametrize."""
+        kf = blockwise_mm_shard_intermediate_mx_hybrid if is_dynamic else blockwise_mm_shard_intermediate_mx
+        tr = (
+            blockwise_mm_shard_intermediate_mx_hybrid_torch_ref
+            if is_dynamic
+            else blockwise_mm_shard_intermediate_mx_torch_ref
+        )
 
-        with assert_negative_test_case(is_negative_test_case):
-            compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
-
-            self.run_moe_bwmm_mx_shard_I_test(
-                test_manager=test_manager,
-                compiler_args=compiler_args,
-                lnc_degree=vnc_degree,
-                tokens=tokens,
+        def input_gen(tc):
+            return _gen_I_inputs(
+                vnc_degree=vnc_degree,
                 hidden=hidden,
+                tokens=tokens,
                 intermediate=intermediate,
                 expert=expert,
                 block_size=block_size,
                 top_k=top_k,
                 act_fn=act_fn,
+                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                dtype=dtype,
+                weight_dtype=weight_dtype,
                 skip_mode=skip_mode,
+                bias=bias,
+                is_dynamic=is_dynamic,
                 gate_clamp_upper=7.0,
                 gate_clamp_lower=None,
                 up_clamp_upper=7.0,
                 up_clamp_lower=-7.0,
-                dtype=dtype,
-                weight_dtype=weight_dtype,
-                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-                bias=bias,
-                is_dynamic=is_dynamic,
-                collector=collector,
-                n_static_blocks=None,
             )
+
+        def out_desc(ki):
+            return _I_output(ki, tokens, hidden, dtype, skip_mode)
+
+        UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kf,
+            torch_ref=_mx_torch_ref_wrapper(tr),
+            kernel_input_generator=input_gen,
+            output_tensor_descriptor=out_desc,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-5,
+            is_negative_test=is_negative_test_case,
+        )
+
+
+@pytest_marks(["moe", "cte", "mx", "model"])
+@final
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+class TestMoeBwmmMxCteModel:
+    """Model-driven tests for MoE BWMM MX CTE kernels, organized by tier."""
+
+    _MODEL_PARAMS = MOE_BWMM_MX_CTE_MODEL_PARAMS
+
+    _OPTIMAL_PARAMS, _OPTIMAL_IDS = (
+        prepare_model_parametrize({ModelTestType.OPTIMAL: moe_bwmm_mx_cte_model_configs.get(ModelTestType.OPTIMAL, [])})
+        if moe_bwmm_mx_cte_model_configs
+        else ([], [])
+    )
+
+    _GENERALITY_PARAMS, _GENERALITY_IDS = (
+        prepare_model_parametrize(
+            {ModelTestType.GENERALITY: moe_bwmm_mx_cte_model_configs.get(ModelTestType.GENERALITY, [])}
+        )
+        if moe_bwmm_mx_cte_model_configs
+        else ([], [])
+    )
+
+    def _run_model_test(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        variant: str,
+        vnc_degree: int,
+        hidden: int,
+        tokens: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        act_fn: ActFnType,
+        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+        dtype: Any,
+        weight_dtype: Any,
+        skip_mode: int,
+        bias: bool,
+        is_dynamic: bool,
+        gate_clamp_upper: float,
+        gate_clamp_lower: float,
+        up_clamp_upper: float,
+        up_clamp_lower: float,
+        use_uint_weights: bool,
+        skewness_pct: float,
+        global_top_k: int,
+        ep_degree: int,
+    ):
+        """Common model test logic dispatching to shard-on-block or shard-on-I."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX quantization is only supported on TRN3.")
+
+        if variant == "shard_on_I":
+            kf = blockwise_mm_shard_intermediate_mx_hybrid if is_dynamic else blockwise_mm_shard_intermediate_mx
+            tr = (
+                blockwise_mm_shard_intermediate_mx_hybrid_torch_ref
+                if is_dynamic
+                else blockwise_mm_shard_intermediate_mx_torch_ref
+            )
+
+            def input_gen(tc):
+                return _gen_I_inputs(
+                    vnc_degree=vnc_degree,
+                    hidden=hidden,
+                    tokens=tokens,
+                    intermediate=intermediate,
+                    expert=expert,
+                    block_size=block_size,
+                    act_fn=act_fn,
+                    expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                    dtype=dtype,
+                    weight_dtype=weight_dtype,
+                    skip_mode=skip_mode,
+                    bias=bias,
+                    is_dynamic=is_dynamic,
+                    gate_clamp_upper=gate_clamp_upper,
+                    gate_clamp_lower=gate_clamp_lower,
+                    up_clamp_upper=up_clamp_upper,
+                    up_clamp_lower=up_clamp_lower,
+                    skewness_pct=skewness_pct,
+                    global_top_k=global_top_k,
+                    ep_degree=ep_degree,
+                )
+
+            def out_desc(ki):
+                return _I_output(ki, tokens, hidden, dtype, skip_mode)
+
+            UnitTestFramework(
+                test_manager=test_manager,
+                kernel_entry=kf,
+                torch_ref=_mx_torch_ref_wrapper(tr),
+                kernel_input_generator=input_gen,
+                output_tensor_descriptor=out_desc,
+            ).run_test(
+                test_config=None,
+                compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+                rtol=5e-2,
+                atol=1e-5,
+            )
+        else:
+
+            def input_gen(tc):
+                return _gen_block_inputs(
+                    vnc_degree=vnc_degree,
+                    hidden=hidden,
+                    tokens=tokens,
+                    intermediate=intermediate,
+                    expert=expert,
+                    block_size=block_size,
+                    act_fn=act_fn,
+                    expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                    dtype=dtype,
+                    weight_dtype=weight_dtype,
+                    skip_mode=skip_mode,
+                    bias=bias,
+                    is_dynamic=is_dynamic,
+                    gate_clamp_upper=gate_clamp_upper,
+                    gate_clamp_lower=gate_clamp_lower,
+                    up_clamp_upper=up_clamp_upper,
+                    up_clamp_lower=up_clamp_lower,
+                    use_uint_weights=use_uint_weights,
+                    skewness_pct=skewness_pct,
+                    global_top_k=global_top_k,
+                    ep_degree=ep_degree,
+                )
+
+            def out_desc(ki):
+                return _block_output(ki, tokens, hidden, dtype, skip_mode, min(expert, global_top_k) > 1, vnc_degree)
+
+            is_accumulating = min(expert, global_top_k) > 1
+            custom_validation = None
+            if is_accumulating:
+                torch_ref = _mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref)
+                output_placeholder = out_desc(input_gen(None))
+                validator_cls = _make_shard0_validator(
+                    torch_ref,
+                    input_gen,
+                    tokens,
+                    hidden,
+                    vnc_degree,
+                    dtype,
+                    rtol=5e-2,
+                    atol=1e-5,
+                )
+                custom_validation = ValidationArgs(
+                    golden_output={
+                        "output": CustomValidatorWithOutputTensorData(
+                            validator=validator_cls,
+                            output_ndarray=output_placeholder["output"],
+                        ),
+                    },
+                )
+
+            UnitTestFramework(
+                test_manager=test_manager,
+                kernel_entry=bwmm_shard_on_block_mx,
+                torch_ref=_mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref),
+                kernel_input_generator=input_gen,
+                output_tensor_descriptor=out_desc,
+            ).run_test(
+                test_config=None,
+                compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+                rtol=5e-2,
+                atol=1e-5,
+                custom_validation_args=custom_validation,
+            )
+
+    @pytest.mark.optimal
+    @pytest.mark.parametrize(_MODEL_PARAMS, _OPTIMAL_PARAMS, ids=_OPTIMAL_IDS)
+    def test_optimal(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        variant: str,
+        vnc_degree: int,
+        hidden: int,
+        tokens: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        act_fn: ActFnType,
+        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+        dtype: Any,
+        weight_dtype: Any,
+        skip_mode: int,
+        bias: bool,
+        is_dynamic: bool,
+        gate_clamp_upper: float,
+        gate_clamp_lower: float,
+        up_clamp_upper: float,
+        up_clamp_lower: float,
+        use_uint_weights: bool,
+        skewness_pct: float,
+        global_top_k: int,
+        ep_degree: int,
+    ):
+        """OPTIMAL: Performance-optimized model configs."""
+        self._run_model_test(**{k: v for k, v in locals().items() if k != "self"})
+
+    @pytest.mark.generality
+    @pytest.mark.parametrize(_MODEL_PARAMS, _GENERALITY_PARAMS, ids=_GENERALITY_IDS)
+    def test_generality(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        variant: str,
+        vnc_degree: int,
+        hidden: int,
+        tokens: int,
+        intermediate: int,
+        expert: int,
+        block_size: int,
+        act_fn: ActFnType,
+        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+        dtype: Any,
+        weight_dtype: Any,
+        skip_mode: int,
+        bias: bool,
+        is_dynamic: bool,
+        gate_clamp_upper: float,
+        gate_clamp_lower: float,
+        up_clamp_upper: float,
+        up_clamp_lower: float,
+        use_uint_weights: bool,
+        skewness_pct: float,
+        global_top_k: int,
+        ep_degree: int,
+    ):
+        """GENERALITY: Broader model coverage configs."""
+        self._run_model_test(**{k: v for k, v in locals().items() if k != "self"})

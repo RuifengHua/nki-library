@@ -205,7 +205,7 @@ class BufferManager(nl.NKIObject):
 
         # Log initialization
         total_size = sb_upper_bound - sb_lower_bound
-        self.logger.info(f"SBM initialized: range=[{sb_lower_bound}, {sb_upper_bound}), size={total_size} B")
+        self.logger.debug(f"SBM initialized: range=[{sb_lower_bound}, {sb_upper_bound}), size={total_size} B")
         self.logger.debug(
             f"SBM config: auto_alloc={use_auto_alloc}, default_stack={default_stack_alloc}, "
             f"stack_start={sb_lower_bound}, heap_start={sb_upper_bound}"
@@ -233,7 +233,7 @@ class BufferManager(nl.NKIObject):
         total = self.upper_bound - self.lower_bound
         free = total - self.max_combined_usage
         pct = (self.max_combined_usage * 100) // total
-        self.logger.info(
+        self.logger.debug(
             f"[SBM] SB memory statistics: max_usage={self.max_combined_usage} B ({pct}%), free={free} B, stack={self.max_stack_usage} B ({self.total_stack_allocs} allocs), heap={self.max_heap_usage} B ({self.total_heap_allocs} allocs)"
         )
 
@@ -548,19 +548,6 @@ class BufferManager(nl.NKIObject):
 
     def get_name_prefix(self):
         return self.prefix
-
-    def alloc_hbm(self, shape, dtype, buffer=nl.shared_hbm, name=None):
-        """
-        Allocate a tensor in HBM with automatic name prefixing.
-
-        :param shape: shape of the tensor to be allocated
-        :param dtype: dtype of the tensor to be allocated
-        :param buffer: type of the buffer (nl.shared_hbm or nl.hbm)
-        :param name: name of the tensor (prefix will be automatically added)
-        :return: an HBM tensor
-        """
-        tensor_name = self._get_prefixed_name(name)
-        return nl.ndarray(shape, dtype=dtype, buffer=buffer, name=tensor_name)
 
     def flush_logs(self):
         """Print buffered allocation logs in tree format."""

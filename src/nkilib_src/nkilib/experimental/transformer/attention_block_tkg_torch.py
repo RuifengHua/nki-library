@@ -35,8 +35,10 @@ import inspect
 import math
 from typing import Dict, Optional, Tuple
 
+import nki.language as nl
 import torch
 
+from ...core.attention.attention_tkg import INACTIVE_BLOCK_IDX
 from ...core.attention.attention_tkg_torch import attention_tkg_torch_ref
 from ...core.attention.attention_tkg_utils import AttnTKGConfig
 from ...core.embeddings.rope_torch import _rope_single_head
@@ -44,11 +46,10 @@ from ...core.output_projection.output_projection_tkg_torch import output_project
 from ...core.qkv.qkv_tkg_torch import qkv_tkg_torch_ref
 from ...core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
 from ...core.utils.kernel_assert import kernel_assert
+from ...core.utils.kernel_helpers import get_max_positive_value_for_dtype
 from ...core.utils.logging import get_logger
 
 logger = get_logger("attention_block_tkg_torch")
-
-_FP8_E4M3_MAX = 240.0
 
 
 class AttentionBlockTkgTorchRef(torch.nn.Module):
@@ -63,9 +64,10 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         out = ref(X=..., ...)
     """
 
-    def __init__(self, lnc: int = 2):
+    def __init__(self, lnc: int = 2, kv_quant_dtype: str = nl.float8_e4m3):
         super().__init__()
         self.lnc = lnc
+        self.kv_quant_dtype = kv_quant_dtype
         self.__signature__ = inspect.signature(self.forward)
 
     def forward(
@@ -121,13 +123,19 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         input_dequant_scale_out: Optional[torch.Tensor],
         # -- output
         transposed_out: bool,
-        out_in_sb: bool,
+        transposed_in: bool = False,
+        out_in_sb: bool = False,
         # -- kernel-only params (accepted for signature compatibility, validated below)
         sbm: None = None,
         X_in_sb: bool = False,
         KVDP: int = 1,
         KVDP_replica_group: None = None,
+        KVDP_collective_mode=None,
         enable_fa_s_prior_tiling: bool = True,
+        pos_ids: Optional[torch.Tensor] = None,
+        swa_start_pos_ids: Optional[torch.Tensor] = None,
+        S_ctx: Optional[int] = None,
+        is_h_transposed_by_4: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """PyTorch reference for the fused attention block TKG kernel.
 
@@ -150,7 +158,9 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             S_max: Maximum context length (KV cache allocation size)
 
         Args:
-            X: Input hidden states. Shape: ``[B, S, H]``.
+            X: Input hidden states.
+                Shape: ``[B, S, H]`` (default) or
+                ``[H0=pmax, n_prgs, H1_shard, BxS]`` when ``transposed_in=True``.
             X_hidden_dim_actual: Actual hidden dimension when H is padded.
                 None means H is the true dimension.
 
@@ -184,24 +194,47 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                 Shape: ``[B, S_ctx // block_len]``. None for non-block KV.
             K_cache: Key cache tensor (see :func:`_update_kv_cache` for shapes).
             V_cache: Value cache tensor.
-            attention_mask: Causal attention mask. Shape: ``[S_ctx, B, N, S]``.
+            attention_mask: Attention mask. Shape: ``[S_ctx, B, N, S]`` when
+                pos_ids is None, ``[S, B, N, S]`` (active-only) when pos_ids is provided.
             sink: Optional attention sink tensor. Forwarded to attention ref.
-            softmax_scale: Custom softmax scale. None uses ``1/√D``.
+            softmax_scale: Custom softmax scale. None uses ``1/√D``. When using FP8
+                KV cache with None, k_scale is automatically absorbed effectively setting
+                ``softmax_scale = (1/√D) / k_scale``. When explicitly provided, caller
+                must incorporate k_scale: ``softmax_scale = softmax_scale / k_scale``.
+            pos_ids: Optional position IDs for in-kernel mask generation.
+                Shape: ``[B, S]``. When provided, the prior causal mask is generated
+                on-chip from position IDs and attention_mask carries only the
+                active-to-active portion.
+            swa_start_pos_ids: Optional per-query sliding window start positions.
+                Shape: ``[B, S]``. When provided with pos_ids, generates a banded
+                SWA mask attending to positions in ``[start_pos, pos_id)``.
+            S_ctx: Optional explicit context length for flat KV with pos_ids.
+                Must be provided when using flat KV with pos_ids, otherwise None.
+            is_h_transposed_by_4: Whether input X and RMSNorm gamma have been
+                pre-shuffled along the H dimension for MXFP quantization.
+                Forwarded to the QKV projection reference. Default: False.
 
             k_scale: FP8 quantization scale for K. Shape: ``[1, 1]`` or ``[P, 1]``.
                 None to disable FP8 KV quantization.
             v_scale: FP8 quantization scale for V. Same shape convention as k_scale.
 
             update_cache: Whether to write new K/V into the cache.
-            kv_cache_update_idx: Per-batch cache write position. Shape: ``[B, 1]``.
+            kv_cache_update_idx: Cache write positions.
+                Shape: ``[B, S_tkg]`` for block KV, ``[B, 1]`` for flat KV.
+                For flat KV, only the start position is needed; consecutive tokens are assumed.
 
             W_out: Output projection weight. Shape: ``[N*D, H]``. None to skip.
+                When using FP8 KV cache, should incorporate v_scale:
+                ``W_out / v_scale`` (NONE) or absorb into weight_dequant_scale_out (ROW/STATIC).
             bias_out: Output projection bias. Shape: ``[1, H]``.
             quantization_type_out: Quantization for output projection.
             weight_dequant_scale_out: Output projection weight dequantization scale.
             input_dequant_scale_out: Output projection input dequantization scale.
 
             transposed_out: Transpose the final output.
+            transposed_in: When True, X is in transposed HBM layout
+                ``[H0=pmax, n_prgs, H1_shard, BxS]``. The ref converts back to
+                ``[B, S, H]`` before processing. Default: False.
             out_in_sb: Output in SBUF layout (``[D, B, N, S]`` instead of ``[B, N, D, S]``).
 
             sbm: Accepted for signature compatibility (kernel-only, SBUF memory handle).
@@ -209,6 +242,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             KVDP: Must be 1. This ref computes a single-rank result; KVDP slicing
                 is handled by the test harness. Asserted to prevent misuse.
             KVDP_replica_group: Accepted for signature compatibility (kernel-only).
+            KVDP_collective_mode: Accepted for signature compatibility (kernel-only).
             enable_fa_s_prior_tiling: Accepted for signature compatibility
                  (kernel-only, whether to enable flash attention in kernel).
             Dict with keys:
@@ -223,6 +257,12 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         )
 
         X = X.float()
+        if transposed_in:
+            # Convert [H0, n_prgs, H1_shard, BxS] back to [B, S_tkg, H]
+            H0, n_prgs, H1_shard, BxS = X.shape
+            H = H0 * n_prgs * H1_shard
+            _, B_mask, _, S_tkg_mask = attention_mask.shape
+            X = X.permute(3, 1, 0, 2).reshape(B_mask, S_tkg_mask, H)
         B, S_tkg, H, d_head, q_heads, S_ctx, S_max_ctx, blk_len = self._extract_shapes(
             X,
             W_qkv,
@@ -230,6 +270,8 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             K_cache_transposed,
             attention_mask,
             active_blocks_table,
+            pos_ids,
+            S_ctx,
         )
 
         # -- QKV projection (reuse qkv_tkg_torch_ref)
@@ -248,6 +290,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             qkv_in_scale=input_dequant_scale_qkv,
             qkv_bias=bias_qkv,
             hidden_actual=X_hidden_dim_actual,
+            is_h_dim_4h_transposed=is_h_transposed_by_4,
         )
         QKV = qkv_result['out'].float()  # [N+2, B, S, D]
 
@@ -308,6 +351,9 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                 softmax_scale,
                 q_heads,
                 sink=sink,
+                pos_ids=pos_ids,
+                swa_start_pos_ids=swa_start_pos_ids,
+                k_scale=k_scale,
             )  # [B, N, D, S]
             output = attn_out.permute(2, 0, 1, 3) if out_in_sb else attn_out  # may be overridden
 
@@ -353,6 +399,8 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         K_cache_transposed: bool,
         attention_mask: torch.Tensor,
         active_blocks_table: Optional[torch.Tensor],
+        pos_ids: Optional[torch.Tensor],
+        S_ctx_param: Optional[int],
     ) -> Tuple[int, int, int, int, int, int, int, int]:
         """Extract and validate tensor dimensions, mirroring the kernel's
         ``_validate_and_extract_config``.
@@ -363,7 +411,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         - ``W_qkv``:  ``(H, (q_heads + 2) * d_head)``
         - ``K_cache`` flat:  ``(B, 1, S_max_ctx, d_head)``  or transposed ``(B, 1, d_head, S_max_ctx)``
         - ``K_cache`` block:  ``(n_blocks, blk_len, d_head)``
-        - ``attention_mask``:  ``(S_ctx, B, q_heads, S_tkg)``
+        - ``attention_mask``:  ``(S_ctx, B, q_heads, S_tkg)`` or ``(S_tkg, B, q_heads, S_tkg)`` when pos_ids is provided
 
         Returns:
             ``(B, S_tkg, H, d_head, q_heads, S_ctx, S_max_ctx, blk_len)``
@@ -387,17 +435,27 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         kernel_assert(q_heads > 0, f"q_heads must be > 0, got {q_heads}")
         kernel_assert(d_head % 2 == 0, f"d_head must be even, got {d_head}")
 
-        S_ctx = attention_mask.shape[0]  # (S_ctx, B, q_heads, S_tkg)
+        use_pos_id = pos_ids is not None
+        if use_pos_id and not is_block_kv:
+            kernel_assert(S_ctx_param is not None, "S_ctx is required when using pos_ids with flat KV")
+        else:
+            kernel_assert(S_ctx_param is None, "S_ctx must be None when not using pos_ids or with block KV")
+
+        S_ctx = attention_mask.shape[0] if not use_pos_id else None
         blk_len = K_cache.shape[1] if is_block_kv else 0
 
         if is_block_kv:
-            S_max_ctx = S_ctx
+            S_max_ctx = active_blocks_table.shape[1] * blk_len
+            S_ctx = S_max_ctx
         elif K_cache_transposed:
             # (B, 1, d_head, S_max_ctx)
             S_max_ctx = K_cache.shape[3]
         else:
             # (B, 1, S_max_ctx, d_head)
             S_max_ctx = K_cache.shape[2]
+
+        if S_ctx is None:
+            S_ctx = S_ctx_param
 
         return B, S_tkg, H, d_head, q_heads, S_ctx, S_max_ctx, blk_len
 
@@ -524,7 +582,9 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Quantize K and V to FP8-E4M3 range: scale and clamp to [-240, 240].
+        """Quantize K and V: scale and clamp to [-max, max].
+
+        The clipping bound is derived from ``self.kv_quant_dtype``.
 
         Args:
             K: Key tensor (any shape, typically ``[D, B, S]``), in float32.
@@ -533,19 +593,20 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             v_scale: Scale for V. Only ``v_scale[0, 0]`` is used (broadcast).
 
         Returns:
-            Tuple of (K_quantized, V_quantized) in float32, clamped to FP8 range.
+            Tuple of (K_quantized, V_quantized) in float32, clamped to the
+            representable range of ``self.kv_quant_dtype``.
         """
+        fp8_max = get_max_positive_value_for_dtype(self.kv_quant_dtype)
+        kernel_assert(fp8_max is not None, f"Unsupported kv_quant_dtype: {self.kv_quant_dtype}")
         K_scaled = K * k_scale[0, 0].float()
         V_scaled = V * v_scale[0, 0].float()
-        k_clip = (K_scaled.abs() > _FP8_E4M3_MAX).float().mean().item()
-        v_clip = (V_scaled.abs() > _FP8_E4M3_MAX).float().mean().item()
-        if k_clip > 0.01:
-            logger.warn(f"Too many K values clipped ({k_clip:.1%}), scale may be inappropriate")
-        if v_clip > 0.01:
-            logger.warn(f"Too many V values clipped ({v_clip:.1%}), scale may be inappropriate")
+        k_clip = (K_scaled.abs() > fp8_max).float().mean().item()
+        v_clip = (V_scaled.abs() > fp8_max).float().mean().item()
+        kernel_assert(k_clip <= 0.01, f"Too many K values clipped ({k_clip:.1%}), scale may be inappropriate")
+        kernel_assert(v_clip <= 0.01, f"Too many V values clipped ({v_clip:.1%}), scale may be inappropriate")
         return (
-            torch.clamp(K_scaled, -_FP8_E4M3_MAX, _FP8_E4M3_MAX),
-            torch.clamp(V_scaled, -_FP8_E4M3_MAX, _FP8_E4M3_MAX),
+            torch.clamp(K_scaled, -fp8_max, fp8_max),
+            torch.clamp(V_scaled, -fp8_max, fp8_max),
         )
 
     def _run_attention(
@@ -564,6 +625,9 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         softmax_scale: Optional[float],
         num_heads: int,
         sink: Optional[torch.Tensor] = None,
+        pos_ids: Optional[torch.Tensor] = None,
+        swa_start_pos_ids: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run scaled dot-product attention via :func:`attention_tkg_torch_ref`.
 
@@ -578,14 +642,18 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                 ``[B, 1, D, S_max]`` (transposed) or ``[B, 1, S_max, D]``.
             V_cache: Value cache. Shape: ``[blocks, block_len, D]`` (block KV) or
                 ``[B, 1, S_max, D]``.
-            attention_mask: Causal mask. Shape: ``[S_ctx, B, N, S]``.
+            attention_mask: Attention mask. Shape: ``[S_ctx, B, N, S]`` when
+                pos_ids is None, ``[S, B, N, S]`` (active-only) when pos_ids is provided.
             active_blocks_table: Block-to-slot mapping for block KV cache.
                 Shape: ``[B, S_ctx // block_len]``. None for non-block KV.
             K_cache_transposed: Whether K cache has transposed layout.
             block_len: Block length for block KV cache (0 = non-block).
             S_ctx: Context length visible to attention.
             S_max_ctx: Maximum context length (cache allocation size).
-            softmax_scale: Custom softmax scale. None uses ``1/√D``.
+            softmax_scale: Custom softmax scale. None uses ``1/√D``. When using FP8
+                KV cache with None, k_scale is automatically absorbed effectively setting
+                ``softmax_scale = (1/√D) / k_scale``. When explicitly provided, caller
+                must incorporate k_scale: ``softmax_scale = softmax_scale / k_scale``.
             num_heads: Number of query heads (N).
             sink: Optional attention sink tensor. Forwarded to attention ref.
 
@@ -601,8 +669,13 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             q = q * softmax_scale
         else:
             q = q / math.sqrt(d_head)
+            # When using FP8 KV cache without explicit softmax_scale,
+            # divide by k_scale to dequantize KV values in the QK matmul
+            if k_scale is not None:
+                q = q / float(k_scale.flat[0] if hasattr(k_scale, 'flat') else k_scale[0, 0])
 
         is_block_kv = block_len > 0
+        use_pos_id = pos_ids is not None
         cfg = AttnTKGConfig(
             bs=batch,
             q_head=num_heads,
@@ -613,11 +686,15 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             block_len=block_len,
             tp_k_prior=not K_cache_transposed,
             strided_mm1=not is_block_kv,
-            use_pos_id=False,
+            use_pos_id=use_pos_id,
             fuse_rope=False,
         )
         out = torch.zeros(batch, num_heads, d_head, S_tkg, dtype=torch.float32)
         abt = active_blocks_table.to(torch.int32) if active_blocks_table is not None else None
+
+        # When use_pos_id=True, attention_tkg_torch_ref generates the prior mask internally
+        # from rope_pos_ids/start_pos_ids. attention_mask contains the active portion.
+        mask_arg = attention_mask.to(torch.uint8)
 
         attention_tkg_torch_ref[self.lnc](
             q=q,
@@ -625,10 +702,12 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             v_active=v_active_attn,
             k_prior=K_cache.float(),
             v_prior=V_cache.float(),
-            mask=attention_mask.to(torch.uint8),
+            mask=mask_arg,
             out=out,
             cfg=cfg,
             sbm=None,
+            rope_pos_ids=pos_ids.float() if pos_ids is not None else None,
+            start_pos_ids=swa_start_pos_ids.float() if swa_start_pos_ids is not None else None,
             sink=sink,
             active_blocks_table=abt if is_block_kv else None,
         )
@@ -652,8 +731,8 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         (they are still needed as outputs for the test harness).
 
         For block KV caches, ``kv_cache_update_idx`` contains *physical* flat
-        indices into the block table. An index of ``-1`` (from uint32 0xFFFFFFFF
-        converted to int32 by the test wrapper) means "skip this batch element".
+        indices into the block table, one per token. An index of
+        ``INACTIVE_BLOCK_IDX`` means "skip".
 
         Args:
             K_new: New key tensor from projection. Shape: ``[D, B, S]``.
@@ -661,7 +740,8 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             K_cache: Key cache to update. Shape: ``[blocks, block_len, D]``
                 (block KV) or ``[B, 1, D, S_max]`` / ``[B, 1, S_max, D]``.
             V_cache: Value cache to update. Same shape convention as K_cache.
-            kv_cache_update_idx: Per-batch write position. Shape: ``[B, 1]``.
+            kv_cache_update_idx: Per-token write positions.
+                Shape: ``[B, S_tkg]`` for block KV, ``[B, 1]`` for flat KV.
             update_cache: Whether to actually write into the cache.
             K_cache_transposed: Whether K cache uses ``[B, 1, D, S_max]`` layout.
             block_len: Block length (0 = non-block KV cache).
@@ -682,11 +762,12 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             K_flat = K_cache.reshape(num_blocks * block_len, d_head)
             V_flat = V_cache.reshape(num_blocks * block_len, d_head)
             for b in range(batch):
-                idx = int(kv_cache_update_idx[b, 0].item())
-                if idx < 0 or idx == 0xFFFFFFFF:
-                    continue
-                K_flat[idx : idx + S_tkg, :] = K_new[:, b, :].T
-                V_flat[idx : idx + S_tkg, :] = V_new[b, :, :]
+                for s in range(S_tkg):
+                    idx = int(kv_cache_update_idx[b, s].item())
+                    if idx == INACTIVE_BLOCK_IDX:
+                        continue
+                    K_flat[idx, :] = K_new[:, b, s]
+                    V_flat[idx, :] = V_new[b, s, :]
             return K_flat.reshape(num_blocks, block_len, d_head), V_flat.reshape(num_blocks, block_len, d_head)
 
         for b in range(batch):

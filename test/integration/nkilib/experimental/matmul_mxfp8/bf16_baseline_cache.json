@@ -1,0 +1,134 @@
+{
+  "4096x4096x1536": {
+    "shape_name": "Qwen3-8B-TP4 - FWD-FuseQKV",
+    "M": 4096,
+    "K": 4096,
+    "N": 1536,
+    "num_lnc": 2,
+    "inference_time": 0.000403826035,
+    "active_inference_time": 0.00040038400000000005,
+    "mfu_percent": 81.14385195595425,
+    "mbu_percent": 36.16343147442783
+  },
+  "4096x1536x4096": {
+    "shape_name": "Qwen3-8B-TP4 - BWD-FuseQKV-IPGrad",
+    "M": 4096,
+    "K": 1536,
+    "N": 4096,
+    "num_lnc": 2,
+    "inference_time": 0.000385070231,
+    "active_inference_time": 0.000379821,
+    "mfu_percent": 85.09616522394846,
+    "mbu_percent": 16.77362441850665
+  },
+  "4096x4096x1024": {
+    "shape_name": "Qwen3-8B-TP4 - BWD-OProj-IPGrad",
+    "M": 4096,
+    "K": 4096,
+    "N": 1024,
+    "num_lnc": 2,
+    "inference_time": 0.000286773719,
+    "active_inference_time": 0.000275857,
+    "mfu_percent": 76.17620404515986,
+    "mbu_percent": 35.40447513983448
+  },
+  "4096x4096x6144": {
+    "shape_name": "Qwen3-8B-TP4 - FWD-MLP-FuseGateUp",
+    "M": 4096,
+    "K": 4096,
+    "N": 6144,
+    "num_lnc": 2,
+    "inference_time": 0.001471894367,
+    "active_inference_time": 0.001466953,
+    "mfu_percent": 89.04986861737207,
+    "mbu_percent": 30.60427785207392
+  },
+  "4096x6144x4096": {
+    "shape_name": "Qwen3-8B-TP4 - BWD-MLP-FuseGateUp-IPGrad",
+    "M": 4096,
+    "K": 6144,
+    "N": 4096,
+    "num_lnc": 2,
+    "inference_time": 0.001491734336,
+    "active_inference_time": 0.0014869820000000002,
+    "mfu_percent": 87.86551119515158,
+    "mbu_percent": 33.41947562902179
+  },
+  "6144x4096x4096": {
+    "shape_name": "Qwen3-8B-TP4 - BWD-MLP-FuseGateUp-WTGrad",
+    "M": 6144,
+    "K": 4096,
+    "N": 4096,
+    "num_lnc": 2,
+    "inference_time": 0.001458066888,
+    "active_inference_time": 0.001455876,
+    "mfu_percent": 89.78527093331259,
+    "mbu_percent": 30.430194753926187
+  },
+  "4096x3072x4096": {
+    "shape_name": "Qwen3-8B-TP4 - FWD-MLP-Down",
+    "M": 4096,
+    "K": 3072,
+    "N": 4096,
+    "num_lnc": 2,
+    "inference_time": 0.000753927156,
+    "active_inference_time": 0.000749043,
+    "mfu_percent": 86.92616982747336,
+    "mbu_percent": 18.041976674717517
+  },
+  "4096x4096x3072": {
+    "shape_name": "Qwen3-8B-TP4 - BWD-MLP-Down-IPGrad",
+    "M": 4096,
+    "K": 4096,
+    "N": 3072,
+    "num_lnc": 2,
+    "inference_time": 0.000761023811,
+    "active_inference_time": 0.000749575,
+    "mfu_percent": 86.11557096207598,
+    "mbu_percent": 34.62898638772105
+  },
+  "1536x4096x4096": {
+    "shape_name": "Qwen3-8B-TP4 - BWD-FuseQKV-WTGrad",
+    "M": 1536,
+    "K": 4096,
+    "N": 4096,
+    "num_lnc": 2,
+    "inference_time": 0.000427030166,
+    "active_inference_time": 0.00041622800000000004,
+    "mfu_percent": 76.73462581563851,
+    "mbu_percent": 18.356381625506735
+  },
+  "4096x128x4096": {
+    "shape_name": "Qwen3-8B-TP4 - FWD-Attn-QKt",
+    "M": 4096,
+    "K": 128,
+    "N": 4096,
+    "num_lnc": 2,
+    "inference_time": 5.8642409e-05,
+    "active_inference_time": 5.0664e-05,
+    "mfu_percent": 46.56470825860286,
+    "mbu_percent": 53.221326994382764
+  },
+  "4096x4096x128": {
+    "shape_name": "Qwen3-8B-TP4 - FWD-Attn-AV",
+    "M": 4096,
+    "K": 4096,
+    "N": 128,
+    "num_lnc": 2,
+    "inference_time": 8.0123208e-05,
+    "active_inference_time": 7.6018e-05,
+    "mfu_percent": 34.080845423296914,
+    "mbu_percent": 38.95284403898724
+  },
+  "4096x1024x4096": {
+    "shape_name": "Qwen3-8B-TP4 - FWD-OProj",
+    "M": 4096,
+    "K": 1024,
+    "N": 4096,
+    "num_lnc": 2,
+    "inference_time": 0.000259557928,
+    "active_inference_time": 0.000254724,
+    "mfu_percent": 84.16361427162163,
+    "mbu_percent": 19.226170289043615
+  }
+}

@@ -19,13 +19,21 @@ from typing import Optional, Tuple, Union
 import nki.isa as nisa
 import nki.language as nl
 
-from ..utils.allocator import SbufManager
+from ..utils.allocator import SbufManager, sizeinbytes
+from ..utils.common_types import MoEBlockIOLayout
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import get_verified_program_sharding_info
+from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
 from ..utils.tensor_view import TensorView
 from ..utils.tiled_range import TiledRange
-from .norm_tkg_utils import load_gamma_to_sbuf, load_input_to_sbuf, validate_shapes, validate_shapes_shard_on_h
+from .norm_tkg_utils import (
+    _DGE_MODE_NONE,
+    load_gamma_to_sbuf,
+    load_input_to_sbuf,
+    pe_transpose,
+    validate_shapes,
+    validate_shapes_shard_on_h,
+)
 
 # Minimum BxS size to enable sharding (balances computation vs communication overhead)
 SHARDING_THRESHOLD = 18
@@ -45,6 +53,7 @@ def rmsnorm_tkg(
     shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[SbufManager] = None,
+    inp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
 ):
     """
     RMSNorm implementation optimized for inference token generation (decoding) phase.
@@ -55,7 +64,8 @@ def rmsnorm_tkg(
         H: Hidden dimension size
 
     Args:
-        input (Union[TensorView, nl.ndarray]): [B, S, H] when in HBM or [128, B×S, H//128] when in SBUF, Input tensor
+        input (Union[TensorView, nl.ndarray]): [B, S, H] when in HBM or [128, B×S, H//128] when in SBUF, Input tensor.
+            When inp_layout=_128_Nprgs_Hfree_T, expects [128, n_prgs, H//128//n_prgs, B×S] in HBM.
         gamma (Union[TensorView, nl.ndarray]): [1, H], Gamma tensor used in normalization on HBM
         output (Union[TensorView, nl.ndarray]): [128, B×S, H//128], Output tensor
         eps (float): Epsilon to maintain numerical stability. Default is 1e-6
@@ -66,6 +76,9 @@ def rmsnorm_tkg(
         shard_on_h (bool): If True, shard computation along H dimension instead of BxS. Default is False
         use_heap_memory (bool): Indicates whether to allocate memory on heap instead of stack. Default is False
         sbm (Optional[SbufManager]): Instance of SbufManager responsible for handling sbuf allocation. Default is None
+        inp_layout (MoEBlockIOLayout): Input tensor layout. When _128_Nprgs_Hfree_T, input is
+            [128, n_prgs, H//128//n_prgs, T] in HBM; loads and permutes to [128, T, H//128]
+            in SBUF before normalization. Default is B_S_H
 
     Returns:
         output (nl.ndarray): [128, BxS, H//128], Output tensor with RMSNorm applied
@@ -89,6 +102,23 @@ def rmsnorm_tkg(
     input_view = TensorView(input) if not isinstance(input, TensorView) else input
     gamma_view = TensorView(gamma) if not isinstance(gamma, TensorView) else gamma
     output_view = TensorView(output) if not isinstance(output, TensorView) else output
+
+    # Handle transposed input: load [H0, n_prgs, H1_shard, T] -> permute to [H0, T, H_free] in SBUF
+    if inp_layout == MoEBlockIOLayout._128_Nprgs_Hfree_T:
+        _pmax = nl.tile_size.pmax
+        H_free = input.shape[1] * input.shape[2]  # n_prgs * H1_shard
+        T = input.shape[3]
+        input_raw_sb = nl.ndarray((_pmax, H_free, T), dtype=input.dtype, buffer=nl.sbuf, name="tin_raw")
+        nisa.dma_copy(
+            dst=input_raw_sb,
+            src=input.reshape((_pmax, H_free * T))[:, : H_free * T].reshape((_pmax, H_free, T)),
+        )
+        input_perm_sb = nl.ndarray((_pmax, T, H_free), dtype=input.dtype, buffer=nl.sbuf, name="tin_perm")
+        nisa.tensor_copy(
+            dst=input_perm_sb,
+            src=TensorView(input_raw_sb).permute(dims=[0, 2, 1]).get_view(),
+        )
+        input_view = TensorView(input_perm_sb)
 
     if not sbm:
         sbm = SbufManager(
@@ -442,6 +472,148 @@ def _process_rmsnorm_tile(
     sbm.close_scope()
 
 
+def rmsnorm_tkg_th(
+    input_hbm: TensorView,
+    gamma: nl.ndarray,
+    output: TensorView,
+    num_H_shards: int,
+    hidden_actual: int,
+    eps: float,
+    sbm: SbufManager = None,
+):
+    """
+    RMSNorm with contiguous DMA load and does rmsnorm in [T,H] layout.
+
+    Computation is done entirely in [T, H] layout (T on partition dim, H on free dim).
+    Only the final result is transposed to [H0, H1_shard, T] for downstream matmul.
+
+    Args:
+        input_hbm: [BxS, H] TensorView in HBM (already T-sliced by caller)
+        gamma: [1, H] nl.ndarray in HBM
+        output: [H0, H1_shard, T] TensorView in SBUF for gate/up projection
+        num_H_shards: number of H-shards (LNC count)
+        hidden_actual: full H for mean calculation
+        eps: epsilon
+        sbm: SBUF memory manager
+    """
+    T, H = input_hbm.shape
+    T0 = nl.tile_size.pmax
+    H0 = nl.tile_size.pmax
+    H1 = H // H0
+    H2 = H1 // num_H_shards  # H1 tiles per shard
+    H_per_shard = H0 * H2
+    inter_dtype = nl.float32
+
+    _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
+    # When num_H_shards=1, both cores process full H — no H-shard slicing needed
+    if num_H_shards == 1:
+        shard_id = 0
+
+    alloc_tensor = sbm.alloc_heap
+
+    # Pre-allocate tensors at H0 size (reused across T-tiles)
+    gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, buffer=nl.sbuf, name="rmsnorm_th_gamma")
+    sbuf_buffer = alloc_tensor(
+        (T0, H),  # [128, H]
+        dtype=input_hbm.dtype,
+        buffer=nl.sbuf,
+        name="rmsnorm_th_buf",
+    )
+    reduced_sq = alloc_tensor(
+        shape=(T0, 1), dtype=inter_dtype, buffer=nl.sbuf, name="rmsnorm_th_reduced_sq"
+    )  # [128, 1]
+    square_sb = alloc_tensor(shape=(H0, H), dtype=inter_dtype, buffer=nl.sbuf, name="rmsnorm_th_square")  # [128, H]
+
+    # Load gamma once, reused across all T-tiles
+    gamma_hbm_view = (
+        TensorView(gamma)
+        .flatten_dims(start_dim=0, end_dim=1)
+        .reshape_dim(dim=0, shape=[num_H_shards, H0, H2])
+        .permute(dims=[1, 0, 2])
+    )
+    gamma_sb_view = TensorView(gamma_sb).reshape_dim(dim=1, shape=[num_H_shards, H2])
+    nisa.dma_copy(dst=gamma_sb_view.get_view(), src=gamma_hbm_view.get_view(), dge_mode=_DGE_MODE_NONE)
+    gamma_shard_view = (
+        TensorView(gamma_sb)
+        .reshape_dim(dim=1, shape=[num_H_shards, H2])
+        .slice(dim=1, start=shard_id, end=shard_id + 1)
+        .squeeze_dim(dim=1)
+    )
+
+    hidden_scale = 1.0 / hidden_actual
+    H_shard_start = shard_id * H_per_shard
+
+    # Compute PSUM banks per T-tile for bank rotation across tiles
+    _psum_fmax = nl.tile_size.psum_fmax
+    _dtype_size = sizeinbytes(input_hbm.dtype)
+    _padded_tile_size = div_ceil(H0 * _dtype_size, 4) * 4 // _dtype_size  # 4 byte aligment
+    _tiles_per_psum = _psum_fmax // _padded_tile_size
+    _psum_banks_per_tile_rmsnorm = div_ceil(H2, _tiles_per_psum)
+
+    for t_tile in TiledRange(T, T0):
+        tile_T = t_tile.size
+
+        # Slice per-tile views from pre-allocated buffers
+        tile_buf = TensorView(sbuf_buffer).slice(dim=0, start=0, end=tile_T)  # [T_tile, H]
+        tile_sq = TensorView(square_sb).slice(dim=0, start=0, end=tile_T)  # [T_tile , H]
+        tile_red = TensorView(reduced_sq).slice(dim=0, start=0, end=tile_T)  # [T_tile, 1]
+
+        # --- Step 1: Contiguous load [tile_T, H] from HBM to SBUF ---
+        input_hbm_tile = input_hbm.slice(dim=0, start=t_tile.start_offset, end=t_tile.end_offset)
+        nisa.dma_copy(dst=tile_buf.get_view(), src=input_hbm_tile.get_view(), dge_mode=_DGE_MODE_NONE)
+
+        # --- Step 2: RMSNorm in [tile_T, H] layout ---
+        # Compute x^2 and reduce along H: [tile_T, H] -> [tile_T, 1]
+        nisa.activation_reduce(
+            tile_sq.get_view(),
+            op=nl.square,
+            data=tile_buf.get_view(),
+            reduce_op=nl.add,
+            reduce_res=tile_red.get_view(),
+        )
+
+        # Normalization factor: 1/sqrt(mean(x^2) + eps)
+        nisa.activation(tile_red.get_view(), op=nl.rsqrt, data=tile_red.get_view(), scale=hidden_scale, bias=eps)
+
+        # input * normalization_factor for this shard's H slice
+        input_shard = tile_buf.slice(dim=1, start=H_shard_start, end=H_shard_start + H_per_shard)  # [T_tile, H_shard]
+        norm_result_shard = tile_buf.slice(dim=1, start=0, end=H_per_shard)  # [T, H_shard]
+        nisa.tensor_scalar(
+            norm_result_shard.get_view(),
+            input_shard.get_view(),
+            op0=nl.multiply,
+            operand0=tile_red.get_view(),
+        )
+
+        # --- Step 3: Transpose [tile_T, H_per_shard] → [H0, H2, tile_T] ---
+        # pe_transpose: [tile_T, H0, H2] → [H0, tile_T, H2]
+        src = norm_result_shard.reshape_dim(dim=1, shape=[H0, H2])  # [tile_T, H0, H2]
+        dst = output.slice(dim=2, start=t_tile.start_offset, end=t_tile.end_offset)  # [H0, H2, tile_T]
+        dst_permuted = dst.permute(dims=[0, 2, 1])  # [H0, H2, tile_T] → [H0, tile_T, H2]
+        pe_transpose(
+            src=src,
+            dst=dst_permuted,
+            tile_size=H0,
+            dtype=input_hbm.dtype,
+            sbm=sbm,
+            psum_bank_base=t_tile.index * _psum_banks_per_tile_rmsnorm,
+        )
+
+        # --- Step 4: Apply gamma in [H0, H2, tile_T] layout ---
+        gamma_broadcast = gamma_shard_view.expand_dim(dim=2).broadcast(dim=2, size=tile_T)
+        nisa.tensor_tensor(
+            dst.get_view(),
+            dst.get_view(),
+            gamma_broadcast.get_view(),
+            nl.multiply,
+        )
+
+    sbm.pop_heap()  # deallocate square_sb
+    sbm.pop_heap()  # deallocate reduced_sq
+    sbm.pop_heap()  # deallocate sbuf_buffer
+    sbm.pop_heap()  # deallocate gamma
+
+
 def _rmsnorm_tkg_llama_impl(
     input: TensorView,
     gamma: TensorView,
@@ -558,3 +730,156 @@ def _rmsnorm_tkg_llama_impl(
     if use_heap_memory:
         for _ in range(num_allocated_tensor):
             sbm.pop_heap()
+
+
+# Tile size for partition dimension in DLoC rmsnorm
+_DLOC_T_TILE_SIZE = 128
+
+
+def _rmsnorm_tkg_dloc(
+    input_hbm: nl.ndarray,
+    gamma: nl.ndarray,
+    output_hbm: nl.ndarray,
+    output_sb: nl.ndarray,
+    eps: float = 1e-6,
+    hidden_actual: Optional[int] = None,
+    sync_output: bool = False,
+    sbm: Optional[SbufManager] = None,
+):
+    """
+    RMSNorm for dynamic all-expert MoE (DLoC layout).
+
+    Computes RMSNorm in [T, H] layout (T on partition dim) with T tiled into
+    128-token chunks. Produces two outputs simultaneously per tile:
+      1. HBM store: normalized [T, H] written to output_hbm
+      2. On-chip transpose: written to output_sb at each core's shard
+
+    Each LNC core processes T//2 tokens independently.
+
+    Args:
+        input_hbm: [T, H] in HBM
+        gamma: [1, H] in HBM
+        output_hbm: [T, H] in shared_hbm, both cores write their halves
+        output_sb: [H0, T//2, H1] if sync_output=False, [H0, T, H1] if sync_output=True, in SBUF
+        eps: epsilon for numerical stability
+        hidden_actual: actual H for mean calculation (if input is padded)
+        sync_output: if True, sendrecv to exchange shards so each core has full [H0, T, H1];
+                     if False, each core only has its own [H0, T//2, H1] shard (other half undefined)
+        sbm: SBUF memory manager
+    """
+    # Flatten [B, S, H] -> [T, H] if needed
+    if len(input_hbm.shape) == 3:
+        B, S, H = input_hbm.shape
+        T = B * S
+        input_hbm_view = TensorView(input_hbm).flatten_dims(start_dim=0, end_dim=1)
+    else:
+        T, H = input_hbm.shape
+        input_hbm_view = TensorView(input_hbm)
+    H0 = nl.tile_size.pmax  # 128
+    H1 = H // H0
+    inter_dtype = nl.float32
+    tile_size = _DLOC_T_TILE_SIZE
+
+    if hidden_actual is None:
+        hidden_actual = H
+
+    _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg_dloc", (0, 1))
+    kernel_assert(lnc == 2, "rmsnorm_tkg_dloc requires LNC=2")
+    kernel_assert(T % 2 == 0, "T must be even for LNC=2 sharding")
+
+    T_shard = T // 2
+    kernel_assert(T_shard % tile_size == 0, f"T//2 must be divisible by {tile_size}")
+
+    if not sbm:
+        sbm = SbufManager(
+            sb_lower_bound=0,
+            sb_upper_bound=nl.tile_size.total_available_sbuf_size,
+            logger=get_logger("rmsnorm_tkg_dloc"),
+            use_auto_alloc=True,
+        )
+
+    sbm.open_scope(name="rmsnorm_tkg_dloc")
+
+    num_tiles = T_shard // tile_size
+    hidden_scale = 1.0 / hidden_actual
+    sb_shard_offset = shard_id * T_shard if sync_output else 0
+
+    # Pre-allocate per-tile scratch buffers
+    tile_buf = sbm.alloc_heap((tile_size, H), dtype=input_hbm.dtype, buffer=nl.sbuf, name="dloc_tile_buf")
+    reduced_sq = sbm.alloc_heap((tile_size, 1), dtype=inter_dtype, buffer=nl.sbuf, name="dloc_reduced_sq")
+    square_sb = sbm.alloc_heap((tile_size, H), dtype=inter_dtype, buffer=nl.sbuf, name="dloc_square")
+
+    # Load gamma [1, H] -> [tile_size, H] replicated across partition dim
+    gamma_sb = sbm.alloc_heap((tile_size, H), dtype=gamma.dtype, buffer=nl.sbuf, name="dloc_gamma")
+    gamma_hbm_view = TensorView(gamma).broadcast(dim=0, size=tile_size)
+    nisa.dma_copy(dst=gamma_sb, src=gamma_hbm_view.get_view(), dge_mode=_DGE_MODE_NONE)
+
+    output_hbm_view = TensorView(output_hbm)
+    output_sb_view = TensorView(output_sb)
+
+    for tile_idx in range(num_tiles):
+        t_start = shard_id * T_shard + tile_idx * tile_size  # HBM offset
+        sb_t_start = sb_shard_offset + tile_idx * tile_size  # SBUF offset (includes shard offset)
+
+        # --- Load [tile_size, H] from HBM ---
+        input_tile = input_hbm_view.slice(dim=0, start=t_start, end=t_start + tile_size)
+        nisa.dma_copy(dst=tile_buf, src=input_tile.get_view(), dge_mode=_DGE_MODE_NONE)
+
+        # --- RMSNorm compute in [tile_size, H] layout ---
+        # Square + reduce along H: [tile_size, H] -> [tile_size, 1]
+        nisa.activation_reduce(
+            square_sb,
+            op=nl.square,
+            data=tile_buf,
+            reduce_op=nl.add,
+            reduce_res=reduced_sq,
+        )
+
+        # rsqrt(mean(x^2) + eps): [tile_size, 1]
+        nisa.activation(reduced_sq[...], op=nl.rsqrt, data=reduced_sq[...], scale=hidden_scale, bias=eps)
+
+        # x * (1/rms) * gamma: [tile_size, H]
+        nisa.tensor_scalar(
+            tile_buf[...],
+            tile_buf[...],
+            op0=nl.multiply,
+            operand0=reduced_sq,
+        )
+        nisa.tensor_tensor(
+            tile_buf[...],
+            tile_buf[...],
+            gamma_sb[...],
+            nl.multiply,
+        )
+
+        # --- Output 1: HBM store [tile_size, H] (no layout change needed) ---
+        output_tile = output_hbm_view.slice(dim=0, start=t_start, end=t_start + tile_size)
+        nisa.dma_copy(dst=output_tile.get_view(), src=tile_buf, dge_mode=_DGE_MODE_NONE)
+
+        # --- Output 2: Transpose [tile_size, H] -> [H0, tile_size, H1] into output_sb ---
+        src_3d = TensorView(tile_buf).reshape_dim(dim=1, shape=[H0, H1])  # [tile_size, H0, H1]
+        dst_3d = output_sb_view.slice(dim=1, start=sb_t_start, end=sb_t_start + tile_size)
+        pe_transpose(src=src_3d, dst=dst_3d, tile_size=H0, dtype=input_hbm.dtype, sbm=sbm)
+
+    sbm.pop_heap()  # gamma_sb
+    sbm.pop_heap()  # square_sb
+    sbm.pop_heap()  # reduced_sq
+    sbm.pop_heap()  # tile_buf
+
+    # --- HBM barrier: both cores must finish writing before downstream reads ---
+    nisa.core_barrier(output_hbm, (0, 1))
+
+    # --- Optional: sync SBUF output across cores ---
+    if sync_output:
+        other_offset = (1 - shard_id) * T_shard
+        local_src = output_sb_view.slice(dim=1, start=sb_shard_offset, end=sb_shard_offset + T_shard)
+        remote_dst = output_sb_view.slice(dim=1, start=other_offset, end=other_offset + T_shard)
+        nisa.sendrecv(
+            dst=remote_dst.get_view(),
+            src=local_src.get_view(),
+            send_to_rank=1 - shard_id,
+            recv_from_rank=1 - shard_id,
+            pipe_id=0,
+        )
+
+    sbm.close_scope()

@@ -37,6 +37,8 @@ def attention_bwd_torch_ref(
     mixed_precision: bool = False,
     softmax_scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
+    transpose_dv: bool = False,
+    cp_offset: int = 0,
 ) -> dict:
     """
     PyTorch reference implementation of Flash Attention backward pass.
@@ -50,10 +52,10 @@ def attention_bwd_torch_ref(
         o_ref (torch.Tensor): Forward pass output (unused, needed for kernel signature match)
         dy_ref (torch.Tensor): Gradient of output of shape (B, Hq, d, seqlen_q)
         lse_ref (torch.Tensor): Log-sum-exp from forward pass (unused, needed for kernel signature match)
-        bound_min (Optional[torch.Tensor]): Shape (seqlen_q,). For sequence packing: K-index where
-            the sequence containing each Q token starts.
-        bound_max (Optional[torch.Tensor]): Shape (seqlen_q,). For sequence packing: K-index where
-            the sequence containing each Q token ends (exclusive).
+        bound_min (Optional[torch.Tensor]): Shape (B, seqlen_q). For sequence packing: per-batch
+            K-index where the sequence containing each Q token starts.
+        bound_max (Optional[torch.Tensor]): Shape (B, seqlen_q). For sequence packing: per-batch
+            K-index where the sequence containing each Q token ends (exclusive).
         sinks_ref (Optional[torch.Tensor]): Optional attention sinks of shape (B, Hq) or (B, Hq, num_sinks)
         use_causal_mask (bool): Whether to apply causal masking
         mixed_precision (bool): Whether to use mixed precision for reductions
@@ -83,6 +85,7 @@ def attention_bwd_torch_ref(
         bound_min=bound_min,
         bound_max=bound_max,
         sinks=sinks_ref,
+        cp_offset=cp_offset,
     )
 
     softmax_dy = mixed_precision_matmul(dy_ref.permute(0, 1, 3, 2), v_expanded)
@@ -113,6 +116,9 @@ def attention_bwd_torch_ref(
     dq_golden = dq_golden.to(q_ref.dtype)
     dk_golden = dk_golden.to(k_ref.dtype)
     dv_golden = dv_golden.to(v_ref.dtype)
+    if transpose_dv:
+        # [bs, nheads_kv, d_head, seqlen_k] -> [bs, seqlen_k, nheads_kv, d_head]
+        dv_golden = dv_golden.permute(0, 3, 1, 2).contiguous()
 
     result = {
         "out_dq_ref": dq_golden,
@@ -137,6 +143,7 @@ def compute_o_lse(
     sinks: Optional[torch.tensor] = None,
     bound_min: Optional[torch.Tensor] = None,
     bound_max: Optional[torch.Tensor] = None,
+    cp_offset: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute forward attention output, log-sum-exp, and normalized scores.
@@ -180,16 +187,26 @@ def compute_o_lse(
     # Create combined mask
     mask = torch.zeros(seqlen_q, seqlen_k, device=q.device, dtype=torch.bool)
     if use_causal_mask:
-        mask |= torch.triu(torch.ones(seqlen_q, seqlen_k, device=q.device, dtype=torch.bool), diagonal=1)
-    if sliding_window > 0:
-        q_pos = torch.arange(seqlen_q, device=q.device).unsqueeze(1)
+        # With cp_offset, Q positions are shifted: q_pos_global = q_pos_local + cp_offset
+        # Causal condition: q_pos_global >= k_pos, i.e., q_pos_local + cp_offset >= k_pos
+        q_pos = torch.arange(seqlen_q, device=q.device).unsqueeze(1) + cp_offset
         k_pos = torch.arange(seqlen_k, device=q.device).unsqueeze(0)
-        mask |= k_pos < (q_pos - sliding_window + 1)
+        mask |= q_pos < k_pos
+    if sliding_window > 0:
+        q_pos_sw = torch.arange(seqlen_q, device=q.device).unsqueeze(1) + cp_offset
+        k_pos_sw = torch.arange(seqlen_k, device=q.device).unsqueeze(0)
+        mask |= k_pos_sw < (q_pos_sw - sliding_window + 1)
+
+    # Sequence packing mask: per-batch, shape (B, 1, seqlen_q, seqlen_k) for broadcasting with (B, Hq, seqlen_q, seqlen_k)
     if bound_min is not None:
         k_pos = torch.arange(seqlen_k, device=q.device, dtype=torch.float32)
-        mask |= (k_pos[None, :] < bound_min[:, None]) | (k_pos[None, :] >= bound_max[:, None])
+        # bound_min/bound_max: (B, seqlen_q) -> (B, seqlen_q, 1) for broadcast
+        seq_pack_mask = (k_pos[None, None, :] < bound_min[:, :, None]) | (k_pos[None, None, :] >= bound_max[:, :, None])
+        # Combine with causal/SWA mask: broadcast (seqlen_q, seqlen_k) -> (B, seqlen_q, seqlen_k)
+        # Then unsqueeze to (B, 1, seqlen_q, seqlen_k) for Hq broadcast
+        mask = (mask.unsqueeze(0) | seq_pack_mask).unsqueeze(1)
 
-    # Apply mask once with broadcasting (mask broadcasts from (seqlen_q, seqlen_k) to (B, Hq, seqlen_q, seqlen_k))
+    # Apply mask with broadcasting (to (B, Hq, seqlen_q, seqlen_k))
     if use_causal_mask or sliding_window > 0 or bound_min is not None:
         raw_score = raw_score.masked_fill(mask, -float("inf"))
 

@@ -35,10 +35,17 @@ from ...utils.allocator import SbufManager
 # common utils
 from ...utils.common_types import ExpertAffinityScaleMode, GateUpDim, QuantizationType
 from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import div_ceil
 from ...utils.logging import get_logger
 from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
-from .moe_tkg_utils import reshape_scale_for_mlp, safe_tensor_view
+from .moe_tkg_utils import (
+    broadcast_all_expert_affinity,
+    get_all_expert_tile_affinities,
+    load_all_expert_affinities,
+    reshape_scale_for_mlp,
+    safe_tensor_view,
+)
 
 
 @dataclass
@@ -56,9 +63,20 @@ class TokenTilingConfig(nl.NKIObject):
 def _create_token_tiling_config(dims) -> TokenTilingConfig:
     """Create TokenTilingConfig from MLPTKGConstants dimensions."""
     T_total = dims.T
+    # LHS/RHS swap path places T in the free dimension (psum_fmax),
+    # but the down projection packs H1_shard tiles into PSUM banks,
+    # constraining T to: psum_fmax // ceil(H1_shard / psum_bmax).
     pmax = dims._pmax
-    tile_T = min(T_total, pmax)
-    num_tiles = (T_total + pmax - 1) // pmax
+    psum_fmax = dims._psum_fmax
+    psum_bmax = dims._psum_bmax
+    min_perBankT = div_ceil(dims.H1_shard, psum_bmax)
+    tile_limit = psum_fmax // max(min_perBankT, 1)
+    tile_limit = min(tile_limit, psum_fmax)
+    # Round down to multiple of pmax so affinity chunking aligns cleanly
+    tile_limit = (tile_limit // pmax) * pmax
+    tile_limit = max(tile_limit, pmax)  # at least pmax
+    tile_T = min(T_total, tile_limit)
+    num_tiles = div_ceil(T_total, tile_limit)
     return TokenTilingConfig(T_total=T_total, tile_T=tile_T, num_tiles=num_tiles)
 
 
@@ -128,10 +146,11 @@ def _all_expert_moe_tkg(
     sbm.open_scope()
     allocator = sbm.alloc_stack
 
-    # Wrap weight/bias tensors in TensorView for slicing (shared across all T-tiles)
-    gate_proj_weights_view = TensorView(params.gate_proj_weights_tensor)
-    up_proj_weights_view = TensorView(params.up_proj_weights_tensor)
-    down_proj_weights_view = TensorView(params.down_proj_weights_tensor)
+    # Wrap hidden/weight/bias tensors in TensorView for slicing (shared across all T-tiles)
+    hidden_tensor_view = safe_tensor_view(params.hidden_tensor)
+    gate_proj_weights_view = safe_tensor_view(params.gate_proj_weights_tensor)
+    up_proj_weights_view = safe_tensor_view(params.up_proj_weights_tensor)
+    down_proj_weights_view = safe_tensor_view(params.down_proj_weights_tensor)
 
     gate_proj_bias_view = safe_tensor_view(params.bias_params.gate_proj_bias_tensor)
     up_proj_bias_view = safe_tensor_view(params.bias_params.up_proj_bias_tensor)
@@ -151,33 +170,15 @@ def _all_expert_moe_tkg(
 
     # Load expert affinities for all T-tiles upfront
     pmax = dims._pmax
-    if expert_affinities_in_sbuf:
-        expert_affinities_sb = expert_affinities
-    else:
-        if t_cfg.num_tiles == 1:
-            expert_affinities_sb = allocator(
-                (t_cfg.T_total, dims.E), dtype=expert_affinities.dtype, buffer=nl.sbuf, name="expertAffinityAll"
-            )
-            nisa.dma_copy(
-                dst=expert_affinities_sb[: t_cfg.T_total, : dims.E], src=expert_affinities[: t_cfg.T_total, : dims.E]
-            )
-        else:
-            expert_affinities_sb = allocator(
-                (t_cfg.tile_T, t_cfg.num_tiles, dims.E),
-                dtype=expert_affinities.dtype,
-                buffer=nl.sbuf,
-                name="expertAffinityAll",
-            )
-            for t_tile in TiledRange(t_cfg.T_total, t_cfg.tile_T):
-                nisa.dma_copy(
-                    dst=expert_affinities_sb[: t_tile.size, t_tile.index, : dims.E],
-                    src=expert_affinities[nl.ds(t_tile.start_offset, t_tile.size), : dims.E],
-                )
+    expert_affinities_sb, aff_num_tiles = load_all_expert_affinities(
+        expert_affinities, expert_affinities_in_sbuf, t_cfg.T_total, dims, allocator
+    )
 
     memory_safe_degree = 2 if t_cfg.tile_T * dims.H * dims.I <= 32 * 3072 * 1024 else 1
 
-    # Pre-load identity matrix (reused across all experts)
-    identity_sb = nl.shared_identity_matrix(t_cfg.tile_T, dtype=io_dtype)
+    # Pre-load identity matrix (reused across all experts, only for T <= pmax)
+    pmax = dims._pmax
+    identity_sb = nl.shared_identity_matrix(t_cfg.tile_T, dtype=io_dtype) if t_cfg.tile_T <= pmax else None
 
     # Pre-load all input tiles (reused across all experts, avoids redundant DMA per expert)
     if hidden_in_sbuf:
@@ -187,13 +188,14 @@ def _all_expert_moe_tkg(
         for t_tile in TiledRange(t_cfg.T_total, t_cfg.tile_T):
             dims.T = t_tile.size  # Temporarily set for input_norm_load
             isb = allocator(
-                [dims.H0, t_tile.size, dims.H1],
+                [dims.H0, t_tile.size, dims.H1_shard],
                 dtype=io_dtype,
                 buffer=nl.sbuf,
                 name=f"input_sb_t{t_tile.index}",
             )
-            input_norm_load(params.hidden_tensor, isb, params, dims, sbm=sbm, T_offset=t_tile.start_offset)
-            input_sb_tiles.append(isb)
+            isb_view = safe_tensor_view(isb)
+            input_norm_load(hidden_tensor_view, isb_view, params, dims, sbm=sbm, T_offset=t_tile.start_offset)
+            input_sb_tiles.append(isb_view)
 
     # E-then-T: outer loop over experts (load weights once), inner loop over T-tiles
     for expertIdx in range(dims.E):
@@ -251,87 +253,67 @@ def _all_expert_moe_tkg(
             dims.T = current_tile_T  # Temporarily set for sub-kernels
 
             # Get expert affinity for this T-tile
-            if t_cfg.num_tiles == 1:
-                expertAffinityLoc = expert_affinities_sb
-            else:
-                expertAffinityLoc = allocator(
-                    (current_tile_T, dims.E), dtype=expert_affinities_sb.dtype, buffer=nl.sbuf, name="expertAffinityLoc"
-                )
-                nisa.tensor_copy(
-                    dst=expertAffinityLoc[:current_tile_T, : dims.E],
-                    src=expert_affinities_sb[:current_tile_T, t_idx, : dims.E],
-                )
+            expertAffinityLoc = get_all_expert_tile_affinities(
+                expert_affinities_sb, aff_num_tiles, t_offset, current_tile_T, dims, allocator
+            )
 
             # Use pre-loaded input for this T-tile
             if hidden_in_sbuf:
-                input_sb = params.hidden_tensor
+                input_sb = hidden_tensor_view
             else:
                 input_sb = input_sb_tiles[t_idx]
 
             # Slice pre-allocated buffers to current tile size
             gate_up_sb = allocator(
-                (dims.I0, dims.num_total_128_tiles_per_I, current_tile_T),
+                (dims.I0, div_ceil(dims.I, dims.I0), current_tile_T),
                 dtype=nl.float32,
                 name="gate_up_sbuf",
                 buffer=nl.sbuf,
             )
+            gate_up_sb_view = safe_tensor_view(gate_up_sb)
             down_sb = allocator(
                 (dims.H0, dims.H1_shard, current_tile_T), dtype=io_dtype, name="down_sbuf", buffer=nl.sbuf
             )
+            down_sb_view = safe_tensor_view(down_sb)
 
             # Gate Up projection
             gate_tile_info = process_gate_up_projection(
                 hidden=input_sb,
-                output=gate_up_sb,
+                output=gate_up_sb_view,
                 params=params,
                 dims=dims,
                 sbm=sbm,
                 T_offset=t_offset if hidden_in_sbuf else 0,
+                share_memory_scope=True,
             )
 
             # Compute POST_SCALE affinity broadcast
             if params.expert_params.expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
-                expert_affinities_broadcast = allocator(
-                    (pmax, current_tile_T), dtype=io_dtype, buffer=nl.sbuf, name="expert_affinities_sb"
+                expert_affinities_broadcast = broadcast_all_expert_affinity(
+                    expert_affinities_sb,
+                    aff_num_tiles,
+                    expertIdx,
+                    t_offset,
+                    current_tile_T,
+                    io_dtype,
+                    identity_sb,
+                    dims,
+                    allocator,
+                    use_auto_alloc,
                 )
-                affinityTpPsum = nl.ndarray(
-                    (1, current_tile_T), dtype=nl.float32, buffer=nl.psum, address=None if use_auto_alloc else (0, 0)
-                )
-                expertAffinityLoc_cast = allocator(
-                    (current_tile_T, 1), dtype=io_dtype, buffer=nl.sbuf, name="expertAffinityLoc_cast"
-                )
-                nisa.activation(
-                    dst=expertAffinityLoc_cast[:current_tile_T, :],
-                    op=nl.copy,
-                    data=expertAffinityLoc[:current_tile_T, nl.ds(expertIdx, 1)],
-                )
-                nisa.nc_matmul(
-                    dst=affinityTpPsum[:, :],
-                    stationary=expertAffinityLoc_cast,
-                    moving=identity_sb[:current_tile_T, :current_tile_T],
-                )
-                nisa.tensor_copy(
-                    src=affinityTpPsum[:, :],
-                    dst=expert_affinities_broadcast[:1, :current_tile_T],
-                )
-                for partition_group_idx in range(4):
-                    nisa.nc_stream_shuffle(
-                        dst=expert_affinities_broadcast[nl.ds(32 * partition_group_idx, 32), :current_tile_T],
-                        src=expert_affinities_broadcast[:1, :current_tile_T],
-                        shuffle_mask=[0] * 32,
-                    )
 
             # Down projection
             gate_up_sb_casted = allocator(
-                (dims.I0, dims.num_total_128_tiles_per_I, current_tile_T),
+                (dims.I0, div_ceil(dims.I, dims.I0), current_tile_T),
                 dtype=io_dtype,
                 name="gate_up_sbuf_with_io_dtype",
                 buffer=nl.sbuf,
             )
+            gate_up_sb_casted_view = safe_tensor_view(gate_up_sb_casted)
             nisa.tensor_copy(dst=gate_up_sb_casted, src=gate_up_sb)
             process_down_projection(
-                hidden=gate_up_sb_casted,
-                output=down_sb,
+                hidden=gate_up_sb_casted_view,
+                output=down_sb_view,
                 params=params,
                 dims=dims,
                 gate_tile_info=gate_tile_info,
@@ -366,19 +348,33 @@ def _all_expert_moe_tkg(
             sbm.increment_section()
         sbm.close_scope()
 
-    # Store: transpose [H0, H1_shard, tile_T] to [tile_T, H] and write to HBM (once per T-tile)
+    # Store: transpose [H0, H1_shard, T] to [T, H] and write to HBM
+    # transpose_store requires T <= pmax, so tile in pmax-sized chunks
+    store_tile_T = min(t_cfg.T_total, pmax)
     if output_in_sbuf:
-        for t_tile in TiledRange(t_cfg.T_total, t_cfg.tile_T):
-            t_free_offset = t_tile.index * t_cfg.tile_T
+        for t_tile in TiledRange(t_cfg.T_total, store_tile_T):
+            t_free_offset = t_tile.start_offset  # offset into output_temp's free dim
             for h1 in range(dims.H1_shard):
                 nisa.tensor_copy(
                     dst=output[:, nl.ds(t_tile.start_offset, t_tile.size), h1],
                     src=output_temp[:, h1, nl.ds(t_free_offset, t_tile.size)],
                 )
-    else:
+    elif params.transposed_out:
         for t_tile in TiledRange(t_cfg.T_total, t_cfg.tile_T):
-            sbm.set_name_prefix(f"store_t{t_tile.index}_")
             t_free_offset = t_tile.index * t_cfg.tile_T
+            tile_nc_size = dims.H1_shard * t_tile.size
+            full_nc_size = dims.H1_shard * t_cfg.T_total
+            nc_offset = dims.shard_id * full_nc_size + dims.H1_shard * t_tile.start_offset
+            nisa.dma_copy(
+                dst=output.reshape((dims.H0, dims.num_shards * full_nc_size))[:, nc_offset : nc_offset + tile_nc_size],
+                src=output_temp[: dims.H0, : dims.H1_shard, nl.ds(t_free_offset, t_tile.size)].reshape(
+                    (dims.H0, tile_nc_size)
+                ),
+            )
+    else:
+        for t_tile in TiledRange(t_cfg.T_total, store_tile_T):
+            sbm.set_name_prefix(f"store_t{t_tile.index}_")
+            t_free_offset = t_tile.start_offset
             dims.T = t_tile.size  # Temporarily set for transpose_store
             transpose_store(
                 output_temp[: dims.H0, : dims.H1_shard, nl.ds(t_free_offset, t_tile.size)],

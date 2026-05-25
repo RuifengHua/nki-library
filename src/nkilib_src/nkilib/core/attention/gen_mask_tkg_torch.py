@@ -206,9 +206,17 @@ def build_swa_attention_mask(
 ) -> torch.Tensor:
     """Per-query SWA mask: each query has its own [start, end) window.
 
+    The prior mask end boundary is clamped to end_vals[b, 0] (the base
+    position = cache_lens[b]) for every query in a batch.  Positions
+    cache_lens[b] .. cache_lens[b]+i-1 are active tokens that live in the
+    active KV buffer, not the prior cache.  The start boundary still shifts
+    per query so the window slides correctly.
+
     Args:
         start_vals: [bs * s_active] per-query SWA window start (inclusive).
         end_vals: [bs * s_active] per-query end positions (exclusive).
+            end_vals[b*s_active + i] = cache_lens[b] + i.  Only the first
+            element per batch (i=0) is used as the prior mask end.
         batch: Batch size.
         num_heads: Number of attention heads.
         s_active: Active sequence length.
@@ -223,9 +231,11 @@ def build_swa_attention_mask(
     # k_indices: [1, 1, s_ctx] global position of each cache slot
     k_indices = torch.arange(s_ctx, dtype=torch.float32).view(1, 1, s_ctx) + s_prior_start_offset
 
-    # Reshape start/end from [bs * s_active] to [batch, s_active, 1] for broadcasting
+    # Reshape start from [bs * s_active] to [batch, s_active, 1] for broadcasting
     starts = start_vals.view(batch, s_active, 1).float()
-    ends = end_vals.view(batch, s_active, 1).float()
+
+    # Prior mask end = end_vals[b, 0] = cache_lens[b], broadcast across all s_active
+    ends = end_vals.view(batch, s_active, 1)[:, 0:1, :].expand(batch, s_active, 1).float()
 
     # Vectorized mask: normal (start <= end) uses AND, wrap-around uses OR
     normal = starts <= ends

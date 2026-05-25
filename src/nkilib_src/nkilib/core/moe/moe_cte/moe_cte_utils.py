@@ -50,16 +50,18 @@ import nki.language as nl
 from nki.isa.constants import oob_mode
 from nki.language import NKIObject
 
+from ...utils.allocator import SbufManager
 from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import reduce
+from ...utils.kernel_helpers import _sbm_alloc, reduce
+from ...utils.tensor_view import TensorView
 
 TILE_SIZE = 128
 PSUM_SIZE = 512
 N_PSUM_BANKS = 8
 DVE_CHANNELS_PER_BANK = 32
 TOTAL_PSUM_SIZE = PSUM_SIZE * N_PSUM_BANKS
-SB_QUADRANT_SIZE = 32
+SBUF_QUADRANT_SIZE = 32
 
 
 class SkipMode(NKIObject):
@@ -237,7 +239,7 @@ def stream_shuffle_broadcast(src, dst):
         )
 
 
-def load_block_expert(block_to_expert, block_idx):
+def load_block_expert(block_to_expert, block_idx, sbm: Optional[SbufManager] = None, name="block_expert"):
     """
     Load expert ID assigned to the current block.
 
@@ -249,6 +251,8 @@ def load_block_expert(block_to_expert, block_idx):
             number of blocks, containing expert indices.
         block_idx (int or nl.ndarray): Block index to load, either static integer
             or dynamic tensor value.
+        sbm (SbufManager): Optional SbufManager for SBUF allocation.
+        name (str): Name for the allocated tensor (must be unique within scope).
 
     Returns:
         block_expert (nl.ndarray): Expert ID tensor of shape [1, 1] in SBUF.
@@ -267,7 +271,7 @@ def load_block_expert(block_to_expert, block_idx):
             dma_copy block_to_expert[block_idx] to block_expert using scalar_offset
         return block_expert
     """
-    block_expert = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    block_expert = _sbm_alloc(sbm, (1, 1), dtype=nl.int32, name=name if sbm else None, align=SBUF_QUADRANT_SIZE)
 
     if isinstance(block_idx, int):
         nisa.dma_copy(dst=block_expert[0, 0], src=block_to_expert.ap(pattern=[[1, 1], [1, 1]], offset=block_idx))
@@ -279,7 +283,7 @@ def load_block_expert(block_to_expert, block_idx):
     return block_expert
 
 
-def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES):
+def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES, sbm=None):
     """
     Load and transpose token indices for the current block.
 
@@ -291,6 +295,7 @@ def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES):
         block_idx (int): Current block index.
         B (int): Block size (number of tokens per block).
         NUM_TILES (int): Number of tiles (B // TILE_SIZE).
+        sbm (SbufManager): Optional SbufManager for SBUF allocation.
 
     Returns:
         result (nl.ndarray): Transposed token indices of shape [TILE_SIZE, NUM_TILES] in SBUF.
@@ -307,7 +312,13 @@ def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES):
         dma_transpose token_position_to_id[offset:offset+B] to result
         return result
     """
-    result = nl.ndarray((TILE_SIZE, NUM_TILES), dtype=nl.int32, buffer=nl.sbuf)
+    result = _sbm_alloc(
+        sbm,
+        (TILE_SIZE, NUM_TILES),
+        dtype=nl.int32,
+        name=f"token_indices_{block_idx}" if sbm else None,
+        align=SBUF_QUADRANT_SIZE,
+    )
     offset = block_idx * B
     nisa.dma_transpose(
         dst=result.ap(pattern=[[NUM_TILES, TILE_SIZE], [1, 1], [1, 1], [1, NUM_TILES]]),
@@ -317,7 +328,7 @@ def load_token_indices(token_position_to_id, block_idx, B, NUM_TILES):
 
 
 def load_token_indices_dynamic_block(
-    token_position_to_id, block_idx, B, NUM_TILES, skip_dma: SkipMode = SkipMode(False, False)
+    token_position_to_id, block_idx, B, NUM_TILES, skip_dma: SkipMode = SkipMode(False, False), sbm=None
 ):
     """
     Load token indices for dynamic block with runtime block index.
@@ -339,7 +350,7 @@ def load_token_indices_dynamic_block(
         - Handles dynamic block_idx by copying to temp tensor for scalar_offset
         - Reshapes token_position_to_id to [total_size//B, B] for indexing
         - Validates total_size is divisible by B
-        - Memsets to zero when skip_dma.skip_token is True
+        - Memsets to zero when skip_dma.skip_token == True
         - Transposes result for partition-dimension access
 
     Pseudocode:
@@ -354,8 +365,12 @@ def load_token_indices_dynamic_block(
             dma_copy reshaped[block_idx_copy, idx*TILE_SIZE:(idx+1)*TILE_SIZE] to local_token_indices[:, idx]
         return local_token_indices
     """
-    local_token_indices = nl.ndarray(
-        (TILE_SIZE, NUM_TILES), dtype=token_position_to_id.dtype, buffer=nl.sbuf
+    local_token_indices = _sbm_alloc(
+        sbm,
+        (TILE_SIZE, NUM_TILES),
+        dtype=token_position_to_id.dtype,
+        name="local_token_indices" if sbm else None,
+        align=SBUF_QUADRANT_SIZE,
     )  # (128, n_B128_tiles)
     total_size = reduce(op='mul', input=token_position_to_id.shape, initial_value=1)  # Blocks * Block_Size
     kernel_assert(total_size % B == 0, "token_position_to_id shape must be divisible by B")
@@ -550,6 +565,8 @@ def calculate_expert_affinities(
     dtype,
     skip_dma: SkipMode = SkipMode(False, False),
     token_indices_offset=0,
+    sbm: Optional[SbufManager] = None,
+    cast_to_f32=False,
 ):
     """
     Calculate expert affinities for the current block.
@@ -576,7 +593,7 @@ def calculate_expert_affinities(
         - Uses pointer arithmetic: addr = token_indices * E + block_expert
         - Broadcasts block_expert to all partitions via stream_shuffle_broadcast
         - Performs indirect load from expert_affinities_masked
-        - Skips DMA for invalid tokens when skip_dma.skip_token is True
+        - Skips DMA for invalid tokens when skip_dma.skip_token == True
         - Returns list of tensors for per-tile processing
 
     Pseudocode:
@@ -590,13 +607,17 @@ def calculate_expert_affinities(
             expert_affinity_f32[n] = load expert_affinities_masked[addr_fin]
         return expert_affinity_f32
     """
-    v_expert = nl.ndarray((TILE_SIZE, 1), dtype=nl.int32, buffer=nl.sbuf)
+    v_expert = _sbm_alloc(
+        sbm, (TILE_SIZE, 1), dtype=nl.int32, name="aff_v_expert" if sbm else None, align=SBUF_QUADRANT_SIZE
+    )
     stream_shuffle_broadcast(block_expert, v_expert)
     expert_affinity_f32_lst = []
 
     # Vectorized address computation for all tiles at once
     # addr_all[i, j] = token_indices[i, offset + j] * E
-    addr_all = nl.ndarray((TILE_SIZE, NUM_TILES), dtype=nl.int32, buffer=nl.sbuf)
+    addr_all = _sbm_alloc(
+        sbm, (TILE_SIZE, NUM_TILES), dtype=nl.int32, name="aff_addr_all" if sbm else None, align=SBUF_QUADRANT_SIZE
+    )
     nisa.tensor_scalar(
         dst=addr_all,
         op0=nl.multiply,
@@ -605,7 +626,9 @@ def calculate_expert_affinities(
     )
 
     # addr_fin_all[i, j] = addr_all[i, j] + v_expert[i, 0] (v_expert broadcasts across free dim)
-    addr_fin_all = nl.ndarray((TILE_SIZE, NUM_TILES), dtype=nl.int32, buffer=nl.sbuf)
+    addr_fin_all = _sbm_alloc(
+        sbm, (TILE_SIZE, NUM_TILES), dtype=nl.int32, name="aff_addr_fin_all" if sbm else None, align=SBUF_QUADRANT_SIZE
+    )
     nisa.tensor_tensor(
         dst=addr_fin_all, data1=addr_all, op=nl.add, data2=v_expert.ap(pattern=[[1, TILE_SIZE], [0, NUM_TILES]])
     )
@@ -613,17 +636,27 @@ def calculate_expert_affinities(
     if skip_dma.skip_token:
         nisa.tensor_scalar(dst=addr_fin_all, data=addr_fin_all, op0=nl.maximum, operand0=-1)
 
-    # Load expert affinities for each tile
-    # Note: Cannot vectorize DMA loads because indirect addressing requires per-tile
-    # [TILE_SIZE, 1] address tensors - each tile has different row indices per partition lane
+    """
+    Load expert affinities for each tile.
+
+    Cannot vectorize DMA loads because indirect addressing requires per-tile
+    [TILE_SIZE, 1] address tensors — each tile has different row indices per partition lane.
+    """
     expert_affinity_f32_lst = []
     num_cols = expert_affinities_masked.shape[1]
-    expert_affinity_dtype = nl.ndarray((TILE_SIZE, NUM_TILES), dtype=dtype, buffer=nl.sbuf)
+    output_dtype = nl.float32 if cast_to_f32 else dtype
+    expert_affinity_buf = _sbm_alloc(
+        sbm,
+        (TILE_SIZE, NUM_TILES),
+        dtype=output_dtype,
+        name="aff_expert_buf" if sbm else None,
+        align=SBUF_QUADRANT_SIZE,
+    )
     if skip_dma.skip_token:
-        nisa.memset(value=0, dst=expert_affinity_dtype)
+        nisa.memset(value=0, dst=expert_affinity_buf)
     for tile_idx in range(NUM_TILES):
         nisa.dma_copy(
-            dst=expert_affinity_dtype[0:TILE_SIZE, tile_idx : tile_idx + 1],
+            dst=expert_affinity_buf[0:TILE_SIZE, tile_idx : tile_idx + 1],
             src=expert_affinities_masked.ap(
                 pattern=[[num_cols, TILE_SIZE], [1, 1]],
                 offset=0,
@@ -631,14 +664,13 @@ def calculate_expert_affinities(
             ),
             oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
         )
-        expert_affinity_f32_lst.append(expert_affinity_dtype[0:TILE_SIZE, tile_idx : tile_idx + 1])
+        expert_affinity_f32_lst.append(expert_affinity_buf[0:TILE_SIZE, tile_idx : tile_idx + 1])
 
     return expert_affinity_f32_lst
 
 
 def reduce_outputs(
     output: nl.ndarray,
-    zeros: nl.ndarray,
     num_tiles: int,
     reduce_tile_size: int,
     offset: int,
@@ -695,56 +727,33 @@ def reduce_outputs(
             reduce_op=nl.add,
         )
 
-        # Zero out output[1]
-        nisa.dma_copy(
-            dst=output.ap(
-                pattern=[[dim_hidden, reduce_tile_size], [1, dim_hidden]],
-                offset=T * dim_hidden + start_idx * dim_hidden,
-            ),
-            src=zeros.ap(pattern=[[dim_hidden, reduce_tile_size], [1, dim_hidden]], offset=0),
-        )
 
-
-def output_initialization(output, dims):
+def output_initialization(output, dims, sbm=None, zeros=None):
     """
     Zero initialize output buffer for accumulation mode.
-
-    Initializes output tensor to zeros, required for topK > 1 scenarios where
-    multiple expert contributions are accumulated per token.
 
     Args:
         output (nl.ndarray): Output tensor in HBM, either [T, H] or [num_shards, T, H].
         dims: Dimension configuration object containing T, H, shard_id, num_shards, and TILESIZE.
-
-    Returns:
-        None: Modifies output tensor in-place.
-
-    Notes:
-        - Required for is_tensor_update_accumulating mode
-        - Handles both single-shard [T, H] and multi-shard [num_shards, T, H] layouts
-        - Processes in tiles of dims.TILESIZE for memory efficiency
-        - Uses DMA copy of zero buffer for initialization
-
-    Pseudocode:
-        T = dims.T
-        H = dims.H
-        for tile_idx in range(ceil(T / TILESIZE)):
-            num_p = min(TILESIZE, T - tile_idx * TILESIZE)
-            zeros = allocate [TILESIZE, H] in SBUF
-            memset zeros to 0
-            if dims.num_shards > 1:
-                offset = shard_id * T * H + tile_idx * TILESIZE * H
-                dma_copy zeros to output[offset:offset+num_p*H]
-            else:
-                dma_copy zeros to output[tile_idx*TILESIZE:tile_idx*TILESIZE+num_p, :]
+        sbm: Optional SBUF manager.
+        zeros: Optional pre-allocated zero buffer of shape [TILE_SIZE, H]. If None, allocates on stack.
     """
     T = dims.T
     H = dims.H
 
-    for tile_idx in range(div_ceil(T, TILE_SIZE)):
+    if zeros == None:
+        if H % 2 == 0 or H % 4 == 0:
+            zeros = _sbm_alloc(sbm, (TILE_SIZE, H), dtype=nl.bfloat16, name=f"init_zeros", align=SBUF_QUADRANT_SIZE)
+            zeros_fp32 = TensorView(zeros).reinterpret_cast(nl.float32)
+            nisa.memset(zeros_fp32.get_view(), value=0.0)
+        else:
+            zeros = _sbm_alloc(sbm, (TILE_SIZE, H), dtype=nl.bfloat16, name=f"init_zeros", align=SBUF_QUADRANT_SIZE)
+            nisa.memset(zeros, value=0.0)
+
+    for tile_idx in nl.affine_range(div_ceil(T, TILE_SIZE)):
+        if sbm != None:
+            sbm.open_scope()
         num_p = min(TILE_SIZE, T - tile_idx * TILE_SIZE)
-        zeros = nl.ndarray((TILE_SIZE, H), dtype=output.dtype, buffer=nl.sbuf)
-        nisa.memset(zeros, value=0)
 
         if dims.num_shards > 1:
             nisa.dma_copy(
@@ -756,3 +765,5 @@ def output_initialization(output, dims):
                 dst=output[tile_idx * TILE_SIZE : tile_idx * TILE_SIZE + num_p, 0:H],
                 src=zeros.ap(pattern=[[H, num_p], [1, H]], offset=0),
             )
+        if sbm != None:
+            sbm.close_scope()

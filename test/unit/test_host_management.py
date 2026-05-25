@@ -16,15 +16,17 @@
 import json
 import os
 import random
+import subprocess
 import tempfile
 from contextlib import closing
-from test.utils.common_dataclasses import Platforms, TargetHost
-from test.utils.exceptions import InferenceException
-from test.utils.host_management import HostManager, temporary_random_seed
 from unittest.mock import MagicMock, patch
 
 import pytest
 from paramiko import SSHException
+
+from test.utils.common_dataclasses import Platforms, TargetHost
+from test.utils.exceptions import InferenceException, LocalExecutionException
+from test.utils.host_management import HostManager, LocalHost, detect_local_neuron_devices, temporary_random_seed
 
 
 class TestHostManagerRetryErrorReporting:
@@ -50,7 +52,6 @@ class TestHostManagerRetryErrorReporting:
                 target_hosts=target_hosts,
                 neuron_installation_path="/opt/aws/neuron/bin",
                 ssh_config_path="~/.ssh/config",
-                default_platform_target=Platforms.TRN2,
             )
 
         # Initialize host stats file
@@ -146,7 +147,6 @@ class TestHostManagerRetryErrorReporting:
                 target_hosts=target_hosts,
                 neuron_installation_path="/opt/aws/neuron/bin",
                 ssh_config_path="~/.ssh/config",
-                default_platform_target=Platforms.TRN2,
             )
 
         # Initialize host stats file with single host
@@ -225,3 +225,222 @@ class TestTemporaryRandomSeed:
         with temporary_random_seed(999):
             random.choice(["a", "b", "c"])
         assert random.choice(["a", "b", "c"]) == expected_next
+
+
+SAMPLE_NEURON_LS_OUTPUT = json.dumps(
+    [
+        {
+            "neuron_device": 0,
+            "bdf": "00:1e.0",
+            "cpu_affinity": "0-3",
+            "numa_node": "0",
+            "connected_to": None,
+            "nc_count": 2,
+            "memory_size": 34359738368,
+            "neuroncore_ids": [0, 1],
+            "neuron_processes": [],
+        }
+    ]
+)
+
+
+class TestDetectLocalNeuronDevices:
+    """Tests for detect_local_neuron_devices()."""
+
+    def setup_method(self):
+        # Clear lru_cache between tests so each test gets a fresh call
+        from test.utils.host_management import _run_neuron_ls
+
+        _run_neuron_ls.cache_clear()
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_returns_true_when_devices_found(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(returncode=0, stdout=SAMPLE_NEURON_LS_OUTPUT)
+        assert detect_local_neuron_devices("/opt/aws/neuron/bin") is True
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_returns_false_when_no_devices(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(returncode=0, stdout="[]")
+        assert detect_local_neuron_devices("/opt/aws/neuron/bin") is False
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_returns_false_when_neuron_ls_not_installed(self, mock_run, _mock_isfile):
+        mock_run.side_effect = FileNotFoundError("neuron-ls not found")
+        assert detect_local_neuron_devices("/opt/aws/neuron/bin") is False
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_returns_false_on_timeout(self, mock_run, _mock_isfile):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="neuron-ls", timeout=10)
+        assert detect_local_neuron_devices("/opt/aws/neuron/bin") is False
+
+    @patch("test.utils.host_management.os.path.isfile", return_value=True)
+    @patch("test.utils.host_management.subprocess.run")
+    def test_returns_false_on_nonzero_exit(self, mock_run, _mock_isfile):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        assert detect_local_neuron_devices("/opt/aws/neuron/bin") is False
+
+    def test_returns_false_when_binary_missing(self):
+        """Binary check should short-circuit without spawning subprocess."""
+        with patch("test.utils.host_management.os.path.isfile", return_value=False):
+            assert detect_local_neuron_devices("/nonexistent/path") is False
+
+
+def _make_mock_device(core_ids: list[int], lnc_config: int = 2) -> MagicMock:
+    """Create a mock NeuronDeviceInfo with the given logical core IDs."""
+    device = MagicMock()
+    device.neuroncore_ids = core_ids
+    device.nc_count = len(core_ids)
+    device.logical_neuroncore_config = lnc_config
+    return device
+
+
+class TestLocalHostCoreAllocation:
+    """Tests for LocalHost.get_core_allocation() with file-based locking."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
+
+    @pytest.fixture
+    def local_host(self, temp_dir):
+        return LocalHost("/opt/aws/neuron/bin", "localhost", temp_dir)
+
+    def test_allocates_correct_cores(self, local_host):
+        """Core allocation returns the requested number of logical cores."""
+        mock_collector = MagicMock()
+        mock_collector.timer = MagicMock(
+            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))
+        )
+
+        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1, 2, 3])]):
+            with local_host.get_core_allocation(collector=mock_collector, collective_ranks=2, lnc_config=2) as alloc:
+                assert len(alloc.logical_core_ids) == 2
+                assert alloc.lnc_config == 2
+                assert alloc.host_id == "localhost"
+
+    def test_releases_cores_after_use(self, local_host):
+        """Cores are released back to the pool after the context manager exits."""
+        mock_collector = MagicMock()
+        mock_collector.timer = MagicMock(
+            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))
+        )
+
+        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1, 2, 3])]):
+            with local_host.get_core_allocation(collector=mock_collector, collective_ranks=2, lnc_config=2):
+                pass
+
+            # After exiting, all physical cores should be free — allocate all 4 logical (8 physical)
+            with local_host.get_core_allocation(collector=mock_collector, collective_ranks=4, lnc_config=2) as alloc:
+                assert len(alloc.logical_core_ids) == 4
+
+    def test_lnc1_and_lnc2_dont_overlap(self, local_host):
+        """LNC1 and LNC2 allocations must not share physical cores."""
+        mock_collector = MagicMock()
+        mock_collector.timer = MagicMock(
+            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))
+        )
+
+        # 4 logical cores at LNC2 = 8 physical cores total
+        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1, 2, 3])]):
+            # Allocate 1 logical core at LNC2 = 2 physical cores
+            with local_host.get_core_allocation(
+                collector=mock_collector, collective_ranks=1, lnc_config=2
+            ) as alloc_lnc2:
+                lnc2_physical = set(range(alloc_lnc2.logical_core_ids[0] * 2, alloc_lnc2.logical_core_ids[0] * 2 + 2))
+
+                # Allocate 1 logical core at LNC1 = 1 physical core, must not overlap
+                with local_host.get_core_allocation(
+                    collector=mock_collector, collective_ranks=1, lnc_config=1
+                ) as alloc_lnc1:
+                    lnc1_physical = {alloc_lnc1.logical_core_ids[0]}
+                    assert lnc2_physical.isdisjoint(lnc1_physical), (
+                        f"Physical cores overlap: LNC2={lnc2_physical}, LNC1={lnc1_physical}"
+                    )
+
+
+class TestLocalHostExecuteCommand:
+    """Tests for LocalHost.execute_command()."""
+
+    @pytest.fixture
+    def temp_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
+
+    @pytest.fixture
+    def local_host(self, temp_dir):
+        return LocalHost("/opt/aws/neuron/bin", "localhost", temp_dir)
+
+    def _mock_collector(self):
+        collector = MagicMock()
+        collector.timer = MagicMock(
+            return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))
+        )
+        return collector
+
+    @patch("test.utils.host_management.subprocess.run")
+    def test_successful_execution_sets_env_vars(self, mock_run, local_host, temp_dir):
+        """Verify env vars are set correctly on local execution."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n")
+        collector = self._mock_collector()
+
+        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1])]):
+            local_host.execute_command(
+                command="echo hello",
+                target_directory=temp_dir,
+                collector=collector,
+                collective_ranks=1,
+                lnc_config=2,
+            )
+
+        # Check subprocess was called with correct env vars
+        call_kwargs = mock_run.call_args
+        env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
+        assert "NEURON_RT_VISIBLE_CORES" in env
+        assert env["NEURON_LOGICAL_NC_CONFIG"] == "2"
+        assert env["NEURON_RT_ENABLE_OCP"] == "1"
+
+    @patch("test.utils.host_management.subprocess.run")
+    def test_raises_on_nonzero_exit(self, mock_run, local_host, temp_dir):
+        """Non-zero exit code raises LocalExecutionException."""
+        mock_run.return_value = MagicMock(returncode=1, stdout="error output", stderr="some error")
+        collector = self._mock_collector()
+
+        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1])]):
+            with pytest.raises(LocalExecutionException):
+                local_host.execute_command(
+                    command="false",
+                    target_directory=temp_dir,
+                    collector=collector,
+                    collective_ranks=1,
+                    lnc_config=2,
+                )
+
+    @patch("test.utils.host_management.subprocess.run")
+    def test_artifact_collection(self, mock_run, local_host, temp_dir):
+        """do_copy_artifacts moves files into infer_result/ subdirectory."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="output.npy\n")
+        collector = self._mock_collector()
+
+        # Create a file in target_directory that should be moved
+        test_file = os.path.join(temp_dir, "output.npy")
+        with open(test_file, "w") as f:
+            f.write("data")
+
+        with patch.object(local_host, "get_neuron_device_info", return_value=[_make_mock_device([0, 1])]):
+            result_path = local_host.execute_command(
+                command="echo output.npy",
+                target_directory=temp_dir,
+                collector=collector,
+                collective_ranks=1,
+                lnc_config=2,
+                do_copy_artifacts=True,
+                get_list_of_files_to_copy=lambda stdout: ["output.npy"],
+            )
+
+        assert result_path == os.path.join(temp_dir, "infer_result")
+        assert os.path.exists(os.path.join(result_path, "output.npy"))

@@ -14,16 +14,16 @@
 
 """Integration tests for find_nonzero_indices kernel."""
 
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.subkernels.find_nonzero_indices import find_nonzero_indices
 from nkilib_src.nkilib.core.subkernels.find_nonzero_indices_torch import find_nonzero_indices_torch_ref
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def generate_sparse_input(T: int, E: int, top_k: int, dtype: np.dtype, seed: int = 42) -> np.ndarray:
@@ -83,10 +83,8 @@ SUBSET_TEST_PARAMS = [
 # fmt: on
 
 
-@pytest_test_metadata(
-    name="FindNonzeroIndices",
-    pytest_marks=["find_nonzero_indices"],
-)
+@pytest_test_metadata(name="FindNonzeroIndices")
+@pytest_marks(["find_nonzero_indices"])
 class TestFindNonzeroIndicesKernel:
     """Test class for find_nonzero_indices kernel."""
 
@@ -95,6 +93,7 @@ class TestFindNonzeroIndicesKernel:
     def test_find_nonzero_indices_fast(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         T,
         E,
         top_k,
@@ -116,13 +115,19 @@ class TestFindNonzeroIndicesKernel:
             kernel_input_generator=input_generator,
             output_tensor_descriptor=_output_tensor_descriptor,
         )
-        framework.run_test(test_config=None, compiler_args=CompilerArgs(logical_nc_config=2), atol=0, rtol=0)
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            atol=0,
+            rtol=0,
+        )
 
     @pytest.mark.fast
     @pytest_parametrize(SUBSET_PARAM_NAMES, SUBSET_TEST_PARAMS)
     def test_find_nonzero_indices_with_col_start_fast(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         T,
         E,
         top_k,
@@ -150,4 +155,9 @@ class TestFindNonzeroIndicesKernel:
             kernel_input_generator=input_generator,
             output_tensor_descriptor=_output_tensor_descriptor,
         )
-        framework.run_test(test_config=None, compiler_args=CompilerArgs(logical_nc_config=2), atol=0, rtol=0)
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            atol=0,
+            rtol=0,
+        )

@@ -19,6 +19,7 @@ from typing import Optional
 
 import nki.language as nl
 
+from ..utils.common_types import MoEBlockIOLayout
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 
@@ -59,6 +60,8 @@ class QuantizationConfig(nl.NKIObject):
     """Weight quantization configuration for MoE Block TKG kernel."""
 
     is_moe_weight_mx: bool  # Whether MoE weights use MX format
+    is_static_quant: bool  # Whether using per-tensor static quantization
+    is_row_quant: bool  # Whether using per-token row-wise quantization
 
 
 @dataclass
@@ -111,23 +114,34 @@ def parse_moe_block_config(
     top_k: int,
     hidden_actual: Optional[int],
     is_all_expert: bool,
+    expert_gate_up_weights_scale: Optional[nl.ndarray] = None,
+    expert_gate_up_input_scale: Optional[nl.ndarray] = None,
+    inp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
 ) -> tuple[MoEBlockTKGDims, QuantizationConfig, ExpertConfig]:
     """
     Parse input tensors and compute dimension constants.
 
     Args:
-        inp (nl.ndarray): [B, S, H], Input tensor.
+        inp (nl.ndarray): [B, S, H] or [H0, n_prgs, H1_shard, BxS] depending on inp_layout.
         router_weights (nl.ndarray): [H, E], Router weights tensor.
         expert_gate_up_weights (nl.ndarray): Expert gate/up projection weights.
         shared_expert_gate_w (nl.ndarray): Optional shared expert gate weights.
         top_k (int): Number of top-K experts.
         hidden_actual (int): Optional actual hidden dimension for RMSNorm.
         is_all_expert (bool): Whether using all-expert mode.
+        expert_gate_up_weights_scale (nl.ndarray): Optional quantization scales for gate/up weights.
+        expert_gate_up_input_scale (nl.ndarray): Optional FP8 dequant scale for gate/up input (STATIC_MX).
+        inp_layout (MoEBlockIOLayout): Input tensor layout.
 
     Returns:
         tuple: (MoEBlockTKGDims, QuantizationConfig, ExpertConfig)
     """
-    B, S, H = inp.shape
+    if inp_layout == MoEBlockIOLayout._128_Nprgs_Hfree_T:
+        H = router_weights.shape[0]
+        B = 1
+        S = inp.shape[3]
+    else:
+        B, S, H = inp.shape
     hidden_actual = H if hidden_actual == None else hidden_actual
     H_free = H // _pmax
     T = B * S
@@ -141,7 +155,7 @@ def parse_moe_block_config(
         T=T,
         H=H,
         H_free=H_free,
-        H_free_shard=H_free // n_prgs,
+        H_free_shard=H_free // n_prgs if prg_id < n_prgs - 1 else H_free - H_free // n_prgs * (n_prgs - 1),
         E=E,
         K=top_k,
         n_prgs=n_prgs,
@@ -149,7 +163,19 @@ def parse_moe_block_config(
         hidden_actual=hidden_actual,
     )
 
-    quant_config = QuantizationConfig(is_moe_weight_mx=is_moe_weight_mx)
+    is_static_quant = expert_gate_up_input_scale != None and is_moe_weight_mx
+    is_row_quant = (
+        is_moe_weight_mx
+        and expert_gate_up_weights_scale != None
+        and expert_gate_up_weights_scale.dtype != nl.uint8
+        and expert_gate_up_weights_scale.shape[-1] > 1
+        and expert_gate_up_input_scale == None
+    )
+    quant_config = QuantizationConfig(
+        is_moe_weight_mx=is_moe_weight_mx,
+        is_static_quant=is_static_quant,
+        is_row_quant=is_row_quant,
+    )
 
     expert_config = ExpertConfig(
         is_all_expert=is_all_expert,
@@ -235,7 +261,9 @@ def validate_moe_block_inputs(
 
     # Current implementation limitations
     kernel_assert(dims.n_prgs == 2, f"moe_block_tkg only supports LNC-2; but got a spmd grid size of {dims.n_prgs}")
-    kernel_assert(dims.H % (_pmax * dims.n_prgs) == 0, f"H={dims.H} must be divisible by {_pmax * dims.n_prgs}")
+    # Unbalanced H-sharding (H not divisible by 128*n_prgs) is only supported for BF16 all-expert path
+    if not (expert_config.is_all_expert and not quant_config.is_moe_weight_mx):
+        kernel_assert(dims.H % (_pmax * dims.n_prgs) == 0, f"H={dims.H} must be divisible by {_pmax * dims.n_prgs}")
     kernel_assert(
         hidden_act_scale_factor == None,
         "hidden_act_scale_factor is currently a placeholder in moe_block_tkg kernel",

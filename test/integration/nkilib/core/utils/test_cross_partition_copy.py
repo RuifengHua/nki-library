@@ -21,10 +21,6 @@ at arbitrary partition offsets. Validates all three internal code paths:
   - Case 3: cross-quadrant copy → shuffle first portion + remaining chunks
 """
 
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
 import nki
@@ -33,7 +29,12 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
+
 from nkilib_src.nkilib.core.utils.cross_partition_copy import cross_partition_copy
+from test.utils.common_dataclasses import CompilerArgs
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # =============================================================================
 # Test Kernel
@@ -106,7 +107,8 @@ def cross_partition_copy_torch_ref(
 
 
 @final
-@pytest_test_metadata(name="CrossPartitionCopy", pytest_marks=["cross_partition_copy"])
+@pytest_test_metadata(name="CrossPartitionCopy")
+@pytest_marks(["cross_partition_copy"])
 class TestCrossPartitionCopy:
     """Tests for cross_partition_copy utility with full data validation."""
 

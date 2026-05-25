@@ -34,7 +34,7 @@ import numpy as np
 from aws_embedded_metrics.logger.metrics_context import MetricsContext
 from typing_extensions import override
 
-from ..utils.exceptions import UnimplementedException
+from .exceptions import UnimplementedException
 from .metadata_loader import match_model_config_id
 
 
@@ -48,6 +48,8 @@ class MetricName:
     # ==========================================================================
     ELAPSED_ALL_SEC = "ElapsedAllSec"
     COMPILATION_TIME = "CompilationTime"
+    MLIR_TO_BIR_TIME = "MlirToBirTime"
+    BIR_TO_NEFF_TIME = "BirToNeffTime"
     INFERENCE_TIME_TOTAL = "InferenceTimeTotal"
     VALIDATION_TIME = "ValidationTime"
     INPUT_DUMP_TIME = "InputDumpTime"
@@ -72,6 +74,7 @@ class MetricName:
     # Core lock contention metrics
     CORE_LOCK_NO_CORES_COUNT = "CoreLockNoCoresCount"
     CORE_LOCK_CONTENTION_WAIT_TIME = "CoreLockContentionWaitTime"
+    CORE_LOCK_HOLD_TIME = "CoreLockHoldTime"
     FAILED_HOSTS_COUNT = "FailedHostsCount"
 
     # ==========================================================================
@@ -127,6 +130,9 @@ class MetricName:
     # ==========================================================================
     INFERENCE_TIME = "InferenceTime"
     ACTIVE_INFERENCE_TIME = "ActiveInferenceTime"
+    ACTIVE_INFERENCE_TIME_OUTLIERS = "ActiveInferenceTimeOutliers"
+    ACTIVE_INFERENCE_TIME_QCD = "ActiveInferenceTimeQCD"
+    ACTIVE_INFERENCE_TIME_SAMPLES = "ActiveInferenceTimeSamples"
     MBU_ESTIMATED_PERCENT = "MbuEstimatedPercent"
     PROFILER_MFU = "ProfilerMFU"
 
@@ -158,6 +164,11 @@ class MetricName:
     SEPARATED_MEMORY_TIME = "SeparatedMemoryTime"
     SEPARATED_COMPUTE_TIME = "SeparatedComputeTime"
 
+    # ==========================================================================
+    # Explorer upload metrics
+    # ==========================================================================
+    EXPLORER_PROFILE_URL = "ExplorerProfileURL"
+
 
 class IMetricsCollector(ABC):
     """
@@ -178,6 +189,12 @@ class IMetricsCollector(ABC):
         # Set dimensions
         collector.set_dimensions({"TestName": "test_rmsnorm", "Target": "trn2"})
     """
+
+    @property
+    @abstractmethod
+    def metrics_enabled(self) -> bool:
+        """Whether metrics collection is enabled."""
+        raise UnimplementedException()
 
     @abstractmethod
     def set_namespace(self, namespace: str) -> None:
@@ -243,7 +260,7 @@ class IMetricsCollector(ABC):
         raise UnimplementedException()
 
     @abstractmethod
-    def parse_artifacts(self, artifact_dir: str, inference_artifact_dir: str) -> None:
+    def parse_artifacts(self, artifact_dir: str, inference_artifact_dir: str, target: str) -> None:
         """
         Parse test artifacts to extract metrics (compilation time, latency, MBU, etc.)
         """
@@ -280,6 +297,16 @@ class IMetricsCollector(ABC):
         """
         raise UnimplementedException()
 
+    @abstractmethod
+    def set_output_dir(self, output_dir: str) -> None:
+        """Set the output directory of the test."""
+        raise UnimplementedException()
+
+    @abstractmethod
+    def get_output_dir(self) -> str | None:
+        """Get the output directory of the test."""
+        raise UnimplementedException()
+
 
 @dataclass
 class MetricsCollector(IMetricsCollector):
@@ -311,6 +338,9 @@ class MetricsCollector(IMetricsCollector):
     kernel_params: dict[str, Any] = field(default_factory=dict)
     """Kernel test parameters (scalars only) for metrics emission"""
 
+    output_dir: str | None = field(default=None)
+    """Output directory of the test"""
+
     _start_time: float = field(default=0.0, init=False)
     """Test start timestamp"""
 
@@ -322,6 +352,11 @@ class MetricsCollector(IMetricsCollector):
     def __post_init__(self):
         """Initialize MetricsContext immediately so it's available for early measurements in test code (e.g. golden compilation time)"""
         self._metrics_context = MetricsContext.empty()
+
+    @property
+    @override
+    def metrics_enabled(self) -> bool:
+        return True
 
     @override
     def set_namespace(self, namespace: str) -> None:
@@ -442,7 +477,7 @@ class MetricsCollector(IMetricsCollector):
         return self._metrics_context
 
     @override
-    def parse_artifacts(self, artifact_dir: str, inference_artifact_dir: str) -> None:
+    def parse_artifacts(self, artifact_dir: str, inference_artifact_dir: str, target: str) -> None:
         """
         Parse test artifacts to extract metrics (compilation time, latency, MBU, etc.)
         """
@@ -462,26 +497,30 @@ class MetricsCollector(IMetricsCollector):
         # Parse show-session JSON files for cycle counts
         self._parse_show_session_json_files(artifact_path / inference_artifact_dir)
 
-        # Parse ntff.json for profiler metrics (MBU, MFU, latency)
-        ntff_path = artifact_path / inference_artifact_dir / "ntff.json"
-        if ntff_path.exists():
-            self._parse_ntff_json(ntff_path)
+        # Parse ntff*.json for profiler metrics (MBU, MFU, latency)
+        # Single run produces ntff.json; multiple profiled runs produce ntff_0.json, ntff_1.json, etc.
+        # Use the last file to match the profile_all_runs=False behavior (last execution).
+        inference_path = artifact_path / inference_artifact_dir
+        ntff_path = inference_path / "ntff.json"
+        if not ntff_path.exists():
+            # Multiple profiled runs: find ntff_N.json files and use the last one
+            ntff_numbered = sorted(inference_path.glob("ntff_[0-9]*.json"))
+            ntff_path = ntff_numbered[-1] if ntff_numbered else None
+        if ntff_path:
+            self._parse_ntff_json(ntff_path, target)
         else:
-            self.logger.debug(f"ntff.json not found")
+            self.logger.debug("No ntff*.json files found")
             # Always record profiler metrics for consistency
             self.record_metric(MetricName.MBU_ESTIMATED_PERCENT, -1.0, "Percent")
             self.record_metric(MetricName.PROFILER_MFU, -1.0, "Percent")
 
-        # Parse ntff_detailed.json for ActiveInferenceTime (summary-json lacks per-instruction data)
-        ntff_detailed_path = artifact_path / inference_artifact_dir / "ntff_detailed.json"
-        if ntff_detailed_path.exists():
-            self._parse_active_inference_time(ntff_detailed_path)
-        else:
-            self.record_metric(MetricName.ACTIVE_INFERENCE_TIME, -1.0, "Seconds")
+        # Parse total_exec_time from ntff*.json for ActiveInferenceTime
+        self._parse_active_inference_time_from_ntff(artifact_path / inference_artifact_dir)
 
     @override
     def set_test_name(self, test_name: str) -> None:
         self.test_name = test_name
+        self.add_dimension({"TestName": test_name})
 
     @override
     def set_kernel_params(self, params: dict[str, Any]) -> None:
@@ -490,6 +529,14 @@ class MetricsCollector(IMetricsCollector):
     @override
     def get_kernel_params(self) -> dict[str, Any]:
         return self.kernel_params
+
+    @override
+    def set_output_dir(self, output_dir: str) -> None:
+        self.output_dir = output_dir
+
+    @override
+    def get_output_dir(self) -> str | None:
+        return self.output_dir
 
     def _parse_neff_info(self, info_path) -> None:
         """Parse info.json for NEFF metadata."""
@@ -580,7 +627,7 @@ class MetricsCollector(IMetricsCollector):
             filtered_averages: dict[int, float] = {}
             for idx, (nc, cycles_list) in enumerate(sorted(cycles_per_core.items())):
                 filtered_avg, outliers_count, qcd = self._iqr_filtered_average(cycles_list, core_id=nc)
-                filtered_averages[nc] = filtered_avg
+                filtered_averages[nc] = int(filtered_avg)
                 self.logger.info(f"Physical core NC={nc} (index {idx}): filtered average = {filtered_avg:.0f}")
 
                 # Record per-core metrics using zero-based index
@@ -615,50 +662,10 @@ class MetricsCollector(IMetricsCollector):
         else:
             raise ValueError(f"Unknown target instance family: {target_instance_family}")
 
-    # Opcodes that are setup/teardown - everything else is considered work
-    _SETUP_OPCODES = {
-        "NOP",
-        "SET_ORDERING_MODE",
-        "EVENT_SEMAPHORE",
-        "EVENT_SEMAPHORE_RANGE_CLEAR",
-        "NOTIFY",
-        "COMPARE_BRANCH",
-        "DRAIN",
-        "WRITE",
-        "TENSOR_LOAD",
-    }
-
-    def _compute_active_inference_time(self, profiler_data: dict) -> float:
-        """Compute active inference time excluding setup/teardown opcodes, including DMA."""
-        min_ts, max_ts = float("inf"), 0
-
-        # Process instructions (excluding setup/teardown)
-        for inst in profiler_data.get("instruction", []):
-            if inst.get("opcode") not in self._SETUP_OPCODES:
-                ts = inst.get("timestamp", 0)
-                dur = inst.get("duration", 0)
-                min_ts = min(min_ts, ts)
-                max_ts = max(max_ts, ts + dur)
-
-        # Process DMA events (only those with semaphore ID)
-        dma_list = profiler_data.get("dma", [])
-        for dma in dma_list:
-            if dma.get("semaphore_id") == "-1":
-                continue
-            ts = dma.get("timestamp", 0)
-            dur = dma.get("duration", 0)
-            min_ts = min(min_ts, ts)
-            max_ts = max(max_ts, ts + dur)
-
-        if min_ts == float("inf"):
-            return -1.0
-        return (max_ts - min_ts) * 1e-9  # ns to seconds
-
-    def _parse_ntff_json(self, ntff_path) -> None:
+    def _parse_ntff_json(self, ntff_path, target: str) -> None:
         """Parse ntff.json for profiler metrics (summary-json format)."""
         try:
             # Get hardware specs for the target platform
-            target = self.dimensions["Target"]
             pe_freq, tensor_engine_size = self._get_hardware_specs(target)
 
             with open(ntff_path, "r") as f:
@@ -684,16 +691,16 @@ class MetricsCollector(IMetricsCollector):
             self.record_metric(MetricName.MBU_ESTIMATED_PERCENT, float(mbu * 100), "Percent")
 
             # MFU Calculation
-            hw_flops = float(profiler_summary.get("hardware_flops") or 0)
-            tr_flops = float(profiler_summary.get("transpose_flops") or 0)
+            actual_flops = float(profiler_summary.get("adjusted_hardware_flops") or 0) - float(
+                profiler_summary.get("adjusted_transpose_flops") or 0
+            )
 
-            if not infer_sec or infer_sec <= 0 or hw_flops < 0:
+            if not infer_sec or infer_sec <= 0 or actual_flops < 0:
                 self.record_metric(MetricName.PROFILER_MFU, -1.0, "None")
                 self.logger.warning("Invalid data for MFU calculation")
                 return
 
             num_lnc = int(self.dimensions["LNCCores"])
-            actual_flops = hw_flops - tr_flops
 
             pe_ops_per_sec = (
                 2 * tensor_engine_size * tensor_engine_size * pe_freq  # 2 ops per PE cycle
@@ -708,16 +715,51 @@ class MetricsCollector(IMetricsCollector):
             self.record_metric(MetricName.MBU_ESTIMATED_PERCENT, -1.0, "Percent")
             self.record_metric(MetricName.PROFILER_MFU, -1.0, "Percent")
 
-    def _parse_active_inference_time(self, ntff_detailed_path) -> None:
-        """Parse ntff_detailed.json for ActiveInferenceTime (requires per-instruction data)."""
+    def _parse_active_inference_time_from_ntff(self, inference_path) -> None:
+        """Extract ActiveInferenceTime from total_exec_time in ntff summary-json files.
+
+        Reads all ntff*.json files, extracts total_exec_time from each, applies
+        IQR filtering across samples, and records the filtered average.
+        Falls back to -1.0 with a warning if total_exec_time is not found.
+        """
+        active_inference_time = -1.0
+        outliers_count = None
+        qcd = None
+        num_samples = None
         try:
-            with open(ntff_detailed_path, "r") as f:
-                profiler_data = json.load(f)
-            active_time = self._compute_active_inference_time(profiler_data)
-            self.record_metric(MetricName.ACTIVE_INFERENCE_TIME, float(active_time), "Seconds")
+            inference_dir = Path(inference_path)
+            ntff_files = sorted(inference_dir.glob("ntff*.json"))
+            if not ntff_files:
+                return
+
+            active_times = []
+            for ntff_file in ntff_files:
+                with open(ntff_file, "r") as f:
+                    data = json.load(f)
+                summary = next(iter(data.values()), {})
+                total_exec = summary.get("total_exec_time")
+                if total_exec is not None and total_exec > 0:
+                    active_times.append(float(total_exec))
+
+            if not active_times:
+                self.logger.warning(
+                    "total_exec_time not found in ntff summary-json; "
+                    "ActiveInferenceTime requires neuron-profile with summary-json v2+"
+                )
+                return
+
+            active_inference_time, outliers_count, qcd = self._iqr_filtered_average(active_times)
+            num_samples = len(active_times)
         except Exception as e:
-            self.logger.warning(f"Failed to parse ntff_detailed.json for ActiveInferenceTime: {e}")
-            self.record_metric(MetricName.ACTIVE_INFERENCE_TIME, -1.0, "Seconds")
+            self.logger.warning(f"Failed to parse ntff json for ActiveInferenceTime: {e}")
+        finally:
+            self.record_metric(MetricName.ACTIVE_INFERENCE_TIME, active_inference_time, "Seconds")
+            if outliers_count is not None:
+                self.record_metric(MetricName.ACTIVE_INFERENCE_TIME_OUTLIERS, float(outliers_count), "Count")
+            if qcd is not None:
+                self.record_metric(MetricName.ACTIVE_INFERENCE_TIME_QCD, qcd, "None")
+            if num_samples is not None:
+                self.record_metric(MetricName.ACTIVE_INFERENCE_TIME_SAMPLES, num_samples, "Count")
 
     def _iqr_filtered_average(self, cycle_list, core_id: int | None = None) -> tuple[float, int, float]:
         """
@@ -756,9 +798,9 @@ class MetricsCollector(IMetricsCollector):
 
         # Calculate average of filtered values, fallback to original if all filtered out
         if filtered:
-            avg_cycles = sum(filtered) // len(filtered)
+            avg_cycles = sum(filtered) / len(filtered)
         else:
-            avg_cycles = sum(cycle_list) // len(cycle_list)
+            avg_cycles = sum(cycle_list) / len(cycle_list)
 
         self.logger.info(
             f'{core_prefix}Filtered out {outliers_count} outliers (bounds: {lower_bound:.2f} - {upper_bound:.2f}), '
@@ -792,6 +834,13 @@ class NoopMetricsCollector(IMetricsCollector):
     """
     Metrics Collector that does nothing. Useful when metrics emissions needs to be disabled
     """
+
+    test_name: str = ""
+
+    @property
+    @override
+    def metrics_enabled(self) -> bool:
+        return False
 
     @override
     def set_namespace(self, namespace: str) -> None:
@@ -872,7 +921,7 @@ class NoopMetricsCollector(IMetricsCollector):
         return None
 
     @override
-    def parse_artifacts(self, artifact_dir: str, inference_artifact_dir: str) -> None:
+    def parse_artifacts(self, artifact_dir: str, inference_artifact_dir: str, target: str) -> None:
         """
         Parse test artifacts to extract metrics (compilation time, latency, MBU, etc.)
         """
@@ -880,7 +929,7 @@ class NoopMetricsCollector(IMetricsCollector):
 
     @override
     def set_test_name(self, test_name: str) -> None:
-        pass
+        self.test_name = test_name
 
     @override
     def set_kernel_params(self, params: dict[str, Any]) -> None:
@@ -889,3 +938,11 @@ class NoopMetricsCollector(IMetricsCollector):
     @override
     def get_kernel_params(self) -> dict[str, Any]:
         return {}
+
+    @override
+    def set_output_dir(self, output_dir: str) -> None:
+        pass
+
+    @override
+    def get_output_dir(self) -> str | None:
+        return None

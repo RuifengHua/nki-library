@@ -20,8 +20,10 @@ import nki.language as nl
 from ...mlp.mlp_tkg.mlp_tkg_constants import MLPTKGConstantsDimensionSizes
 from ...utils.allocator import SbufManager
 from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ...utils.tensor_view import TensorView
+from ...utils.tiled_range import TiledRange
 
 
 def gather_expert_affinities(
@@ -225,17 +227,180 @@ def reshape_scale_for_mlp(scale_tensor: TensorView):
     return scale_tensor.expand_dim(dim=0).broadcast(dim=0, size=128)
 
 
-def safe_tensor_view(tensor: nl.ndarray):
+def safe_tensor_view(tensor):
     """
     Creates a TensorView wrapper for a tensor if it is not None.
 
     Args:
-        tensor (nl.ndarray): Tensor to wrap, or None.
+        tensor (nl.ndarray | TensorView | None): Tensor to wrap, or None.
 
     Returns:
         TensorView or None: TensorView wrapper if tensor != None, otherwise None.
 
     Notes:
         - Safe wrapper to handle optional tensor inputs
+        - If tensor is already a TensorView, returns it as-is without double-wrapping
     """
-    return TensorView(tensor) if tensor != None else None
+    if tensor is None:
+        return None
+    if isinstance(tensor, TensorView):
+        return tensor
+    return TensorView(tensor)
+
+
+def load_all_expert_affinities(expert_affinities, expert_affinities_in_sbuf, T_total, dims, allocator):
+    """Load all-expert affinities into SBUF, tiling along T in pmax-sized chunks.
+
+    Args:
+        expert_affinities: HBM or SBUF tensor (T, E).
+        expert_affinities_in_sbuf: Whether affinities are already in SBUF.
+        T_total: Total number of tokens.
+        dims: MLPTKGConstantsDimensionSizes.
+        allocator: SBUF allocator callable.
+
+    Returns:
+        expert_affinities_sb: SBUF tensor — (T, E) if single chunk, (pmax, num_chunks, E) if tiled.
+        aff_num_tiles: Number of pmax-sized chunks along T.
+    """
+    pmax = dims._pmax
+    aff_num_tiles = div_ceil(T_total, pmax)
+    if expert_affinities_in_sbuf:
+        return expert_affinities, aff_num_tiles
+
+    aff_tile_T = min(T_total, pmax)
+    if aff_num_tiles == 1:
+        expert_affinities_sb = allocator(
+            (T_total, dims.E), dtype=expert_affinities.dtype, buffer=nl.sbuf, name="expertAffinityAll"
+        )
+        nisa.dma_copy(dst=expert_affinities_sb[:T_total, : dims.E], src=expert_affinities[:T_total, : dims.E])
+    else:
+        expert_affinities_sb = allocator(
+            (aff_tile_T, aff_num_tiles, dims.E), dtype=expert_affinities.dtype, buffer=nl.sbuf, name="expertAffinityAll"
+        )
+        for t_tile in TiledRange(T_total, aff_tile_T):
+            nisa.dma_copy(
+                dst=expert_affinities_sb[: t_tile.size, t_tile.index, : dims.E],
+                src=expert_affinities[nl.ds(t_tile.start_offset, t_tile.size), : dims.E],
+            )
+    return expert_affinities_sb, aff_num_tiles
+
+
+def get_all_expert_tile_affinities(expert_affinities_sb, aff_num_tiles, t_offset, current_tile_T, dims, allocator):
+    """Get all-expert affinities for a T-tile, gathering from pmax-sized chunks if needed.
+
+    Args:
+        expert_affinities_sb: SBUF tensor from load_all_expert_affinities.
+        aff_num_tiles: Number of pmax-sized affinity chunks.
+        t_offset: Start offset of the current T-tile.
+        current_tile_T: Size of the current T-tile.
+        dims: MLPTKGConstantsDimensionSizes.
+        allocator: SBUF allocator callable.
+
+    Returns:
+        SBUF tensor with affinities for this T-tile.
+    """
+    pmax = dims._pmax
+    if aff_num_tiles == 1:
+        return expert_affinities_sb
+
+    aff_start = t_offset // pmax
+    aff_count = div_ceil(current_tile_T, pmax)
+    if aff_count == 1:
+        result = allocator(
+            (current_tile_T, dims.E), dtype=expert_affinities_sb.dtype, buffer=nl.sbuf, name="expertAffinityLoc"
+        )
+        nisa.tensor_copy(
+            dst=result[:current_tile_T, : dims.E], src=expert_affinities_sb[:current_tile_T, aff_start, : dims.E]
+        )
+    else:
+        result = allocator(
+            (pmax, aff_count, dims.E), dtype=expert_affinities_sb.dtype, buffer=nl.sbuf, name="expertAffinityLoc"
+        )
+        for ai in range(aff_count):
+            chunk_size = min(pmax, current_tile_T - ai * pmax)
+            nisa.tensor_copy(
+                dst=result[:chunk_size, ai, : dims.E],
+                src=expert_affinities_sb[:chunk_size, aff_start + ai, : dims.E],
+            )
+    return result
+
+
+def broadcast_all_expert_affinity(
+    expert_affinities_sb,
+    aff_num_tiles,
+    expertIdx,
+    t_offset,
+    current_tile_T,
+    io_dtype,
+    identity_sb,
+    dims,
+    allocator,
+    use_auto_alloc,
+):
+    """Broadcast per-token all-expert affinity to (pmax, T) for POST_SCALE element-wise scaling.
+
+    Processes in pmax-sized chunks to support T > pmax.
+
+    Args:
+        expert_affinities_sb: SBUF tensor from load_all_expert_affinities.
+        aff_num_tiles: Number of pmax-sized affinity chunks.
+        expertIdx: Current expert index.
+        t_offset: Start offset of the current T-tile.
+        current_tile_T: Size of the current T-tile.
+        io_dtype: Data type for the broadcast tensor.
+        identity_sb: Pre-loaded identity matrix (or None if T > pmax).
+        dims: MLPTKGConstantsDimensionSizes.
+        allocator: SBUF allocator callable.
+        use_auto_alloc: Whether auto allocation is enabled.
+
+    Returns:
+        expert_affinities_broadcast: SBUF tensor (pmax, current_tile_T).
+    """
+    pmax = dims._pmax
+    expert_affinities_broadcast = allocator(
+        (pmax, current_tile_T), dtype=io_dtype, buffer=nl.sbuf, name="expert_affinities_sb"
+    )
+    aff_chunks = div_ceil(current_tile_T, pmax)
+    for ac in range(aff_chunks):
+        chunk_t_start = ac * pmax
+        chunk_size = min(pmax, current_tile_T - chunk_t_start)
+        chunk_identity = (
+            identity_sb
+            if (identity_sb is not None and aff_chunks == 1)
+            else nl.shared_identity_matrix(chunk_size, dtype=io_dtype)
+        )
+
+        chunk_affinity_cast = allocator((chunk_size, 1), dtype=io_dtype, buffer=nl.sbuf, name=f"affinity_cast_c{ac}")
+        if aff_num_tiles == 1:
+            nisa.activation(
+                dst=chunk_affinity_cast[:chunk_size, :],
+                op=nl.copy,
+                data=expert_affinities_sb[nl.ds(chunk_t_start, chunk_size), nl.ds(expertIdx, 1)],
+            )
+        else:
+            aff_chunk_idx = (t_offset + chunk_t_start) // pmax
+            nisa.activation(
+                dst=chunk_affinity_cast[:chunk_size, :],
+                op=nl.copy,
+                data=expert_affinities_sb[:chunk_size, aff_chunk_idx, nl.ds(expertIdx, 1)],
+            )
+
+        chunk_psum = nl.ndarray(
+            (1, chunk_size), dtype=nl.float32, buffer=nl.psum, address=None if use_auto_alloc else (0, 0)
+        )
+        nisa.nc_matmul(
+            dst=chunk_psum[:, :],
+            stationary=chunk_affinity_cast,
+            moving=chunk_identity[:chunk_size, :chunk_size],
+        )
+        nisa.tensor_copy(
+            src=chunk_psum[:, :],
+            dst=expert_affinities_broadcast[:1, nl.ds(chunk_t_start, chunk_size)],
+        )
+    for partition_group_idx in range(4):
+        nisa.nc_stream_shuffle(
+            dst=expert_affinities_broadcast[nl.ds(32 * partition_group_idx, 32), :current_tile_T],
+            src=expert_affinities_broadcast[:1, :current_tile_T],
+            shuffle_mask=[0] * 32,
+        )
+    return expert_affinities_broadcast

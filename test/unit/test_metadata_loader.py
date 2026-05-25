@@ -14,6 +14,7 @@
 """Unit tests for metadata_loader module."""
 
 from enum import Enum
+
 from test.utils.metadata_loader import (
     _coerce_json_value,
     compute_config_version_id,

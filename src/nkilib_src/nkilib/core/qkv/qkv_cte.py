@@ -18,28 +18,39 @@ This kernel implements QKV (Query, Key, Value) projection optimized for Context 
 
 # Standard Library
 import math
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
 from nki.isa.constants import dge_mode
 
-from ..utils import stream_shuffle_broadcast
-from ..utils.allocator import Logger, SbufManager, sizeinbytes
+from ..utils.allocator import SbufManager, sizeinbytes
 
 # NKI Library
-from ..utils.common_types import NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
-from ..utils.kernel_helpers import get_verified_program_sharding_info
+from ..utils.common_types import (
+    NormType,
+    QKNormConfig,
+    QKVOutputLayout,
+    QKVWeightLayout,
+    QuantizationType,
+    StridedInputConfig,
+)
+from ..utils.kernel_assert import kernel_assert
+from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
+from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
 # QKV CTE
 from .qkv_cte_utils import (
+    ROW_MX_TAIL_SCALE_BYTES,
     QKV_CTE_Config,
     QKV_CTE_Dims,
     QKV_CTE_UserInput,
     _build_config,
     _get_tensor_dimensions,
+    _mx_partition_splits,
+    _validate_strided_input_config,
     _validate_user_inputs,
 )
 
@@ -74,6 +85,171 @@ def _get_fp8_e4m3_max_pos_val() -> float:
     return 448.0 if nki.isa.get_nc_version() == nki.isa.nc_version.gen4 else 240.0
 
 
+def _scalar_activation_bias_supported() -> bool:
+    """nisa.activation supports scalar bias on NeuronCore gen4 (Trn3) and later.
+
+    gen3 (Trn2) also supports scalar bias in the ISA, but using it changes the SBUF
+    address layout and triggers a compiler sensitivity that causes accuracy regressions.
+    """
+    return nki.isa.get_nc_version() >= nki.isa.nc_version.gen4
+
+
+def _make_activation_constant_bias(value: float, sbm: SbufManager, pmax: int, dtype=nl.float32):
+    """Create a constant bias for nisa.activation, broadcast across all partitions."""
+    if _scalar_activation_bias_supported():
+        return value
+    buf = sbm.alloc_stack((pmax, 1), dtype=dtype, buffer=nl.sbuf)
+    nisa.memset(dst=buf, value=value)
+    return buf
+
+
+def _slice_activation_constant_bias(bias, s_tile_sz: int):
+    """Slice a constant activation bias to [s_tile_sz, 1] if tensor, or pass through if scalar."""
+    if isinstance(bias, (int, float)):
+        return bias
+    return bias[0:s_tile_sz, 0:1]
+
+
+class QKNormBuffers(nl.NKIObject):
+    """SBUF working buffers for per-head QK-norm, shared by MX and non-MX paths."""
+
+    pre_rope_q_gamma_sb: Optional[nl.ndarray] = None
+    pre_rope_k_gamma_sb: Optional[nl.ndarray] = None
+    post_rope_q_gamma_sb: Optional[nl.ndarray] = None
+    post_rope_k_gamma_sb: Optional[nl.ndarray] = None
+    pre_rope_eps_sb = None
+    post_rope_eps_sb = None
+    scratch_sb: Optional[list] = None
+    zero_bias_sb: Optional[nl.ndarray] = None
+
+
+def _alloc_qk_norm_position_buffers(bufs, prefix, qk_norm_cfg, sbm, pmax, d_head, dtype):
+    """Allocate eps and gamma SBUF buffers for a single QK-norm position (pre or post RoPE).
+
+    Sets bufs.{prefix}_eps_sb, bufs.{prefix}_q_gamma_sb, bufs.{prefix}_k_gamma_sb.
+    """
+    eps_sb = _make_activation_constant_bias(qk_norm_cfg.eps, sbm, pmax)
+    q_gamma_sb = None
+    k_gamma_sb = None
+    if qk_norm_cfg.q_gamma_norm_weights is not None:
+        q_gamma_sb = sbm.alloc_stack((pmax, d_head), dtype=dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=q_gamma_sb[0:1, :], src=qk_norm_cfg.q_gamma_norm_weights)
+        stream_shuffle_broadcast(q_gamma_sb[0:1, :], q_gamma_sb)
+    if qk_norm_cfg.k_gamma_norm_weights is not None:
+        k_gamma_sb = sbm.alloc_stack((pmax, d_head), dtype=dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=k_gamma_sb[0:1, :], src=qk_norm_cfg.k_gamma_norm_weights)
+        stream_shuffle_broadcast(k_gamma_sb[0:1, :], k_gamma_sb)
+    if prefix == "pre_rope":
+        bufs.pre_rope_eps_sb = eps_sb
+        bufs.pre_rope_q_gamma_sb = q_gamma_sb
+        bufs.pre_rope_k_gamma_sb = k_gamma_sb
+    else:
+        bufs.post_rope_eps_sb = eps_sb
+        bufs.post_rope_q_gamma_sb = q_gamma_sb
+        bufs.post_rope_k_gamma_sb = k_gamma_sb
+
+
+def _allocate_qk_norm_buffers(cfg, dims, sbm, pmax):
+    """Allocate SBUF buffers for QK-norm. Returns None if QK-norm is disabled."""
+    if cfg.qk_norm_pre_rope is None and cfg.qk_norm_post_rope is None:
+        return None
+
+    bufs = QKNormBuffers()
+    bufs.scratch_sb = [
+        sbm.alloc_stack((pmax, 1), dtype=nl.float32, buffer=nl.sbuf),
+        sbm.alloc_stack((pmax, 1), dtype=nl.float32, buffer=nl.sbuf),
+        sbm.alloc_stack((pmax, 1), dtype=nl.float32, buffer=nl.sbuf),
+    ]
+    bufs.zero_bias_sb = sbm.alloc_stack((pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=bufs.zero_bias_sb, value=0)
+
+    if cfg.qk_norm_pre_rope is not None:
+        _alloc_qk_norm_position_buffers(
+            bufs, "pre_rope", cfg.qk_norm_pre_rope, sbm, pmax, dims.d_head, cfg.compute_mm_dtype
+        )
+    if cfg.qk_norm_post_rope is not None:
+        _alloc_qk_norm_position_buffers(
+            bufs, "post_rope", cfg.qk_norm_post_rope, sbm, pmax, dims.d_head, cfg.compute_mm_dtype
+        )
+    return bufs
+
+
+class RoPEBuffers(nl.NKIObject):
+    """SBUF/HBM buffers for fused RoPE, shared by MX and non-MX paths."""
+
+    cos_sb: Optional[List[nl.ndarray]] = None
+    sin_sb: Optional[List[nl.ndarray]] = None
+    scratch_sb: Optional[List[list]] = None
+    cos_hbm: Optional[nl.ndarray] = None
+    sin_hbm: Optional[nl.ndarray] = None
+    # K-specific fused caches (only when gamma_fused_in_rope_caches=True)
+    k_cos_hbm: Optional[nl.ndarray] = None
+    k_sin_hbm: Optional[nl.ndarray] = None
+    k_cos_sb: Optional[List[nl.ndarray]] = None
+    k_sin_sb: Optional[List[nl.ndarray]] = None
+
+
+def _get_num_rope_scratch_bufs(has_qk_norm: bool, H: int) -> int:
+    """Number of rope scratch buffers per S-tile.
+
+    Triple-buffered when QK-norm is active to break carried dependency across
+    heads. Double-buffered otherwise, falling back to single buffer at large H
+    to avoid reducing multi-buffering degree.
+    """
+    if has_qk_norm:
+        return 3
+    MAX_H_FOR_DOUBLE_BUFFER = 8192  # Llama3 70B hidden dim
+    if H > MAX_H_FOR_DOUBLE_BUFFER:
+        return 1
+    return 2
+
+
+def _allocate_rope_buffers(
+    cfg,
+    dims,
+    sbm,
+    pmax,
+    num_s_tiles,
+    has_qk_norm,
+    cos_cache_hbm,
+    sin_cache_hbm,
+    k_cos_cache_hbm=None,
+    k_sin_cache_hbm=None,
+):
+    """Allocate SBUF buffers for fused RoPE. Returns None if fused_rope is disabled."""
+    if not cfg.fused_rope:
+        return None
+
+    _gamma_fused_in_rope = cfg.qk_norm_pre_rope is not None and cfg.qk_norm_pre_rope.gamma_fused_in_rope_caches
+    # When gamma_fused_in_rope_caches: sin cache is [B, S, d_head] packed
+    # (sin_lo in [0:d_half], sin_hi in [d_half:d_head])
+    _sin_buf_fdim = dims.d_head if _gamma_fused_in_rope else dims.d_head // 2
+    _has_separate_k_caches = _gamma_fused_in_rope and k_cos_cache_hbm is not None
+
+    bufs = RoPEBuffers()
+    bufs.cos_hbm = cos_cache_hbm
+    bufs.sin_hbm = sin_cache_hbm
+    bufs.k_cos_hbm = k_cos_cache_hbm if _has_separate_k_caches else None
+    bufs.k_sin_hbm = k_sin_cache_hbm if _has_separate_k_caches else None
+    bufs.cos_sb = []
+    bufs.sin_sb = []
+    bufs.scratch_sb = []
+    bufs.k_cos_sb = [] if _has_separate_k_caches else None
+    bufs.k_sin_sb = [] if _has_separate_k_caches else None
+    _num_rope_bufs = _get_num_rope_scratch_bufs(has_qk_norm, dims.H)
+    for _ in range(num_s_tiles):
+        bufs.cos_sb.append(sbm.alloc_stack((pmax, dims.d_head), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
+        bufs.sin_sb.append(sbm.alloc_stack((pmax, _sin_buf_fdim), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
+        if _has_separate_k_caches:
+            bufs.k_cos_sb.append(sbm.alloc_stack((pmax, dims.d_head), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
+            bufs.k_sin_sb.append(sbm.alloc_stack((pmax, _sin_buf_fdim), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
+        scratch = []
+        for _ in range(_num_rope_bufs):
+            scratch.append(sbm.alloc_stack((pmax, dims.d_head * 2), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
+        bufs.scratch_sb.append(scratch)
+    return bufs
+
+
 def qkv_cte(
     input: nl.ndarray,
     fused_qkv_weights: nl.ndarray,
@@ -94,10 +270,13 @@ def qkv_cte(
     fused_rope: Optional[bool] = False,
     cos_cache: Optional[nl.ndarray] = None,
     sin_cache: Optional[nl.ndarray] = None,
+    # Fused RoPE + QK-norm: K-specific gamma-fused caches
+    k_cos_cache: Optional[nl.ndarray] = None,
+    k_sin_cache: Optional[nl.ndarray] = None,
     d_head: Optional[int] = None,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
-    # --- FP8 KV Cache Quantization Related
+    # --- KV Cache Related
     k_cache: Optional[nl.ndarray] = None,
     v_cache: Optional[nl.ndarray] = None,
     k_scale: Optional[nl.ndarray] = None,
@@ -107,6 +286,7 @@ def qkv_cte(
     kv_dtype: Optional[type] = None,
     # --- Block KV Cache Related
     use_block_kv: bool = False,
+    transpose_k_cache: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.ndarray] = None,
     # -----------------------------------------
@@ -125,6 +305,13 @@ def qkv_cte(
     # ----------------------------------------
     is_input_swizzled: bool = False,
     weight_layout: QKVWeightLayout = QKVWeightLayout.CONTIGUOUS,
+    # --- QK-Norm Related
+    qk_norm_pre_rope: Optional[QKNormConfig] = None,
+    qk_norm_post_rope: Optional[QKNormConfig] = None,
+    # --- Output
+    output_hbm: Optional[nl.ndarray] = None,
+    # --- Strided Input
+    strided_input_config: Optional[StridedInputConfig] = None,
 ) -> nl.ndarray:
     """
     QKV (Query, Key, Value) projection kernel with multiple (optional) fused operations.
@@ -191,6 +378,8 @@ def qkv_cte(
         d_head (Optional[int]): Dimension per attention head (required for QKVOutputLayout.NBSd and RoPE). Default: None
         num_q_heads (Optional[int]): Number of query heads (required for RoPE). Default: None
         num_kv_heads (Optional[int]): Number of key/value heads (required for RoPE). Default: None
+        transpose_k_cache (bool): Whether to store K in transposed layout [num_blocks*num_kv_heads, d_head, block_size] in the block KV cache
+            or [B, kv_dim, max_seq_len] for flat KV cache. Default: False
         store_output_in_sbuf (bool): Whether to store output in SBUF (currently unsupported, must be False). Default: False
         sbm (Optional[SbufManager]): Optional SBUF manager for memory allocation control, with pre-specified bounds for SBUF usage.
             If sbm is not provided, kernel will by default be allocated and use all of the available SBUF space. Default: None
@@ -291,7 +480,7 @@ def qkv_cte(
         d_head=d_head,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
-        # FP8 KV Cache Quantization
+        # KV Cache
         k_cache=k_cache,
         v_cache=v_cache,
         k_scale=k_scale,
@@ -301,6 +490,7 @@ def qkv_cte(
         kv_dtype=kv_dtype,
         # Block KV Cache
         use_block_kv=use_block_kv,
+        transpose_k_cache=transpose_k_cache,
         block_size=block_size,
         slot_mapping=slot_mapping,
         # Performance
@@ -313,6 +503,10 @@ def qkv_cte(
         qkv_in_scale=qkv_in_scale,
         is_input_swizzled=is_input_swizzled,
         weight_layout=weight_layout,
+        qk_norm_pre_rope=qk_norm_pre_rope,
+        qk_norm_post_rope=qk_norm_post_rope,
+        strided_input_config=strided_input_config,
+        output_hbm=output_hbm,
     )
 
     _validate_user_inputs(args=user_inputs)
@@ -320,6 +514,13 @@ def qkv_cte(
     cfg = _build_config(args=user_inputs)
     # Build 'dims' object to store tensor dimensions used throughout the kernel.
     dims = _get_tensor_dimensions(args=user_inputs, cfg=cfg)
+
+    # Strided input: validate S-shard alignment (requires dims).
+    if cfg.strided_input_config is not None:
+        _validate_strided_input_config(user_inputs, dims=dims)
+
+    # HBM tensor name prefix: use sbm prefix when provided to avoid name collisions.
+    _hbm_name_prefix = (sbm.get_name_prefix() + "_") if sbm is not None and sbm.get_name_prefix() else ""
 
     # Create output tensor with original dimensions
     if cfg.quantization_config.quantization_type == QuantizationType.STATIC:
@@ -331,14 +532,26 @@ def qkv_cte(
     else:
         output_dtype = input.dtype
 
-    if cfg.use_kv_quantization:
+    # Output S dimension matches kernel's processing S (= num_local_tokens for strided, S_orig otherwise).
+    if cfg.use_kv_cache:
+        # Output Q tensor: S matches kernel's processing S (= num_local_tokens for strided).
+        q_S = cfg.strided_input_config.num_local_tokens if cfg.strided_input_config != None else dims.S_orig
         q_tensor_hbm = nl.ndarray(
-            (dims.B_orig, dims.S_orig, dims.q_dim), dtype=input.dtype, buffer=nl.shared_hbm, name="qkv_cte_output_hbm"
+            (dims.B_orig, q_S, dims.q_dim),
+            dtype=input.dtype,
+            buffer=nl.shared_hbm,
+            name=f"{_hbm_name_prefix}qkv_cte_output_hbm",
         )
         output_hbm = None
+    elif output_hbm is not None:
+        # Caller provided output tensor — skip allocation.
+        q_tensor_hbm = None
     elif cfg.output_layout == QKVOutputLayout.BSD:
         output_hbm = nl.ndarray(
-            (dims.B_orig, dims.S_orig, dims.I), dtype=output_dtype, buffer=nl.shared_hbm, name="qkv_cte_output_hbm"
+            (dims.B_orig, dims.S_orig, dims.I),
+            dtype=output_dtype,
+            buffer=nl.shared_hbm,
+            name=f"{_hbm_name_prefix}qkv_cte_output_hbm",
         )
         q_tensor_hbm = None
     else:  # QKVOutputLayout.NBSd
@@ -346,24 +559,28 @@ def qkv_cte(
             (dims.num_heads, dims.B_orig, dims.S_orig, dims.d_head),
             dtype=output_dtype,
             buffer=nl.shared_hbm,
-            name="qkv_cte_output_hbm",
+            name=f"{_hbm_name_prefix}qkv_cte_output_hbm",
         )
         q_tensor_hbm = None
 
     # Potentially reshape B,S to BxS, for performance benefits.
     if cfg.use_BxS_input_reshape:
-        input = input.reshape((1, dims.BxS, dims.H))
+        input = input.reshape((1, dims.BxS, input.shape[-1]))
         if cfg.fused_residual_add:
             mlp_prev = mlp_prev.reshape((1, dims.BxS, dims.H))
             attention_prev = attention_prev.reshape((1, dims.BxS, dims.H))
         if cfg.fused_rope:
             cos_cache = cos_cache.reshape((1, dims.BxS, dims.d_head))
             sin_cache = sin_cache.reshape((1, dims.BxS, dims.d_head))
-        if cfg.use_kv_quantization:
+        if cfg.use_kv_cache:
             q_tensor_hbm = q_tensor_hbm.reshape((1, dims.BxS, dims.q_dim))
             if not use_block_kv:
-                # Cache layout: [B, max_seq_len, kv_dim] -> [1, max_seq_len, kv_dim] (B folded)
-                k_cache = k_cache.reshape((1, k_cache.shape[1], dims.kv_dim))
+                if transpose_k_cache:
+                    # Cache layout: [B, kv_dim, max_seq_len] -> [1, kv_dim, max_seq_len]
+                    k_cache = k_cache.reshape((1, dims.kv_dim, k_cache.shape[2]))
+                else:
+                    # Cache layout: [B, max_seq_len, kv_dim] -> [1, max_seq_len, kv_dim] (B folded)
+                    k_cache = k_cache.reshape((1, k_cache.shape[1], dims.kv_dim))
                 v_cache = v_cache.reshape((1, v_cache.shape[1], dims.kv_dim))
             if use_block_kv:
                 slot_mapping = slot_mapping.reshape((1, dims.BxS))
@@ -374,7 +591,7 @@ def qkv_cte(
 
     # Pass values and directly, and keep 'cfg' and 'dims'
     # object separate for clarity.
-    if quantization_type == QuantizationType.MX:
+    if quantization_type in (QuantizationType.MX, QuantizationType.ROW_MX):
         _qkv_cte_mx_impl(
             input_hbm=input,
             fused_qkv_weights_hbm=fused_qkv_weights,
@@ -392,6 +609,8 @@ def qkv_cte(
             sin_cache_hbm=sin_cache,
             qkv_w_scale=qkv_w_scale,
             qkv_in_scale=qkv_in_scale,
+            k_cos_cache_hbm=k_cos_cache,
+            k_sin_cache_hbm=k_sin_cache,
         )
     else:
         _qkv_cte_impl(
@@ -421,18 +640,22 @@ def qkv_cte(
 
     # Revert BxS to B,S as it is required by the user provided output_layout.
     if cfg.use_BxS_input_reshape:
-        input = input.reshape((dims.B_orig, dims.S_orig, dims.H))
+        input = input.reshape((dims.B_orig, dims.S_orig, input.shape[-1]))
         if cfg.fused_residual_add:
             mlp_prev = mlp_prev.reshape((dims.B_orig, dims.S_orig, dims.H))
             attention_prev = attention_prev.reshape((dims.B_orig, dims.S_orig, dims.H))
         if cfg.fused_rope:
             cos_cache = cos_cache.reshape((dims.B_orig, dims.S_orig, dims.d_head))
             sin_cache = sin_cache.reshape((dims.B_orig, dims.S_orig, dims.d_head))
-        if cfg.use_kv_quantization:
+        if cfg.use_kv_cache:
             q_tensor_hbm = q_tensor_hbm.reshape((dims.B_orig, dims.S_orig, dims.q_dim))
             if not use_block_kv:
-                # Cache layout: [B, max_seq_len, kv_dim] - restore original shape
-                k_cache = k_cache.reshape((dims.B_orig, k_cache.shape[1], dims.kv_dim))
+                if transpose_k_cache:
+                    # Cache layout: [1, kv_dim, max_seq_len] -> [B, kv_dim, max_seq_len]
+                    k_cache = k_cache.reshape((dims.B_orig, dims.kv_dim, k_cache.shape[2]))
+                else:
+                    # Cache layout: [1, max_seq_len, kv_dim] -> [B, max_seq_len, kv_dim]
+                    k_cache = k_cache.reshape((dims.B_orig, k_cache.shape[1], dims.kv_dim))
                 v_cache = v_cache.reshape((dims.B_orig, v_cache.shape[1], dims.kv_dim))
             if use_block_kv:
                 slot_mapping = slot_mapping.reshape((dims.B_orig, dims.S_orig))
@@ -441,7 +664,7 @@ def qkv_cte(
         elif cfg.output_layout == QKVOutputLayout.NBSd:
             output_hbm = output_hbm.reshape((dims.num_heads, dims.B_orig, dims.S_orig, dims.d_head))
 
-    if cfg.use_kv_quantization:
+    if cfg.use_kv_cache:
         return q_tensor_hbm, k_cache, v_cache
 
     # Barrier: ensure both NCs finish writing output_hbm before any consumer reads it.
@@ -455,7 +678,7 @@ def qkv_cte(
 
 def _quantize_and_store_kv(
     output_sb: nl.ndarray,
-    scale_sb: nl.ndarray,
+    scale_sb: Optional[nl.ndarray],
     cache_hbm: nl.ndarray,
     kv_offset: int,
     i_batch: int,
@@ -467,8 +690,12 @@ def _quantize_and_store_kv(
     slot_mapping_sb: Optional[nl.ndarray] = None,
 ):
     """
-    Scale values and clamp to FP8 range, then store to cache.
-    Quantization formula: quantized_value = clamp(value / scale, fp8_min, fp8_max)
+    Optionally quantize KV values, then store to cache.
+
+    When scale_sb is provided (FP8 path):
+        quantized_value = clamp(value / scale, fp8_min, fp8_max)
+    When scale_sb is None (bf16 path):
+        Values are stored directly without quantization.
 
     Uses NBSd-style .ap() pattern for multi-head output.
     """
@@ -477,27 +704,31 @@ def _quantize_and_store_kv(
     num_kv_heads = dims.num_kv_heads
     max_seq_len = cache_hbm.shape[1] if not cfg.use_block_kv else None
 
-    # Compute reciprocal of scale once
-    inv_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=scale_sb.dtype, buffer=nl.sbuf)
-    nisa.reciprocal(dst=inv_scale_sb[0:s_tile_sz, 0:1], data=scale_sb[0:s_tile_sz, 0:1])
+    if scale_sb is not None:
+        # FP8 quantization path: scale, clamp, then store
+        inv_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=scale_sb.dtype, buffer=nl.sbuf)
+        nisa.reciprocal(dst=inv_scale_sb[0:s_tile_sz, 0:1], data=scale_sb[0:s_tile_sz, 0:1])
 
-    # Allocate buffer for full kv_dim, scale and clamp all heads at once
-    clamped_sb = sbm.alloc_stack((nl.tile_size.pmax, kv_dim), dtype=cfg.kv_dtype, buffer=nl.sbuf)
+        clamped_sb = sbm.alloc_stack((nl.tile_size.pmax, kv_dim), dtype=cfg.kv_dtype, buffer=nl.sbuf)
 
-    nisa.tensor_scalar(
-        dst=clamped_sb[0:s_tile_sz, 0:kv_dim],
-        data=output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim],
-        op0=nl.multiply,
-        operand0=inv_scale_sb[0:s_tile_sz, 0:1],
-    )
-    nisa.tensor_scalar(
-        dst=clamped_sb[0:s_tile_sz, 0:kv_dim],
-        data=clamped_sb[0:s_tile_sz, 0:kv_dim],
-        op0=nl.maximum,
-        operand0=cfg.fp8_min,
-        op1=nl.minimum,
-        operand1=cfg.fp8_max,
-    )
+        nisa.tensor_scalar(
+            dst=clamped_sb[0:s_tile_sz, 0:kv_dim],
+            data=output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim],
+            op0=nl.multiply,
+            operand0=inv_scale_sb[0:s_tile_sz, 0:1],
+        )
+        nisa.tensor_scalar(
+            dst=clamped_sb[0:s_tile_sz, 0:kv_dim],
+            data=clamped_sb[0:s_tile_sz, 0:kv_dim],
+            op0=nl.maximum,
+            operand0=cfg.fp8_min,
+            op1=nl.minimum,
+            operand1=cfg.fp8_max,
+        )
+        src_sb = clamped_sb[0:s_tile_sz, 0:kv_dim]
+    else:
+        # bf16 path: store directly without quantization
+        src_sb = output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim]
 
     if cfg.use_block_kv:
         # Block KV layout: [num_blocks, block_size, kv_dim]
@@ -513,7 +744,7 @@ def _quantize_and_store_kv(
                 vector_offset=slot_mapping_sb.ap(pattern=[[1, s_tile_sz], [1, 1]], offset=0),
                 indirect_dim=0,
             ),
-            src=clamped_sb[0:s_tile_sz, 0:kv_dim],
+            src=src_sb,
             dge_mode=dge_mode.swdge,
         )
     else:
@@ -523,7 +754,249 @@ def _quantize_and_store_kv(
                 pattern=[[kv_dim, s_tile_sz], [1, kv_dim]],
                 offset=i_batch * max_seq_len * kv_dim + s_tile_global_offset * kv_dim,
             ),
-            src=clamped_sb[0:s_tile_sz, 0:kv_dim],
+            src=src_sb,
+            dge_mode=dge_mode.swdge,
+        )
+
+
+def _quantize_and_store_k_transposed(
+    output_sb: nl.ndarray,
+    scale_sb: Optional[nl.ndarray],
+    cache_hbm: nl.ndarray,
+    kv_offset: int,
+    s_tile_sz: int,
+    cfg: QKV_CTE_Config,
+    dims: QKV_CTE_Dims,
+    sbm: SbufManager,
+    slot_mapping_sb: Optional[nl.ndarray] = None,
+    i_batch: int = 0,
+    s_tile_global_offset: int = 0,
+):
+    """
+    Optionally quantize K values, then transpose and store in [d_head, seq] layout to cache.
+
+    When scale_sb is provided (FP8 path):
+        quantized_value = clamp(value / scale, fp8_min, fp8_max)
+    When scale_sb is None (bf16 path):
+        Values are transposed and stored directly without quantization.
+
+    Transposes each KV head from [s_tile_sz, d_head] to [d_head, s_tile_sz] before writing,
+    which is the layout expected by attention TKG kernels for efficient K access.
+
+    Supports two cache layouts:
+    - Block KV: cache shape [num_blocks * num_kv_heads, d_head, block_size], uses slot_mapping_sb
+      for indirect addressing to map tokens to non-contiguous physical blocks.
+    - Flat KV: cache shape [B, kv_dim, max_seq_len], writes contiguously per batch.
+
+    Args:
+        output_sb (nl.ndarray): [s_tile_sz, I], QKV projection output tile in SBUF.
+        scale_sb (Optional[nl.ndarray]): [s_tile_sz, 1], Per-token quantization scale in SBUF.
+            When None, values are stored directly without quantization (bf16 path).
+        cache_hbm (nl.ndarray): K cache tensor in HBM. Shape depends on cache mode:
+            - Block KV: [num_blocks * num_kv_heads, d_head, block_size]
+            - Flat KV: [B, kv_dim, max_seq_len]
+        kv_offset (int): Column offset into output_sb where K values start (typically q_dim).
+        s_tile_sz (int): Number of active sequence positions in this tile.
+        cfg (QKV_CTE_Config): Kernel configuration (fp8_min, fp8_max, kv_dtype, block_size, etc.).
+        dims (QKV_CTE_Dims): Tensor dimensions (kv_dim, d_head, num_kv_heads).
+        sbm (SbufManager): SBUF memory manager for scratch allocations.
+        slot_mapping_sb (Optional[nl.ndarray]): [s_tile_sz, 1], Per-token slot indices for block KV
+            cache. Each slot encodes block_idx and offset within block. Required when cfg.use_block_kv
+            is True. Default: None
+        i_batch (int): Batch index for flat KV cache addressing. Default: 0
+        s_tile_global_offset (int): Global sequence offset for flat KV cache addressing. Default: 0
+    """
+    kv_dim = dims.kv_dim
+    d_head = dims.d_head
+    num_kv_heads = dims.num_kv_heads
+
+    if scale_sb is not None:
+        # FP8 path: scale first, clamp after transpose
+        inv_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=scale_sb.dtype, buffer=nl.sbuf)
+        nisa.reciprocal(dst=inv_scale_sb[0:s_tile_sz, 0:1], data=scale_sb[0:s_tile_sz, 0:1])
+
+        scaled_sb = sbm.alloc_stack((nl.tile_size.pmax, kv_dim), dtype=output_sb.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=scaled_sb[0:s_tile_sz, 0:kv_dim],
+            data=output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim],
+            op0=nl.multiply,
+            operand0=inv_scale_sb[0:s_tile_sz, 0:1],
+        )
+        transpose_src_sb = scaled_sb
+    else:
+        # bf16 path: transpose directly from output_sb (no scaling)
+        transpose_src_sb = output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim]
+
+    transposed_sb = sbm.alloc_stack(
+        (nl.tile_size.pmax, num_kv_heads * nl.tile_size.pmax),
+        dtype=cfg.kv_dtype,
+        buffer=nl.sbuf,
+    )
+    NUM_TRANSPOSE_PSUM_BUFS = min(num_kv_heads, NUM_HW_PSUM_BANKS)
+    transpose_psum_bufs = []
+    for _ in nl.affine_range(NUM_TRANSPOSE_PSUM_BUFS):
+        transpose_psum_bufs.append(
+            nl.ndarray(
+                (nl.tile_size.pmax, nl.tile_size.pmax),
+                dtype=output_sb.dtype,
+                buffer=nl.psum,
+            )
+        )
+
+    num_chunks = math.ceil(num_kv_heads / NUM_TRANSPOSE_PSUM_BUFS)
+    for i_chunk in nl.affine_range(num_chunks):
+        chunk_start = i_chunk * NUM_TRANSPOSE_PSUM_BUFS
+        chunk_size = min(NUM_TRANSPOSE_PSUM_BUFS, num_kv_heads - chunk_start)
+        for j in nl.affine_range(chunk_size):
+            i_head = chunk_start + j
+            nisa.nc_transpose(
+                data=transpose_src_sb[0:s_tile_sz, nl.ds(i_head * d_head, d_head)],
+                dst=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
+            )
+
+            if scale_sb is not None:
+                # FP8 path: clamp during PSUM→SBUF eviction
+                nisa.tensor_scalar(
+                    dst=transposed_sb[0:d_head, nl.ds(i_head * nl.tile_size.pmax, s_tile_sz)],
+                    data=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
+                    op0=nl.maximum,
+                    operand0=cfg.fp8_min,
+                    op1=nl.minimum,
+                    operand1=cfg.fp8_max,
+                )
+            else:
+                # bf16 path: plain copy from PSUM→SBUF
+                nisa.tensor_copy(
+                    dst=transposed_sb[0:d_head, nl.ds(i_head * nl.tile_size.pmax, s_tile_sz)],
+                    src=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
+                )
+
+    if cfg.use_block_kv:
+        block_size = cfg.block_size
+
+        # Divide by num_kv_heads to get the number of physical blocks.
+        num_blocks = cache_hbm.shape[0] // num_kv_heads
+
+        # block_size must be power-of-2
+        log2_block_size = int(math.log2(block_size))
+        block_size_mask = block_size - 1
+
+        # Strides for linearized addressing into the flattened cache:
+        #   Within a block: elements are [d_head, block_size] contiguous
+        #   Across heads:   head_stride = d_head * block_size
+        #   Across blocks:  block_stride = num_kv_heads * head_stride
+        head_stride = d_head * block_size
+        block_stride = num_kv_heads * head_stride
+
+        # Flatten cache to 1D for indirect DMA addressing via offset tensors.
+        total_elems = num_blocks * num_kv_heads * d_head * block_size
+        cache_flat = cache_hbm.reshape((total_elems, 1))
+
+        num_full_blocks = s_tile_sz // block_size
+        remainder = s_tile_sz % block_size
+
+        # Compute block base addresses for ALL tokens in partition dim:
+        #   block_base_sb[t, 0] = slot[t] * (num_kv_heads * d_head)
+        block_base_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=block_base_sb[0:s_tile_sz, 0:1],
+            data=slot_mapping_sb[0:s_tile_sz, 0:1],
+            op0=nl.multiply,
+            operand0=num_kv_heads * d_head,
+        )
+
+        # Loop over full blocks: scalar_offset reads from partition token_start.
+        # AP partition stride [[block_size, d_head]] adds p * block_size.
+        for i_block in nl.affine_range(num_full_blocks):
+            token_start = i_block * block_size
+            nisa.dma_copy(
+                dst=cache_flat.ap(
+                    pattern=[
+                        [block_size, d_head],
+                        [head_stride, num_kv_heads],
+                        [1, block_size],
+                    ],
+                    offset=0,
+                    scalar_offset=block_base_sb[token_start : token_start + 1, 0:1],
+                    indirect_dim=0,
+                ),
+                src=transposed_sb.ap(
+                    pattern=[
+                        [num_kv_heads * nl.tile_size.pmax, d_head],
+                        [nl.tile_size.pmax, num_kv_heads],
+                        [1, block_size],
+                    ],
+                    offset=token_start,
+                ),
+                dge_mode=dge_mode.swdge,
+            )
+
+        # Handle remainder (partial last block) if any.
+        if remainder > 0:
+            token_start = num_full_blocks * block_size
+
+            # slot_in_block from original slot_mapping (partition dim)
+            slot_in_block_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=slot_in_block_sb[0:1, 0:1],
+                data=slot_mapping_sb[token_start : token_start + 1, 0:1],
+                op0=nl.bitwise_and,
+                operand0=block_size_mask,
+            )
+            # Compute block_idx * block_stride for remainder (can't reuse block_base_sb
+            # since it has slot * num_kv_heads * d_head which includes slot_in_block).
+            base_offset_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=base_offset_sb[0:1, 0:1],
+                data=slot_mapping_sb[token_start : token_start + 1, 0:1],
+                op0=nl.right_shift,
+                operand0=log2_block_size,
+            )
+            nisa.scalar_tensor_tensor(
+                dst=base_offset_sb[0:1, 0:1],
+                data=base_offset_sb[0:1, 0:1],
+                op0=nl.multiply,
+                operand0=float(block_stride),
+                op1=nl.add,
+                operand1=slot_in_block_sb[0:1, 0:1],
+            )
+
+            nisa.dma_copy(
+                dst=cache_flat.ap(
+                    pattern=[[block_size, d_head], [head_stride, num_kv_heads], [1, remainder]],
+                    offset=0,
+                    scalar_offset=base_offset_sb[0:1, 0:1],
+                    indirect_dim=0,
+                ),
+                src=transposed_sb.ap(
+                    pattern=[
+                        [num_kv_heads * nl.tile_size.pmax, d_head],
+                        [nl.tile_size.pmax, num_kv_heads],
+                        [1, remainder],
+                    ],
+                    offset=token_start,
+                ),
+                dge_mode=dge_mode.swdge,
+            )
+
+    else:
+        # Flat KV cache: [B, kv_dim, max_seq_len] — no block indirection needed.
+        max_seq_len = cache_hbm.shape[2]
+        total_elems = cache_hbm.shape[0] * kv_dim * max_seq_len
+        cache_col = cache_hbm.reshape((total_elems, 1))
+        batch_base = i_batch * kv_dim * max_seq_len + s_tile_global_offset
+
+        # Batched DMA: write all heads with a single strided DMA.
+        head_stride_flat = d_head * max_seq_len
+        nisa.dma_copy(
+            dst=cache_col.ap(
+                pattern=[[max_seq_len, d_head], [head_stride_flat, num_kv_heads], [1, s_tile_sz]],
+                offset=batch_base,
+            ),
+            src=transposed_sb.ap(
+                pattern=[[num_kv_heads * nl.tile_size.pmax, d_head], [nl.tile_size.pmax, num_kv_heads], [1, s_tile_sz]],
+                offset=0,
+            ),
             dge_mode=dge_mode.swdge,
         )
 
@@ -546,7 +1019,10 @@ def _qkv_cte_impl(
     # Fused RoPE Related
     cos_cache_hbm: Optional[nl.ndarray] = None,
     sin_cache_hbm: Optional[nl.ndarray] = None,
-    # FP8 KV Cache Quantization Related
+    # Fused RoPE + QK-norm: K-specific gamma-fused caches
+    k_cos_cache_hbm: Optional[nl.ndarray] = None,
+    k_sin_cache_hbm: Optional[nl.ndarray] = None,
+    # KV Cache Related
     q_tensor_hbm: Optional[nl.ndarray] = None,
     k_cache_hbm: Optional[nl.ndarray] = None,
     v_cache_hbm: Optional[nl.ndarray] = None,
@@ -626,8 +1102,7 @@ def _qkv_cte_impl(
     zero_bias_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
     nisa.memset(dst=zero_bias_sb, value=0)
 
-    norm_eps_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
-    nisa.memset(dst=norm_eps_sb, value=norm_eps)
+    norm_eps_sb = _make_activation_constant_bias(norm_eps, sbm, nl.tile_size.pmax, dtype=cfg.compute_mm_dtype)
 
     if cfg.add_bias:
         # Load Bias (1, I) to SBUF as (1, I), and broadcast it to (128, I) using stream_shuffle.
@@ -651,7 +1126,9 @@ def _qkv_cte_impl(
             # Shape: [128, ceil(H / nl.tile_size.pmax)]
             layer_norm_bias_sb = _load_norm_weights(norm_weights_hbm=layer_norm_bias_hbm, cfg=cfg, dims=dims, sbm=sbm)
 
-    # Load KV quantization scales if enabled
+    # Load KV quantization scales if enabled (not needed for bf16 KV cache)
+    k_scale_sb = None
+    v_scale_sb = None
     if cfg.use_kv_quantization:
         k_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
         v_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -668,6 +1145,7 @@ def _qkv_cte_impl(
 
     # Load quantization scales
     w_scale_tile, in_scale_tile = None, None
+    row_w_scale_sb = None
     if cfg.quantization_config.quantization_type == QuantizationType.STATIC:
         w_scale_tile = sbm.alloc_stack(shape=(nl.tile_size.pmax, 3), dtype=qkv_w_scale.dtype, buffer=nl.sbuf)
         # Load and broadcast weight scale
@@ -688,6 +1166,18 @@ def _qkv_cte_impl(
 
         # Compute reciprocal once for quantization: 1/scale
         nisa.reciprocal(dst=in_scale_tile, data=in_scale_tile)
+    elif cfg.quantization_config.quantization_type == QuantizationType.ROW:
+        # ROW quantization: per-column weight scale [P_MAX, I] or [1, I]
+        row_w_scale_sb = sbm.alloc_stack(shape=(nl.tile_size.pmax, I), dtype=qkv_w_scale.dtype, buffer=nl.sbuf)
+        if qkv_w_scale.shape[0] == 1:
+            nisa.dma_copy(dst=row_w_scale_sb[0:1, :], src=qkv_w_scale[0:1, :I])
+            stream_shuffle_broadcast(row_w_scale_sb, row_w_scale_sb)
+        else:
+            nisa.dma_copy(dst=row_w_scale_sb, src=qkv_w_scale[:, :I])
+
+    ######################## QK-Norm SBUF Allocations ########################################
+    qk_norm_bufs = _allocate_qk_norm_buffers(cfg, dims, sbm, nl.tile_size.pmax)
+    _has_qk_norm = qk_norm_bufs is not None
 
     ######################## Choose Multi-Buffering Degree ###################################
 
@@ -814,40 +1304,19 @@ def _qkv_cte_impl(
                         sbm.alloc_stack((nl.tile_size.pmax, NUM_AGGR_STATS), dtype=cfg.act_dtype, buffer=nl.sbuf)
                     )
 
-            if cfg.fused_rope:
-                # For the input head X = [X1, X2] , RoPE does the following:
-                # X = [X1, X2] * cos_cache + [-X2, X1] * sin_cache
-                # X = [X1, X2] * cos_cache + [-X2*sin_cache_1, X1*sin_cache_2]
-                # sin_cache_1 = sin_cache_2. Therefore, we can keep only half of the sin_cache.
-                cos_buffer_sb = []
-                for _ in range(num_S_tiles_in_block):
-                    cos_buffer_sb.append(
-                        sbm.alloc_stack(
-                            (nl.tile_size.pmax, dims.d_head),
-                            dtype=cfg.compute_mm_dtype,
-                            buffer=nl.sbuf,
-                        )
-                    )
-
-                sin_buffer_sb = []
-                for _ in range(num_S_tiles_in_block):
-                    sin_buffer_sb.append(
-                        sbm.alloc_stack(
-                            (nl.tile_size.pmax, dims.d_head // 2),
-                            dtype=cfg.compute_mm_dtype,
-                            buffer=nl.sbuf,
-                        )
-                    )
-
-                rope_intermediate_buffer_sb = []
-                for _ in range(num_S_tiles_in_block):
-                    rope_intermediate_buffer_sb.append(
-                        sbm.alloc_stack(
-                            (nl.tile_size.pmax, dims.d_head * 2),
-                            dtype=cfg.compute_mm_dtype,
-                            buffer=nl.sbuf,
-                        )
-                    )
+            # RoPE buffers: cos [pmax, d_head], sin [pmax, d_head//2], scratch [pmax, d_head*2]
+            rope_bufs = _allocate_rope_buffers(
+                cfg,
+                dims,
+                sbm,
+                nl.tile_size.pmax,
+                num_S_tiles_in_block,
+                _has_qk_norm,
+                cos_cache_hbm,
+                sin_cache_hbm,
+                k_cos_cache_hbm=k_cos_cache_hbm,
+                k_sin_cache_hbm=k_sin_cache_hbm,
+            )
             #########################  End of Allocations for Multi-Buffered tensors ##################################
 
             # In this case, we will transpose the input buffer using PE array.
@@ -1259,29 +1728,47 @@ def _qkv_cte_impl(
                         # Load/transpose only [128, 1024] elements of input.
 
                         # NOTE: To drop H divisible by 128 constraint, update AP below with valid "num_h" for the last iteration.
-                        src_offset = (
-                            i_batch * dims.S * H + (dims.S_shard_offset + s_tile_local_offset) * H + weight_load_offset
-                        )
-                        nisa.dma_transpose(
-                            dst=input_sb[i_tile_S].ap(
-                                pattern=[
-                                    [H, nl.tile_size.pmax],
-                                    [1, 1],
-                                    [nl.tile_size.pmax, curr_num_128_H_subtiles_per_weight_block],
-                                    [1, s_tile_sz],
-                                ],
-                                offset=weight_load_offset,
-                            ),
-                            src=input_hbm.ap(
-                                pattern=[
-                                    [H, s_tile_sz],
-                                    [1, 1],
-                                    [nl.tile_size.pmax, curr_num_128_H_subtiles_per_weight_block],
-                                    [1, nl.tile_size.pmax],
-                                ],
-                                offset=src_offset,
-                            ),
-                        )
+                        if cfg.strided_input_config is None:
+                            _dma_xpose_input_non_strided(
+                                input_sb,
+                                input_hbm,
+                                i_tile_S,
+                                dims,
+                                i_batch,
+                                weight_load_offset,
+                                s_tile_local_offset,
+                                s_tile_sz,
+                                curr_num_128_H_subtiles_per_weight_block,
+                                H,
+                            )
+                        elif cfg.strided_input_config.block_len <= nl.tile_size.pmax:
+                            _dma_xpose_input_strided_packed(
+                                input_sb,
+                                input_hbm,
+                                i_tile_S,
+                                cfg.strided_input_config,
+                                dims,
+                                i_batch,
+                                weight_load_offset,
+                                s_tile_local_offset,
+                                s_tile_sz,
+                                curr_num_128_H_subtiles_per_weight_block,
+                                H,
+                            )
+                        else:
+                            _dma_xpose_input_strided_contiguous(
+                                input_sb,
+                                input_hbm,
+                                i_tile_S,
+                                cfg.strided_input_config,
+                                dims,
+                                i_batch,
+                                weight_load_offset,
+                                s_tile_local_offset,
+                                s_tile_sz,
+                                curr_num_128_H_subtiles_per_weight_block,
+                                H,
+                            )
 
                         if cfg.quantization_config.quantization_type == QuantizationType.STATIC:
                             # perform quantization for the input
@@ -1421,24 +1908,22 @@ def _qkv_cte_impl(
                 s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * nl.tile_size.pmax
                 s_tile_sz = min(nl.tile_size.pmax, S_shard - s_tile_local_offset)
 
-                # Copy results PSUM -> SBUF, apply RoPE fusion, (optionally) add_bias.
-                if cfg.fused_rope:
-                    _copy_psum_to_sbuf_apply_rope_and_bias(
+                # Copy results PSUM -> SBUF, apply per-head processing (RoPE and/or QK-norm).
+                if cfg.fused_rope or _has_qk_norm:
+                    _evict_and_postprocess_per_head(
                         qkv_MM_output_psum=qkv_MM_output_psum,
                         output_sb=output_sb,
-                        cos_buffer_sb=cos_buffer_sb,
-                        sin_buffer_sb=sin_buffer_sb,
-                        rope_intermediate_buffer_sb=rope_intermediate_buffer_sb,
-                        cos_cache_hbm=cos_cache_hbm,
-                        sin_cache_hbm=sin_cache_hbm,
                         i_tile_S=i_tile_S,
                         s_tile_sz=s_tile_sz,
-                        i_batch=i_batch,
-                        s_tile_local_offset=s_tile_local_offset,
                         cfg=cfg,
                         dims=dims,
                         bias_sb=bias_sb if cfg.add_bias else None,
                         w_scale_tile=w_scale_tile,
+                        rope_bufs=rope_bufs,
+                        i_batch=i_batch,
+                        s_tile_local_offset=s_tile_local_offset,
+                        qk_norm_bufs=qk_norm_bufs,
+                        row_w_scale_sb=row_w_scale_sb,
                     )
                 # Copy results PSUM -> SBUF, (optionally) add_bias.
                 else:
@@ -1566,6 +2051,15 @@ def _qkv_cte_impl(
                                     src=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, 0:num_i],
                                 )
 
+                        # ROW dequantization: element-wise multiply with per-column weight scale
+                        if row_w_scale_sb is not None:
+                            nisa.tensor_tensor(
+                                dst=output_sb[i_tile_S][0:s_tile_sz, :I],
+                                data1=output_sb[i_tile_S][0:s_tile_sz, :I],
+                                data2=row_w_scale_sb[0:s_tile_sz, :I],
+                                op=nl.multiply,
+                            )
+
                 # End of i_tile_S loop.
 
             #######################################################################################################
@@ -1573,8 +2067,8 @@ def _qkv_cte_impl(
             #######################################################################################################
             # This parts reads from output_matmult_sbuf and writes to out_tensor.
 
-            if cfg.use_kv_quantization and cfg.output_layout == QKVOutputLayout.BSD:
-                # KV quantization mode: store Q separately, quantize and store K/V to caches
+            if cfg.use_kv_cache and cfg.output_layout == QKVOutputLayout.BSD:
+                # KV cache mode: store Q separately, optionally quantize and store K/V to caches
                 for i_tile_S in range(num_S_tiles_in_block):
                     s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * nl.tile_size.pmax
                     s_tile_sz = min(nl.tile_size.pmax, S_shard - s_tile_local_offset)
@@ -1602,20 +2096,34 @@ def _qkv_cte_impl(
                             ),
                             dge_mode=dge_mode.swdge,
                         )
-
-                    _quantize_and_store_kv(
-                        output_sb=output_sb[i_tile_S],
-                        scale_sb=k_scale_sb,
-                        cache_hbm=k_cache_hbm,
-                        kv_offset=dims.q_dim,
-                        i_batch=i_batch,
-                        s_tile_global_offset=s_tile_global_offset,
-                        s_tile_sz=s_tile_sz,
-                        cfg=cfg,
-                        dims=dims,
-                        sbm=sbm,
-                        slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
-                    )
+                    if cfg.transpose_k_cache:
+                        _quantize_and_store_k_transposed(
+                            output_sb=output_sb[i_tile_S],
+                            scale_sb=k_scale_sb,
+                            cache_hbm=k_cache_hbm,
+                            kv_offset=dims.q_dim,
+                            s_tile_sz=s_tile_sz,
+                            cfg=cfg,
+                            dims=dims,
+                            sbm=sbm,
+                            slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
+                            i_batch=i_batch,
+                            s_tile_global_offset=s_tile_global_offset,
+                        )
+                    else:
+                        _quantize_and_store_kv(
+                            output_sb=output_sb[i_tile_S],
+                            scale_sb=k_scale_sb,
+                            cache_hbm=k_cache_hbm,
+                            kv_offset=dims.q_dim,
+                            i_batch=i_batch,
+                            s_tile_global_offset=s_tile_global_offset,
+                            s_tile_sz=s_tile_sz,
+                            cfg=cfg,
+                            dims=dims,
+                            sbm=sbm,
+                            slot_mapping_sb=slot_mapping_tile_sb if cfg.use_block_kv else None,
+                        )
 
                     _quantize_and_store_kv(
                         output_sb=output_sb[i_tile_S],
@@ -1692,6 +2200,8 @@ def _qkv_cte_mx_impl(
     sin_cache_hbm: Optional[nl.ndarray] = None,
     qkv_w_scale: Optional[nl.ndarray] = None,
     qkv_in_scale: Optional[nl.ndarray] = None,
+    k_cos_cache_hbm: Optional[nl.ndarray] = None,
+    k_sin_cache_hbm: Optional[nl.ndarray] = None,
 ) -> nl.ndarray:
     """
     MX Quantization implementation of QKV CTE kernel.
@@ -1790,7 +2300,7 @@ def _qkv_cte_mx_impl(
     PSUM_BANK_SIZE = _get_psum_bank_size()
 
     if sbm is None:
-        sbm_logger = Logger(name="logger")
+        sbm_logger = get_logger("qkv_cte")
         sbm = SbufManager(
             sb_lower_bound=0,
             sb_upper_bound=cfg.total_available_sbuf_space_to_this_kernel,
@@ -1804,22 +2314,24 @@ def _qkv_cte_mx_impl(
 
     # MX constants
     SCALE_P_PER_QUAD = H_pack = 4
-    H_128_tiles = H // (P_MAX * H_pack)
+    H_128_tiles = div_ceil(H, P_MAX * H_pack)
 
     # Load norm weights only for non-swizzled path
     if not cfg.is_input_swizzled:
         zero_bias_sb = sbm.alloc_stack((P_MAX, 1), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
         nisa.memset(dst=zero_bias_sb, value=0)
 
-        norm_eps_sb = sbm.alloc_stack((P_MAX, 1), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
-        nisa.memset(dst=norm_eps_sb, value=norm_eps)
+        norm_eps_sb = _make_activation_constant_bias(norm_eps, sbm, P_MAX, dtype=cfg.compute_mm_dtype)
     else:
         input_view = input_hbm.reshape((dims.B, dims.S * H_pack, H_128_tiles, P_MAX))
 
     _is_fp8_input = input_hbm.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
     _use_static_dequant = qkv_in_scale is not None
     _is_bf16_with_static_quant = input_hbm.dtype == nl.bfloat16 and _use_static_dequant
-    _use_dma_xpose_mx_path = (_is_fp8_input or _is_bf16_with_static_quant) and cfg.load_input_with_DMA_transpose
+    _is_row_mx = cfg.quantization_config.has_row_mx_dequant
+    _use_dma_xpose_mx_path = (
+        (_is_fp8_input or _is_bf16_with_static_quant) and cfg.load_input_with_DMA_transpose and not _is_row_mx
+    )
 
     # When on static dequant path, qkv_w_scale carries the per-tensor dequant w_scale
     # ([1,3] or [128,3]), not per-block MX scales. Extract it and clear so per-block logic sees None.
@@ -1828,11 +2340,31 @@ def _qkv_cte_mx_impl(
         mx_static_dequant_w_scale = qkv_w_scale
         qkv_w_scale = None
 
+    # ROW_MX: extract per-channel weight scale and clear qkv_w_scale so per-block MX logic sees None.
+    row_mx_w_channel_scale = None
+    if _is_row_mx:
+        row_mx_w_channel_scale = qkv_w_scale
+        qkv_w_scale = None
+
     # DMA transpose path: pack pairs of elements into a wider type for x4-interleaved layout.
     # FP8 (1B)→FP16 (2B), BF16 (2B)→FP32 (4B); reshape [B, S, H] → [B*S*2, H//2] viewed as wider type.
     if _use_dma_xpose_mx_path:
         _dma_xpose_packed_2d = input_hbm.reshape((dims.B * dims.S * 2, H // 2))
         _dma_xpose_view_dtype = nl.float32 if _is_bf16_with_static_quant else nl.float16
+
+    # Precompute DMA transpose parameters for the shared helper.
+    # ROW_MX: float32 AP directly on [B, S, H+4], no reshape, seq_mult=1.
+    # Existing MX: fp16/fp32 AP on reshaped [B*S*2, H//2], seq_mult=2.
+    if _is_row_mx:
+        _xpose_src = input_hbm
+        _xpose_row_stride = (H + ROW_MX_TAIL_SCALE_BYTES) // 4
+        _xpose_seq_mult = 1
+        _xpose_dtype = nl.float32
+    elif _use_dma_xpose_mx_path:
+        _xpose_src = _dma_xpose_packed_2d
+        _xpose_row_stride = H_PACKED
+        _xpose_seq_mult = 2
+        _xpose_dtype = _dma_xpose_view_dtype
 
     if cfg.fused_norm_type == NormType.RMS_NORM or cfg.fused_norm_type == NormType.LAYER_NORM:
         gamma_norm_weights_sb = _load_norm_weights_mx(
@@ -1860,40 +2392,62 @@ def _qkv_cte_mx_impl(
         neutral_scale_sb = sbm.alloc_stack((P_MAX, 1, F_MAX), dtype=nl.uint8, buffer=nl.sbuf)
         nisa.memset(dst=neutral_scale_sb, value=MX_NEUTRAL_SCALE)
 
+    # ROW_MX: load per-channel weight scale [P_MAX, I] float32 into SBUF (global allocation)
+    row_mx_w_channel_scale_sb = None
+    if _is_row_mx:
+        row_mx_w_channel_scale_sb = sbm.alloc_stack((P_MAX, I), dtype=nl.float32, buffer=nl.sbuf)
+        if row_mx_w_channel_scale.shape[0] == 1:
+            nisa.dma_copy(dst=row_mx_w_channel_scale_sb[0:1, 0:I], src=row_mx_w_channel_scale[0:1, 0:I])
+            stream_shuffle_broadcast(row_mx_w_channel_scale_sb, row_mx_w_channel_scale_sb)
+        else:
+            nisa.dma_copy(dst=row_mx_w_channel_scale_sb, src=row_mx_w_channel_scale)
+
     if use_weight_prefetch_mx:
         num_weight_load_blocks_mx = H_128_tiles
         h_tiles_per_block = H_128_tiles
 
+        H_128_tiles_full = H // (P_MAX * H_pack)  # Count of complete 512-element tiles
+        h_pack_last = (H % (P_MAX * H_pack)) // P_MAX if H % (P_MAX * H_pack) != 0 else H_pack
+
         weight_scale_sb = []
         if qkv_w_scale is not None:
             mx_weight_scale_sb = sbm.alloc_stack((P_MAX, H_128_tiles, I), dtype=nl.uint8, buffer=nl.sbuf)
-            for h_tile_idx in nl.affine_range(H_128_tiles):
+            # Full tiles: all 4 quads
+            for h_tile_idx in nl.affine_range(H_128_tiles_full):
                 for quad_idx in nl.affine_range(4):
-                    # HBM layout: [H/32, I] = [64, 512], rows are interleaved by quadrant per H_128_tile
-                    # Row index = h_tile_idx * 16 + quad_idx * 4 ... + 4
                     hbm_row_offset = (h_tile_idx * 16 + quad_idx * SCALE_P_PER_QUAD) * I
                     nisa.dma_copy(
                         dst=mx_weight_scale_sb[nl.ds(quad_idx * 32, SCALE_P_PER_QUAD), h_tile_idx, :],
                         src=qkv_w_scale.ap(
                             pattern=[[I, SCALE_P_PER_QUAD], [1, I]], offset=hbm_row_offset, dtype=nl.uint8
                         ),
-                        dge_mode=dge_mode.swdge,
+                        dge_mode=dge_mode.hwdge,
+                    )
+            # Partial last tile (if exists)
+            _is_remainder = H_128_tiles > H_128_tiles_full
+            if _is_remainder:
+                for quad_idx in nl.affine_range(h_pack_last):
+                    hbm_row_offset = (H_128_tiles_full * 16 + quad_idx * SCALE_P_PER_QUAD) * I
+                    nisa.dma_copy(
+                        dst=mx_weight_scale_sb[nl.ds(quad_idx * 32, SCALE_P_PER_QUAD), H_128_tiles_full, :],
+                        src=qkv_w_scale.ap(
+                            pattern=[[I, SCALE_P_PER_QUAD], [1, I]], offset=hbm_row_offset, dtype=nl.uint8
+                        ),
+                        dge_mode=dge_mode.hwdge,
                     )
             weight_scale_sb.append(mx_weight_scale_sb)
 
         # Load MX weights
         weights_sb = []
-        mx_weights_sb = sbm.alloc_stack(
-            (P_MAX, dims.num_128_tiles_per_H // 4, I), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf
-        )
-        for h_tile_idx in nl.affine_range(dims.num_128_tiles_per_H // 4):
+        mx_weights_sb = sbm.alloc_stack((P_MAX, dims.num_512_tiles_per_H, I), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+        for h_tile_idx in nl.affine_range(H_128_tiles):
             h_tile_sz = min(P_MAX, H_PACKED - h_tile_idx * P_MAX)
             nisa.dma_copy(
                 dst=mx_weights_sb[0:h_tile_sz, h_tile_idx, 0:I],
                 src=fused_qkv_weights_hbm.ap(
                     pattern=[[I, h_tile_sz], [1, I]], offset=h_tile_idx * P_MAX * I, dtype=nl.float8_e4m3fn_x4
                 ),
-                dge_mode=dge_mode.swdge,
+                dge_mode=dge_mode.hwdge,
             )
         weights_sb.append(mx_weights_sb)
     else:
@@ -1934,6 +2488,10 @@ def _qkv_cte_mx_impl(
             inv_in_scale_sb = sbm.alloc_stack(shape=(P_MAX, 1), dtype=qkv_in_scale.dtype, buffer=nl.sbuf)
             nisa.reciprocal(dst=inv_in_scale_sb, data=in_scale_sb)
 
+    # QK-norm buffers: gamma weights [pmax, d_head] broadcast via stream_shuffle + scratch [pmax, 1]
+    qk_norm_bufs = _allocate_qk_norm_buffers(cfg, dims, sbm, P_MAX)
+    _has_qk_norm = qk_norm_bufs is not None
+
     for i_batch in range(dims.B):
         for i_block_S in nl.affine_range(num_blocks_per_S_shard):
             sbm.open_scope()
@@ -1941,7 +2499,8 @@ def _qkv_cte_mx_impl(
             s_block_sz = min(S_BLOCK_SIZE, S_shard - S_BLOCK_SIZE * i_block_S)
             num_S_tiles_in_block = math.ceil(s_block_sz / S_TILE_SIZE)
 
-            if _use_dma_xpose_mx_path:
+            row_mx_input_scale_sb = None
+            if _is_row_mx or _use_dma_xpose_mx_path:
                 # DMA transpose path: allocate buffers, loading happens per-weight-block below
                 quant_s_tiles = num_S_tiles_in_block * S_TILE_SIZE
                 hidden_qtz_sb = sbm.alloc_stack(
@@ -1958,10 +2517,19 @@ def _qkv_cte_mx_impl(
                         (P_MAX, H_128_tiles, quant_s_tiles * 2), dtype=nl.float32, buffer=nl.sbuf, align=32
                     )
 
-            _use_bf16_mx_path = not _use_dma_xpose_mx_path
+                # ROW_MX: per-S-tile input row scale [P_MAX, 1] float32
+                if _is_row_mx:
+                    row_mx_input_scale_sb = []
+                    for _ in range(num_S_tiles_in_block):
+                        row_mx_input_scale_sb.append(sbm.alloc_stack((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf))
+
+            _use_bf16_mx_path = not _use_dma_xpose_mx_path and not _is_row_mx
 
             # BF16/swizzled path: load → norm → transpose → swizzle → quantize_mx
             if _use_bf16_mx_path:
+                # For non-swizzled path, pad H to next multiple of 512 so the transpose
+                # loop iterates full H_pack sub-tiles uniformly. Padding is zero-filled.
+                H_padded = H_128_tiles * P_MAX * H_pack  # H_padded == H when H % 512 == 0
                 input_sb = []
                 for _ in range(num_S_tiles_in_block):
                     if cfg.is_input_swizzled:
@@ -1969,7 +2537,7 @@ def _qkv_cte_mx_impl(
                             sbm.alloc_stack((P_MAX, H_128_tiles, P_MAX), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
                         )
                     else:
-                        input_sb.append(sbm.alloc_stack((P_MAX, H), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
+                        input_sb.append(sbm.alloc_stack((P_MAX, H_padded), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf))
 
                 if cfg.fused_norm_type == NormType.RMS_NORM or cfg.fused_norm_type == NormType.RMS_NORM_SKIP_GAMMA:
                     square_sum_sb = []
@@ -2137,7 +2705,9 @@ def _qkv_cte_mx_impl(
                             for h_sub in nl.affine_range(H_pack):
                                 src_h_base = h_tile * P_MAX * H_pack + h_sub
                                 nisa.nc_transpose(
-                                    data=input_sb[s_tile].ap(pattern=[[H, P_MAX], [H_pack, P_MAX]], offset=src_h_base),
+                                    data=input_sb[s_tile].ap(
+                                        pattern=[[H_padded, P_MAX], [H_pack, P_MAX]], offset=src_h_base
+                                    ),
                                     dst=transpose_psum[h_sub][0:P_MAX, 0:P_MAX],
                                 )
 
@@ -2194,20 +2764,18 @@ def _qkv_cte_mx_impl(
                 )
 
             # RoPE buffers: allocated for both BF16 and FP8 paths (used in Step 5 post-matmul)
-            if cfg.fused_rope:
-                cos_buffer_sb = []
-                sin_buffer_sb = []
-                rope_intermediate_buffer_sb = []
-                for _ in range(num_S_tiles_in_block):
-                    cos_buffer_sb.append(
-                        sbm.alloc_stack((P_MAX, dims.d_head), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
-                    )
-                    sin_buffer_sb.append(
-                        sbm.alloc_stack((P_MAX, dims.d_head // 2), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
-                    )
-                    rope_intermediate_buffer_sb.append(
-                        sbm.alloc_stack((P_MAX, dims.d_head * 2), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
-                    )
+            rope_bufs = _allocate_rope_buffers(
+                cfg,
+                dims,
+                sbm,
+                P_MAX,
+                num_S_tiles_in_block,
+                _has_qk_norm,
+                cos_cache_hbm,
+                sin_cache_hbm,
+                k_cos_cache_hbm=k_cos_cache_hbm,
+                k_sin_cache_hbm=k_sin_cache_hbm,
+            )
 
             # Step 4: MX Matrix Multiplication
             num_output_s_tiles = max(1, num_S_tiles_in_block // 4) if cfg.is_input_swizzled else num_S_tiles_in_block
@@ -2229,21 +2797,23 @@ def _qkv_cte_mx_impl(
 
             for i_weight_block in nl.affine_range(num_weight_load_blocks_mx):
                 buf_idx = i_weight_block % NUM_MX_WEIGHT_BUFFERS if not use_weight_prefetch_mx else 0
+                h_packed_current_tile = min(P_MAX, H_PACKED - i_weight_block * P_MAX)
 
                 if not use_weight_prefetch_mx:
                     # Load this chunk: weights and scales for H_128_tile = i_weight_block
                     h_tile_idx = i_weight_block
                     h_tile_sz = min(P_MAX, H_PACKED - h_tile_idx * P_MAX)
+                    num_quads_current_tile = h_packed_current_tile // 32
 
                     if qkv_w_scale is not None:
-                        for quad_idx in nl.affine_range(4):
+                        for quad_idx in nl.affine_range(num_quads_current_tile):
                             hbm_row_offset = (h_tile_idx * 16 + quad_idx * SCALE_P_PER_QUAD) * I
                             nisa.dma_copy(
                                 dst=weight_scale_sb[buf_idx][nl.ds(quad_idx * 32, SCALE_P_PER_QUAD), 0, :],
                                 src=qkv_w_scale.ap(
                                     pattern=[[I, SCALE_P_PER_QUAD], [1, I]], offset=hbm_row_offset, dtype=nl.uint8
                                 ),
-                                dge_mode=dge_mode.swdge,
+                                dge_mode=dge_mode.hwdge,
                             )
 
                     # Load weights for this h_tile
@@ -2252,7 +2822,7 @@ def _qkv_cte_mx_impl(
                         src=fused_qkv_weights_hbm.ap(
                             pattern=[[I, h_tile_sz], [1, I]], offset=h_tile_idx * P_MAX * I, dtype=nl.float8_e4m3fn_x4
                         ),
-                        dge_mode=dge_mode.swdge,
+                        dge_mode=dge_mode.hwdge,
                     )
 
                 # DMA transpose: load one H_128_tile for each S tile
@@ -2260,26 +2830,44 @@ def _qkv_cte_mx_impl(
                     s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * P_MAX
                     s_tile_sz = min(P_MAX, S_shard - s_tile_local_offset)
 
-                    if _use_dma_xpose_mx_path:
+                    if _is_row_mx or _use_dma_xpose_mx_path:
                         s_global = dims.S_shard_offset + s_tile_local_offset
-                        src_offset = i_batch * dims.S * 2 * H_PACKED + s_global * 2 * H_PACKED + i_weight_block * P_MAX
 
                         # FP8: transpose directly into hidden_qtz_sb (no quantize_mx needed)
                         # BF16: transpose into staging buffer (quantize_mx runs after all H tiles)
                         xpose_dst_buf = bf16_xpose_staging_sb if _is_bf16_with_static_quant else hidden_qtz_sb
-                        dst_offset = i_weight_block * quant_s_tiles * 2 + i_tile_S * S_TILE_SIZE * 2
-                        nisa.dma_transpose(
-                            src=_dma_xpose_packed_2d.ap(
-                                pattern=[[H_PACKED, s_tile_sz * 2], [1, 1], [1, 1], [1, P_MAX]],
-                                offset=src_offset,
-                                dtype=_dma_xpose_view_dtype,
-                            ),
-                            dst=xpose_dst_buf.ap(
-                                pattern=[[quant_s_tiles * 2 * H_128_tiles, P_MAX], [1, 1], [1, 1], [1, s_tile_sz * 2]],
-                                offset=dst_offset,
-                                dtype=_dma_xpose_view_dtype,
-                            ),
+                        _dma_transpose_mx_tile(
+                            src_tensor=_xpose_src,
+                            dst_buf=xpose_dst_buf,
+                            row_stride=_xpose_row_stride,
+                            seq_mult=_xpose_seq_mult,
+                            view_dtype=_xpose_dtype,
+                            h_packed_current_tile=h_packed_current_tile,
+                            i_batch=i_batch,
+                            s_global=s_global,
+                            i_weight_block=i_weight_block,
+                            i_tile_S=i_tile_S,
+                            s_tile_sz=s_tile_sz,
+                            S_TILE_SIZE=S_TILE_SIZE,
+                            quant_s_tiles=quant_s_tiles,
+                            H_128_tiles=H_128_tiles,
+                            P_MAX=P_MAX,
+                            S=dims.S,
                         )
+
+                        # ROW_MX: extract per-row float32 scale from tail of packed input (once per S-tile)
+                        if _is_row_mx and i_weight_block == 0:
+                            nisa.dma_copy(
+                                dst=row_mx_input_scale_sb[i_tile_S][0:s_tile_sz, 0:1],
+                                src=input_hbm.ap(
+                                    dtype=nl.float32,
+                                    pattern=[[_xpose_row_stride, s_tile_sz], [1, 1]],
+                                    offset=i_batch * dims.S * _xpose_row_stride
+                                    + s_global * _xpose_row_stride
+                                    + _xpose_row_stride
+                                    - 1,
+                                ),
+                            )
 
                         # BF16: quantize the transposed staging data for this (H_128_tile, S_tile)
                         if _is_bf16_with_static_quant:
@@ -2304,81 +2892,75 @@ def _qkv_cte_mx_impl(
                         # Key mapping: h_idx in buffer depends on prefetch mode
                         h_idx_in_buf = i_weight_block if use_weight_prefetch_mx else 0
 
-                        # Stationary scale: neutral (pre-quantized FP8) or computed (BF16 quantize_mx)
-                        if _is_fp8_input:
-                            stat_scale = neutral_scale_sb[0:P_MAX, 0, 0:s_tile_sz]
-                        else:
-                            stat_scale = hidden_scale_sb[0:P_MAX, i_weight_block, nl.ds(i_tile_S * P_MAX, s_tile_sz)]
+                        # Split partition dim into valid nc_matmul_mx sizes (32, 64, 128).
+                        # E.g. 96 partitions → 64+32 since 96 is not a valid size.
+                        partition_starts, partition_sizes = _mx_partition_splits(h_packed_current_tile)
+                        for partition_idx in range(len(partition_starts)):
+                            partition_start = partition_starts[partition_idx]
+                            partition_size = partition_sizes[partition_idx]
+                            # Stationary scale: neutral (pre-quantized FP8) or computed (BF16 quantize_mx)
+                            if _is_fp8_input:
+                                stat_scale = neutral_scale_sb[nl.ds(partition_start, partition_size), 0, 0:s_tile_sz]
+                            else:
+                                stat_scale = hidden_scale_sb[
+                                    nl.ds(partition_start, partition_size),
+                                    i_weight_block,
+                                    nl.ds(i_tile_S * P_MAX, s_tile_sz),
+                                ]
 
-                        # Moving scale: neutral (no weight scales) or loaded from HBM
-                        if qkv_w_scale is None:
-                            mov_scale = neutral_scale_sb[0:P_MAX, 0, 0:i_tile_sz]
-                        else:
-                            mov_scale = weight_scale_sb[buf_idx][
-                                0:P_MAX, h_idx_in_buf, nl.ds(k_tile_I * F_MAX, i_tile_sz)
-                            ]
+                            # Moving scale: neutral (no weight scales) or loaded from HBM
+                            if qkv_w_scale is None:
+                                mov_scale = neutral_scale_sb[nl.ds(partition_start, partition_size), 0, 0:i_tile_sz]
+                            else:
+                                mov_scale = weight_scale_sb[buf_idx][
+                                    nl.ds(partition_start, partition_size),
+                                    h_idx_in_buf,
+                                    nl.ds(k_tile_I * F_MAX, i_tile_sz),
+                                ]
 
-                        nisa.nc_matmul_mx(
-                            dst=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, 0:i_tile_sz],
-                            stationary=hidden_qtz_sb[0:P_MAX, i_weight_block, nl.ds(i_tile_S * P_MAX, s_tile_sz)],
-                            moving=weights_sb[buf_idx][0:P_MAX, h_idx_in_buf, nl.ds(k_tile_I * F_MAX, i_tile_sz)],
-                            stationary_scale=stat_scale,
-                            moving_scale=mov_scale,
-                        )
+                            nisa.nc_matmul_mx(
+                                dst=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, 0:i_tile_sz],
+                                stationary=hidden_qtz_sb[
+                                    nl.ds(partition_start, partition_size),
+                                    i_weight_block,
+                                    nl.ds(i_tile_S * P_MAX, s_tile_sz),
+                                ],
+                                moving=weights_sb[buf_idx][
+                                    nl.ds(partition_start, partition_size),
+                                    h_idx_in_buf,
+                                    nl.ds(k_tile_I * F_MAX, i_tile_sz),
+                                ],
+                                stationary_scale=stat_scale,
+                                moving_scale=mov_scale,
+                            )
 
             # Step 5: Copy PSUM to SBUF, apply RoPE/bias
             for i_tile_S in nl.affine_range(num_output_s_tiles):
                 s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * P_MAX
                 s_tile_sz = min(P_MAX, S_shard - s_tile_local_offset)
 
-                # RoPE with optional static dequant and optional bias.
-                if cfg.fused_rope:
-                    _copy_psum_to_sbuf_apply_rope_and_bias(
-                        qkv_MM_output_psum=qkv_MM_output_psum,
-                        output_sb=output_sb,
-                        cos_buffer_sb=cos_buffer_sb,
-                        sin_buffer_sb=sin_buffer_sb,
-                        rope_intermediate_buffer_sb=rope_intermediate_buffer_sb,
-                        cos_cache_hbm=cos_cache_hbm,
-                        sin_cache_hbm=sin_cache_hbm,
-                        i_tile_S=i_tile_S,
-                        s_tile_sz=s_tile_sz,
-                        i_batch=i_batch,
-                        s_tile_local_offset=s_tile_local_offset,
-                        cfg=cfg,
-                        dims=dims,
-                        bias_sb=bias_sb if cfg.add_bias else None,
-                        w_scale_tile=mx_dequant_sb,
-                    )
-                # Static dequant with optional bias.
-                elif _use_static_dequant:
-                    _evict_psum_to_sbuf_static_dequant_apply_bias(
-                        output_sb=output_sb[i_tile_S],
-                        qkv_MM_output_psum=qkv_MM_output_psum,
-                        s_tile_sz=s_tile_sz,
-                        i_tile_S=i_tile_S,
-                        mx_dequant_sb=mx_dequant_sb,
-                        bias_sb=bias_sb if cfg.add_bias else None,
-                        q_dim=dims.num_q_heads * dims.d_head,
-                        kv_dim=dims.num_kv_heads * dims.d_head,
-                        I=I,
-                        num_512_tiles_per_I=dims.num_512_tiles_per_I,
-                    )
-                # No RoPE, no static dequant with optional bias.
-                else:
-                    _evict_psum_to_sbuf_apply_bias(
-                        output_sb=output_sb[i_tile_S],
-                        qkv_MM_output_psum=qkv_MM_output_psum,
-                        s_tile_sz=s_tile_sz,
-                        i_tile_S=i_tile_S,
-                        bias_sb=bias_sb if cfg.add_bias else None,
-                        I=I,
-                        num_512_tiles_per_I=dims.num_512_tiles_per_I,
-                    )
+                _evict_psum_to_sbuf(
+                    qkv_MM_output_psum=qkv_MM_output_psum,
+                    output_sb=output_sb,
+                    i_tile_S=i_tile_S,
+                    s_tile_sz=s_tile_sz,
+                    cfg=cfg,
+                    dims=dims,
+                    bias_sb=bias_sb if cfg.add_bias else None,
+                    I=I,
+                    use_static_dequant=_use_static_dequant,
+                    mx_dequant_sb=mx_dequant_sb,
+                    rope_bufs=rope_bufs,
+                    i_batch=i_batch,
+                    s_tile_local_offset=s_tile_local_offset,
+                    qk_norm_bufs=qk_norm_bufs,
+                    row_mx_input_scale=row_mx_input_scale_sb[i_tile_S] if row_mx_input_scale_sb is not None else None,
+                    row_mx_w_channel_scale_sb=row_mx_w_channel_scale_sb,
+                )
 
             # Step 6: Store output to HBM
             if cfg.output_layout == QKVOutputLayout.BSD:
-                for i_tile_S in range(num_output_s_tiles):
+                for i_tile_S in nl.affine_range(num_output_s_tiles):
                     s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * P_MAX
                     s_tile_sz = min(P_MAX, S_shard - s_tile_local_offset)
 
@@ -2388,7 +2970,7 @@ def _qkv_cte_mx_impl(
                             offset=i_batch * dims.S * I + (dims.S_shard_offset + s_tile_local_offset) * I,
                         ),
                         src=output_sb[i_tile_S][0:s_tile_sz, 0:I],
-                        dge_mode=dge_mode.swdge,
+                        dge_mode=dge_mode.hwdge,
                     )
             else:  # NBSd = [heads, B, S, head_dim]
                 d_head = int(dims.d_head)
@@ -2409,14 +2991,125 @@ def _qkv_cte_mx_impl(
                                 pattern=[[I, s_tile_sz], [1, num_d]],
                                 offset=i_head * d_head,
                             ),
-                            dge_mode=dge_mode.swdge,
+                            dge_mode=dge_mode.hwdge,
                         )
             sbm.close_scope()
     sbm.close_scope()
     return output_hbm
 
 
-def _evict_psum_to_sbuf_apply_bias(
+def _dequant_row_mx(
+    dst: nl.ndarray,
+    psum_src: nl.ndarray,
+    row_scale: nl.ndarray,
+    channel_scale: nl.ndarray,
+    bias: Optional[nl.ndarray] = None,
+) -> None:
+    """Apply ROW_MX two-scale dequant: dst = psum * row_scale * channel_scale [+ bias].
+
+    Args:
+        dst (nl.ndarray): Destination slice in SBUF.
+        psum_src (nl.ndarray): Source slice in PSUM.
+        row_scale (nl.ndarray): [s_tile_sz, 1] per-row input scale.
+        channel_scale (nl.ndarray): [s_tile_sz, num_d] per-channel weight scale.
+        bias (Optional[nl.ndarray]): Bias slice in SBUF, or None.
+    """
+    nisa.scalar_tensor_tensor(
+        dst=dst,
+        data=psum_src,
+        op0=nl.multiply,
+        operand0=row_scale,
+        op1=nl.multiply,
+        operand1=channel_scale,
+    )
+    if bias is not None:
+        nisa.tensor_tensor(dst=dst, data1=dst, data2=bias, op=nl.add)
+
+
+def _evict_psum_to_sbuf(
+    qkv_MM_output_psum: list,
+    output_sb: List[nl.ndarray],
+    i_tile_S: int,
+    s_tile_sz: int,
+    cfg: QKV_CTE_Config,
+    dims: QKV_CTE_Dims,
+    bias_sb: Optional[nl.ndarray],
+    I: int,
+    use_static_dequant: bool,
+    mx_dequant_sb: Optional[nl.ndarray],
+    # RoPE buffers (None when fused_rope=False)
+    rope_bufs: Optional[RoPEBuffers],
+    i_batch: Optional[int],
+    s_tile_local_offset: Optional[int],
+    # QK-norm buffers (None when qk_norm is disabled)
+    qk_norm_bufs: Optional[QKNormBuffers] = None,
+    # ROW_MX dequant buffers (None when not ROW_MX)
+    row_mx_input_scale: Optional[nl.ndarray] = None,
+    row_mx_w_channel_scale_sb: Optional[nl.ndarray] = None,
+) -> None:
+    """Evict PSUM matmul results to SBUF, applying optional post-matmul operations.
+
+    Routes to the appropriate path based on which features are enabled:
+    - per_head: RoPE and/or QK-norm (Q/K heads processed individually)
+    - per_segment: static dequant with per-Q/K/V scale
+    - bulk: straight copy ± bias
+    """
+    _has_qk_norm = cfg.qk_norm_pre_rope is not None or cfg.qk_norm_post_rope is not None
+    if cfg.fused_rope or _has_qk_norm:
+        _evict_and_postprocess_per_head(
+            qkv_MM_output_psum=qkv_MM_output_psum,
+            output_sb=output_sb,
+            i_tile_S=i_tile_S,
+            s_tile_sz=s_tile_sz,
+            cfg=cfg,
+            dims=dims,
+            bias_sb=bias_sb,
+            w_scale_tile=mx_dequant_sb,
+            rope_bufs=rope_bufs,
+            i_batch=i_batch,
+            s_tile_local_offset=s_tile_local_offset,
+            qk_norm_bufs=qk_norm_bufs,
+            row_mx_input_scale=row_mx_input_scale,
+            row_mx_w_channel_scale_sb=row_mx_w_channel_scale_sb,
+        )
+    elif use_static_dequant:
+        _evict_psum_to_sbuf_per_segment(
+            output_sb=output_sb[i_tile_S],
+            qkv_MM_output_psum=qkv_MM_output_psum,
+            s_tile_sz=s_tile_sz,
+            i_tile_S=i_tile_S,
+            mx_dequant_sb=mx_dequant_sb,
+            bias_sb=bias_sb,
+            q_dim=dims.num_q_heads * dims.d_head,
+            kv_dim=dims.num_kv_heads * dims.d_head,
+            I=I,
+            num_512_tiles_per_I=dims.num_512_tiles_per_I,
+        )
+    elif row_mx_w_channel_scale_sb is not None:
+        _evict_psum_to_sbuf_bulk_row_mx(
+            output_sb=output_sb[i_tile_S],
+            qkv_MM_output_psum=qkv_MM_output_psum,
+            s_tile_sz=s_tile_sz,
+            i_tile_S=i_tile_S,
+            bias_sb=bias_sb,
+            row_mx_input_scale=row_mx_input_scale,
+            row_mx_w_channel_scale_sb=row_mx_w_channel_scale_sb,
+            I=I,
+            num_512_tiles_per_I=dims.num_512_tiles_per_I,
+        )
+    else:
+        _evict_psum_to_sbuf_bulk(
+            output_sb=output_sb[i_tile_S],
+            qkv_MM_output_psum=qkv_MM_output_psum,
+            s_tile_sz=s_tile_sz,
+            i_tile_S=i_tile_S,
+            bias_sb=bias_sb,
+            I=I,
+            num_512_tiles_per_I=dims.num_512_tiles_per_I,
+        )
+
+
+def _evict_psum_to_sbuf_bulk(
     output_sb: nl.ndarray,
     qkv_MM_output_psum: list,
     s_tile_sz: int,
@@ -2457,7 +3150,45 @@ def _evict_psum_to_sbuf_apply_bias(
             )
 
 
-def _evict_psum_to_sbuf_static_dequant_apply_bias(
+def _evict_psum_to_sbuf_bulk_row_mx(
+    output_sb: nl.ndarray,
+    qkv_MM_output_psum: list,
+    s_tile_sz: int,
+    i_tile_S: int,
+    bias_sb: Optional[nl.ndarray],
+    row_mx_input_scale: nl.ndarray,
+    row_mx_w_channel_scale_sb: nl.ndarray,
+    I: int,
+    num_512_tiles_per_I: int,
+) -> None:
+    """ROW_MX PSUM eviction: apply two-scale dequant (± bias) across all banks.
+
+    Args:
+        output_sb (nl.ndarray): Destination SBUF tile for this S-tile.
+        qkv_MM_output_psum (list): List of PSUM bank tensors from matmul.
+        s_tile_sz (int): Active rows in the S tile.
+        i_tile_S (int): S-tile index within the current S-block.
+        bias_sb (Optional[nl.ndarray]): Bias tensor in SBUF, or None.
+        row_mx_input_scale (nl.ndarray): [P_MAX, 1] per-row input scale.
+        row_mx_w_channel_scale_sb (nl.ndarray): [P_MAX, I] per-channel weight scale.
+        I (int): Total output dimension (Q+K+V heads * d_head).
+        num_512_tiles_per_I (int): Number of 512-wide tiles spanning I.
+    """
+    F_MAX = 512
+    for k_tile_I in nl.affine_range(num_512_tiles_per_I):
+        psum_accumulation_bank_id = i_tile_S * num_512_tiles_per_I + k_tile_I
+        num_i = min(F_MAX, I - k_tile_I * F_MAX)
+        bank_start = k_tile_I * F_MAX
+        _dequant_row_mx(
+            dst=output_sb[0:s_tile_sz, nl.ds(bank_start, num_i)],
+            psum_src=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, 0:num_i],
+            row_scale=row_mx_input_scale[0:s_tile_sz, 0:1],
+            channel_scale=row_mx_w_channel_scale_sb[0:s_tile_sz, nl.ds(bank_start, num_i)],
+            bias=bias_sb[0:s_tile_sz, nl.ds(bank_start, num_i)] if bias_sb is not None else None,
+        )
+
+
+def _evict_psum_to_sbuf_per_segment(
     output_sb: nl.ndarray,
     qkv_MM_output_psum: list,
     s_tile_sz: int,
@@ -2522,6 +3253,171 @@ def _evict_psum_to_sbuf_static_dequant_apply_bias(
                 )
 
 
+def _dma_xpose_input_non_strided(
+    input_sb: nl.ndarray,
+    input_hbm: nl.ndarray,
+    i_tile_S: int,
+    dims: QKV_CTE_Dims,
+    i_batch: int,
+    weight_load_offset: int,
+    s_tile_local_offset: int,
+    s_tile_sz: int,
+    curr_num_128_H_subtiles_per_weight_block: int,
+    H: int,
+) -> None:
+    """DMA-transpose one contiguous S tile of input from HBM into SBUF."""
+    pmax = nl.tile_size.pmax
+    H_subtiles = curr_num_128_H_subtiles_per_weight_block
+    src_offset = i_batch * dims.S * H + (dims.S_shard_offset + s_tile_local_offset) * H + weight_load_offset
+    nisa.dma_transpose(
+        dst=input_sb[i_tile_S].ap(
+            pattern=[[H, pmax], [1, 1], [pmax, H_subtiles], [1, s_tile_sz]],
+            offset=weight_load_offset,
+        ),
+        src=input_hbm.ap(
+            pattern=[[H, s_tile_sz], [1, 1], [pmax, H_subtiles], [1, pmax]],
+            offset=src_offset,
+        ),
+    )
+
+
+def _dma_xpose_input_strided_packed(
+    input_sb: nl.ndarray,
+    input_hbm: nl.ndarray,
+    i_tile_S: int,
+    si: StridedInputConfig,
+    dims: QKV_CTE_Dims,
+    i_batch: int,
+    weight_load_offset: int,
+    s_tile_local_offset: int,
+    s_tile_sz: int,
+    curr_num_128_H_subtiles_per_weight_block: int,
+    H: int,
+) -> None:
+    """Strided gather, packed regime (block_len <= pmax): multiple blocks per DMA tile."""
+    pmax = nl.tile_size.pmax
+    H_subtiles = curr_num_128_H_subtiles_per_weight_block
+    local_token_start = dims.S_shard_offset + s_tile_local_offset
+    local_block = local_token_start // si.block_len
+    local_pos_in_block = local_token_start % si.block_len
+    global_token_start = si.block_offset + local_block * si.block_stride + local_pos_in_block
+    src_offset = i_batch * dims.S_orig * H + global_token_start * H + weight_load_offset
+
+    blocks_per_tile = s_tile_sz // si.block_len
+    stride_el = si.block_stride * H
+    # Workaround: on gen4 (Trn3), dge_mode.unknown produces incorrect results for this 4D AP.
+    packed_dge_mode = dge_mode.none if nki.isa.get_nc_version() == nki.isa.nc_version.gen4 else dge_mode.unknown
+    nisa.dma_transpose(
+        dst=input_sb[i_tile_S].ap(
+            pattern=[[H, pmax], [si.block_len, blocks_per_tile], [pmax, H_subtiles], [1, si.block_len]],
+            offset=weight_load_offset,
+        ),
+        src=input_hbm.ap(
+            pattern=[[H, si.block_len], [stride_el, blocks_per_tile], [pmax, H_subtiles], [1, pmax]],
+            offset=src_offset,
+        ),
+        dge_mode=packed_dge_mode,
+    )
+
+
+def _dma_xpose_input_strided_contiguous(
+    input_sb: nl.ndarray,
+    input_hbm: nl.ndarray,
+    i_tile_S: int,
+    si: StridedInputConfig,
+    dims: QKV_CTE_Dims,
+    i_batch: int,
+    weight_load_offset: int,
+    s_tile_local_offset: int,
+    s_tile_sz: int,
+    curr_num_128_H_subtiles_per_weight_block: int,
+    H: int,
+) -> None:
+    """Strided gather, contiguous-tile regime (block_len > pmax): one block spans multiple DMA tiles;
+    inter-block jumps folded into src_offset, AP identical to non-strided."""
+    pmax = nl.tile_size.pmax
+    H_subtiles = curr_num_128_H_subtiles_per_weight_block
+    local_token_start = dims.S_shard_offset + s_tile_local_offset
+    local_block = local_token_start // si.block_len
+    local_pos_in_block = local_token_start % si.block_len
+    global_token_start = si.block_offset + local_block * si.block_stride + local_pos_in_block
+    src_offset = i_batch * dims.S_orig * H + global_token_start * H + weight_load_offset
+    nisa.dma_transpose(
+        dst=input_sb[i_tile_S].ap(
+            pattern=[[H, pmax], [1, 1], [pmax, H_subtiles], [1, s_tile_sz]],
+            offset=weight_load_offset,
+        ),
+        src=input_hbm.ap(
+            pattern=[[H, s_tile_sz], [1, 1], [pmax, H_subtiles], [1, pmax]],
+            offset=src_offset,
+        ),
+    )
+
+
+def _dma_transpose_mx_tile(
+    src_tensor: nl.ndarray,
+    dst_buf: nl.ndarray,
+    row_stride: int,
+    seq_mult: int,
+    view_dtype: nki.dtype,
+    h_packed_current_tile: int,
+    i_batch: int,
+    s_global: int,
+    i_weight_block: int,
+    i_tile_S: int,
+    s_tile_sz: int,
+    S_TILE_SIZE: int,
+    quant_s_tiles: int,
+    H_128_tiles: int,
+    P_MAX: int,
+    S: int,
+) -> None:
+    """DMA transpose one (H_128_tile, S_tile) from HBM into SBUF.
+
+    Shared by the existing fp16/bf16 MX path and the ROW_MX float32 path.
+    The caller controls the difference via row_stride, seq_mult, and view_dtype.
+
+    Args:
+        src_tensor (nl.ndarray): Source tensor on HBM (packed 2D or raw input).
+        dst_buf (nl.ndarray): Destination buffer in SBUF.
+        row_stride (int): Stride between rows in the source tensor (in elements of view_dtype).
+        seq_mult (int): Sequence multiplier (2 for fp16/bf16 packed, 1 for ROW_MX float32).
+        view_dtype (nki.dtype): DMA view dtype (nl.float16, nl.float32).
+        h_packed_current_tile (int): Number of packed H elements in the current tile.
+        i_batch (int): Batch index.
+        s_global (int): Global S offset for the current tile.
+        i_weight_block (int): Weight block (H_128_tile) index.
+        i_tile_S (int): S-tile index within the current S-block.
+        s_tile_sz (int): Active rows in the S tile.
+        S_TILE_SIZE (int): Full S tile size.
+        quant_s_tiles (int): Number of quantized S tiles in the block.
+        H_128_tiles (int): Number of 128-wide H tiles.
+        P_MAX (int): Partition dimension size.
+        S (int): Total sequence length.
+    """
+    src_offset = i_batch * S * seq_mult * row_stride + s_global * seq_mult * row_stride + i_weight_block * P_MAX
+    dst_offset = i_weight_block * quant_s_tiles * seq_mult + i_tile_S * S_TILE_SIZE * seq_mult
+    seq_count = s_tile_sz * seq_mult
+
+    nisa.dma_transpose(
+        src=src_tensor.ap(
+            pattern=[[row_stride, seq_count], [1, 1], [1, 1], [1, h_packed_current_tile]],
+            offset=src_offset,
+            dtype=view_dtype,
+        ),
+        dst=dst_buf.ap(
+            pattern=[
+                [quant_s_tiles * seq_mult * H_128_tiles, h_packed_current_tile],
+                [1, 1],
+                [1, 1],
+                [1, seq_count],
+            ],
+            offset=dst_offset,
+            dtype=view_dtype,
+        ),
+    )
+
+
 def _static_mx_quantize_bf16_hidden_tile(
     bf16_xpose_staging_sb: nl.ndarray,
     hidden_qtz_sb: nl.ndarray,
@@ -2540,6 +3436,10 @@ def _static_mx_quantize_bf16_hidden_tile(
     Applies static quantization in-place on the bfloat16 AP view (divide by in_scale,
     clamp to FP8 range), then runs quantize_mx to produce fp8_x4 data and uint8 scales
     for nc_matmul_mx.
+
+    Always uses full P_MAX partitions and H_pack=4 for the free dim so that quantize_mx
+    output aligns to s_tile_sz. For partial H tiles, unused partitions contain garbage
+    that gets quantized but is never consumed by nc_matmul_mx (partition splits skip them).
 
     Args:
         bf16_xpose_staging_sb: Float32 staging buffer holding transposed BF16 data
@@ -2595,29 +3495,41 @@ def _load_and_broadcast_bias(
     bias_hbm: nl.ndarray, cfg: QKV_CTE_Config, dims: QKV_CTE_Dims, sbm: SbufManager
 ) -> nl.ndarray:
     """
-    Loads bias with shape [1,I] to SBUF and broadcasts it to [nl.tile_size.pmax, I], using stream_shuffle.
+    Loads bias to SBUF and broadcasts it to [nl.tile_size.pmax, I], using stream_shuffle.
+
+    Accepts bias with shape [1, I] (broadcast required) or [pmax, I] (already broadcast,
+    skip stream_shuffle).
 
     Returns allocated SBUF bias tensor.
     Note: User is responsible for deallocating SBUF tensor.
     """
-    # Load Bias (1, I) to SBUF as (1, I), and broadcast it to (128, I) using stream_shuffle.
     bias_sb = sbm.alloc_stack((nl.tile_size.pmax, dims.I), dtype=cfg.compute_mm_dtype, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=bias_sb[0:1, 0 : dims.I],
-        src=bias_hbm[0:1, 0 : dims.I],
-        dge_mode=dge_mode.swdge,
-    )
-    # Stream Shuffle works on 32 partitions only, apply it nl.tile_size.pmax // 32 = 4 times.
-    NUM_BROADCASTS = nl.tile_size.pmax // MAX_STREAM_SHUFFLE_PARTITIONS
-    for broadcast_idx in nl.affine_range(NUM_BROADCASTS):
-        nisa.nc_stream_shuffle(
-            dst=bias_sb[
-                nl.ds(broadcast_idx * MAX_STREAM_SHUFFLE_PARTITIONS, MAX_STREAM_SHUFFLE_PARTITIONS),
-                0 : dims.I,
-            ],
-            src=bias_sb[0:1, 0 : dims.I],
-            shuffle_mask=[0] * MAX_STREAM_SHUFFLE_PARTITIONS,
+
+    if bias_hbm.shape[0] == nl.tile_size.pmax:
+        # Bias is already [pmax, I] — load directly, no broadcast needed.
+        nisa.dma_copy(
+            dst=bias_sb[0 : nl.tile_size.pmax, 0 : dims.I],
+            src=bias_hbm[0 : nl.tile_size.pmax, 0 : dims.I],
+            dge_mode=dge_mode.swdge,
         )
+    else:
+        # Bias is [1, I] — load and broadcast to [pmax, I] using stream_shuffle.
+        nisa.dma_copy(
+            dst=bias_sb[0:1, 0 : dims.I],
+            src=bias_hbm[0:1, 0 : dims.I],
+            dge_mode=dge_mode.swdge,
+        )
+        # Stream Shuffle works on 32 partitions only, apply it nl.tile_size.pmax // 32 = 4 times.
+        NUM_BROADCASTS = nl.tile_size.pmax // MAX_STREAM_SHUFFLE_PARTITIONS
+        for broadcast_idx in nl.affine_range(NUM_BROADCASTS):
+            nisa.nc_stream_shuffle(
+                dst=bias_sb[
+                    nl.ds(broadcast_idx * MAX_STREAM_SHUFFLE_PARTITIONS, MAX_STREAM_SHUFFLE_PARTITIONS),
+                    0 : dims.I,
+                ],
+                src=bias_sb[0:1, 0 : dims.I],
+                shuffle_mask=[0] * MAX_STREAM_SHUFFLE_PARTITIONS,
+            )
     return bias_sb
 
 
@@ -2680,26 +3592,44 @@ def _load_norm_weights_mx(
 
     Notes:
         - H_pack = 4 for MX format
-        - H_128_tiles = H // (P_MAX * H_pack)
+        - H_128_tiles = ceil(H / (P_MAX * H_pack))
+        - For partial last tile, only valid sub-tiles are loaded; remaining
+          columns stay zero (from memset) so padded input zeros stay zero
+          after gamma multiply.
         - User is responsible for deallocating SBUF tensor
     """
     P_MAX = nl.tile_size.pmax
     H_pack = 4
-    H_128_tiles = dims.H // (P_MAX * H_pack)
+    H_128_tiles = div_ceil(dims.H, P_MAX * H_pack)
 
     # Reshape to [1, H] so stride-4 gather works on free dimension
     norm_weights_hbm = norm_weights_hbm.reshape((1, dims.H))
     gamma_sb = sbm.alloc_stack((P_MAX, H_128_tiles * H_pack), dtype=cfg.act_dtype, buffer=nl.sbuf)
 
+    # Zero-init so unused sub-tile columns in the last partial tile are zero.
+    # This ensures padded zeros in input_sb remain zero after gamma multiply.
+    if dims.H % (P_MAX * H_pack) != 0:
+        nisa.memset(dst=gamma_sb, value=0)
+
+    H_128_tiles_full = dims.H // (P_MAX * H_pack)
+
+    # For partial last tile, compute valid partitions per sub-tile.
+    # H % 128 == 0 guarantees remaining is divisible by H_pack.
+    if H_128_tiles > H_128_tiles_full:
+        remaining = dims.H - H_128_tiles_full * P_MAX * H_pack
+        p_count_last = div_ceil(remaining, H_pack)
+    else:
+        p_count_last = P_MAX
+
     for h_tile_idx in range(H_128_tiles):
+        p_count = P_MAX if h_tile_idx < H_128_tiles_full else p_count_last
         for h_sub_idx in range(H_pack):
             src_offset = h_tile_idx * P_MAX * H_pack + h_sub_idx
             dst_col = h_tile_idx * H_pack + h_sub_idx
-            # Load 128 elements with stride-4: gamma[src_offset + 0*4], gamma[src_offset + 1*4], ...
             nisa.dma_copy(
-                dst=gamma_sb[0:P_MAX, nl.ds(dst_col, 1)],
+                dst=gamma_sb[0:p_count, nl.ds(dst_col, 1)],
                 src=norm_weights_hbm.ap(
-                    pattern=[[H_pack, P_MAX], [1, 1]],  # stride-4 on partition dim, 1 element free dim
+                    pattern=[[H_pack, p_count], [1, 1]],
                     offset=src_offset,
                 ),
                 dge_mode=dge_mode.swdge,
@@ -2749,7 +3679,8 @@ def _multi_buffering_degree_for_seqlen(
     sbuf_tile_space_non_buffered = 0
     # zero_bias_sb, norm_eps_sb, bias_sb, gamma_weights_sb, layer_norm_bias_sb, act_reduce_sum, bn_stats_result.
     sbuf_tile_space_non_buffered += 1 * sizeinbytes(cfg.compute_mm_dtype)  # zero_bias_sb (nl.tile_size.pmax, 1)
-    sbuf_tile_space_non_buffered += 1 * sizeinbytes(cfg.compute_mm_dtype)  # norm_eps_sb (nl.tile_size.pmax, 1)
+    if not _scalar_activation_bias_supported():
+        sbuf_tile_space_non_buffered += 1 * sizeinbytes(cfg.compute_mm_dtype)  # norm_eps_sb (nl.tile_size.pmax, 1)
     if cfg.add_bias:
         sbuf_tile_space_non_buffered += dims.I * sizeinbytes(
             cfg.compute_mm_dtype
@@ -2777,6 +3708,26 @@ def _multi_buffering_degree_for_seqlen(
         * sizeinbytes(cfg.compute_mm_dtype)
     )
     sbuf_tile_space_non_buffered += weights_space_per_partition
+
+    # QK-norm: gamma weights [pmax, d_head] broadcast + scratch [pmax, 1]
+    _has_qk_norm = cfg.qk_norm_pre_rope is not None or cfg.qk_norm_post_rope is not None
+    if _has_qk_norm:
+        sbuf_tile_space_non_buffered += 3 * sizeinbytes(nl.float32)  # norm_scratch_sb [pmax, 1] × 3 (triple-buffered)
+        sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # norm_zero_bias_sb [pmax, 1]
+        if cfg.qk_norm_pre_rope is not None:
+            if not _scalar_activation_bias_supported():
+                sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # qk_norm_pre_rope_eps_sb [pmax, 1]
+            if cfg.qk_norm_pre_rope.q_gamma_norm_weights is not None:
+                sbuf_tile_space_non_buffered += dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
+            if cfg.qk_norm_pre_rope.k_gamma_norm_weights is not None:
+                sbuf_tile_space_non_buffered += dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
+        if cfg.qk_norm_post_rope is not None:
+            if not _scalar_activation_bias_supported():
+                sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # qk_norm_post_rope_eps_sb [pmax, 1]
+            if cfg.qk_norm_post_rope.q_gamma_norm_weights is not None:
+                sbuf_tile_space_non_buffered += dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
+            if cfg.qk_norm_post_rope.k_gamma_norm_weights is not None:
+                sbuf_tile_space_non_buffered += dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
 
     # --------------------SBUF Space Taken By Tensors We Will be Multi-Buffering ---------------------#
 
@@ -2825,7 +3776,7 @@ def _multi_buffering_degree_for_seqlen_mx(cfg: QKV_CTE_Config, dims: QKV_CTE_Dim
     """
     P_MAX = nl.tile_size.pmax
     H_pack = 4
-    H_128_tiles = dims.H // (P_MAX * H_pack)
+    H_128_tiles = div_ceil(dims.H, P_MAX * H_pack)
 
     s_multi_buffer_degree = min(math.ceil(dims.S_shard / P_MAX), dims.MAX_S_MULTI_BUFFER_DEGREE)
 
@@ -2834,28 +3785,65 @@ def _multi_buffering_degree_for_seqlen_mx(cfg: QKV_CTE_Config, dims: QKV_CTE_Dim
     sbuf_tile_space_non_buffered = 0
     if not cfg.is_input_swizzled:
         sbuf_tile_space_non_buffered += 1 * sizeinbytes(cfg.compute_mm_dtype)  # zero_bias_sb
-        sbuf_tile_space_non_buffered += 1 * sizeinbytes(cfg.compute_mm_dtype)  # norm_eps_sb
+        if not _scalar_activation_bias_supported():
+            sbuf_tile_space_non_buffered += 1 * sizeinbytes(cfg.compute_mm_dtype)  # norm_eps_sb
 
     if cfg.add_bias:
         sbuf_tile_space_non_buffered += dims.I * sizeinbytes(cfg.compute_mm_dtype)
     if cfg.fused_norm_type == NormType.RMS_NORM or cfg.fused_norm_type == NormType.LAYER_NORM:
-        sbuf_tile_space_non_buffered += dims.num_128_tiles_per_H * sizeinbytes(cfg.act_dtype)
+        sbuf_tile_space_non_buffered += (
+            H_128_tiles * H_pack * sizeinbytes(cfg.act_dtype)
+        )  # gamma_sb [P_MAX, H_128_tiles * H_pack]
         if cfg.add_layer_norm_bias:
-            sbuf_tile_space_non_buffered += dims.num_128_tiles_per_H * sizeinbytes(cfg.act_dtype)
+            sbuf_tile_space_non_buffered += H_128_tiles * H_pack * sizeinbytes(cfg.act_dtype)
 
     # MX weight buffers (chunked mode - worst case)
     sbuf_tile_space_non_buffered += NUM_MX_WEIGHT_BUFFERS_LOCAL * 1 * dims.I * sizeinbytes(nl.float8_e4m3fn_x4)
     sbuf_tile_space_non_buffered += NUM_MX_WEIGHT_BUFFERS_LOCAL * 1 * dims.I * sizeinbytes(nl.uint8)
 
+    # QK-norm: gamma weights [pmax, d_head] broadcast + scratch [pmax, 1]
+    _has_qk_norm = cfg.qk_norm_pre_rope is not None or cfg.qk_norm_post_rope is not None
+    if _has_qk_norm:
+        sbuf_tile_space_non_buffered += 3 * sizeinbytes(
+            nl.float32
+        )  # QKNormBuffers.norm_scratch_sb [pmax, 1] × 3 (triple-buffered)
+        sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # QKNormBuffers.norm_zero_bias_sb [pmax, 1]
+        if cfg.qk_norm_pre_rope is not None:
+            if not _scalar_activation_bias_supported():
+                sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # qk_norm_pre_rope_eps_sb [pmax, 1]
+            if cfg.qk_norm_pre_rope.q_gamma_norm_weights is not None:
+                sbuf_tile_space_non_buffered += P_MAX * dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
+            if cfg.qk_norm_pre_rope.k_gamma_norm_weights is not None:
+                sbuf_tile_space_non_buffered += P_MAX * dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
+        if cfg.qk_norm_post_rope is not None:
+            if not _scalar_activation_bias_supported():
+                sbuf_tile_space_non_buffered += 1 * sizeinbytes(nl.float32)  # qk_norm_post_rope_eps_sb [pmax, 1]
+            if cfg.qk_norm_post_rope.q_gamma_norm_weights is not None:
+                sbuf_tile_space_non_buffered += P_MAX * dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
+            if cfg.qk_norm_post_rope.k_gamma_norm_weights is not None:
+                sbuf_tile_space_non_buffered += P_MAX * dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
+
     _is_fp8_input = cfg.input_dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
+    _is_row_mx = cfg.quantization_config.has_row_mx_dequant
     _is_dma_xpose_mx = (
-        _is_fp8_input or (cfg.input_dtype == nl.bfloat16 and cfg.quantization_config.has_mx_static_dequant_scales)
-    ) and cfg.load_input_with_DMA_transpose
+        (_is_fp8_input or (cfg.input_dtype == nl.bfloat16 and cfg.quantization_config.has_mx_static_dequant_scales))
+        and cfg.load_input_with_DMA_transpose
+    ) or _is_row_mx
+
+    # ROW_MX: global weight channel scale [P_MAX, I] float32
+    if _is_row_mx:
+        sbuf_tile_space_non_buffered += dims.I * sizeinbytes(nl.float32)  # row_mx_w_channel_scale_sb
 
     # Per-S-tile space: input_sb + output_sb + norm buffers + rope buffers
     sbuf_tile_space_per_s_tile = _get_sbuf_space_taken_by_tensors_about_to_be_multi_buffered(
         cfg=cfg, dims=dims, sbm=sbm, is_fp8_dma_xpose=_is_dma_xpose_mx
     )
+
+    # Non-DMA-xpose BF16 MX path pads input_sb from H to H_padded (next multiple of 512).
+    # Account for the extra space in the per-S-tile budget.
+    H_padded = H_128_tiles * P_MAX * H_pack
+    if not _is_dma_xpose_mx and H_padded != dims.H:
+        sbuf_tile_space_per_s_tile += (H_padded - dims.H) * sizeinbytes(cfg.compute_mm_dtype)
 
     # MX-specific per-S-tile space (scales with num_s_tiles)
     mx_space_per_s_tile = H_128_tiles * P_MAX * sizeinbytes(nl.float8_e4m3fn_x4)  # hidden_qtz
@@ -2875,18 +3863,29 @@ def _multi_buffering_degree_for_seqlen_mx(cfg: QKV_CTE_Config, dims: QKV_CTE_Dim
     if _is_bf16_dma_xpose_mx:
         mx_space_per_s_tile += H_128_tiles * P_MAX * 2 * sizeinbytes(nl.float32)  # bf16_xpose_staging_sb
 
+    # ROW_MX: per-S-tile input row scale [P_MAX, 1] float32
+    if _is_row_mx:
+        mx_space_per_s_tile += 1 * sizeinbytes(nl.float32)  # row_mx_input_scale_sb
+
     total_space_per_s_tile = sbuf_tile_space_per_s_tile + mx_space_per_s_tile
+
+    # When input is swizzled, S_TILE_SIZE=32 instead of P_MAX=128, so each
+    # multi-buffer degree unit (P_MAX rows) contains P_MAX/S_TILE_SIZE actual
+    # S-tiles. Scale the per-unit cost accordingly.
+    S_TILE_SIZE = 32 if cfg.is_input_swizzled else P_MAX
+    tiles_per_unit = P_MAX // S_TILE_SIZE
+    total_space_per_unit = total_space_per_s_tile * tiles_per_unit
 
     max_s_buffer = (
         cfg.total_available_sbuf_space_to_this_kernel - sbuf_tile_space_non_buffered
-    ) // total_space_per_s_tile
+    ) // total_space_per_unit
     s_multi_buffer_degree = min(s_multi_buffer_degree, max(1, max_s_buffer))
 
     # PSUM constraint
     MAX_PSUM_TILING_GROUPS = NUM_HW_PSUM_BANKS // dims.num_512_tiles_per_I
     s_multi_buffer_degree = min(s_multi_buffer_degree, MAX_PSUM_TILING_GROUPS)
 
-    projected_space = s_multi_buffer_degree * total_space_per_s_tile + sbuf_tile_space_non_buffered
+    projected_space = s_multi_buffer_degree * total_space_per_unit + sbuf_tile_space_non_buffered
     return s_multi_buffer_degree, projected_space
 
 
@@ -2916,7 +3915,7 @@ def _use_weight_prefetch_mx(
     """
     P_MAX = nl.tile_size.pmax
     H_pack = 4
-    H_128_tiles = dims.H // (P_MAX * H_pack)
+    H_128_tiles = div_ceil(dims.H, P_MAX * H_pack)
     NUM_MX_WEIGHT_BUFFERS_LOCAL = 2
 
     # Prefetch space needed
@@ -2956,7 +3955,7 @@ def _get_sbuf_space_taken_by_tensors_about_to_be_multi_buffered(
     'input_sb', 'output_sb'                                      (unless FP8 DMA transpose: no input_sb)
     'square_sum_sb',                                             (if cfg.fused_norm_type.RMS_NORM or cfg.fused_norm_type.RMS_NORM_GAMMA)
     'bn_aggr_result_sb'                                          (if cfg.fused_norm_type.LAYER_NORM)
-    'cos_buffer_sb', 'sin_buffer_sb', 'rope_intermediate_buffer' (if cfg.fused_rope)
+    'cos_buffer_sb', 'sin_buffer_sb', 'rope_scratch_sb'          (if cfg.fused_rope, via RoPEBuffers)
     """
 
     pre_buffer_tile_space_per_partition = 0
@@ -2987,12 +3986,21 @@ def _get_sbuf_space_taken_by_tensors_about_to_be_multi_buffered(
         pre_buffer_tile_space_per_partition += NUM_AGGR_STATS * sizeinbytes(cfg.act_dtype)
 
     if cfg.fused_rope:
-        # 'cos_buffer_sb [nl.tile_size.pmax, d_head]'
+        # RoPEBuffers.cos_sb [pmax, d_head]
         pre_buffer_tile_space_per_partition += dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
-        # 'sin_buffer_sb [nl.tile_size.pmax, d_head // 2]'
-        pre_buffer_tile_space_per_partition += dims.d_head // 2 * sizeinbytes(cfg.compute_mm_dtype)
-        # 'rope_intermediate_buffer [nl.tile_size.pmax, d_head * 2]'
-        pre_buffer_tile_space_per_partition += dims.d_head * 2 * sizeinbytes(cfg.compute_mm_dtype)
+        # RoPEBuffers.sin_sb [pmax, d_head // 2] or [pmax, d_head] when gamma fused
+        _gamma_fused_in_rope = cfg.qk_norm_pre_rope is not None and cfg.qk_norm_pre_rope.gamma_fused_in_rope_caches
+        _sin_fdim = dims.d_head if _gamma_fused_in_rope else dims.d_head // 2
+        pre_buffer_tile_space_per_partition += _sin_fdim * sizeinbytes(cfg.compute_mm_dtype)
+        # RoPEBuffers.k_cos_sb + k_sin_sb (when separate K caches provided)
+        if _gamma_fused_in_rope:
+            pre_buffer_tile_space_per_partition += dims.d_head * sizeinbytes(cfg.compute_mm_dtype)
+            pre_buffer_tile_space_per_partition += _sin_fdim * sizeinbytes(cfg.compute_mm_dtype)
+        # RoPEBuffers.scratch_sb [pmax, d_head * 2] × N
+        # Triple-buffered (N=3) only when QK-norm is active to break carried dependency
+        _has_qk_norm = cfg.qk_norm_pre_rope is not None or cfg.qk_norm_post_rope is not None
+        _num_rope_bufs = _get_num_rope_scratch_bufs(_has_qk_norm, dims.H)
+        pre_buffer_tile_space_per_partition += dims.d_head * 2 * _num_rope_bufs * sizeinbytes(cfg.compute_mm_dtype)
 
     return pre_buffer_tile_space_per_partition
 
@@ -3066,7 +4074,7 @@ def _apply_rms_normalization(
         dst=square_sum_row_sb[0:s_tile_sz, 0:1],
         op=nl.rsqrt,
         data=square_sum_row_sb[0:s_tile_sz, 0:1],
-        bias=norm_eps[0:s_tile_sz, 0:1],
+        bias=_slice_activation_constant_bias(norm_eps, s_tile_sz),
         scale=float(1.0 / dims.H_actual),
     )
 
@@ -3133,190 +4141,643 @@ def _compute_layer_norm_stats(
     nisa.activation(
         dst=bn_aggr_result_tile[0:s_tile_sz, 1:NUM_AGGR_STATS],
         data=bn_aggr_result_tile[0:s_tile_sz, 1:NUM_AGGR_STATS],
-        bias=norm_eps[0:s_tile_sz, 0:1],
+        bias=_slice_activation_constant_bias(norm_eps, s_tile_sz),
         op=nl.rsqrt,
     )
 
 
-def _copy_psum_to_sbuf_apply_rope_and_bias(
+# Per-head norm registry, keyed on NormType.name strings due to compiler incompatibility with enum lookups.
+_QK_NORM_REGISTRY: Dict[str, Callable] = {}
+
+
+def register_norm(norm_type: NormType):
+    """Decorator to register a per-head norm implementation.
+
+    Args:
+        norm_type: NormType enum value.
+    """
+
+    def decorator(fn):
+        _QK_NORM_REGISTRY[norm_type.name] = fn
+        return fn
+
+    return decorator
+
+
+@register_norm(NormType.RMS_NORM)  # Qwen3.5, Gemma 4
+def _rms_norm_impl(
+    head_sb: nl.ndarray,
+    i_head: int,
+    num_q_heads: int,
+    is_pre_rope: bool,
+    qk_norm_bufs: QKNormBuffers,
+    norm_config: QKNormConfig,
+) -> None:
+    """RMSNorm: x / sqrt(mean(x²) + eps) * gamma.
+
+    Derives all buffers from qk_norm_bufs. Reads s_tile_sz and d_head from head_sb.shape.
+    """
+    s_tile_sz = head_sb.shape[0]
+    d_head = head_sb.shape[1]
+    is_q_head = i_head < num_q_heads
+    norm_scratch_sb = qk_norm_bufs.scratch_sb[i_head % 3]
+    eps_sb = qk_norm_bufs.pre_rope_eps_sb if is_pre_rope else qk_norm_bufs.post_rope_eps_sb
+    if is_q_head:
+        gamma_sb = qk_norm_bufs.pre_rope_q_gamma_sb if is_pre_rope else qk_norm_bufs.post_rope_q_gamma_sb
+    else:
+        gamma_sb = qk_norm_bufs.pre_rope_k_gamma_sb if is_pre_rope else qk_norm_bufs.post_rope_k_gamma_sb
+    norm_zero_bias_sb = qk_norm_bufs.zero_bias_sb
+    # sum(x²) -> [s_tile_sz, 1]
+    nisa.activation_reduce(
+        dst=norm_scratch_sb.ap(pattern=[[1, s_tile_sz], [0, d_head]]),
+        op=nl.square,
+        data=head_sb,
+        reduce_op=nl.add,
+        reduce_res=norm_scratch_sb[0:s_tile_sz, 0:1],
+        bias=norm_zero_bias_sb[0:s_tile_sz, 0:1],
+    )
+
+    # 1/sqrt(mean(x²) + eps) -> [s_tile_sz, 1]
+    nisa.activation(
+        dst=norm_scratch_sb[0:s_tile_sz, 0:1],
+        op=nl.rsqrt,
+        data=norm_scratch_sb[0:s_tile_sz, 0:1],
+        bias=_slice_activation_constant_bias(eps_sb, s_tile_sz),
+        scale=1.0 / d_head,
+    )
+
+    # x *= 1/sqrt(mean(x²) + eps), optionally fused with gamma multiply
+    if gamma_sb is not None:
+        nisa.scalar_tensor_tensor(
+            dst=head_sb,
+            data=head_sb,
+            op0=nl.multiply,
+            operand0=norm_scratch_sb[0:s_tile_sz, 0:1],
+            op1=nl.multiply,
+            operand1=gamma_sb[0:s_tile_sz, 0:d_head],
+        )
+    else:
+        nisa.tensor_scalar(
+            dst=head_sb,
+            data=head_sb,
+            op0=nl.multiply,
+            operand0=norm_scratch_sb[0:s_tile_sz, 0:1],
+        )
+
+
+def _apply_qk_norm_to_head(
+    head_sb: nl.ndarray,
+    i_head: int,
+    num_q_heads: int,
+    is_pre_rope: bool,
+    norm_func: str,
+    qk_norm_bufs: QKNormBuffers,
+    norm_config: QKNormConfig,
+) -> None:
+    """Dispatch per-head norm to the registered implementation.
+
+    Args:
+        head_sb: Pre-sliced [s_tile_sz, d_head] SBUF region to normalize in-place.
+            The impl reads dimensions from head_sb.shape.
+        i_head: Head index in the Q+K range. Determines Q vs K (i_head < num_q_heads)
+            and scratch buffer selection.
+        num_q_heads: Number of Q heads.
+        is_pre_rope: True for pre-RoPE norm, False for post-RoPE.
+        norm_func: NormType.name string (e.g. "RMS_NORM").
+        qk_norm_bufs: Shared SBUF buffers (eps, gamma, scratch, zero_bias).
+        norm_config: The QKNormConfig for this position (pre or post RoPE).
+    """
+    kernel_assert(
+        norm_func in _QK_NORM_REGISTRY,
+        f"[QKV CTE Kernel] QK norm type '{norm_func}' is not registered. Registered: {list(_QK_NORM_REGISTRY.keys())}.",
+    )
+    impl = _QK_NORM_REGISTRY[norm_func]
+    impl(head_sb, i_head, num_q_heads, is_pre_rope, qk_norm_bufs, norm_config)
+
+
+def _apply_rope_to_head(
+    src_sb: nl.ndarray,
+    dst_sb: nl.ndarray,
+    cos_sb: nl.ndarray,
+    sin_sb: nl.ndarray,
+    s_tile_sz: int,
+    d_head: int,
+    num_d: int,
+):
+    """Apply RoPE rotation to a single head.
+
+    Reads from src_sb [s_tile_sz, d_head*2] scratch buffer (first d_head holds the head data),
+    writes the rotated result to dst_sb [s_tile_sz, num_d].
+
+    Implements: output = X * cos + [-X2, X1] * sin
+    where X = [X1, X2] split at d_head // 2.
+    """
+    d_head_half = d_head // 2
+    num_d_half = num_d // 2
+
+    # -X2 * sin
+    nisa.scalar_tensor_tensor(
+        dst=src_sb[0:s_tile_sz, nl.ds(d_head, num_d_half)],
+        data=src_sb[0:s_tile_sz, nl.ds(d_head_half, num_d_half)],
+        op0=nl.multiply,
+        operand0=-1.0,
+        op1=nl.multiply,
+        operand1=sin_sb[0:s_tile_sz, 0:num_d_half],
+    )
+
+    # X1 * sin
+    nisa.tensor_tensor(
+        dst=src_sb[0:s_tile_sz, nl.ds(d_head + d_head_half, num_d_half)],
+        data1=src_sb[0:s_tile_sz, 0:num_d_half],
+        data2=sin_sb[0:s_tile_sz, 0:num_d_half],
+        op=nl.multiply,
+    )
+
+    # X * cos
+    nisa.tensor_tensor(
+        dst=src_sb[0:s_tile_sz, 0:num_d],
+        data1=src_sb[0:s_tile_sz, 0:num_d],
+        data2=cos_sb[0:s_tile_sz, 0:num_d],
+        op=nl.multiply,
+    )
+
+    # X * cos + [-X2 * sin, X1 * sin] → dst
+    nisa.tensor_tensor(
+        dst=dst_sb,
+        data1=src_sb[0:s_tile_sz, 0:num_d],
+        data2=src_sb[0:s_tile_sz, nl.ds(d_head, num_d)],
+        op=nl.add,
+    )
+
+
+def _evict_and_postprocess_per_head(
     qkv_MM_output_psum: List[nl.ndarray],
     output_sb: List[nl.ndarray],
-    cos_buffer_sb: List[nl.ndarray],
-    sin_buffer_sb: List[nl.ndarray],
-    rope_intermediate_buffer_sb: List[nl.ndarray],
-    cos_cache_hbm: nl.ndarray,
-    sin_cache_hbm: nl.ndarray,
     i_tile_S: int,
     s_tile_sz: int,
-    i_batch: int,
-    s_tile_local_offset: int,
     cfg: QKV_CTE_Config,
     dims: QKV_CTE_Dims,
     bias_sb: Optional[nl.ndarray],
-    # Quantization Related
     w_scale_tile: Optional[nl.ndarray],
+    rope_bufs: Optional[RoPEBuffers],
+    i_batch: Optional[int],
+    s_tile_local_offset: Optional[int],
+    qk_norm_bufs: Optional[QKNormBuffers] = None,
+    row_mx_input_scale: Optional[nl.ndarray] = None,
+    row_mx_w_channel_scale_sb: Optional[nl.ndarray] = None,
+    row_w_scale_sb: Optional[nl.ndarray] = None,
 ) -> None:
+    """Per-head PSUM eviction + postprocessing (QK-norm, RoPE).
+
+    Handles all per-head eviction paths:
+    - Gamma fusion (gamma_fused_in_rope_caches): evict to output_sb, fused rsqrt-in-RoPE in-place
+    - Non-fusion with RoPE: evict to rope scratch, QK-norm, out-of-place RoPE to output_sb
+    - Non-fusion without RoPE: bulk evict to output_sb, then QK-norm in-place per head
+
+    V heads are always evicted directly to output_sb with optional dequant/bias.
+
+    Args:
+        qkv_MM_output_psum: PSUM banks from matmul, indexed [i_tile_S * num_512_tiles_per_I + k].
+        output_sb: Multi-buffered SBUF output tiles, indexed [i_tile_S].
+        i_tile_S: Current S-tile index within the block.
+        s_tile_sz: Active rows in this S tile.
+        cfg: Kernel configuration.
+        dims: Kernel dimension parameters.
+        bias_sb: [pmax, I] bias in SBUF, or None.
+        w_scale_tile: [pmax, 3] per-Q/K/V dequant scales, or None.
+        rope_bufs: RoPE cos/sin caches and scratch buffers, or None.
+        i_batch: Current batch index.
+        s_tile_local_offset: S offset of this tile within the current block.
+        qk_norm_bufs: QK-norm scratch and weight buffers, or None.
     """
-    Apply RoPE rotation to Q/K heads and copy V heads from PSUM matmul results to output buffer.
-    Performs the copy only for "i_tile_S" contracted row.
-
-    w_scale_tile: shape of [128, 3] contains the dequant scale for q, k, v
-
-    Src: * qkv_MM_output_psum (QKV Projection Results)
-         * Pre-allocated RoPE buffers: cos_buffer_sb, sin_buffer_sb, rope_intermediate_buffer_sb.
-            and corresponding HBM tensors: cos_buffer_hbm, sin_buffer_hbm
-
-    Dst: Store results to output_matmult_sb[i_tile_S]
-
-    - Each element is a PSUM bank [128, 512] storing results for specific (S_tile, I_tile)
-    - Bank indexing: i_tile_S * dims.num_512_tiles_per_I + k_tile_I
-    - Contains Q, K, V head data across different banks based on head_offset
-    """
-
     d_head = dims.d_head
     d_head_half = d_head // 2
-
     NUM_HEADS_PER_PSUM_BANK = 512 // d_head
-
-    # Load RoPE tensors if RoPE fusion is enabled.
-    cos_src_offset = i_batch * dims.S * d_head + (dims.S_shard_offset + s_tile_local_offset) * d_head
-    nisa.dma_copy(
-        dst=cos_buffer_sb[i_tile_S].ap(pattern=[[d_head, s_tile_sz], [1, d_head]], offset=0),
-        src=cos_cache_hbm.ap(pattern=[[d_head, s_tile_sz], [1, d_head]], offset=cos_src_offset),
-        dge_mode=dge_mode.swdge,
+    _has_qk_norm = cfg.qk_norm_pre_rope is not None or cfg.qk_norm_post_rope is not None
+    _gamma_fused_in_rope = (
+        cfg.qk_norm_pre_rope is not None and cfg.qk_norm_pre_rope.gamma_fused_in_rope_caches and cfg.fused_rope
     )
 
-    sin_src_offset = i_batch * dims.S * d_head + (dims.S_shard_offset + s_tile_local_offset) * d_head
-    nisa.dma_copy(
-        dst=sin_buffer_sb[i_tile_S].ap(pattern=[[d_head_half, s_tile_sz], [1, d_head_half]], offset=0),
-        src=sin_cache_hbm.ap(pattern=[[d_head, s_tile_sz], [1, d_head_half]], offset=sin_src_offset),
-        dge_mode=dge_mode.swdge,
-    )
+    # No-RoPE fast path: bulk evict all banks to output_sb, then per-head QK-norm in-place.
+    # This avoids per-head PSUM reads when only QK-norm is needed (no RoPE scratch buffer required).
+    if not cfg.fused_rope and _has_qk_norm:
+        # Step 1: Bulk evict PSUM → output_sb (per-bank, not per-head)
+        if row_mx_w_channel_scale_sb is not None:
+            _evict_psum_to_sbuf_bulk_row_mx(
+                output_sb=output_sb[i_tile_S],
+                qkv_MM_output_psum=qkv_MM_output_psum,
+                s_tile_sz=s_tile_sz,
+                i_tile_S=i_tile_S,
+                bias_sb=bias_sb,
+                row_mx_input_scale=row_mx_input_scale,
+                row_mx_w_channel_scale_sb=row_mx_w_channel_scale_sb,
+                I=dims.I,
+                num_512_tiles_per_I=dims.num_512_tiles_per_I,
+            )
+        elif w_scale_tile is not None:
+            _evict_psum_to_sbuf_per_segment(
+                output_sb=output_sb[i_tile_S],
+                qkv_MM_output_psum=qkv_MM_output_psum,
+                s_tile_sz=s_tile_sz,
+                i_tile_S=i_tile_S,
+                mx_dequant_sb=w_scale_tile,
+                bias_sb=bias_sb,
+                q_dim=dims.num_q_heads * d_head,
+                kv_dim=dims.num_kv_heads * d_head,
+                I=dims.I,
+                num_512_tiles_per_I=dims.num_512_tiles_per_I,
+            )
+        else:
+            _evict_psum_to_sbuf_bulk(
+                output_sb=output_sb[i_tile_S],
+                qkv_MM_output_psum=qkv_MM_output_psum,
+                s_tile_sz=s_tile_sz,
+                i_tile_S=i_tile_S,
+                bias_sb=bias_sb,
+                I=dims.I,
+                num_512_tiles_per_I=dims.num_512_tiles_per_I,
+            )
 
-    # For each head, RoPE([X1, X2]) = [X1, X2] * cos + [-X2 * sin, X1 * sin]
-    for i_head in nl.sequential_range(dims.num_q_heads + dims.num_kv_heads):
+        # ROW dequantization after bulk eviction (before per-head processing)
+        if row_w_scale_sb is not None:
+            nisa.tensor_tensor(
+                dst=output_sb[i_tile_S][0:s_tile_sz, : dims.I],
+                data1=output_sb[i_tile_S][0:s_tile_sz, : dims.I],
+                data2=row_w_scale_sb[0:s_tile_sz, : dims.I],
+                op=nl.multiply,
+            )
+
+        # Step 2: Per-head QK-norm in-place on already-evicted output_sb
+        for i_head in nl.affine_range(dims.num_q_heads + dims.num_kv_heads):
+            head_offset = i_head * d_head
+            num_d = min(d_head, dims.I - head_offset)
+
+            if cfg.qk_norm_pre_rope is not None:
+                _pre_norm_func = (
+                    cfg.qk_norm_pre_rope.q_norm if i_head < dims.num_q_heads else cfg.qk_norm_pre_rope.k_norm
+                )
+                if _pre_norm_func is not None:
+                    _apply_qk_norm_to_head(
+                        head_sb=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
+                        i_head=i_head,
+                        num_q_heads=dims.num_q_heads,
+                        is_pre_rope=True,
+                        norm_func=_pre_norm_func.name,
+                        qk_norm_bufs=qk_norm_bufs,
+                        norm_config=cfg.qk_norm_pre_rope,
+                    )
+
+            if cfg.qk_norm_post_rope is not None:
+                _post_norm_func = (
+                    cfg.qk_norm_post_rope.q_norm if i_head < dims.num_q_heads else cfg.qk_norm_post_rope.k_norm
+                )
+                if _post_norm_func is not None:
+                    _apply_qk_norm_to_head(
+                        head_sb=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
+                        i_head=i_head,
+                        num_q_heads=dims.num_q_heads,
+                        is_pre_rope=False,
+                        norm_func=_post_norm_func.name,
+                        qk_norm_bufs=qk_norm_bufs,
+                        norm_config=cfg.qk_norm_post_rope,
+                    )
+        return
+
+    # RoPE path: per-head eviction required (RoPE needs scratch buffer for out-of-place rotation)
+    _load_rope_caches(rope_bufs, cfg, dims, i_tile_S, s_tile_sz, i_batch, s_tile_local_offset)
+
+    # Q/K heads: evict + postprocess
+    for i_head in nl.affine_range(dims.num_q_heads + dims.num_kv_heads):
         head_offset = i_head * d_head
         num_d = min(d_head, dims.I - head_offset)
-        num_d_half = num_d // 2
-
-        psum_accumulation_bank_id = i_tile_S * dims.num_512_tiles_per_I + i_head // NUM_HEADS_PER_PSUM_BANK
+        psum_bank_id = i_tile_S * dims.num_512_tiles_per_I + i_head // NUM_HEADS_PER_PSUM_BANK
         psum_head_offset = (i_head % NUM_HEADS_PER_PSUM_BANK) * d_head
 
+        _num_rope_bufs = len(rope_bufs.scratch_sb[i_tile_S]) if cfg.fused_rope else 0
+        _rope_buf = rope_bufs.scratch_sb[i_tile_S][i_head % _num_rope_bufs] if cfg.fused_rope else None
+        _norm_scratch = qk_norm_bufs.scratch_sb[i_head % 3] if qk_norm_bufs is not None else None
+
         if w_scale_tile is not None:
-            if i_head < dims.num_q_heads:
-                current_head_w_scale_tile = w_scale_tile[0:s_tile_sz, 0]
-            else:
-                current_head_w_scale_tile = w_scale_tile[0:s_tile_sz, 1]
+            current_scale = w_scale_tile[0:s_tile_sz, 0] if i_head < dims.num_q_heads else w_scale_tile[0:s_tile_sz, 1]
 
-        # Copy the current head from psum to sbuf first. we maintain two copy of the head, the first copy is for cos * X and the second for sin * rotate_half(X)
-        if cfg.add_bias:
-            if w_scale_tile is not None:
-                nisa.scalar_tensor_tensor(
-                    dst=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d],
-                    data=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
-                    op0=nl.multiply,
-                    operand0=current_head_w_scale_tile,
-                    op1=nl.add,
-                    operand1=bias_sb[0:s_tile_sz, nl.ds(head_offset, num_d)],
-                )
-            else:
-                nisa.tensor_tensor(
-                    dst=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d],
-                    data1=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
-                    data2=bias_sb[0:s_tile_sz, nl.ds(head_offset, num_d)],
-                    op=nl.add,
-                )
+        # Gamma fusion: evict to output_sb
+        # Non-fusion with RoPE: evict to rope scratch (out-of-place RoPE needs it)
+        if cfg.fused_rope and not _gamma_fused_in_rope:
+            evict_dst = _rope_buf[0:s_tile_sz, 0:num_d]
         else:
-            # Copy the current head from psum to sbuf first. we maintain two copy of the head, the first copy is for cos * X and the second for sin * rotate_half(X)
-            if w_scale_tile is not None:
-                nisa.tensor_scalar(
-                    dst=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d],
-                    data=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
-                    op0=nl.multiply,
-                    operand0=current_head_w_scale_tile,
+            evict_dst = output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)]
+
+        _row_mx_in_scale = row_mx_input_scale[0:s_tile_sz, 0:1] if row_mx_input_scale is not None else None
+        _row_mx_w_scale = (
+            row_mx_w_channel_scale_sb[0:s_tile_sz, nl.ds(head_offset, num_d)]
+            if row_mx_w_channel_scale_sb is not None
+            else None
+        )
+
+        _evict_one_head(
+            dst=evict_dst,
+            psum_src=qkv_MM_output_psum[psum_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
+            bias_slice=bias_sb[0:s_tile_sz, nl.ds(head_offset, num_d)]
+            if cfg.add_bias
+            else None,  # None when qkv_bias=False
+            w_scale=current_scale if w_scale_tile is not None else None,  # None for non-MX (no static dequant)
+            s_tile_sz=s_tile_sz,
+            use_activation_for_scale=_has_qk_norm,
+            row_mx_input_scale=_row_mx_in_scale,
+            row_mx_w_scale_slice=_row_mx_w_scale,
+        )
+
+        # ROW dequantization: per-element weight scale applied after eviction
+        if row_w_scale_sb is not None:
+            nisa.tensor_tensor(
+                dst=evict_dst,
+                data1=evict_dst,
+                data2=row_w_scale_sb[0:s_tile_sz, nl.ds(head_offset, num_d)],
+                op=nl.multiply,
+            )
+
+        if _gamma_fused_in_rope:
+            # Gamma fusion: postprocess in-place on output_sb (fused rsqrt-in-RoPE)
+            _postprocess_one_qk_head(
+                output_sb=output_sb,
+                i_tile_S=i_tile_S,
+                s_tile_sz=s_tile_sz,
+                head_offset=head_offset,
+                num_d=num_d,
+                i_head=i_head,
+                cfg=cfg,
+                dims=dims,
+                rope_bufs=rope_bufs,
+                qk_norm_bufs=qk_norm_bufs,
+                _rope_buf=_rope_buf,
+                _norm_scratch=_norm_scratch,
+            )
+        else:
+            # Non-fusion: QK-norm on evict_dst, then out-of-place RoPE, then post-RoPE QK-norm
+            if cfg.qk_norm_pre_rope is not None:
+                _pre_norm_func = (
+                    cfg.qk_norm_pre_rope.q_norm if i_head < dims.num_q_heads else cfg.qk_norm_pre_rope.k_norm
                 )
-            else:
-                nisa.tensor_copy(
-                    dst=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d],
-                    src=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
+                if _pre_norm_func is not None:
+                    _apply_qk_norm_to_head(
+                        head_sb=evict_dst,
+                        i_head=i_head,
+                        num_q_heads=dims.num_q_heads,
+                        is_pre_rope=True,
+                        norm_func=_pre_norm_func.name,
+                        qk_norm_bufs=qk_norm_bufs,
+                        norm_config=cfg.qk_norm_pre_rope,
+                    )
+
+            if cfg.fused_rope:
+                _apply_rope_to_head(
+                    src_sb=_rope_buf,
+                    dst_sb=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
+                    cos_sb=rope_bufs.cos_sb[i_tile_S],
+                    sin_sb=rope_bufs.sin_sb[i_tile_S],
+                    s_tile_sz=s_tile_sz,
+                    d_head=d_head,
+                    num_d=num_d,
                 )
 
-            # -X2 * sin
-        nisa.tensor_tensor(
-            dst=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, nl.ds(d_head, num_d_half)],
-            data1=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, nl.ds(d_head_half, num_d_half)],
-            data2=sin_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d_half],
-            op=nl.multiply,
-        )
+            if cfg.qk_norm_post_rope is not None:
+                _post_norm_func = (
+                    cfg.qk_norm_post_rope.q_norm if i_head < dims.num_q_heads else cfg.qk_norm_post_rope.k_norm
+                )
+                if _post_norm_func is not None:
+                    _apply_qk_norm_to_head(
+                        head_sb=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
+                        i_head=i_head,
+                        num_q_heads=dims.num_q_heads,
+                        is_pre_rope=False,
+                        norm_func=_post_norm_func.name,
+                        qk_norm_bufs=qk_norm_bufs,
+                        norm_config=cfg.qk_norm_post_rope,
+                    )
 
-        nisa.tensor_scalar(
-            dst=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, nl.ds(d_head, num_d_half)],
-            data=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, nl.ds(d_head, num_d_half)],
-            op0=nl.multiply,
-            operand0=-1,
-        )
-
-        # X1 * sin
-        nisa.tensor_tensor(
-            dst=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, nl.ds(d_head + d_head_half, num_d_half)],
-            data1=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d_half],
-            data2=sin_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d_half],
-            op=nl.multiply,
-        )
-
-        # X * cos
-        nisa.tensor_tensor(
-            dst=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d],
-            data1=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d],
-            data2=cos_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d],
-            op=nl.multiply,
-        )
-
-        # Copy X * cos + [-X2 * sin, X1 * sin] to output sbuf
-        nisa.tensor_tensor(
-            dst=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
-            data1=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, 0:num_d],
-            data2=rope_intermediate_buffer_sb[i_tile_S][0:s_tile_sz, nl.ds(d_head, num_d)],
-            op=nl.add,
-        )
-
-    # Copy V
+    # V heads: evict only
     for i_head in range(dims.num_q_heads + dims.num_kv_heads, dims.num_q_heads + 2 * dims.num_kv_heads):
         head_offset = i_head * d_head
         num_d = min(d_head, dims.I - head_offset)
-        psum_accumulation_bank_id = i_tile_S * dims.num_512_tiles_per_I + i_head // NUM_HEADS_PER_PSUM_BANK
+        psum_bank_id = i_tile_S * dims.num_512_tiles_per_I + i_head // NUM_HEADS_PER_PSUM_BANK
         psum_head_offset = (i_head % NUM_HEADS_PER_PSUM_BANK) * d_head
 
-        if w_scale_tile is not None:
-            current_head_w_scale_tile = w_scale_tile[0:s_tile_sz, 2]
+        _row_mx_in_scale = row_mx_input_scale[0:s_tile_sz, 0:1] if row_mx_input_scale is not None else None
+        _row_mx_w_scale = (
+            row_mx_w_channel_scale_sb[0:s_tile_sz, nl.ds(head_offset, num_d)]
+            if row_mx_w_channel_scale_sb is not None
+            else None
+        )
 
-        if cfg.add_bias:
-            if w_scale_tile is not None:
-                nisa.scalar_tensor_tensor(
-                    dst=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
-                    data=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
-                    op0=nl.multiply,
-                    operand0=current_head_w_scale_tile,
-                    op1=nl.add,
-                    operand1=bias_sb[0:s_tile_sz, nl.ds(head_offset, num_d)],
-                )
-            else:
-                nisa.tensor_tensor(
-                    dst=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
-                    data1=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
-                    data2=bias_sb[0:s_tile_sz, nl.ds(head_offset, num_d)],
-                    op=nl.add,
-                )
+        _evict_one_head(
+            dst=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
+            psum_src=qkv_MM_output_psum[psum_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
+            bias_slice=bias_sb[0:s_tile_sz, nl.ds(head_offset, num_d)]
+            if cfg.add_bias
+            else None,  # None when qkv_bias=False
+            w_scale=w_scale_tile[0:s_tile_sz, 2]
+            if w_scale_tile is not None
+            else None,  # None for non-MX (no static dequant)
+            s_tile_sz=s_tile_sz,
+            use_activation_for_scale=_has_qk_norm,
+            row_mx_input_scale=_row_mx_in_scale,
+            row_mx_w_scale_slice=_row_mx_w_scale,
+        )
+
+        # ROW dequantization: per-element weight scale applied after eviction
+        if row_w_scale_sb is not None:
+            nisa.tensor_tensor(
+                dst=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
+                data1=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
+                data2=row_w_scale_sb[0:s_tile_sz, nl.ds(head_offset, num_d)],
+                op=nl.multiply,
+            )
+
+
+def _load_rope_caches(rope_bufs, cfg, dims, i_tile_S, s_tile_sz, i_batch, s_tile_local_offset):
+    """DMA load cos/sin RoPE caches for the current S tile.
+
+    When gamma_fused_in_rope_caches=True, sin is full d_head width (sin_lo_fused and
+    sin_hi_fused packed) and separate K cos/sin caches are loaded if present.
+    """
+    if not cfg.fused_rope:
+        return
+    d_head = dims.d_head
+    _gamma_fused_in_rope = cfg.qk_norm_pre_rope is not None and cfg.qk_norm_pre_rope.gamma_fused_in_rope_caches
+    sin_fdim = d_head if _gamma_fused_in_rope else d_head // 2
+
+    cos_src_offset = i_batch * dims.S * d_head + (dims.S_shard_offset + s_tile_local_offset) * d_head
+    nisa.dma_copy(
+        dst=rope_bufs.cos_sb[i_tile_S].ap(pattern=[[d_head, s_tile_sz], [1, d_head]], offset=0),
+        src=rope_bufs.cos_hbm.ap(pattern=[[d_head, s_tile_sz], [1, d_head]], offset=cos_src_offset),
+        dge_mode=dge_mode.swdge,
+    )
+    sin_src_offset = i_batch * dims.S * d_head + (dims.S_shard_offset + s_tile_local_offset) * d_head
+    nisa.dma_copy(
+        dst=rope_bufs.sin_sb[i_tile_S].ap(pattern=[[sin_fdim, s_tile_sz], [1, sin_fdim]], offset=0),
+        src=rope_bufs.sin_hbm.ap(pattern=[[d_head, s_tile_sz], [1, sin_fdim]], offset=sin_src_offset),
+        dge_mode=dge_mode.swdge,
+    )
+
+    if rope_bufs.k_cos_hbm is not None:
+        nisa.dma_copy(
+            dst=rope_bufs.k_cos_sb[i_tile_S].ap(pattern=[[d_head, s_tile_sz], [1, d_head]], offset=0),
+            src=rope_bufs.k_cos_hbm.ap(pattern=[[d_head, s_tile_sz], [1, d_head]], offset=cos_src_offset),
+            dge_mode=dge_mode.swdge,
+        )
+        nisa.dma_copy(
+            dst=rope_bufs.k_sin_sb[i_tile_S].ap(pattern=[[sin_fdim, s_tile_sz], [1, sin_fdim]], offset=0),
+            src=rope_bufs.k_sin_hbm.ap(pattern=[[d_head, s_tile_sz], [1, sin_fdim]], offset=sin_src_offset),
+            dge_mode=dge_mode.swdge,
+        )
+
+
+def _postprocess_one_qk_head(
+    output_sb,
+    i_tile_S,
+    s_tile_sz,
+    head_offset,
+    num_d,
+    i_head,
+    cfg,
+    dims,
+    rope_bufs,
+    qk_norm_bufs,
+    _rope_buf,
+    _norm_scratch,
+) -> None:
+    """Fused rsqrt-in-RoPE for a single Q/K head (gamma_fused_in_rope_caches path).
+
+    Uses 6 instructions: rsqrt is folded into the cos/sin multiplies, gamma is
+    pre-baked into the caches by the caller. Data is in output_sb.
+    """
+    head_sb = output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)]
+    d_head = dims.d_head
+    d_head_half = d_head // 2
+    num_d_half = num_d // 2
+
+    # Select Q or K fused cos/sin
+    if rope_bufs.k_cos_hbm is not None and i_head >= dims.num_q_heads:
+        _fused_cos = rope_bufs.k_cos_sb[i_tile_S]
+        _fused_sin = rope_bufs.k_sin_sb[i_tile_S]
+    else:
+        _fused_cos = rope_bufs.cos_sb[i_tile_S]
+        _fused_sin = rope_bufs.sin_sb[i_tile_S]
+
+    # 1. sum(x²)
+    nisa.activation_reduce(
+        dst=_norm_scratch.ap(pattern=[[1, s_tile_sz], [0, num_d]]),
+        op=nl.square,
+        data=head_sb,
+        reduce_op=nl.add,
+        reduce_res=_norm_scratch[0:s_tile_sz, 0:1],
+        bias=_slice_activation_constant_bias(qk_norm_bufs.zero_bias_sb, s_tile_sz),
+    )
+
+    # 2. rsqrt(mean(x²) + eps)
+    nisa.activation(
+        dst=_norm_scratch[0:s_tile_sz, 0:1],
+        op=nl.rsqrt,
+        data=_norm_scratch[0:s_tile_sz, 0:1],
+        bias=_slice_activation_constant_bias(qk_norm_bufs.pre_rope_eps_sb, s_tile_sz),
+        scale=1.0 / num_d,
+    )
+    _rsqrt = _norm_scratch[0:s_tile_sz, 0:1]
+
+    # 3. -x2 * sin_hi_fused → scratch[0:d_half]
+    nisa.scalar_tensor_tensor(
+        dst=_rope_buf[0:s_tile_sz, 0:num_d_half],
+        data=head_sb[0:s_tile_sz, nl.ds(d_head_half, num_d_half)],
+        op0=nl.multiply,
+        operand0=-1.0,
+        op1=nl.multiply,
+        operand1=_fused_sin[0:s_tile_sz, nl.ds(d_head_half, num_d_half)],
+    )
+
+    # 4. x1 * sin_lo_fused → scratch[d_half:d]
+    nisa.tensor_tensor(
+        dst=_rope_buf[0:s_tile_sz, nl.ds(d_head_half, num_d_half)],
+        data1=head_sb[0:s_tile_sz, 0:num_d_half],
+        data2=_fused_sin[0:s_tile_sz, 0:num_d_half],
+        op=nl.multiply,
+    )
+
+    # 5. x * rsqrt * cos_fused → head_sb
+    nisa.scalar_tensor_tensor(
+        dst=head_sb,
+        data=head_sb,
+        op0=nl.multiply,
+        operand0=_rsqrt,
+        op1=nl.multiply,
+        operand1=_fused_cos[0:s_tile_sz, 0:num_d],
+    )
+
+    # 6. sin_terms * rsqrt + cos_result → head_sb
+    nisa.scalar_tensor_tensor(
+        dst=head_sb,
+        data=_rope_buf[0:s_tile_sz, 0:num_d],
+        op0=nl.multiply,
+        operand0=_rsqrt,
+        op1=nl.add,
+        operand1=head_sb,
+    )
+
+
+def _evict_one_head(
+    dst,
+    psum_src,
+    bias_slice,
+    w_scale,
+    s_tile_sz: int,
+    use_activation_for_scale: bool,
+    row_mx_input_scale=None,
+    row_mx_w_scale_slice=None,
+) -> None:
+    """Evict a single head from PSUM to SBUF with optional dequant and bias.
+
+    Selects the appropriate instruction based on which optional operations are active:
+    - ROW_MX dequant: scalar_tensor_tensor (psum * row_scale * channel_scale) [+ bias]
+    - dequant + bias: scalar_tensor_tensor (fused multiply + add)
+    - bias only: tensor_tensor add
+    - dequant with QK-norm: activation copy with scale (ScalarE, reduces DVE pressure)
+    - dequant without QK-norm: tensor_scalar multiply (VectorE)
+    - neither: tensor_copy
+
+    Args:
+        dst: Destination slice in SBUF.
+        psum_src: Source slice in PSUM.
+        bias_slice: Bias slice in SBUF, or None.
+        w_scale: Per-segment dequant scale [s_tile_sz, 1], or None.
+        s_tile_sz: Active rows in the S tile.
+        use_activation_for_scale: When True, use ScalarE activation for dequant
+            to reduce DVE pressure (typically set when QK-norm is active).
+        row_mx_input_scale: [s_tile_sz, 1] per-row input scale, or None.
+        row_mx_w_scale_slice: [s_tile_sz, d_head] per-element weight scale, or None.
+    """
+    if row_mx_w_scale_slice is not None:
+        _dequant_row_mx(
+            dst=dst,
+            psum_src=psum_src,
+            row_scale=row_mx_input_scale,
+            channel_scale=row_mx_w_scale_slice,
+            bias=bias_slice,
+        )
+    elif bias_slice is not None:
+        if w_scale is not None:
+            nisa.scalar_tensor_tensor(
+                dst=dst,
+                data=psum_src,
+                op0=nl.multiply,
+                operand0=w_scale,
+                op1=nl.add,
+                operand1=bias_slice,
+            )
         else:
-            if w_scale_tile is not None:
-                nisa.tensor_scalar(
-                    dst=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
-                    data=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
-                    op0=nl.multiply,
-                    operand0=current_head_w_scale_tile,
-                )
-            else:
-                nisa.tensor_copy(
-                    dst=output_sb[i_tile_S][0:s_tile_sz, nl.ds(head_offset, num_d)],
-                    src=qkv_MM_output_psum[psum_accumulation_bank_id][0:s_tile_sz, nl.ds(psum_head_offset, num_d)],
-                )
+            nisa.tensor_tensor(dst=dst, data1=psum_src, data2=bias_slice, op=nl.add)
+    elif w_scale is not None:
+        if use_activation_for_scale:
+            nisa.activation(dst=dst, op=nl.copy, data=psum_src, scale=w_scale)
+        else:
+            nisa.tensor_scalar(dst=dst, data=psum_src, op0=nl.multiply, operand0=w_scale)
+    else:
+        nisa.tensor_copy(dst=dst, src=psum_src)

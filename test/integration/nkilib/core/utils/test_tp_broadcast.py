@@ -13,11 +13,6 @@
 # limitations under the License.
 
 
-from test.integration.nkilib.utils.tensor_generators import np_random_sample
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import Tuple
 
 import nki
@@ -25,8 +20,14 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from nkilib_src.nkilib.core.utils.tp_broadcast import tp_broadcast
+from test.integration.nkilib.utils.tensor_generators import np_random_sample
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 @nki.jit
@@ -71,6 +72,7 @@ _ABBREVS = {"src_shape": "shape", "src_dim_to_broadcast": "dim", "broadcast_coun
 )
 def test_tp_broadcast(
     test_manager: Orchestrator,
+    platform_target: Platforms,
     src_shape: Tuple[int, int],
     src_dim_to_broadcast: int,
     broadcast_count: int,
@@ -100,4 +102,9 @@ def test_tp_broadcast(
         kernel_input_generator=input_generator,
         output_tensor_descriptor=output_tensors,
     )
-    framework.run_test(test_config=None, compiler_args=CompilerArgs(logical_nc_config=1), rtol=0, atol=0)
+    framework.run_test(
+        test_config=None,
+        compiler_args=CompilerArgs(logical_nc_config=1, platform_target=platform_target),
+        rtol=0,
+        atol=0,
+    )

@@ -14,7 +14,6 @@
 
 """Utility functions and configuration classes for top-k operations including rotational algorithm support and scanning implementations."""
 
-import logging
 import math
 import os
 from dataclasses import dataclass
@@ -617,6 +616,22 @@ def _find_optimal_tile_size(orig_k: int, vocab_size: int, per_lnc_BxS: int, pmax
     return best_tile_size
 
 
+def _exceeds_concatenated_free_dim(orig_k: int, vocab_size: int, tile_size: int, pmax: int) -> bool:
+    """Check if tile_size would cause the concatenated SBUF free dimension to exceed the HW limit.
+
+    The rotational algorithm concatenates vocab chunks and per-stage top-k results along the
+    free dimension. When vocab is large and K is large, a single stage may exceed 16384 elements.
+    """
+    max_n_stages = pmax // tile_size
+    min_n_stages = div_ceil(vocab_size, HW_PARAMS.max_free_dim)
+    n_stages = max(max_n_stages, min_n_stages)
+    if n_stages > max_n_stages:
+        return True
+    chunk = div_ceil(vocab_size, n_stages)
+    local_k = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
+    return chunk + n_stages * local_k > HW_PARAMS.max_free_dim
+
+
 def create_rotational_topk_config(
     inp_shape: Tuple, topk_config: TopkConfig, shared_const_cache: Optional[dict] = None
 ) -> RotationalTopkConfig:
@@ -650,8 +665,8 @@ def create_rotational_topk_config(
     inp_dtype = topk_config.inp_dtype
     index_dtype = topk_config.index_dtype
 
-    # Find optimal tile size if BxS > PMAX
-    if per_lnc_BxS > pmax:
+    # Find optimal tile size if BxS > PMAX or default tile violates HW constraints
+    if per_lnc_BxS > pmax or _exceeds_concatenated_free_dim(orig_k, vocab_size, per_lnc_BxS, pmax):
         tile_size = _find_optimal_tile_size(orig_k, vocab_size, per_lnc_BxS, pmax, topk_config.sorted)
         n_bxs_tiles = div_ceil(per_lnc_BxS, tile_size)
     else:

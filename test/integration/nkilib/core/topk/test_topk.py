@@ -13,19 +13,6 @@
 # limitations under the License.
 
 import math
-from test.integration.nkilib.utils.comparators import maxAllClose
-from test.utils.common_dataclasses import (
-    CompilerArgs,
-    CustomValidator,
-    CustomValidatorWithOutputTensorData,
-    ValidationArgs,
-)
-from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult, assert_negative_test_case
-from test.utils.metrics_collector import MetricsCollector
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import Any, final
 
 import ml_dtypes
@@ -33,6 +20,8 @@ import nki.language as nl
 import numpy as np
 import numpy.typing as npt
 import pytest
+from typing_extensions import override
+
 from nkilib_src.nkilib.core.topk.rotational_topk import (
     cleanup_rotational_constants,
     create_rotational_topk_config,
@@ -41,66 +30,27 @@ from nkilib_src.nkilib.core.topk.rotational_topk import (
     rotational_topk,
 )
 from nkilib_src.nkilib.core.topk.torch_ref import topk_torch_ref
-from typing_extensions import override
 
-INPUT_TENSOR_NAME = "input_tensor"
-BATCH_DIM_NAME = "batch"
-VOCAB_DIM_NAME = "vocab"
-SEQUENCE_LEN_DIM_NAME = "seqlen"
+try:
+    from test.integration.nkilib.core.topk.test_topk_model_config import rotational_topk_model_configs
+except ImportError:
+    rotational_topk_model_configs = {}
 
-
-def golden_output_validator_values(
-    inp: dict[str, Any],
-):
-    class RotationalTopkValueValidator(CustomValidator):
-        @override
-        def validate(self, actual_raw_output: npt.NDArray[Any]):
-            input_tensor = inp.get("inp", inp.get("inp.must_alias_input"))
-            BxS, _ = input_tensor.shape
-            config = inp["config"]
-            k = config.topk_config.k
-            output = np.frombuffer(actual_raw_output, dtype=input_tensor.dtype).reshape(BxS, k)
-
-            output_ref = torch_ref_wrapper(topk_torch_ref)(inp=input_tensor, config=config)
-
-            self._print_with_log("Results for topk_values:")
-            passed = maxAllClose(
-                np.sort(output, axis=-1),
-                np.sort(output_ref["topk_values"], axis=-1),
-                verbose=1,
-                logfile=self.logfile,
-            )
-            return passed
-
-    return RotationalTopkValueValidator
-
-
-def golden_output_validator_indices(
-    inp: dict[str, Any],
-):
-    class RotationalTopkIndicesValidator(CustomValidator):
-        @override
-        def validate(self, inference_output: npt.NDArray[Any]):
-            input_tensor = inp.get("inp", inp.get("inp.must_alias_input"))
-            config = inp["config"]
-            BxS, _ = input_tensor.shape
-            k = config.topk_config.k
-            output = np.frombuffer(inference_output, dtype=np.uint32).reshape(BxS, k)
-
-            output_ref = torch_ref_wrapper(topk_torch_ref)(inp=input_tensor, config=config)
-            val = np.take_along_axis(input_tensor, output.astype(np.uint64), axis=-1)
-
-            self._print_with_log("Results for topk_indices:")
-            passed = maxAllClose(
-                np.sort(output_ref["topk_values"], axis=-1),
-                np.sort(val, axis=-1),
-                verbose=1,
-                logfile=self.logfile,
-            )
-
-            return passed
-
-    return RotationalTopkIndicesValidator
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    CustomValidator,
+    CustomValidatorWithOutputTensorData,
+    ModelTestType,
+    Platforms,
+    prepare_model_parametrize,
+)
+from test.utils.comparators import maxAllClose
+from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult, assert_negative_test_case
+from test.utils.metrics_collector import MetricsCollector
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def _get_np_dtype(dtype):
@@ -180,10 +130,8 @@ def filter_topk_combinations(batch, seqlen, vocab, K, lnc_degree):
     return TopkEdgeCaseValidator.is_valid_config(batch, seqlen, vocab, K, lnc_degree=lnc_degree)
 
 
-@pytest_test_metadata(
-    name="Rotational TopK",
-    pytest_marks=["topk", "rotational"],
-)
+@pytest_test_metadata(name="Rotational TopK")
+@pytest_marks(["topk", "rotational"])
 @final
 class TestTopKKernel:
     @staticmethod
@@ -219,6 +167,7 @@ class TestTopKKernel:
     def run_topk_test(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         batch: int,
         seqlen: int,
@@ -266,23 +215,51 @@ class TestTopKKernel:
             cleanup_rotational_constants()
 
         inputs = input_generator(test_config=None)
-        golden_validator_values = golden_output_validator_values(inputs)
-        golden_validator_indices = golden_output_validator_indices(inputs)
-        placeholder_output_values = self.output_tensors(kernel_input=inputs)["topk_values"]
-        placeholder_output_indices = self.output_tensors(kernel_input=inputs)["topk_indices"]
 
-        validation_args = ValidationArgs(
-            golden_output={
+        def topk_comparator(golden_dict, output_tensors):
+            input_tensor = inputs.get("inp", inputs.get("inp.must_alias_input"))
+            golden_values = golden_dict["topk_values"]
+
+            class ValuesValidator(CustomValidator):
+                @override
+                def validate(self, actual_raw_output: npt.NDArray[Any]):
+                    BxS, _ = input_tensor.shape
+                    k = inputs["config"].topk_config.k
+                    output = np.frombuffer(actual_raw_output, dtype=input_tensor.dtype).reshape(BxS, k)
+                    self._print_with_log("Results for topk_values:")
+                    return maxAllClose(
+                        np.sort(output, axis=-1),
+                        np.sort(golden_values, axis=-1),
+                        verbose=1,
+                        logfile=self.logfile,
+                    )
+
+            class IndicesValidator(CustomValidator):
+                @override
+                def validate(self, inference_output: npt.NDArray[Any]):
+                    BxS, _ = input_tensor.shape
+                    k = inputs["config"].topk_config.k
+                    output = np.frombuffer(inference_output, dtype=np.uint32).reshape(BxS, k)
+                    val = np.take_along_axis(input_tensor, output.astype(np.uint64), axis=-1)
+                    self._print_with_log("Results for topk_indices:")
+                    return maxAllClose(
+                        np.sort(golden_values, axis=-1),
+                        np.sort(val, axis=-1),
+                        verbose=1,
+                        logfile=self.logfile,
+                    )
+
+            return {
                 "topk_values": CustomValidatorWithOutputTensorData(
-                    validator=golden_validator_values,
-                    output_ndarray=placeholder_output_values,
+                    validator=ValuesValidator,
+                    output_ndarray=output_tensors["topk_values"],
                 ),
                 "topk_indices": CustomValidatorWithOutputTensorData(
-                    validator=golden_validator_indices,
-                    output_ndarray=placeholder_output_indices,
+                    validator=IndicesValidator,
+                    output_ndarray=output_tensors["topk_indices"],
                 ),
             }
-        )
+
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=rotational_topk,
@@ -293,10 +270,15 @@ class TestTopKKernel:
 
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=lnc_degree),
+            compiler_args=CompilerArgs(
+                logical_nc_config=lnc_degree,
+                platform_target=platform_target,
+                # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
+                additional_cmd_args=["--internal-backend-options=--skip-pass=address_rotation_sb"],
+            ),
             rtol=1e-3,
             atol=1e-5,
-            custom_validation_args=validation_args,
+            custom_comparator=topk_comparator,
         )
         cleanup_fn()
 
@@ -343,6 +325,10 @@ class TestTopKKernel:
         [2, 99, 1, 3168, 256, nl.float32],
         [2, 128, 1, 3168, 256, nl.float32],
         [2, 256, 1, 3168, 256, nl.float32],
+
+        # High batch and vocab
+        [2, 256, 1, 16384, 256, nl.float32],
+        [2, 256, 1, 2374, 256, nl.float32],
 
         # K generalization nominal
         [2, 1, 1, 3168, 8, nl.float32],
@@ -393,6 +379,7 @@ class TestTopKKernel:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         lnc_degree,
         batch,
         seqlen,
@@ -404,6 +391,7 @@ class TestTopKKernel:
         with assert_negative_test_case(is_negative_test_case):
             self.run_topk_test(
                 test_manager=test_manager,
+                platform_target=platform_target,
                 lnc_degree=lnc_degree,
                 batch=batch,
                 seqlen=seqlen,
@@ -425,6 +413,7 @@ class TestTopKKernel:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         lnc_degree,
         batch,
         seqlen,
@@ -434,6 +423,7 @@ class TestTopKKernel:
     ):
         self.run_topk_test(
             test_manager=test_manager,
+            platform_target=platform_target,
             lnc_degree=lnc_degree,
             batch=batch,
             seqlen=seqlen,
@@ -452,6 +442,7 @@ class TestTopKKernel:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         lnc_degree,
         batch,
         seqlen,
@@ -464,6 +455,7 @@ class TestTopKKernel:
         with assert_negative_test_case(is_negative_test_case):
             test_cls.run_topk_test(
                 test_manager=test_manager,
+                platform_target=platform_target,
                 lnc_degree=lnc_degree,
                 batch=batch,
                 seqlen=seqlen,
@@ -471,3 +463,59 @@ class TestTopKKernel:
                 k=K,
                 dtype=nl.float32,
             )
+
+
+def _make_model_id(params):
+    """Generate a test ID string from a model config parameter list."""
+    abbrevs = ["lnc", "b", "s", "v", "K", "dt"]
+
+    def fmt(v):
+        if hasattr(v, "value"):
+            return v.value
+        return v
+
+    return "_".join(f"{k}-{fmt(v)}" for k, v in zip(abbrevs, params))
+
+
+# MODEL TESTING ENTRY POINT
+@pytest_marks(["topk", "model"])
+@final
+class TestTopKModel:
+    """Model regression tests for rotational_topk kernel."""
+
+    _TIER0_PARAMS, _TIER0_IDS = (
+        prepare_model_parametrize(
+            {ModelTestType.TIER0: rotational_topk_model_configs.get(ModelTestType.TIER0, [])},
+            id_formatter=_make_model_id,
+        )
+        if rotational_topk_model_configs
+        else ([], [])
+    )
+
+    topk_model_params = "lnc_degree, batch, seqlen, vocab_size, K, dtype"
+
+    @pytest.mark.tier0
+    @pytest.mark.parametrize(topk_model_params, _TIER0_PARAMS, ids=_TIER0_IDS)
+    def test_tier0(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        vocab_size,
+        K,
+        dtype,
+    ):
+        """TIER0: Critical model configs for rotational_topk."""
+        TestTopKKernel().run_topk_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            lnc_degree=lnc_degree,
+            batch=batch,
+            seqlen=seqlen,
+            vocab=vocab_size,
+            k=K,
+            dtype=dtype,
+        )

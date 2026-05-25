@@ -17,34 +17,46 @@ Tests for attention_bwd kernel implementation
 with various sequence length and head configurations.
 """
 
-from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
-from test.integration.nkilib.utils.test_kernel_common import convert_to_torch
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import Any, Optional, Tuple, final
 
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.attention.attention_bwd import attention_bwd
 from nkilib_src.nkilib.core.attention.attention_bwd_torch import attention_bwd_torch_ref, compute_o_lse
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
+from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
+from test.integration.nkilib.utils.test_kernel_common import convert_to_torch
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 PMAX = 128
 
 
-def generate_sequence_packing_bounds(cu_seqlens_q, cu_seqlens_k, total_q: int):
-    """Expand cu_seqlens into per-token bound_min/bound_max float32 vectors."""
-    bound_min = np.zeros(total_q, dtype=np.float32)
-    bound_max = np.zeros(total_q, dtype=np.float32)
-    for i in range(len(cu_seqlens_q) - 1):
-        q_start, q_end = int(cu_seqlens_q[i]), int(cu_seqlens_q[i + 1])
-        bound_min[q_start:q_end] = int(cu_seqlens_k[i])
-        bound_max[q_start:q_end] = int(cu_seqlens_k[i + 1])
+def generate_sequence_packing_bounds(cu_seqlens_q, cu_seqlens_k, total_q: int, batch_size: int):
+    """Expand cu_seqlens into per-token bound_min/bound_max float32 arrays.
+
+    Args:
+        cu_seqlens_q: List of lists, one per batch, of cumulative sequence lengths for Q.
+        cu_seqlens_k: List of lists, one per batch, of cumulative sequence lengths for K.
+        total_q: Total query sequence length.
+        batch_size: Number of batches.
+
+    Returns:
+        bound_min, bound_max: Arrays of shape (batch_size, total_q).
+    """
+    bound_min = np.zeros((batch_size, total_q), dtype=np.float32)
+    bound_max = np.zeros((batch_size, total_q), dtype=np.float32)
+    for b in range(batch_size):
+        for i in range(len(cu_seqlens_q[b]) - 1):
+            q_start, q_end = int(cu_seqlens_q[b][i]), int(cu_seqlens_q[b][i + 1])
+            bound_min[b, q_start:q_end] = int(cu_seqlens_k[b][i])
+            bound_max[b, q_start:q_end] = int(cu_seqlens_k[b][i + 1])
     return bound_min, bound_max
 
 
@@ -61,6 +73,9 @@ def generate_inputs(
     num_sinks: int = 0,
     softmax_scale: Optional[float] = None,
     seqlens_list: Optional[list] = None,
+    transpose_dv: bool = False,
+    cp_offset: int = 0,
+    seq_len_k: Optional[int] = None,
 ) -> dict:
     import torch
 
@@ -70,12 +85,18 @@ def generate_inputs(
     bound_min, bound_max = None, None
     if seqlens_list is not None:
         seq_len = sum(seqlens_list)
-        cu_seqlens = np.concatenate([[0], np.cumsum(seqlens_list)]).astype(np.int32)
-        bound_min, bound_max = generate_sequence_packing_bounds(cu_seqlens, cu_seqlens, seq_len)
+        # Generate per-batch cu_seqlens by rotating seqlens_list for each batch
+        cu_seqlens = []
+        for b in range(batch_size):
+            rotated = seqlens_list[b % len(seqlens_list) :] + seqlens_list[: b % len(seqlens_list)]
+            cu_seqlens.append(np.concatenate([[0], np.cumsum(rotated)]).astype(np.int32))
+        bound_min, bound_max = generate_sequence_packing_bounds(cu_seqlens, cu_seqlens, seq_len, batch_size)
+
+    actual_seq_len_k = seq_len_k if seq_len_k is not None else seq_len
 
     q = generate_tensor(name="q", shape=(batch_size, num_q_heads, head_dim, seq_len), dtype=dtype)
-    k = generate_tensor(name="k", shape=(batch_size, num_kv_heads, head_dim, seq_len), dtype=dtype)
-    v = generate_tensor(name="v", shape=(batch_size, num_kv_heads, head_dim, seq_len), dtype=dtype)
+    k = generate_tensor(name="k", shape=(batch_size, num_kv_heads, head_dim, actual_seq_len_k), dtype=dtype)
+    v = generate_tensor(name="v", shape=(batch_size, num_kv_heads, head_dim, actual_seq_len_k), dtype=dtype)
     dy = generate_tensor(name="dy", shape=(batch_size, num_q_heads, head_dim, seq_len), dtype=dtype)
 
     sinks = None
@@ -94,6 +115,7 @@ def generate_inputs(
         sinks=convert_to_torch(sinks) if num_sinks > 0 else None,
         bound_min=torch.from_numpy(bound_min) if bound_min is not None else None,
         bound_max=torch.from_numpy(bound_max) if bound_max is not None else None,
+        cp_offset=cp_offset,
     )
     o_ref = dt.static_cast(o_proj.float().numpy(), dtype)
     lse_ref = lse.float().numpy()
@@ -112,6 +134,8 @@ def generate_inputs(
         "sliding_window": sliding_window,
         "bound_min": bound_min,
         "bound_max": bound_max,
+        "transpose_dv": transpose_dv,
+        "cp_offset": cp_offset,
     }
     return result
 
@@ -144,10 +168,8 @@ def is_negative_test_case(
 
 
 @final
-@pytest_test_metadata(
-    name="Attention backward",
-    pytest_marks=["attention", "bwd"],
-)
+@pytest_test_metadata(name="Attention backward")
+@pytest_marks(["attention", "bwd"])
 class TestAttentionBwdKernel:
     """Test class for attention bwd kernel"""
 
@@ -204,7 +226,13 @@ class TestAttentionBwdKernel:
         (1, 16, 8, 8192, 256, nl.bfloat16, True, 4096, 0),    # gemma2-9b (window=4096)
     ]
 
-    attention_bwd_test_cases = test_cases_4K + test_cases_8K + test_cases_misc + test_cases_sliding_window
+    # ===== Ring attention baseline comparison (2) =====
+    test_cases_ring_baseline = [
+        pytest.param(1, 2, 2, 8192, 128, nl.bfloat16, True, None, 0, id="ring_baseline_causal"),
+        pytest.param(1, 2, 2, 8192, 128, nl.bfloat16, False, None, 0, id="ring_baseline_nocausal"),
+    ]
+
+    attention_bwd_test_cases = test_cases_4K + test_cases_8K + test_cases_misc + test_cases_sliding_window + test_cases_ring_baseline
     # fmt: on
 
     base_test_cases = [
@@ -241,6 +269,7 @@ class TestAttentionBwdKernel:
         sliding_window: Optional[int],
         num_sinks: int,
         softmax_scale: Optional[float],
+        transpose_dv: bool = False,
     ) -> None:
         np.random.seed(0)
 
@@ -258,15 +287,21 @@ class TestAttentionBwdKernel:
                 sliding_window=sliding_window,
                 num_sinks=num_sinks,
                 softmax_scale=softmax_scale,
+                transpose_dv=transpose_dv,
             )
 
         def output_tensors(kernel_input):
             q = kernel_input["q_ref"]
             k = kernel_input["k_ref"]
+            bs_k, nheads_kv_k, d_head_k, seqlen_k = k.shape
+            if transpose_dv:
+                dv_shape = (bs_k, seqlen_k, nheads_kv_k, d_head_k)
+            else:
+                dv_shape = k.shape
             result = {
                 "out_dq_ref": np.zeros(q.shape, q.dtype),
                 "out_dk_ref": np.zeros(k.shape, k.dtype),
-                "out_dv_ref": np.zeros(k.shape, k.dtype),
+                "out_dv_ref": np.zeros(dv_shape, k.dtype),
             }
             if kernel_input["sinks_ref"] is not None:
                 sinks = kernel_input["sinks_ref"]
@@ -293,6 +328,7 @@ class TestAttentionBwdKernel:
     def test_attention_bwd_fast(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         batch_size: int,
         num_q_heads: int,
         num_kv_heads: int,
@@ -306,7 +342,7 @@ class TestAttentionBwdKernel:
         """Test attention backward kernel with minimal configurations."""
         softmax_scale = 1.0 if causal else None
         lnc_count = 2 if batch_size * num_kv_heads % 2 == 0 else 1
-        compiler_args = CompilerArgs(enable_birsim=False, logical_nc_config=lnc_count)
+        compiler_args = CompilerArgs(enable_birsim=False, logical_nc_config=lnc_count, platform_target=platform_target)
         self._run_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -326,6 +362,7 @@ class TestAttentionBwdKernel:
     def test_attention_bwd(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         batch_size: int,
         num_q_heads: int,
         num_kv_heads: int,
@@ -338,7 +375,7 @@ class TestAttentionBwdKernel:
     ) -> None:
         """Test attention backward kernel with various configurations."""
         lnc_count = 2 if batch_size * num_kv_heads % 2 == 0 else 1
-        compiler_args = CompilerArgs(enable_birsim=False, logical_nc_config=lnc_count)
+        compiler_args = CompilerArgs(enable_birsim=False, logical_nc_config=lnc_count, platform_target=platform_target)
         self._run_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -354,53 +391,127 @@ class TestAttentionBwdKernel:
             softmax_scale=None,
         )
 
+    # ===== Transpose dV =====
+    # fmt: off
+    transpose_dv_params = "batch_size, num_q_heads, num_kv_heads, seq_len, head_dim, dtype, causal, sliding_window, num_sinks"
+    _TRANSPOSE_DV_ABBREVS = {
+        "batch_size": "b", "num_q_heads": "qh", "num_kv_heads": "kvh",
+        "seq_len": "s", "head_dim": "dh", "dtype": "dt", "causal": "causal",
+        "sliding_window": "sw", "num_sinks": "sinks",
+    }
+
+    transpose_dv_fast_test_cases = [
+        pytest.param(1, 1, 1, 2048, 128, nl.bfloat16, True, None, 0, marks=pytest.mark.fast),
+        pytest.param(1, 1, 1, 2048, 128, nl.float32, True, None, 0, marks=pytest.mark.fast),
+        pytest.param(2, 3, 3, 2048, 128, nl.bfloat16, True, None, 0, marks=pytest.mark.fast),
+        pytest.param(1, 1, 1, 2048, 128, nl.bfloat16, False, None, 0, marks=pytest.mark.fast),
+    ]
+
+    transpose_dv_test_cases = [
+        (1, 32, 32, 4096, 128, nl.bfloat16, True, None, 0),    # MHA 32h 4k
+        (1, 32, 8, 4096, 128, nl.bfloat16, True, None, 0),     # GQA qwen3-8b
+        (1, 8, 2, 4096, 128, nl.bfloat16, True, None, 0),      # GQA qwen3-8b TP=4
+        (1, 8, 2, 8192, 128, nl.bfloat16, True, None, 0),      # GQA llama3.1-8b TP=4
+        (1, 12, 12, 1024, 64, nl.bfloat16, True, None, 0),     # gpt-2
+        (1, 64, 8, 4096, 64, nl.bfloat16, True, 128, 0),       # sliding window=128
+        (1, 32, 16, 8192, 128, nl.bfloat16, True, 4096, 0),    # sliding window=4096
+        (1, 64, 8, 4096, 64, nl.bfloat16, True, None, 1),      # sinks=1
+        (1, 64, 8, 4096, 64, nl.bfloat16, True, 128, 1),       # sliding window + sinks
+    ]
+    # fmt: on
+
+    @pytest_parametrize(
+        transpose_dv_params, transpose_dv_fast_test_cases + transpose_dv_test_cases, abbrevs=_TRANSPOSE_DV_ABBREVS
+    )
+    def test_attention_bwd_transpose_dv(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch_size: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        seq_len: int,
+        head_dim: int,
+        dtype: Any,
+        causal: bool,
+        sliding_window: Optional[int],
+        num_sinks: int,
+    ) -> None:
+        """Test attention backward kernel with transpose_dv=True (output in [bs, s, h, d] layout)."""
+        lnc_count = 2 if batch_size * num_kv_heads % 2 == 0 else 1
+        compiler_args = CompilerArgs(enable_birsim=False, logical_nc_config=lnc_count, platform_target=platform_target)
+        self._run_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            batch_size=batch_size,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            seq_len=seq_len,
+            head_dim=head_dim,
+            dtype=dtype,
+            causal=causal,
+            sliding_window=sliding_window,
+            num_sinks=num_sinks,
+            softmax_scale=None,
+            transpose_dv=True,
+        )
+
     # ===== Sequence Packing =====
     # fmt: off
-    sequence_packing_params = "num_q_heads, num_kv_heads, head_dim, dtype, seqlens_list, causal, num_sinks, sliding_window, neg_case"
+    sequence_packing_params = "batch_size, num_q_heads, num_kv_heads, head_dim, dtype, seqlens_list, causal, num_sinks, sliding_window, neg_case"
     _SEQ_PACK_ABBREVS = {
-        "num_q_heads": "qh", "num_kv_heads": "kvh", "head_dim": "dh", "dtype": "dt",
+        "batch_size": "b", "num_q_heads": "qh", "num_kv_heads": "kvh", "head_dim": "dh", "dtype": "dt",
         "seqlens_list": "seqs", "causal": "causal", "num_sinks": "sinks",
         "sliding_window": "sw", "neg_case": "neg",
     }
 
     sequence_packing_test_cases = [
-        # Basic
-        pytest.param(1, 1, 128, nl.bfloat16, [128, 128],       True,  0, None, None, marks=pytest.mark.fast),  # two equal seqs, causal
-        pytest.param(1, 1, 128, nl.bfloat16, [256, 256],       True,  0, None, None, marks=pytest.mark.fast),  # larger equal seqs
-        pytest.param(1, 1, 64,  nl.bfloat16, [128, 256, 128],  True,  0, None, None, marks=pytest.mark.fast),  # three seqs, varying lengths
-        pytest.param(1, 1, 128, nl.bfloat16, [512],            True,  0, None, None, marks=pytest.mark.fast),  # single seq
-        pytest.param(1, 1, 128, nl.bfloat16, [128, 384],       True,  0, None, None, marks=pytest.mark.fast),  # unequal lengths
-        pytest.param(1, 1, 128, nl.float32, [128, 128],       False, 0, None, None, marks=pytest.mark.fast),  # non-causal, float32
-        pytest.param(1, 1, 64,  nl.bfloat16, [128, 256, 128],  False, 0, None, None, marks=pytest.mark.fast),  # non-causal, varying lengths
+        # Basic (bs=1)
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 128],       True,  0, None, None, marks=pytest.mark.fast),  # two equal seqs, causal
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [256, 256],       True,  0, None, None, marks=pytest.mark.fast),  # larger equal seqs
+        pytest.param(1, 1, 1, 64,  nl.bfloat16, [128, 256, 128],  True,  0, None, None, marks=pytest.mark.fast),  # three seqs, varying lengths
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [512],            True,  0, None, None, marks=pytest.mark.fast),  # single seq
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 384],       True,  0, None, None, marks=pytest.mark.fast),  # unequal lengths
+        pytest.param(1, 1, 1, 128, nl.float32, [128, 128],       False, 0, None, None, marks=pytest.mark.fast),  # non-causal, float32
+        pytest.param(1, 1, 1, 64,  nl.bfloat16, [128, 256, 128],  False, 0, None, None, marks=pytest.mark.fast),  # non-causal, varying lengths
         # Sink
-        (2, 2, 64, nl.bfloat16, [2048, 2000, 48], True, 1, None, None),  # sink + sequence packing
-        # GQA
-        pytest.param(8, 1, 128, nl.bfloat16, [256, 256], True,  0, None, None, marks=pytest.mark.fast),   # GQA factor 8
-        pytest.param(4, 2, 128, nl.bfloat16, [512, 512], True,  0, None, None, marks=pytest.mark.fast),   # GQA factor 2
-        (8, 8, 128, nl.bfloat16, [256, 256], True,  0, None, None),   # MHA
-        # Seqlen stress
-        (1, 1, 128, nl.bfloat16, [128] * 16,           True, 0, None, None),   # many short seqs, total=2048
-        (1, 1, 128, nl.bfloat16, [4096, 512],          True, 0, None, None),   # one long + one short, total=4608
-        (1, 1, 128, nl.bfloat16, [512, 4096],          True, 0, None, None),   # one short + one long, total=4608
-        (1, 1, 128, nl.bfloat16, [2048] * 4,           True, 0, None, None),   # multi-section, total=8192
-        (1, 1, 128, nl.bfloat16, [127, 129, 255, 513], True, 0, None, None),   # non-power-of-2 lengths, total=1024
-        # Larger tests
-        (16, 2, 128, nl.bfloat16, [1024, 1072]+[500]*4,   True, 0, None, None),   # qwen3-32b TP=4, 4096
-        (16, 8, 256, nl.float32,  [1000]*8+[192],         True, 0, None, None),   # gemma2-9b (dtype=float32), 8192
-        # Sliding window + sequence packing
-        pytest.param(1, 1, 128, nl.bfloat16, [256, 256], True, 0, 128, None, marks=pytest.mark.fast),   # SWA=128, two seqs
-        pytest.param(1, 1, 128, nl.bfloat16, [128, 384], True, 0, 64,  None, marks=pytest.mark.fast),   # SWA=64, unequal
-        (1, 1, 128, nl.bfloat16, [512, 512],             True, 0, 256, None),   # SWA=256, equal seqs
-        (1, 1, 128, nl.bfloat16, [2048] * 4,             True, 0, 512, None),   # SWA=512, multi-section
+        (1, 2, 2, 64, nl.bfloat16, [2048, 2000, 48], True, 1, None, None),  # sink + sequence packing
+        # GQA (bs=1)
+        pytest.param(1, 8, 1, 128, nl.bfloat16, [256, 256], True,  0, None, None, marks=pytest.mark.fast),   # GQA factor 8
+        pytest.param(1, 4, 2, 128, nl.bfloat16, [512, 512], True,  0, None, None, marks=pytest.mark.fast),   # GQA factor 2
+        (1, 8, 8, 128, nl.bfloat16, [256, 256], True,  0, None, None),   # MHA
+        # Seqlen stress (bs=1)
+        (1, 1, 1, 128, nl.bfloat16, [128] * 16,           True, 0, None, None),   # many short seqs, total=2048
+        (1, 1, 1, 128, nl.bfloat16, [4096, 512],          True, 0, None, None),   # one long + one short, total=4608
+        (1, 1, 1, 128, nl.bfloat16, [512, 4096],          True, 0, None, None),   # one short + one long, total=4608
+        (1, 1, 1, 128, nl.bfloat16, [2048] * 4,           True, 0, None, None),   # multi-section, total=8192
+        (1, 1, 1, 128, nl.bfloat16, [127, 129, 255, 513], True, 0, None, None),   # non-power-of-2 lengths, total=1024
+        # Larger tests (bs=1)
+        (1, 16, 2, 128, nl.bfloat16, [1024, 1072]+[500]*4,   True, 0, None, None),   # qwen3-32b TP=4, 4096
+        (1, 16, 8, 256, nl.float32,  [1000]*8+[192],         True, 0, None, None),   # gemma2-9b (dtype=float32), 8192
+        # Sliding window + sequence packing (bs=1)
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [256, 256], True, 0, 128, None, marks=pytest.mark.fast),   # SWA=128, two seqs
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 384], True, 0, 64,  None, marks=pytest.mark.fast),   # SWA=64, unequal
+        (1, 1, 1, 128, nl.bfloat16, [512, 512],             True, 0, 256, None),   # SWA=256, equal seqs
+        (1, 1, 1, 128, nl.bfloat16, [2048] * 4,             True, 0, 512, None),   # SWA=512, multi-section
+        # Multi-batch (bs>1) — each batch gets rotated seqlens for different masks
+        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 384],       True,  0, None, None, marks=pytest.mark.fast),  # bs=2, basic causal
+        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 256, 128],  False, 0, None, None, marks=pytest.mark.fast),  # bs=2, non-causal
+        pytest.param(3, 1, 1, 128, nl.bfloat16, [768, 256],       True,  0, None, None, marks=pytest.mark.fast),  # bs=3
+        pytest.param(2, 8, 1, 128, nl.bfloat16, [256, 768],       True,  0, None, None, marks=pytest.mark.fast),  # bs=2, GQA factor 8
+        pytest.param(2, 4, 2, 128, nl.bfloat16, [512, 512],       True,  0, None, None, marks=pytest.mark.fast),  # bs=2, GQA factor 2
+        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 896],       True, 0, 128, None, marks=pytest.mark.fast),   # bs=2, SWA
+        pytest.param(4, 1, 1, 128, nl.bfloat16, [128, 256, 128],  True, 0, None, None, marks=pytest.mark.fast),  # bs=4, three seqs
+        (4, 2, 2, 64,  nl.bfloat16, [2048, 2000, 48], True, 1, None, None),  # bs=4, sink + seq packing
         # Negative
-        pytest.param(1, 1, 128, nl.bfloat16, [128, 128], True, 0, None, "only_bound_min", marks=pytest.mark.fast, id="only_bound_min"),
-        pytest.param(1, 1, 128, nl.bfloat16, [128, 128], True, 0, None, "wrong_dtype",    marks=pytest.mark.fast, id="wrong_dtype"),
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 128], True, 0, None, "only_bound_min", marks=pytest.mark.fast, id="only_bound_min"),
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 128], True, 0, None, "wrong_dtype",    marks=pytest.mark.fast, id="wrong_dtype"),
     ]    # fmt: on
 
     @pytest_parametrize(sequence_packing_params, sequence_packing_test_cases, abbrevs=_SEQ_PACK_ABBREVS)
-    def test_attention_bwd_sequence_packing(self, test_manager, num_q_heads, num_kv_heads, head_dim, dtype, seqlens_list, causal, num_sinks, sliding_window, neg_case):
+    def test_attention_bwd_sequence_packing(self, test_manager: Orchestrator, platform_target: Platforms, batch_size, num_q_heads, num_kv_heads, head_dim, dtype, seqlens_list, causal, num_sinks, sliding_window, neg_case):
         """Test attention_bwd with sequence packing."""
-        inputs = generate_inputs(batch_size=1, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
+        inputs = generate_inputs(batch_size=batch_size, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
                                  seq_len=0, head_dim=head_dim, dtype=dtype, causal=causal,
                                  seqlens_list=seqlens_list, num_sinks=num_sinks,
                                  sliding_window=sliding_window if sliding_window else -1)
@@ -427,5 +538,90 @@ class TestAttentionBwdKernel:
                           torch_ref=torch_ref_wrapper(attention_bwd_torch_ref),
                           kernel_input_generator=input_generator,
                           output_tensor_descriptor=output_tensors).run_test(
-            test_config=None, compiler_args=CompilerArgs(enable_birsim=False, logical_nc_config=2 if num_kv_heads % 2 == 0 else 1),
+            test_config=None, compiler_args=CompilerArgs(enable_birsim=False, logical_nc_config=2 if batch_size * num_kv_heads % 2 == 0 else 1, platform_target=platform_target),
             rtol=2e-2, atol=1e-5, is_negative_test=neg_case is not None)
+
+    # ===== Context Parallelism (cp_offset) =====
+    # fmt: off
+    cp_offset_params = "batch_size, num_q_heads, num_kv_heads, seq_len_q, seq_len_k, head_dim, dtype, sliding_window, cp_offset"
+    _CP_OFFSET_ABBREVS = {
+        "batch_size": "b", "num_q_heads": "qh", "num_kv_heads": "kvh",
+        "seq_len_q": "sq", "seq_len_k": "sk", "head_dim": "dh", "dtype": "dt",
+        "sliding_window": "sw", "cp_offset": "cp",
+    }
+
+    cp_offset_test_cases = [
+        # Simulates CP shard 1 in sliding window ring attention:
+        # Q is local chunk (512 tokens), K is prev_window + local (1024 tokens), cp_offset=512
+        pytest.param(1, 1, 1, 512, 1024, 128, nl.bfloat16, 512, 512, marks=pytest.mark.fast),
+        pytest.param(1, 2, 2, 512, 1024, 128, nl.bfloat16, 512, 512, marks=pytest.mark.fast),
+        pytest.param(1, 8, 2, 512, 1024, 128, nl.bfloat16, 512, 512, marks=pytest.mark.fast),   # GQA
+        # Larger sequence chunks
+        (1, 4, 2, 1024, 2048, 128, nl.bfloat16, 1024, 1024),
+        (1, 8, 2, 2048, 4096, 128, nl.bfloat16, 2048, 2048),
+        # Different cp_offset values
+        pytest.param(1, 1, 1, 512, 1024, 128, nl.bfloat16, 512, 256, marks=pytest.mark.fast),
+        # Multi-batch
+        pytest.param(2, 2, 2, 512, 1024, 128, nl.bfloat16, 512, 512, marks=pytest.mark.fast),
+        # Equal Q/K lengths with offset — use smaller cp_offset so sliding window still covers valid K range
+        pytest.param(1, 1, 1, 512, 512, 128, nl.bfloat16, 512, 256, marks=pytest.mark.fast),
+    ]
+    # fmt: on
+
+    @pytest_parametrize(cp_offset_params, cp_offset_test_cases, abbrevs=_CP_OFFSET_ABBREVS)
+    def test_attention_bwd_cp_offset(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch_size: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        seq_len_q: int,
+        seq_len_k: int,
+        head_dim: int,
+        dtype: Any,
+        sliding_window: int,
+        cp_offset: int,
+    ) -> None:
+        """Test attention backward kernel with cp_offset for context parallelism sliding window ring attention."""
+        np.random.seed(0)
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_inputs(
+                batch_size=batch_size,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                seq_len=seq_len_q,
+                head_dim=head_dim,
+                dtype=dtype,
+                causal=True,
+                sliding_window=sliding_window,
+                cp_offset=cp_offset,
+                seq_len_k=seq_len_k,
+            )
+
+        def output_tensors(kernel_input):
+            q = kernel_input["q_ref"]
+            k = kernel_input["k_ref"]
+            return {
+                "out_dq_ref": np.zeros(q.shape, q.dtype),
+                "out_dk_ref": np.zeros(k.shape, k.dtype),
+                "out_dv_ref": np.zeros(k.shape, k.dtype),
+            }
+
+        lnc_count = 2 if batch_size * num_kv_heads % 2 == 0 else 1
+        compiler_args = CompilerArgs(enable_birsim=False, logical_nc_config=lnc_count, platform_target=platform_target)
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_bwd,
+            torch_ref=torch_ref_wrapper(attention_bwd_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            is_negative_test=False,
+        )

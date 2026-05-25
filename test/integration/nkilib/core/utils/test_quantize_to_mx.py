@@ -18,11 +18,6 @@ Validates quantize_to_mx as torch ref against nisa.quantize_mx kernel
 via UnitTestFramework (end-to-end on Trainium).
 """
 
-from test.utils.common_dataclasses import CompilerArgs, Platforms
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
 import neuron_dtypes as dt
@@ -31,7 +26,13 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.utils import mx_torch_common
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # Hardware kernel: thin wrapper around nisa.quantize_mx
 
@@ -123,10 +124,8 @@ _ABBREVS = {"out_x4_dtype": "odt", "input_dtype": "idt"}
 HW_TEST_PARAMS = [(P, F, out_dt, in_dt) for P, F in HW_SHAPES for out_dt in HW_OUT_DTYPES for in_dt in HW_INPUT_DTYPES]
 
 
-@pytest_test_metadata(
-    name="Quantize To MX Hardware",
-    pytest_marks=["utils", "mx", "quantize"],
-)
+@pytest_test_metadata(name="Quantize To MX Hardware")
+@pytest_marks(["utils", "mx", "quantize"])
 @final
 @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
 class TestQuantizeToMxHardware:

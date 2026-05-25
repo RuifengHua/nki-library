@@ -13,13 +13,14 @@
 # limitations under the License.
 import inspect
 from dataclasses import dataclass
-from test.utils.mx_utils import NL_TO_DT_DTYPE, dequantize_mx_golden, get_mx_fp_max, get_mx_max_exp, quantize_mx_golden
 
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 from neuron_dtypes import static_cast
 from typing_extensions import override
+
+from test.utils.mx_utils import NL_TO_DT_DTYPE, dequantize_mx_golden, get_mx_fp_max, get_mx_max_exp, quantize_mx_golden
 
 # FP8 quantization constants
 FP8_E4M3_MAX = 240.0
@@ -244,33 +245,63 @@ def np_random_sample_static_quantize_inp(seed=0):
         seed: Random seed for reproducibility
 
     Returns:
-        Generator function with signature (shape, dtype, name=None) -> np.ndarray
+        Generator function with signature (shape, dtype, name=None, fan_in=None) -> np.ndarray
+        When fan_in is provided, w_scale is calibrated so that the effective weight
+        (W_fp8 × w_scale) has variance 1/fan_in, keeping matmul outputs O(1).
+        A random jitter of 0.8-1.2× is applied to preserve per-call variation.
+        For per-row scales (granularity="row"), the random per-row ratios are
+        preserved and the mean is shifted to the target.
+        When fan_in is None (default), w_scale is random (legacy behavior).
     """
     np.random.seed(0)
 
     @update_func_str(seed=seed)
-    def generator(shape, dtype, name=None):
+    def generator(shape, dtype, granularity="tensor", name=None, fan_in=None):
+        assert dtype in (
+            nl.float8_e4m3,
+            nl.float8_e5m2,
+            nl.float8_e4m3fn,
+        ), f"unsupported dtype {dtype} for random number generation"
         rand_arr = np.random.random_sample(shape)
-        w_scale = np.random.random_sample()
-        in_scale = np.random.random_sample()
-        if dtype in (nl.float8_e4m3, nl.float8_e5m2, nl.float8_e4m3fn):
-            # FP8 dtype ranges: (min_val, max_val)
-            range_map = {
-                nl.float8_e4m3: (-240.0, 240.0),
-                nl.float8_e4m3fn: (-448.0, 448.0),
-                nl.float8_e5m2: (-57344.0, 57344.0),
-            }
-            scale_map = {nl.float8_e4m3: 1 / 256.0, nl.float8_e4m3fn: 1 / 512.0, nl.float8_e5m2: 1 / 65536.0}
-            min_val, max_val = range_map[dtype]
-            # Generate numbers in [min_val, max_val] range
-            rand_arr_casted = dt.static_cast(
-                dt.static_cast(rand_arr * (max_val - min_val) + min_val, dtype), np.float32
-            )
-            w_scale = dt.static_cast(w_scale * scale_map[dtype], np.float32)
-            in_scale = dt.static_cast(in_scale * scale_map[dtype], np.float32)
-            return dt.static_cast(rand_arr_casted, dtype), w_scale, in_scale
+
+        if granularity == "tensor":
+            w_scale = np.random.random_sample()
+            in_scale = np.random.random_sample()
         else:
-            assert False, f"unsupported dtype {dtype} for random number generation"
+            w_scale = np.random.random_sample((1, shape[-1]))
+            in_scale = np.random.random_sample((1, shape[-1]))
+
+        # FP8 dtype ranges: (min_val, max_val)
+        range_map = {
+            nl.float8_e4m3: (-240.0, 240.0),
+            nl.float8_e4m3fn: (-448.0, 448.0),
+            nl.float8_e5m2: (-57344.0, 57344.0),
+        }
+        scale_map = {nl.float8_e4m3: 1 / 256.0, nl.float8_e4m3fn: 1 / 512.0, nl.float8_e5m2: 1 / 65536.0}
+        min_val, max_val = range_map[dtype]
+        # Generate numbers in [min_val, max_val] range
+        rand_arr_casted = dt.static_cast(dt.static_cast(rand_arr * (max_val - min_val) + min_val, dtype), np.float32)
+
+        if fan_in is not None:
+            # Calibrate w_scale so that W_fp8 × w_scale has variance 1/fan_in.
+            # W_fp8 ~ Uniform[min_val, max_val], so Var(W_fp8) = (max_val - min_val)²/12.
+            # We need Var(W_fp8) × w_scale² = 1/fan_in, so w_scale = 1/(std(W_fp8) × √fan_in).
+            # For per-row scales (granularity="row"), rescale the random per-row values
+            # so their mean magnitude is variance-preserving while keeping per-row variation.
+            fp8_std = (max_val - min_val) / np.sqrt(12)
+            target_w_scale = 1.0 / (fp8_std * np.sqrt(fan_in))
+            if granularity == "tensor":
+                # Use random value as jitter (0.8-1.2×) around target to preserve per-projection variation
+                jitter = 0.8 + 0.4 * w_scale  # w_scale is random in [0, 1)
+                w_scale = dt.static_cast(target_w_scale * jitter, np.float32)
+            else:
+                # w_scale has shape (1, shape[-1]) with random values in [0, 1)
+                # Rescale so mean(w_scale) = target_w_scale, preserving per-row ratios
+                w_scale = dt.static_cast(w_scale * (target_w_scale / w_scale.mean()), np.float32)
+        else:
+            w_scale = dt.static_cast(w_scale * scale_map[dtype], np.float32)
+        in_scale = dt.static_cast(in_scale * scale_map[dtype], np.float32)
+        return dt.static_cast(rand_arr_casted, dtype), w_scale, in_scale
 
     return generator
 
@@ -290,6 +321,7 @@ def duplicate_row_rmsnorm_inp_generator(all_ones: bool = False):
             # Generate [B, 1, H] rmsnorm output, then broadcast to [B, S, H]
             inp1 = rng.normal(size=(B, 1, H)).astype(dtype)
             inp1 = np.broadcast_to(inp1, shape=(B, S, H)) / 100.0
+            inp1 = inp1.astype(dtype)
 
             return inp1
 
@@ -385,18 +417,20 @@ def generate_stabilized_mx_data(mx_dtype, shape, val_range=1.0):
 
     # For each scaling block, randomly select one element to have max exponent.
     # This prevents change in mx_scale after quantize(dequantize(rand_mx_data, rand_mx_scale)), causing precision loss.
-    for i in range(0, shape[0], _q_height):
-        for j in range(0, shape[1], _q_width):
-            # Random position within the tile
-            tile_i = np.random.randint(0, _q_height - 1)
-            tile_j = np.random.randint(0, _q_width - 1)
 
-            # Set this element to have maximum exponent
-            # Value = ±1.xxx × 2^max_exp (where 1.xxx is the mantissa)
-            sign = np.random.choice([-1, 1])
-            # Within the range of [1.0, 1.5) (could be upto 1.75 for mxfp8).
-            mantissa = 1.0 + np.random.random() * 0.5
-            rand_data[i + tile_i, j + tile_j] = sign * mantissa * (2**max_exp)
+    n_blocks_row = shape[0] // _q_height
+    n_blocks_col = shape[1] // _q_width
+    tile_is = np.random.randint(0, _q_height, size=(n_blocks_row, n_blocks_col))
+    tile_js = np.random.randint(0, _q_width, size=(n_blocks_row, n_blocks_col))
+    signs = np.random.choice([-1, 1], size=(n_blocks_row, n_blocks_col))
+    # Within the range of [1.0, 1.5) (could be upto 1.75 for mxfp8).
+    mantissas = 1.0 + np.random.random((n_blocks_row, n_blocks_col)) * 0.5
+    # Value = ±1.xxx × 2^max_exp (where 1.xxx is the mantissa)
+    row_bases = np.arange(n_blocks_row) * _q_height
+    col_bases = np.arange(n_blocks_col) * _q_width
+    row_indices = row_bases[:, None] + tile_is
+    col_indices = col_bases[None, :] + tile_js
+    rand_data[row_indices, col_indices] = signs * mantissas * (2**max_exp)
 
     rand_quantized_data = static_cast(rand_data.astype(np.float32), NL_TO_DT_DTYPE.get(mx_dtype, mx_dtype))
 

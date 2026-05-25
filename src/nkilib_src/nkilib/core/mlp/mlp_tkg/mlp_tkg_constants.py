@@ -22,7 +22,8 @@ import nki.language as nl
 
 from ...subkernels.layernorm_tkg import SHARDING_THRESHOLD as LAYERNORM_THRESHOLD
 from ...subkernels.rmsnorm_tkg import SHARDING_THRESHOLD as RMSNORM_THRESHOLD
-from ...utils.allocator import sizeinbytes
+from ...utils.allocator import SbufManager, sizeinbytes
+from ...utils.common_types import HiddenLayout
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..mlp_parameters import (
@@ -60,15 +61,11 @@ class MLPTKGConstantsDimensionSizes(nl.NKIObject):
     H1_shard: int
     H1_offset: int
     H_per_shard: int
-    num_total_128_tiles_per_I: int
-    num_128_tiles_per_I: int
-    remainderI: int
-    remainderIFused: int
     column_tiling_dim: int
     column_tiling_factor: int
-    num_shards_per_I: int
     max_I_shard_size: int
     do_norm_batch_sharding: int
+    hidden_layout: HiddenLayout
     K: Optional[int] = None
     E: Optional[int] = None
 
@@ -82,15 +79,10 @@ class MLPTKGConstantsGateUpTileCounts(nl.NKIObject):
     """
 
     HTile: int
-    remainderHTile: int
-    num_HTiles: int
-    num_128_tiles_per_HTile: int
-    num_128_tiles_per_remainderHTile: int
     num_allocated_w_tile: int
     last_accessed_addr: int
-    num_allocated_psums: int
-    gate_psum_base_bank: int
     up_psum_base_bank: int
+    I_shard_size: int
 
 
 @dataclass
@@ -102,12 +94,8 @@ class MLPTKGConstantsDownTileCounts(nl.NKIObject):
     """
 
     HTile: int
-    remainderHTile: int
-    num_HTiles: int
     num_allocated_w_tile: int
     weight_base_idx: int
-    num_128_tiles_per_HTile: int
-    num_128_tiles_per_remainderHTile: int
 
 
 class MLPTKGConstants(nl.NKIObject):
@@ -173,30 +161,36 @@ class MLPTKGConstants(nl.NKIObject):
         if params.expert_params and params.expert_params.expert_index:
             K = params.expert_params.expert_index.shape[-1]
 
-        H1_per_shard_base, H1_remainder = divmod(H1, num_shards)
+        H1_per_shard_base = H1 // num_shards
+        H1_remainder = H1 % num_shards
 
-        H1_shard = H1_per_shard_base
+        # Unbalanced sharding is only supported for MoE all-expert BF16 path.
+        # For all other paths, H1 must be evenly divisible by num_shards.
+        is_moe_expert = params.expert_params and params.expert_params.expert_index
+        if H1_remainder != 0 and is_moe_expert:
+            # Unbalanced: first (num_shards - 1) shards get floor(H1/num_shards),
+            # last shard gets the remainder so all H1 tiles are covered.
+            if shard_id < num_shards - 1:
+                H1_shard = H1_per_shard_base
+            else:
+                H1_shard = H1 - H1_per_shard_base * (num_shards - 1)
+        else:
+            kernel_assert(
+                H1_remainder == 0,
+                f"Invalid sharding: H1={H1} cannot be evenly divided across {num_shards} cores",
+            )
+            H1_shard = H1_per_shard_base
         H1_offset = shard_id * H1_per_shard_base
         H_shard = H1_shard * H0
-        H_per_shard = H1_per_shard_base * H0
-
-        kernel_assert(
-            H1_remainder == 0,
-            f"Invalid sharding: H1={H1} cannot be evenly divided across {num_shards} cores",
-        )
+        H_per_shard = H1_shard * H0
 
         # --- Determine the number of shards along the I dimension ---
         if params.use_tkg_gate_up_proj_column_tiling:
             # Hardware restriction: moving tensor processes 512 elements per PSUM bank, with 8 PSUM banks
-            max_I_shard_size = 512 * 8  # Maximum I elements per loop
+            max_I_shard_size = _psum_fmax * _psum_bmax  # Maximum I elements per loop
         else:
             # Hardware restriction: stationary tensor processes 128 elements per PSUM bank, with 8 PSUM banks
-            max_I_shard_size = 128 * 8  # Maximum I elements per loop
-        num_shards_per_I = div_ceil(I, max_I_shard_size)
-
-        # --- 128 tiling across I dimension ---
-        num_128_tiles_per_I, remainderI = divmod(I, I0)
-        num_total_128_tiles_per_I = num_128_tiles_per_I + int(remainderI != 0)
+            max_I_shard_size = _pmax * _psum_bmax  # Maximum I elements per loop
 
         # --- Column tiling strategy based on T ---
         if T <= 32:
@@ -221,6 +215,14 @@ class MLPTKGConstants(nl.NKIObject):
             mlpp_has_rms_normalization(params) and T > RMSNORM_THRESHOLD and is_T_evenly_divisible
         ) or (mlpp_has_layer_normalization(params) and T > LAYERNORM_THRESHOLD and is_T_evenly_divisible)
         do_norm_batch_sharding = do_norm_batch_sharding and (not params.shard_on_h_disabled)
+        hidden_layout = HiddenLayout.H0_T_H1
+
+        # TODO: update the conditions here for the hidden layout when
+        # we sort out the rmsnorm layout issue for low latency cases
+        # Currently, we only use (H0, H1, T) when applying rmsnorm on
+        # HBM input of shape (T, H)
+        if mlpp_has_rms_normalization(params) and not params.input_in_sbuf and not params.transposed_in and T >= _pmax:
+            hidden_layout = HiddenLayout.H0_H1_T
 
         return MLPTKGConstantsDimensionSizes(
             _pmax=_pmax,
@@ -240,207 +242,191 @@ class MLPTKGConstants(nl.NKIObject):
             H1_shard=H1_shard,
             H1_offset=H1_offset,
             H_per_shard=H_per_shard,
-            num_total_128_tiles_per_I=num_total_128_tiles_per_I,
-            num_128_tiles_per_I=num_128_tiles_per_I,
-            remainderI=remainderI,
             column_tiling_dim=column_tiling_dim,
             column_tiling_factor=column_tiling_factor,
-            num_shards_per_I=num_shards_per_I,
             max_I_shard_size=max_I_shard_size,
             do_norm_batch_sharding=do_norm_batch_sharding,
+            hidden_layout=hidden_layout,
             K=K,
             E=local_E,
         )
 
     @staticmethod
     def calculate_gate_up_tiles(
-        gate_up_io_size: int,
-        remaining_space: int,
         params: MLPParameters,
-        kernel_dims: MLPTKGConstantsDimensionSizes,
-        use_auto_alloc: bool = False,
+        dims: MLPTKGConstantsDimensionSizes,
+        sbm: SbufManager,
+        share_memory_scope: bool = False,
     ) -> MLPTKGConstantsGateUpTileCounts:
         """
         Calculate tiling and PSUM allocation for Gate/Up projection.
 
         Args:
-            gate_up_io_size (int): Size of IO tensors in Gate/Up projection.
-            remaining_space (int): Remaining SBUF memory available for weights.
             params (MLPParameters): MLP configuration parameters.
-            kernel_dims (MLPTKGConstantsDimensionSizes): Precomputed dimension constants.
-            use_auto_alloc (bool): Whether auto-allocation is enabled. Default is False.
+            dims (MLPTKGConstantsDimensionSizes): Precomputed dimension constants.
+            sbm (SbufManager): SBUF memory manager used to query allocation state.
+            share_memory_scope (bool): If True, the gate/up projection shares SBUF memory
+                with an outer scope (e.g., MoE expert loop) instead of owning its own
+                allocation. Defaults to False.
 
         Returns:
             MLPTKGConstantsGateUpTileCounts: Dataclass with tiling and PSUM allocation info.
         """
-        I = kernel_dims.I
-        num_total_128_tiles_per_I = kernel_dims.num_total_128_tiles_per_I
-        weight_dtype = (
-            params.gate_proj_weights_tensor.dtype
-            if params.gate_proj_weights_tensor is not None
-            else params.up_proj_weights_tensor.dtype
-        )
-        weight_dtype_size = sizeinbytes(weight_dtype)
+        I = dims.I
+        gate_up_io_size = 0 if sbm.is_auto_alloc() else sbm.get_stack_curr_addr()
+        remaining_space = 0 if sbm.is_auto_alloc() else sbm.get_free_space()
 
+        w_dtype_sz = sizeinbytes(params.up_proj_weights_tensor.dtype)
+
+        # --- Compute HTile for Gate + Up projection ---
+        ini_HTile = 2048 * 2 if params.quant_params.is_quant() else 2048
+        min_HTile = 512 * 2 if params.quant_params.is_quant() else 512
+        min_ITile = 512
         # Weight tiles are loaded [HTile, I] at a time for efficient memory access
-        gate_up_HTile = 2048 * 2 if params.quant_params.is_quant() else 2048
-        # number of H-tiles along H dimension
-        gate_up_num_HTile_per_H, gate_up_remainderHTile = divmod(kernel_dims.H_per_shard, gate_up_HTile)
-        gate_up_num_HTiles = gate_up_num_HTile_per_H + (gate_up_remainderHTile != 0)
-        # number of 128-size tiles per H-tile
-        gate_num_128_tiles_per_HTile = gate_up_HTile // kernel_dims._pmax
-        gate_num_128_tiles_per_remainderHTile = gate_up_remainderHTile // kernel_dims._pmax
-        # compute size of weight tile
-        size_of_weight_tile = I * gate_num_128_tiles_per_HTile * weight_dtype_size
-        # number of weight tiles to allocate (x2 for both gate and up projections)
-        num_required_w_tile = gate_up_num_HTiles * 2
-        num_available_w_tile = remaining_space // size_of_weight_tile
-        gate_num_allocated_w_tile = min(num_required_w_tile, num_available_w_tile)
+        if sbm.is_auto_alloc():
+            HTile = min_HTile
+            w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
+            num_required_w_tile = div_ceil(dims.H_per_shard, HTile)
+            num_allocated_w_tile = 2
+        elif share_memory_scope:
+            HTile = ini_HTile
+            w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
+            num_available_w_tile = remaining_space // w_tile_sz
 
-        if gate_num_allocated_w_tile <= 0:
-            gate_up_HTile = 512 * 2 if params.quant_params.is_quant() else 512
-            # number of H-tiles along H dimension
-            gate_up_num_HTile_per_H, gate_up_remainderHTile = divmod(kernel_dims.H_per_shard, gate_up_HTile)
-            gate_up_num_HTiles = gate_up_num_HTile_per_H + (gate_up_remainderHTile != 0)
-            # number of 128-size tiles per H-tile
-            gate_num_128_tiles_per_HTile = gate_up_HTile // kernel_dims._pmax
-            gate_num_128_tiles_per_remainderHTile = gate_up_remainderHTile // kernel_dims._pmax
-            # compute size of weight tile
-            size_of_weight_tile = I * gate_num_128_tiles_per_HTile * weight_dtype_size
-            # number of weight tiles to allocate (x2 for both gate and up projections)
-            num_required_w_tile = gate_up_num_HTiles * 2
-            num_available_w_tile = remaining_space // size_of_weight_tile
-            gate_num_allocated_w_tile = min(num_required_w_tile, num_available_w_tile)
+            # reduce HTile size. Fall back to min_HTile
+            if num_available_w_tile < 1:
+                HTile = min_HTile
+                w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
+                num_available_w_tile = remaining_space // w_tile_sz
 
-        if not use_auto_alloc:
-            kernel_assert(
-                gate_num_allocated_w_tile > 0,
-                "Not enough memory for Gate/Up projection weights",
-            )
+            # compute num_allocated_w_tile
+            num_required_w_tile = div_ceil(dims.H_per_shard, HTile)
+            num_allocated_w_tile = min(num_required_w_tile, num_available_w_tile)
         else:
-            gate_num_allocated_w_tile = 2  # Default for auto-alloc: double-buffering
+            I = min(I, dims.max_I_shard_size)
+            HTile = min(dims.H_per_shard, ini_HTile)
+            w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
+            num_available_w_tile = remaining_space // w_tile_sz
+            num_required_w_tile = div_ceil(dims.H_per_shard, HTile)
+
+            # reduce HTile size
+            # allocate at least 2 tiles for each gate and up projection
+            while (num_required_w_tile < 2 or num_available_w_tile < 4) and HTile >= min_HTile:
+                ini_HTile = ini_HTile // 2
+                HTile = min(dims.H_per_shard, ini_HTile)
+                w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
+                num_available_w_tile = remaining_space // w_tile_sz
+                num_required_w_tile = div_ceil(dims.H_per_shard, HTile)
+
+            # reduce I size
+            while num_available_w_tile < 4 and I >= min_ITile:
+                I = div_ceil(I, 2)
+                w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
+                num_available_w_tile = remaining_space // w_tile_sz
+
+            # compute num_allocated_w_tile
+            num_allocated_w_tile = min(4, num_available_w_tile)
+
+        kernel_assert(
+            num_allocated_w_tile > 0,
+            "Not enough memory for Gate/Up projection weights",
+        )
 
         # --- PSUM management for Gate + Up projection ---
-        # Required the number of PSUMs for a single projection
         if params.use_tkg_gate_up_proj_column_tiling:
-            num_required_psums = div_ceil(I, kernel_dims._psum_fmax)
+            num_required_psums = div_ceil(I, dims._psum_fmax)
         else:
-            num_required_psums = num_total_128_tiles_per_I
+            num_required_psums = div_ceil(I, dims._pmax)
 
-        # Allocate PSUMs, capped by the hardware maximum
-        num_allocated_psums = min(num_required_psums, kernel_dims._psum_bmax)
-
-        # Assign separate PSUM banks for Gate and Up if enough banks available, otherwise share
-        gate_psum_base_bank = 0
-        up_psum_base_bank = num_allocated_psums if (num_allocated_psums * 2) < kernel_dims._psum_bmax else 0
+        # Assign base PSUM bank for Up (Gate always starts at 0)
+        up_psum_base_bank = num_required_psums
 
         # --- Ring buffer index tracking for weight tile reuse ---
         # Gate and Up projections share weight tiles as a ring buffer. Track the last accessed
         # index so Up projection loads after Gate to avoid anti-dependencies.
-        w_mod = num_required_w_tile % gate_num_allocated_w_tile
-        last_gate_idx = gate_num_allocated_w_tile - 1 if w_mod == 0 else w_mod - 1
-
-        # Track last memory address accessed by Gate/Up projection. Down projection uses this
-        # to start at a safe offset, avoiding anti-dependencies so it can load weights ASAP.
-        last_accessed_addr = gate_up_io_size + size_of_weight_tile * (last_gate_idx + 1)
+        w_mod = num_required_w_tile % num_allocated_w_tile
+        last_gate_idx = num_allocated_w_tile if w_mod == 0 else w_mod
+        last_accessed_addr = gate_up_io_size + w_tile_sz * last_gate_idx
 
         return MLPTKGConstantsGateUpTileCounts(
-            HTile=gate_up_HTile,
-            remainderHTile=gate_up_remainderHTile,
-            num_HTiles=gate_up_num_HTiles,
-            num_128_tiles_per_HTile=gate_num_128_tiles_per_HTile,
-            num_128_tiles_per_remainderHTile=gate_num_128_tiles_per_remainderHTile,
-            num_allocated_w_tile=gate_num_allocated_w_tile,
+            HTile=HTile,
+            num_allocated_w_tile=num_allocated_w_tile,
             last_accessed_addr=last_accessed_addr,
-            num_allocated_psums=num_allocated_psums,
-            gate_psum_base_bank=gate_psum_base_bank,
             up_psum_base_bank=up_psum_base_bank,
+            I_shard_size=I,
         )
 
     @staticmethod
     def calculate_down_tiles(
-        down_io_size: int,
-        remaining_space: int,
         params: MLPParameters,
-        kernel_dims: MLPTKGConstantsDimensionSizes,
+        dims: MLPTKGConstantsDimensionSizes,
         gate_tile_info: MLPTKGConstantsGateUpTileCounts,
-        use_auto_alloc: bool = False,
+        sbm: SbufManager,
     ) -> MLPTKGConstantsDownTileCounts:
         """
         Calculate tiling and memory allocation for Down projection.
 
         Args:
-            down_io_size (int): Size of IO tensors in Down projection.
-            remaining_space (int): Remaining SBUF memory available for weights.
             params (MLPParameters): MLP configuration parameters.
-            kernel_dims (MLPTKGConstantsDimensionSizes): Precomputed dimension constants.
+            dims (MLPTKGConstantsDimensionSizes): Precomputed dimension constants.
             gate_tile_info (MLPTKGConstantsGateUpTileCounts): Gate/Up tiling info for anti-dependency avoidance.
-            use_auto_alloc (bool): Whether auto-allocation is enabled. Default is False.
+            sbm (SbufManager): SBUF memory manager used to query allocation state.
 
         Returns:
             MLPTKGConstantsDownTileCounts: Dataclass with tiling and memory allocation info.
         """
-        weight_dtype = params.down_proj_weights_tensor.dtype
-        weight_dtype_size = sizeinbytes(weight_dtype)
-        num_total_128_tiles_per_I = kernel_dims.num_total_128_tiles_per_I
+        down_io_size = 0 if sbm.is_auto_alloc() else sbm.get_stack_curr_addr()
+        remaining_space = 0 if sbm.is_auto_alloc() else sbm.get_free_space()
 
-        # --- H-tile size for Down projection ---
+        # H-tile size for Down projection
         if params.use_tkg_down_proj_column_tiling:
-            down_HTile = 4096 * 2 if params.quant_params.is_quant() else 4096
-            down_HTile = min(kernel_dims.H_per_shard, down_HTile)
-            num_required_psums_per_HTile = div_ceil(down_HTile, kernel_dims._psum_fmax)
-            num_required_psum_after_column_tiling = div_ceil(
-                num_required_psums_per_HTile, kernel_dims.column_tiling_factor
-            )
+            down_HTile = 8192 if params.quant_params.is_quant() else 4096
+            down_HTile = min(dims.H_per_shard, down_HTile)
+            num_required_psums_per_HTile = div_ceil(down_HTile, dims._psum_fmax)
+            num_required_psum_after_column_tiling = div_ceil(num_required_psums_per_HTile, dims.column_tiling_factor)
 
-            while kernel_dims._psum_bmax < num_required_psum_after_column_tiling:
+            while dims._psum_bmax < num_required_psum_after_column_tiling:
                 down_HTile = div_ceil(down_HTile, 2)
-                num_required_psums_per_HTile = div_ceil(down_HTile, kernel_dims._psum_fmax)
+                num_required_psums_per_HTile = div_ceil(down_HTile, dims._psum_fmax)
                 num_required_psum_after_column_tiling = div_ceil(
-                    num_required_psums_per_HTile, kernel_dims.column_tiling_factor
+                    num_required_psums_per_HTile, dims.column_tiling_factor
                 )
         else:
-            down_HTile = kernel_dims.H1_shard * kernel_dims.H0
+            down_HTile = dims.H1_shard * dims.H0
 
-        # --- Compute number of H-tiles along H dimension ---
-        down_num_HTile_per_H, down_remainderHTile = divmod(kernel_dims.H_per_shard, down_HTile)
-        down_num_HTiles = down_num_HTile_per_H + int(down_remainderHTile != 0)
+        if sbm.is_auto_alloc():
+            return MLPTKGConstantsDownTileCounts(
+                HTile=down_HTile,
+                num_allocated_w_tile=2,
+                weight_base_idx=0,
+            )
 
-        # --- Compute number of 128-size tiles per H-tile ---
-        down_num_128_tiles_per_HTile = down_HTile // kernel_dims._pmax
-        down_num_128_tiles_per_remainderHTile = down_remainderHTile // kernel_dims._pmax
+        stack_cur_addr = sbm.get_stack_curr_addr()
+        free_space = sbm.get_free_space()
 
-        # --- Compute number of weight tiles to allocate ---
-        size_of_weight_tile = down_HTile * weight_dtype_size
-        num_required_w_tile = num_total_128_tiles_per_I * down_num_HTiles
-        num_available_w_tile = remaining_space // size_of_weight_tile
+        w_dtype_size = sizeinbytes(params.down_proj_weights_tensor.dtype)
+        num_HTiles = div_ceil(dims.H_per_shard, down_HTile)
+        num_required_w_tile = div_ceil(dims.I, dims.I0) * num_HTiles
+        size_of_w_tile = down_HTile * w_dtype_size
+        num_available_w_tile = free_space // size_of_w_tile
         down_num_allocated_w_tile = min(num_required_w_tile, num_available_w_tile)
 
-        if not use_auto_alloc:
-            kernel_assert(
-                down_num_allocated_w_tile > 0,
-                "Not enough memory for Down projection weights",
-            )
-        else:
-            down_num_allocated_w_tile = 2  # Default for auto-alloc: double-buffering
+        kernel_assert(
+            down_num_allocated_w_tile > 0,
+            "Not enough memory for Down projection weights",
+        )
 
         # --- Compute starting weight index to avoid anti-dependencies with Gate/Up ---
         # If Down's weight address range overlaps with Gate/Up's last accessed address,
         # offset the starting index to avoid anti-dependencies and enable early weight loading.
         last_accessed_addr = gate_tile_info.last_accessed_addr
-        down_weight_addr_space = last_accessed_addr - down_io_size
-
-        if down_io_size < last_accessed_addr < down_io_size + down_num_allocated_w_tile * size_of_weight_tile:
-            weight_base_idx = div_ceil(down_weight_addr_space, size_of_weight_tile)
-        else:
-            weight_base_idx = 0
+        overlapped_w_addr_space = gate_tile_info.last_accessed_addr - stack_cur_addr
+        weight_base_idx = 0
+        if 0 < overlapped_w_addr_space < down_num_allocated_w_tile * size_of_w_tile:
+            weight_base_idx = div_ceil(overlapped_w_addr_space, size_of_w_tile)
 
         return MLPTKGConstantsDownTileCounts(
             HTile=down_HTile,
-            remainderHTile=down_remainderHTile,
-            num_HTiles=down_num_HTiles,
             num_allocated_w_tile=down_num_allocated_w_tile,
             weight_base_idx=weight_base_idx,
-            num_128_tiles_per_HTile=down_num_128_tiles_per_HTile,
-            num_128_tiles_per_remainderHTile=down_num_128_tiles_per_remainderHTile,
         )

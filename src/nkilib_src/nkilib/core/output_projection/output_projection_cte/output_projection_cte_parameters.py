@@ -79,6 +79,8 @@ class QuantizationConfig(nl.NKIObject):
     is_fp8_quantized: bool = False
     is_mxfp4_quantized: bool = False
     is_mxfp8_static_quantized: bool = False
+    is_row_mxfp8_quantized: bool = False
+    is_row_fp8_quantized: bool = False
 
 
 @dataclass
@@ -174,9 +176,12 @@ def _get_dtype_size(dtype) -> int:
 
 def _calculate_head_packing(n_size: int, d_size: int, partition_size: int) -> Tuple[int, int, int]:
     """
-    Optimize contraction dimension by folding N into D when D < partition_size.
+    Optimize contraction dimension by folding N into D when D < partition_size,
+    or folding D back into N when D > partition_size.
 
     Maximizes PE engine utilization by packing multiple heads into the partition dimension.
+    When D exceeds partition_size, splits D across multiple virtual heads to bring it
+    within hardware limits.
 
     Args:
         n_size (int): Number of heads.
@@ -188,8 +193,23 @@ def _calculate_head_packing(n_size: int, d_size: int, partition_size: int) -> Tu
 
     Notes:
         - group_size indicates how many heads are packed together.
-        - new_n_size = n_size // group_size, new_d_size = d_size * group_size.
+        - When D > partition_size, D is folded back into N by a fold_factor,
+          and group_size is set to fold_factor to trigger attention reshape.
     """
+    # When D > partition_size, fold D back into N to bring D within hardware limits.
+    # Find the smallest fold_factor that evenly divides d_size and yields d_size/fold_factor <= partition_size.
+    if d_size > partition_size:
+        fold_factor = div_ceil(d_size, partition_size)
+        while d_size % fold_factor != 0:
+            fold_factor += 1
+        n_size = n_size * fold_factor
+        d_size = d_size // fold_factor
+        kernel_assert(
+            d_size <= partition_size,
+            f"Failed to fold D={d_size * fold_factor} into N: d_size={d_size} still exceeds {partition_size}.",
+        )
+        return n_size, d_size, fold_factor
+
     group_size = n_size
     while (n_size % group_size) or (group_size * d_size) > partition_size:
         group_size -= 1
@@ -203,6 +223,7 @@ def _calculate_head_packing(n_size: int, d_size: int, partition_size: int) -> Tu
 def _calculate_double_row_head_packing(
     n_size: int,
     d_size: int,
+    h_size: int,
     is_fp8_quantized: bool,
 ) -> Tuple[int, int, bool]:
     """
@@ -214,6 +235,7 @@ def _calculate_double_row_head_packing(
     Args:
         n_size (int): Number of heads.
         d_size (int): Head dimension size.
+        h_size (int): Hidden dimension size.
         is_fp8_quantized (bool): Whether FP8 quantization is enabled.
 
     Returns:
@@ -225,7 +247,11 @@ def _calculate_double_row_head_packing(
     """
     use_double_row = is_fp8_quantized
     if is_fp8_quantized:
-        if n_size % 2 != 0:
+        # Double row matmul requires the weight free dimension (h_size / 2)
+        # to be divisible by 16 for the BIR verifier access pattern constraint.
+        if h_size % 32 != 0:
+            use_double_row = False
+        elif n_size % 2 != 0:
             if d_size % 2 == 0:
                 n_size = n_size * 2
                 d_size = d_size // 2
@@ -319,7 +345,12 @@ def build_tiling_config(
     Notes:
         - n_size and d_size in config may differ from inputs due to head packing.
     """
-    if quant_config.is_mxfp4_quantized or quant_config.is_mxfp8_static_quantized:
+    if (
+        quant_config.is_mxfp4_quantized
+        or quant_config.is_mxfp8_static_quantized
+        or quant_config.is_row_mxfp8_quantized
+        or quant_config.is_row_fp8_quantized
+    ):
         group_size = 1
     else:
         n_size, d_size, group_size = _calculate_head_packing(n_size, d_size, P_MAX)
@@ -327,6 +358,7 @@ def build_tiling_config(
     n_size, d_size, use_double_row = _calculate_double_row_head_packing(
         n_size=n_size,
         d_size=d_size,
+        h_size=h_size,
         is_fp8_quantized=quant_config.is_fp8_quantized,
     )
     quant_config.use_double_row = use_double_row
@@ -341,7 +373,7 @@ def build_tiling_config(
     h_subtile_size = F_MAX
 
     d_tile = None
-    if quant_config.is_mxfp4_quantized or quant_config.is_mxfp8_static_quantized:
+    if quant_config.is_mxfp4_quantized or quant_config.is_mxfp8_static_quantized or quant_config.is_row_mxfp8_quantized:
         """
         MX quantization D-tile padding logic.
 
@@ -424,6 +456,8 @@ def build_quantization_config(
     is_fp8_quantized = False
     is_mxfp4_quantized = False
     is_mxfp8_static_quantized = False
+    is_row_mxfp8_quantized = False
+    is_row_fp8_quantized = False
     input_quantized = False
 
     if quantization_type == QuantizationType.STATIC:
@@ -439,6 +473,12 @@ def build_quantization_config(
     elif quantization_type == QuantizationType.STATIC_MX:
         quant_data_type = nl.float8_e4m3fn_x4
         is_mxfp8_static_quantized = True
+    elif quantization_type == QuantizationType.ROW_MX:
+        quant_data_type = nl.float8_e4m3fn_x4
+        is_row_mxfp8_quantized = True
+    elif quantization_type == QuantizationType.ROW:
+        quant_data_type = nl.float8_e4m3
+        is_row_fp8_quantized = True
 
     return QuantizationConfig(
         is_enabled=True,
@@ -452,6 +492,8 @@ def build_quantization_config(
         is_fp8_quantized=is_fp8_quantized,
         is_mxfp4_quantized=is_mxfp4_quantized,
         is_mxfp8_static_quantized=is_mxfp8_static_quantized,
+        is_row_mxfp8_quantized=is_row_mxfp8_quantized,
+        is_row_fp8_quantized=is_row_fp8_quantized,
     )
 
 
@@ -500,10 +542,20 @@ def validate_output_projection_inputs(
         f"Got B={b_size}, S={s_size}, B*S={b_size * s_size}",
     )
 
-    kernel_assert(
-        d_size <= P_MAX or quantization_type == QuantizationType.MX or quantization_type == QuantizationType.STATIC_MX,
-        f"Head dimension D must not exceed {P_MAX}. Got D={d_size} and quantization_type as {quantization_type}",
-    )
+    # For non-MX paths, d_size > P_MAX is handled by folding D back into N in _calculate_head_packing.
+    # MX paths handle d>128 via their own d_tile logic.
+    # ROW quantization uses [B, S, N, D] layout and skips head packing, so d must be <= P_MAX.
+    if quantization_type == QuantizationType.ROW:
+        kernel_assert(
+            d_size <= P_MAX,
+            f"Head dimension D={d_size} exceeds {P_MAX}, which is not yet supported for ROW quantization.",
+        )
+    else:
+        kernel_assert(
+            d_size <= P_MAX or d_size % 2 == 0,
+            f"Head dimension D={d_size} exceeds {P_MAX} and is odd, which is not supported. "
+            f"Please pad D to an even value (e.g., {d_size + 1}).",
+        )
 
     if quantization_type == QuantizationType.MX:
         n_d = n_size * d_size
@@ -534,13 +586,28 @@ def validate_output_projection_inputs(
         kernel_assert(n_d >= P_MAX, f"N*D={n_d} must be >= {P_MAX} for STATIC_MX quantization")
         kernel_assert(n_d % P_MAX == 0, f"N*D={n_d} must be a multiple of {P_MAX} for STATIC_MX quantization")
 
+    if quantization_type == QuantizationType.ROW_MX:
+        n_d = n_size * d_size
+        kernel_assert(
+            weight_dtype == nl.float8_e4m3fn,
+            f"Weight type={weight_dtype} is not supported for ROW_MX quantization, expected float8_e4m3fn",
+        )
+        kernel_assert(n_d >= P_MAX, f"N*D={n_d} must be >= {P_MAX} for ROW_MX quantization")
+        kernel_assert(n_d % P_MAX == 0, f"N*D={n_d} must be a multiple of {P_MAX} for ROW_MX quantization")
+
+    if quantization_type == QuantizationType.ROW:
+        kernel_assert(
+            weight_dtype == nl.float8_e4m3,
+            f"Weight type={weight_dtype} is not supported for ROW quantization, expected float8_e4m3",
+        )
+
     kernel_assert(
         h_size <= _MAX_VALIDATED_H_SIZE,
         f"Hidden dimension H must not exceed {_MAX_VALIDATED_H_SIZE}. Got H={h_size}",
     )
 
     kernel_assert(
-        n_size <= _MAX_VALIDATED_N_SIZE or quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX),
+        n_size <= _MAX_VALIDATED_N_SIZE or quantization_type.is_mx(),
         f"Number of heads N must not exceed {_MAX_VALIDATED_N_SIZE}. Got N={n_size}",
     )
 
@@ -595,3 +662,23 @@ def validate_output_projection_inputs(
                 weight_scales.shape == (n_d // 8, h_size),
                 f"weight_scales shape must be ({n_d // _q_height}, {h_size}) for MX quantization. Got {weight_scales.shape}",
             )
+
+    if quantization_type == QuantizationType.ROW_MX:
+        kernel_assert(
+            weight_scales != None,
+            "weight_scales is required for ROW_MX quantization",
+        )
+        kernel_assert(
+            weight_scales.shape == (P_MAX, h_size),
+            f"weight_scales shape must be ({P_MAX}, {h_size}) for ROW_MX quantization. Got {weight_scales.shape}",
+        )
+
+    if quantization_type == QuantizationType.ROW:
+        kernel_assert(
+            weight_scales != None,
+            "weight_scales is required for ROW quantization",
+        )
+        kernel_assert(
+            weight_scales.shape == (P_MAX, h_size),
+            f"weight_scales shape must be ({P_MAX}, {h_size}) for ROW quantization. Got {weight_scales.shape}",
+        )

@@ -23,7 +23,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from ..utils.common_dataclasses import InferenceArgs, KernelArgs
+from ..utils.common_dataclasses import CompilerArgs, InferenceArgs, KernelArgs, Platforms
 from ..utils.determinism_checker import DeterminismChecker
 from ..utils.exceptions import ValidationException
 
@@ -75,6 +75,7 @@ def test_determinism_check_success_two_runs():
 
         # Create dummy KernelArgs
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=2, enable_determinism_check=True),
         )
@@ -93,6 +94,7 @@ def test_determinism_check_success_five_runs():
         create_output_files(artifact_dir, num_runs=5)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=5, enable_determinism_check=True),
         )
@@ -110,6 +112,7 @@ def test_determinism_check_failure_second_run_differs():
         create_output_files(artifact_dir, num_runs=3, make_run_differ=1)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=3, enable_determinism_check=True),
         )
@@ -134,6 +137,7 @@ def test_determinism_check_failure_middle_run_differs():
         create_output_files(artifact_dir, num_runs=5, make_run_differ=2)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=5, enable_determinism_check=True),
         )
@@ -158,6 +162,7 @@ def test_determinism_check_failure_last_run_differs():
         create_output_files(artifact_dir, num_runs=4, make_run_differ=3)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=4, enable_determinism_check=True),
         )
@@ -182,6 +187,7 @@ def test_determinism_check_multiple_output_tensors_all_match():
         create_output_files(artifact_dir, num_runs=3, file_name="cached_max")
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=3, enable_determinism_check=True),
         )
@@ -200,6 +206,7 @@ def test_determinism_check_multiple_outputs_one_differs():
         create_output_files(artifact_dir, num_runs=3, file_name="cached_max", make_run_differ=1)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=3, enable_determinism_check=True),
         )
@@ -231,6 +238,7 @@ def test_determinism_check_ignores_log_files():
         (artifact_dir / "allclose_summary.txt").write_text("allclose results")
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=3, enable_determinism_check=True),
         )
@@ -254,6 +262,7 @@ def test_determinism_check_different_sizes():
         different_size_data.tofile(artifact_dir / "out.3")  # Different!
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=3, enable_determinism_check=True),
         )
@@ -277,6 +286,7 @@ def test_determinism_check_byte_offset_displayed_on_failure():
         create_output_files(artifact_dir, num_runs=2, make_run_differ=1)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(num_runs=2, enable_determinism_check=True),
         )
@@ -302,6 +312,7 @@ def test_determinism_check_with_profile_all_runs_true():
         create_output_files(artifact_dir, num_runs=3)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(
                 num_runs=3,
@@ -324,6 +335,7 @@ def test_determinism_check_with_profile_all_runs_false():
         create_output_files(artifact_dir, num_runs=4)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(
                 num_runs=4,
@@ -346,6 +358,7 @@ def test_determinism_check_failure_with_profile_all_false():
         create_output_files(artifact_dir, num_runs=3, make_run_differ=2)
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(
                 num_runs=3,
@@ -373,6 +386,7 @@ def test_determinism_checker_validates_insufficient_runs():
         create_output_files(artifact_dir, num_runs=1, file_name="out")
 
         kernel_args = KernelArgs(
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
             kernel_func=lambda: None,
             inference_args=InferenceArgs(
                 num_runs=1,  # Not enough for determinism check!

@@ -16,11 +16,11 @@
 
 import math
 from enum import Enum
-from test.utils.mx_utils import is_mx_quantize
 from typing import Callable, Tuple
 
 import nki.language as nl
 import numpy as np
+
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_block import bwmm_shard_on_block
 from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I import (
     SkipMode,
@@ -30,6 +30,7 @@ from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I import (
 )
 from nkilib_src.nkilib.core.moe.moe_cte.moe_cte_utils import BlockShardStrategy
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
+from test.utils.mx_utils import is_mx_quantize
 
 from ....utils.test_kernel_common import act_fn_type2func
 
@@ -264,10 +265,7 @@ def generate_token_position_to_id_and_experts(
     return token_experts, token_position_to_id, block_to_expert, conditions
 
 
-def generate_blockwise_numpy_golden(
-    lnc_degree: int,
-    expert_affinities,
-    down_proj_weights,
+def build_bwmm_inputs(
     token_position_to_id,
     block_to_expert,
     gate_and_up_proj_weights,
@@ -447,110 +445,6 @@ def generate_blockwise_numpy_golden(
     return out_return, DBG_golden_tensors
 
 
-# NOTE: golden_bwmm is still used by test_moe_cte_unified.py (legacy unified test path)
-def golden_bwmm(
-    inp_np: dict,
-    lnc_degree: int,
-    tokens: int,
-    hidden: int,
-    intermediate: int,
-    expert: int,
-    block_size: int,
-    dtype,
-    dma_skip: SkipMode,
-    bias: bool,
-    quantize,
-    quantize_strategy: int,
-    expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-    activation_function: ActFnType,
-    checkpoint_activation: bool,
-    is_block_parallel: bool,
-    top_k: int,
-    n_block_per_iter: int = 1,
-    gate_clamp_lower_limit=None,
-    gate_clamp_upper_limit=None,
-    up_clamp_lower_limit=None,
-    up_clamp_upper_limit=None,
-    is_shard_block: bool = False,
-    expert_affinity_multiply_on_I: bool = False,
-    is_dropping: bool = False,
-):
-    """Generate golden output for blockwise matmul kernel."""
-    if is_dropping:
-        N = expert
-    else:
-        N = get_n_blocks(
-            tokens,
-            top_k,
-            expert,
-            block_size,
-            n_block_per_iter=lnc_degree if is_block_parallel else n_block_per_iter,
-        )
-    conditions = inp_np.get("conditions", None)
-    expert_affinities_masked = inp_np["expert_affinities_masked"].reshape(-1, expert)
-    down_proj_weights = inp_np["down_proj_weight"]
-    token_position_to_id = inp_np["token_position_to_id"]
-    block_to_expert = inp_np["block_to_expert"]
-    gate_up_proj_weights = inp_np["gate_up_proj_weight"]
-    hidden_states = inp_np["hidden_states"]
-
-    gate_up_proj_bias = inp_np.get("gate_and_up_proj_bias", None)
-    down_proj_bias = inp_np.get("down_proj_bias", None)
-    gate_up_proj_scale = inp_np.get("gate_up_proj_scale", np.empty([]))
-    down_proj_scale = inp_np.get("down_proj_scale", np.empty([]))
-
-    separate_outputs = is_block_parallel and top_k > 1
-
-    result = generate_blockwise_numpy_golden(
-        lnc_degree=lnc_degree,
-        expert_affinities=expert_affinities_masked,
-        down_proj_weights=down_proj_weights,
-        token_position_to_id=token_position_to_id,
-        block_to_expert=block_to_expert,
-        gate_and_up_proj_weights=gate_up_proj_weights,
-        hidden_states=hidden_states,
-        T=tokens,
-        H=hidden,
-        B=block_size,
-        N=N,
-        E=expert,
-        I_TP=intermediate,
-        dtype=dtype,
-        dma_skip=dma_skip,
-        quantize=quantize,
-        quantize_strategy=quantize_strategy,
-        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-        activation_function=activation_function,
-        gate_up_proj_bias=gate_up_proj_bias,
-        down_proj_bias=down_proj_bias,
-        gate_up_proj_scale=gate_up_proj_scale,
-        down_proj_scale=down_proj_scale,
-        checkpoint_activation=checkpoint_activation,
-        separate_outputs=separate_outputs,
-        conditions=conditions,
-        gate_clamp_upper_limit=gate_clamp_upper_limit,
-        gate_clamp_lower_limit=gate_clamp_lower_limit,
-        up_clamp_lower_limit=up_clamp_lower_limit,
-        up_clamp_upper_limit=up_clamp_upper_limit,
-        is_shard_block=is_shard_block,
-    )
-
-    if checkpoint_activation:
-        output, gate_up_activations_T, down_activations = result
-        return_dict = {
-            "output": output,
-            "gate_up_activations_T": gate_up_activations_T,
-        }
-        if not expert_affinity_multiply_on_I:
-            return_dict["down_activations"] = down_activations
-        return return_dict
-    else:
-        output, dbg_tensors = result
-        golden = {"output": output}
-        golden.update(dbg_tensors)
-        return golden
-
-
 def build_bwmm_inputs(
     bwmm_func_enum: BWMMFunc,
     tokens: int,
@@ -709,75 +603,6 @@ def build_bwmm_inputs(
         inputs.pop("checkpoint_activation", None)
 
     return inputs
-
-
-def _create_bwmm_test_config(test_params_list, test_type="manual"):
-    """Create RangeTestConfig from parameter list. Used by legacy tests."""
-    from test.utils.ranged_test_harness import (
-        RangeManualGeneratorStrategy,
-        RangeTestConfig,
-        TensorRangeConfig,
-    )
-
-    test_cases = []
-    for test_params in test_params_list:
-        (
-            bwmm_func,
-            hidden,
-            tokens,
-            expert,
-            block_size,
-            top_k,
-            intermediate,
-            dtype,
-            skip,
-            bias,
-            training,
-            quantize,
-            act_fn,
-            expert_affinities_scaling_mode,
-            gate_cl_upper,
-            gate_cl_lower,
-            up_cl_upper,
-            up_cl_lower,
-            expert_affinity_multiply_on_I,
-        ) = test_params
-
-        test_cases.append(
-            {
-                BWMM_CONFIG: {
-                    BWMM_FUNC_DIM_NAME: bwmm_func,
-                    VNC_DEGREE_DIM_NAME: 2,
-                    TOKENS_DIM_NAME: tokens,
-                    HIDDEN_DIM_NAME: hidden,
-                    INTERMEDIATE_DIM_NAME: intermediate,
-                    EXPERT_DIM_NAME: expert,
-                    BLOCK_SIZE_DIM_NAME: block_size,
-                    TOP_K_DIM_NAME: top_k,
-                    ACT_FN_DIM_NAME: act_fn,
-                    EXPERT_AFFINITIES_SCALING_MODE_DIM_NAME: expert_affinities_scaling_mode,
-                    DTYPE_DIM_NAME: dtype,
-                    SKIP_DIM_NAME: skip,
-                    BIAS_DIM_NAME: bias,
-                    TRAINING_DIM_NAME: training,
-                    QUANTIZE_DIM_NAME: quantize,
-                    GATE_CLAMP_UPPER_DIM_NAME: gate_cl_upper,
-                    GATE_CLAMP_LOWER_DIM_NAME: gate_cl_lower,
-                    UP_CLAMP_UPPER_DIM_NAME: up_cl_upper,
-                    UP_CLAMP_LOWER_DIM_NAME: up_cl_lower,
-                    EXPERT_AFFINITY_MULTIPLY_ON_I_DIM_NAME: expert_affinity_multiply_on_I,
-                },
-            }
-        )
-
-    return RangeTestConfig(
-        additional_params={},
-        global_tensor_configs=TensorRangeConfig(
-            tensor_configs={},
-            monotonic_step_size=1,
-            custom_generators=[RangeManualGeneratorStrategy(test_cases=test_cases, test_type=test_type)],
-        ),
-    )
 
 
 # =============================================================================
@@ -1158,3 +983,310 @@ def moe_cte_output_tensors(
             }
     else:
         return {"output": np.zeros(output_shape, dtype=dtype)}
+
+
+# =============================================================================
+# Unified moe_cte() entry point wrappers for UnitTestFramework
+# =============================================================================
+
+# Module-level storage for MX _internal data (keyed by quantization_config id)
+# Used to pass MX golden computation data to torch ref without polluting kernel_input
+_mx_internal_data = {}
+# =============================================================================
+
+
+def generate_moe_cte_unified_inputs(
+    impl,
+    tokens: int,
+    hidden: int,
+    intermediate: int,
+    expert: int,
+    block_size: int,
+    top_k: int,
+    dtype,
+    skip: int,
+    bias: bool,
+    training: bool,
+    quantize,
+    activation_function,
+    expert_affinities_scaling_mode,
+    gate_clamp_upper=None,
+    gate_clamp_lower=None,
+    up_clamp_upper=None,
+    up_clamp_lower=None,
+    expert_affinity_multiply_on_I: bool = False,
+    weight_dtype=None,
+    is_dynamic: bool = False,
+    lnc_degree: int = 2,
+):
+    """Generate inputs dict for unified moe_cte() entry point, compatible with UnitTestFramework.
+
+    Keys match moe_cte() signature: uses spec and quantization_config instead of
+    raw bwmm_func/gate_up_proj_scale/down_proj_scale.
+
+    Args:
+        impl: MoECTEImplementation enum value
+        (other args match test parameter columns)
+
+    Returns:
+        dict with keys matching moe_cte() parameter names
+    """
+    from nkilib_src.nkilib.core.moe.moe_cte import (
+        MoECTEImplementation,
+        MoECTESpec,
+        QuantizationConfig,
+        ShardOnBlockConfig,
+        ShardOnIConfig,
+    )
+    from test.integration.nkilib.core.moe.moe_cte.test_utils import build_moe_bwmm_mx_cte
+    from test.utils.mx_utils import is_mx_quantize
+
+    dma_skip = map_skip_mode(skip)
+
+    # Build spec
+    if impl in (MoECTEImplementation.shard_on_block, MoECTEImplementation.shard_on_block_mx):
+        spec = MoECTESpec(implementation=impl, shard_on_block=ShardOnBlockConfig(), shard_on_I=None)
+    elif impl in (MoECTEImplementation.shard_on_i, MoECTEImplementation.shard_on_i_dropping):
+        spec = MoECTESpec(
+            implementation=impl,
+            shard_on_block=None,
+            shard_on_I=ShardOnIConfig(
+                checkpoint_activation=training,
+                expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
+            ),
+        )
+    elif impl == MoECTEImplementation.shard_on_i_hybrid:
+        spec = MoECTESpec(implementation=impl, shard_on_block=None, shard_on_I=ShardOnIConfig())
+    elif impl in (MoECTEImplementation.shard_on_i_mx, MoECTEImplementation.shard_on_i_mx_hybrid):
+        spec = MoECTESpec(implementation=impl, shard_on_block=None, shard_on_I=None)
+    else:
+        spec = MoECTESpec(implementation=impl, shard_on_block=None, shard_on_I=None)
+
+    # MX path
+    if is_mx_quantize(weight_dtype):
+        skip_mode = (1 if dma_skip.skip_token else 0) + (2 if dma_skip.skip_weight else 0)
+        is_shard_on_I = impl in (
+            MoECTEImplementation.shard_on_i_mx,
+            MoECTEImplementation.shard_on_i_mx_hybrid,
+        )
+        raw = build_moe_bwmm_mx_cte(
+            H=hidden,
+            T=tokens,
+            E=expert,
+            B=block_size,
+            TOPK=top_k,
+            I_TP=intermediate,
+            dtype=dtype,
+            weight_dtype=weight_dtype,
+            skip_mode=skip_mode,
+            bias=bias,
+            activation_function=activation_function,
+            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+            is_dynamic=is_dynamic,
+            vnc_degree=lnc_degree,
+            gate_clamp_upper_limit=gate_clamp_upper,
+            gate_clamp_lower_limit=gate_clamp_lower,
+            up_clamp_upper_limit=up_clamp_upper,
+            up_clamp_lower_limit=up_clamp_lower,
+            is_shard_on_I=is_shard_on_I,
+        )
+        # Remap to moe_cte() signature - pass scales directly (not in QuantizationConfig)
+        # because NKI tracer can't handle tensors wrapped in dataclass
+        inputs = {
+            "hidden_states": raw["hidden_states"],
+            "expert_affinities_masked": raw["expert_affinities_masked"],
+            "gate_up_proj_weight": raw["gate_up_proj_weight"],
+            "down_proj_weight": raw["down_proj_weight"],
+            "token_position_to_id": raw["token_position_to_id"],
+            "block_to_expert": raw["block_to_expert"],
+            "block_size": raw["block_size"],
+            "spec": spec,
+            "activation_function": raw["activation_function"],
+            "skip_dma": raw["skip_dma"],
+            "compute_dtype": raw.get("compute_dtype", dtype),
+            "is_tensor_update_accumulating": raw.get("is_tensor_update_accumulating", top_k != 1),
+            "expert_affinities_scaling_mode": raw["expert_affinities_scaling_mode"],
+        }
+        if raw.get("gate_up_proj_scale") is not None:
+            inputs["gate_up_proj_scale"] = raw["gate_up_proj_scale"]
+        if raw.get("down_proj_scale") is not None:
+            inputs["down_proj_scale"] = raw["down_proj_scale"]
+        if "conditions" in raw:
+            inputs["conditions"] = raw["conditions"]
+        if "gate_and_up_proj_bias" in raw:
+            inputs["gate_and_up_proj_bias"] = raw["gate_and_up_proj_bias"]
+        if "down_proj_bias" in raw:
+            inputs["down_proj_bias"] = raw["down_proj_bias"]
+        for clamp_key in (
+            "gate_clamp_upper_limit",
+            "gate_clamp_lower_limit",
+            "up_clamp_upper_limit",
+            "up_clamp_lower_limit",
+        ):
+            if clamp_key in raw:
+                inputs[clamp_key] = raw[clamp_key]
+        # Store _internal in module-level dict for MX golden computation
+        if "_internal" in raw:
+            _mx_internal_data[id(inputs["spec"])] = raw["_internal"]
+        return inputs
+
+    # Non-MX path: reuse build_bwmm_inputs
+    # Map impl back to BWMMFunc for build_bwmm_inputs
+    from nkilib_src.nkilib.core.moe.moe_cte import MoECTEImplementation
+
+    impl_to_bwmm = {
+        MoECTEImplementation.shard_on_block: BWMMFunc.SHARD_ON_BLOCK,
+        MoECTEImplementation.shard_on_i: BWMMFunc.SHARD_ON_INTERMEDIATE,
+        MoECTEImplementation.shard_on_i_hybrid: BWMMFunc.SHARD_ON_INTERMEDIATE_HW,
+        MoECTEImplementation.shard_on_i_dropping: BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING,
+    }
+    bwmm_func_enum = impl_to_bwmm[impl]
+    _, _, is_dyn = bwmm_func_enum.get_bwmm_func()
+    is_block_parallel = bwmm_func_enum == BWMMFunc.SHARD_ON_BLOCK
+    is_dropping = bwmm_func_enum == BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING
+    quantize_strategy = 6 if quantize else 0
+
+    raw = build_bwmm_inputs(
+        bwmm_func_enum=bwmm_func_enum,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        expert=expert,
+        block_size=block_size,
+        top_k=top_k,
+        dtype=dtype,
+        dma_skip=dma_skip,
+        bias=bias,
+        quantize=quantize,
+        quantize_strategy=quantize_strategy,
+        vnc_degree=lnc_degree,
+        n_block_per_iter=1,
+        is_block_parallel=is_block_parallel,
+        is_dynamic=is_dyn,
+        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        activation_function=activation_function,
+        checkpoint_activation=training,
+        gate_clamp_lower_limit=gate_clamp_lower,
+        gate_clamp_upper_limit=gate_clamp_upper,
+        up_clamp_lower_limit=up_clamp_lower,
+        up_clamp_upper_limit=up_clamp_upper,
+        expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
+    )
+
+    # Remap to moe_cte() signature
+    inputs = {
+        "hidden_states": raw["hidden_states"],
+        "expert_affinities_masked": raw["expert_affinities_masked"],
+        "gate_up_proj_weight": raw["gate_up_proj_weight"],
+        "down_proj_weight": raw["down_proj_weight"],
+        "token_position_to_id": raw["token_position_to_id"],
+        "block_to_expert": raw["block_to_expert"],
+        "block_size": raw["block_size"],
+        "spec": spec,
+        "activation_function": raw["activation_function"],
+        "skip_dma": raw["skip_dma"],
+        "compute_dtype": raw["compute_dtype"],
+        "is_tensor_update_accumulating": raw["is_tensor_update_accumulating"],
+        "expert_affinities_scaling_mode": raw["expert_affinities_scaling_mode"],
+    }
+    if "conditions" in raw:
+        inputs["conditions"] = raw["conditions"]
+    if "gate_and_up_proj_bias" in raw:
+        inputs["gate_and_up_proj_bias"] = raw["gate_and_up_proj_bias"]
+    if "down_proj_bias" in raw:
+        inputs["down_proj_bias"] = raw["down_proj_bias"]
+    if raw.get("gate_up_proj_scale") is not None or raw.get("down_proj_scale") is not None:
+        inputs["quantization_config"] = QuantizationConfig(
+            gate_up_proj_scale=raw.get("gate_up_proj_scale"),
+            down_proj_scale=raw.get("down_proj_scale"),
+        )
+    for clamp_key in (
+        "gate_clamp_upper_limit",
+        "gate_clamp_lower_limit",
+        "up_clamp_upper_limit",
+        "up_clamp_lower_limit",
+    ):
+        if clamp_key in raw:
+            inputs[clamp_key] = raw[clamp_key]
+    return inputs
+
+
+def moe_cte_unified_output_tensors(
+    kernel_input: dict,
+    tokens: int,
+    hidden: int,
+    intermediate: int,
+    expert: int,
+    block_size: int,
+    top_k: int,
+    dtype,
+    impl,
+    training: bool,
+    expert_affinity_multiply_on_I: bool,
+    lnc_degree: int = 2,
+):
+    """Generate output tensor placeholders for unified moe_cte() UnitTestFramework tests.
+
+    Args:
+        kernel_input: dict from generate_moe_cte_unified_inputs
+        (other args match test parameter columns)
+
+    Returns:
+        dict of numpy zero arrays matching expected output shapes
+    """
+
+    from nkilib_src.nkilib.core.moe.moe_cte import MoECTEImplementation
+
+    is_block_parallel = impl in (
+        MoECTEImplementation.shard_on_block,
+        MoECTEImplementation.shard_on_block_mx,
+    )
+    is_dropping = impl == MoECTEImplementation.shard_on_i_dropping
+    is_shard_block = impl == MoECTEImplementation.shard_on_block
+    is_mx = impl in (
+        MoECTEImplementation.shard_on_block_mx,
+        MoECTEImplementation.shard_on_i_mx,
+        MoECTEImplementation.shard_on_i_mx_hybrid,
+    )
+
+    dma_skip = kernel_input["skip_dma"]
+    T_out = tokens if dma_skip.skip_token else tokens + 1
+    separate_outputs = is_block_parallel and top_k > 1
+    is_accumulating = top_k != 1
+
+    if is_mx:
+        if impl == MoECTEImplementation.shard_on_block_mx and is_accumulating:
+            output_shape = (lnc_degree, T_out, hidden)
+        else:
+            output_shape = (T_out, hidden)
+    elif separate_outputs:
+        if is_shard_block:
+            output_shape = (T_out, lnc_degree, hidden)
+        else:
+            output_shape = (lnc_degree, T_out, hidden)
+    else:
+        output_shape = (T_out, hidden)
+
+    if is_mx:
+        return {"output": np.zeros(output_shape, dtype=dtype)}
+
+    if training or is_dropping:
+        if is_dropping:
+            N = expert
+        else:
+            N = get_n_blocks(
+                tokens,
+                top_k,
+                expert,
+                block_size,
+                n_block_per_iter=lnc_degree if is_block_parallel else 1,
+            )
+        result = {
+            "output": np.zeros(output_shape, dtype=dtype),
+            "gate_up_activations_T": np.zeros((N, 2, intermediate, block_size), dtype=dtype),
+        }
+        if not expert_affinity_multiply_on_I:
+            result["down_activations"] = np.zeros((N, block_size, hidden), dtype=dtype)
+        return result
+
+    return {"output": np.zeros(output_shape, dtype=dtype)}

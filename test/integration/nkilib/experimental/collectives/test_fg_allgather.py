@@ -13,53 +13,51 @@
 # limitations under the License.
 """Tests for fine-grained ring-based all-gather kernel."""
 
-from test.utils.common_dataclasses import (
-    CompilerArgs,
-    InferenceArgs,
-    KernelArgs,
-    PerRankLazyGoldenGenerator,
-    PerRankLazyInputGenerator,
-    ValidationArgs,
-)
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.experimental.collectives.fg_allgather import (
     fine_grained_allgather,
 )
+from test.integration.nkilib.experimental.collectives.test_collectives import make_golden_torch_ref
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import CollectiveUnitTestFramework
+
+PARAM_NAMES = "m, K, dtype, tp_degree, lnc, force_hbm_cc"
+TEST_PARAMS = [
+    # Basic LNC2 tests
+    (1024, 4096, nl.bfloat16, 4, 2, False),
+    # NKILIB-795: The following cases failed in time out from trn2.3xl fleet in pipeline
+    # while passed on trn2.48xl instance
+    #
+    #
+    # (256, 2048, nl.bfloat16, 16, 2, False),
+    # (512, 8192, nl.bfloat16, 4, 2, False),
+    # Force HBM mode
+    # (512, 8192, nl.bfloat16, 4, 2, True),
+    # Float32
+    # (1024, 4096, nl.float32, 16, 2, False),
+    # LNC1
+    # (1024, 4096, nl.bfloat16, 4, 1, False),
+]
+_ABBREVS = {"tp_degree": "tp", "force_hbm_cc": "hbm"}
 
 
-@pytest_test_metadata(
-    name="FgAllgather",
-    pytest_marks=["collectives", "FgAllgather"],
-)
+@pytest_test_metadata(name="FgAllgather")
+@pytest_marks(["collectives", "FgAllgather"])
 class TestFgAllgather:
     """Test class for fine-grained ring-based all-gather kernel."""
 
-    @pytest.mark.parametrize(
-        "m, K, dtype, tp_degree, lnc, force_hbm_cc",
-        [
-            # Basic LNC2 tests
-            pytest.param(1024, 4096, nl.bfloat16, 4, 2, False, id="m1024_K4096_bf16_tp4_lnc2"),
-            # FIXME: The following tests doesn't work and suffers from time out
-            # NKILIB-795
-            #
-            # pytest.param(256, 2048, nl.bfloat16, 16, 2, False, id="m256_K2048_bf16_tp16_lnc2"),
-            # pytest.param(512, 8192, nl.bfloat16, 4, 2, False, id="m512_K8192_bf16_tp4_lnc2"),
-            # # Force HBM mode
-            # pytest.param(512, 8192, nl.bfloat16, 4, 2, True, id="m512_K8192_bf16_tp4_lnc2_hbm"),
-            # # Float32
-            # pytest.param(1024, 4096, nl.float32, 16, 2, False, id="m1024_K4096_f32_tp4_lnc2"),
-            # # LNC1
-            # pytest.param(1024, 4096, nl.bfloat16, 4, 1, False, id="m1024_K4096_bf16_tp4_lnc1"),
-        ],
-    )
+    @pytest.mark.fast
+    @pytest_parametrize(PARAM_NAMES, TEST_PARAMS, abbrevs=_ABBREVS)
     def test_fine_grained_allgather(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         m: int,
         K: int,
         dtype: np.dtype,
@@ -87,16 +85,17 @@ class TestFgAllgather:
             # All ranks produce the full gathered tensor
             return {"result": lhs_global.astype(dtype)}
 
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=fine_grained_allgather,
-                compiler_input=CompilerArgs(logical_nc_config=lnc),
-                kernel_input=PerRankLazyInputGenerator(create_inputs),
-                inference_args=InferenceArgs(collective_ranks=tp_degree),
-                validation_args=ValidationArgs(
-                    golden_output=PerRankLazyGoldenGenerator(create_golden),
-                    absolute_accuracy=1e-3,
-                    relative_accuracy=1e-3,
-                ),
-            )
+        torch_ref, ref_override = make_golden_torch_ref(fine_grained_allgather, create_golden)
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=fine_grained_allgather,
+            torch_ref=torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=tp_degree,
+            per_rank_torch_ref_input_override=ref_override,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            rtol=1e-3,
+            atol=1e-3,
         )

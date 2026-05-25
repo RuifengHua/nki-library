@@ -30,8 +30,15 @@ import nki.isa as nisa
 import nki.language as nl
 from nki.isa.constants import oob_mode
 
+from ...quantization.fp8_quantize import pre_combine_dequant_scales
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil, get_nl_act_fn_from_type
+from ...utils.kernel_helpers import (
+    PSUM_BANK_SIZE,
+    _psum_alloc,
+    _sbm_alloc,
+    div_ceil,
+    get_nl_act_fn_from_type,
+)
 from ...utils.tensor_view import TensorView
 from ..mlp_parameters import MLPParameters
 from .mlp_tkg_constants import MLPTKGConstantsDimensionSizes
@@ -39,6 +46,7 @@ from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
     _pmax,
+    _psum_bmax,
     _psum_fmax,
     _q_height,
     _q_width,
@@ -52,6 +60,12 @@ def gate_up_projection_mx_tp_shard_H(
     weight_scale: TensorView,
     bias_sb: TensorView,
     cfg: ProjConfig,
+    w_dequant_scale=None,
+    input_dequant_scale=None,
+    sbm=None,
+    psum_bank_offset: int = 0,
+    name_prefix: str = None,
+    out_sb=None,
 ) -> nl.ndarray:
     """
     Performs the Gate/Up projection. This is the TP version of the projection, i.e. the output will be in transposed
@@ -74,6 +88,10 @@ def gate_up_projection_mx_tp_shard_H(
     :param bias_sb [OPTIONAL]: TensorView of bf16[_pmax, n_I512_tile, _q_width] @ SB.
         - For already-sliced (gate or up only): cfg.bias_t_shared_base_offset should be 0
         - For combined gate+up: cfg.bias_t_shared_base_offset specifies offset for up projection
+    :param w_dequant_scale [OPTIONAL]: Weight dequant scale in SBUF.
+        [_pmax, 1] for STATIC_MX, [_pmax, n_I512_tile * _q_width] for ROW_MX, None for MX.
+    :param input_dequant_scale [OPTIONAL]: Input dequant scale in SBUF.
+        [_pmax, 1] for STATIC_MX, [_pmax, T_padded, 1] for ROW_MX, None for MX.
     :return: bf16[_pmax, ceil(I / 512), BxS, _q_width] @ SB.
     """
     n_prgs, prg_id = cfg.n_prgs, cfg.prg_id
@@ -95,10 +113,17 @@ def gate_up_projection_mx_tp_shard_H(
             f"Expect weight_qtz in HBM to be in shape (128, {cfg.n_H512_tile}, {I}), got {weight_qtz.shape}",
         )
         # Load weight into [H0, cfg.n_H512_tile, I] NOTE: this is pre-quantized and each elt is mxfp_x4 (packed H)
-        weight_qtz_sb = nl.ndarray((H0, cfg.n_H512_tile_sharded, I), dtype=weight_qtz.base_tensor.dtype, buffer=nl.sbuf)
+        weight_qtz_sb = _sbm_alloc(
+            sbm,
+            (H0, cfg.n_H512_tile_sharded, I),
+            dtype=weight_qtz.base_tensor.dtype,
+            name=f"{name_prefix}_weight_qtz_sb" if name_prefix else None,
+            align=SBUF_QUADRANT_SIZE,
+        )
         nisa.dma_copy(
             dst=weight_qtz_sb,
             src=weight_qtz.base_tensor[:, prg_id * cfg.n_H512_tile_sharded : (prg_id + 1) * cfg.n_H512_tile_sharded, :],
+            dge_mode=nisa.dge_mode.hwdge,
         )
         weight_qtz_tv = TensorView(weight_qtz_sb)
 
@@ -117,7 +142,13 @@ def gate_up_projection_mx_tp_shard_H(
             weight_scale.shape == (_pmax // _q_height, cfg.n_H512_tile, I),
             f"Expect weight_scale in SBUF to have the shape of (16, {cfg.n_H512_tile}, {I}), got {weight_scale.shape}",
         )
-        weight_scale_sb = nl.ndarray((H0, cfg.n_H512_tile_sharded, I), dtype=nl.uint8, buffer=nl.sbuf)
+        weight_scale_sb = _sbm_alloc(
+            sbm,
+            (H0, cfg.n_H512_tile_sharded, I),
+            dtype=nl.uint8,
+            name=f"{name_prefix}_weight_scale_sb" if name_prefix else None,
+            align=SBUF_QUADRANT_SIZE,
+        )
         # Load 4 partitions of scales for every quadrant
         n_quadrants_needed = H0 // SBUF_QUADRANT_SIZE
         for i_quad in range(n_quadrants_needed):
@@ -128,13 +159,35 @@ def gate_up_projection_mx_tp_shard_H(
                     :,
                 ],
                 dst=weight_scale_sb[i_quad * SBUF_QUADRANT_SIZE : i_quad * SBUF_QUADRANT_SIZE + 4, :, :],
+                dge_mode=nisa.dge_mode.hwdge,
             )
         weight_scale_tv = TensorView(weight_scale_sb)
 
     if cfg.dbg_weight:
         return weight_qtz_tv.base_tensor, weight_scale_tv.base_tensor
 
-    out_sb = nl.ndarray((_pmax, cfg.n_total_I512_tile, BxS, _q_width), dtype=nl.bfloat16, buffer=nl.sbuf)
+    out_sb = (
+        out_sb
+        if out_sb != None
+        else _sbm_alloc(
+            sbm,
+            (_pmax, cfg.n_total_I512_tile, BxS, _q_width),
+            dtype=nl.bfloat16,
+            name=f"{name_prefix}_out_sb" if name_prefix else None,
+            align=SBUF_QUADRANT_SIZE,
+        )
+    )
+
+    """
+    Zero-initialize the last I512 tile if it has fewer than _pmax valid partitions.
+
+    This prevents uninitialized SBUF data (potentially NaN) from corrupting
+    downstream operations like row_quantization's cross-partition reduce.
+    Full-tile memset (DMA engine) is preferred over partial-partition tensor_scalar
+    (ACT engine) to avoid contention with the matmul output copies that follow.
+    """
+    if cfg.r_I512_tile > 0 and cfg.zero_unused_partitions:
+        nisa.memset(dst=out_sb[:, cfg.n_total_I512_tile - 1, :, :], value=0.0)
 
     # Loop over BxS tiles (each of size 256)
     for i_BxS_tile in range(n_BxS_tile):
@@ -145,7 +198,10 @@ def gate_up_projection_mx_tp_shard_H(
         # Allocate and init output psum and sbuf. Note that there are cfg.n_total_I512_tile instances of out_psum
         out_psum_lst = []
         for i_I512_tile in range(cfg.n_total_I512_tile):
-            out_psum_lst.append(nl.ndarray((_pmax, _q_width, cur_BxS_tile_sz), dtype=nl.bfloat16, buffer=nl.psum))
+            psum_bank_id = (i_I512_tile + psum_bank_offset) % _psum_bmax
+            out_psum_lst.append(
+                _psum_alloc((_pmax, _q_width, cur_BxS_tile_sz), nl.bfloat16, sbm, psum_bank_id * PSUM_BANK_SIZE)
+            )
 
         # Matmul compute, tiles on H, then I, then _q_width (4)
         for i_H512_tile in range(cfg.n_H512_tile_sharded):
@@ -185,42 +241,135 @@ def gate_up_projection_mx_tp_shard_H(
             out_sb shape: [_pmax, cfg.n_total_I512_tile, BxS, _q_width]
             out_psum shape: [_pmax, _q_width, BxS_tile_sz] (for each item in out_psum_lst)
             """
-            if (bias_sb is not None) and (prg_id == 0):
-                # Slice and broadcast bias to match output shape
-                bias_tile_view = bias_sb.slice(dim=0, start=0, end=cur_I_pdim_sz)
-                if cfg.bias_t_shared_between_gate_up:
-                    # 4D [_pmax, 2, n_I512_tile, _q_width] becomes 3D via select
-                    gate_or_up_idx = 0 if cfg.bias_t_shared_base_offset == 0 else 1
-                    bias_tile_view = bias_tile_view.select(dim=1, index=gate_or_up_idx)
-                # Now 3D: [cur_I_pdim_sz, n_I512_tile, _q_width]
-                bias_tile_view = bias_tile_view.slice(dim=1, start=i_I512_tile, end=i_I512_tile + 1)
-                bias_tile_view = bias_tile_view.broadcast(dim=1, size=cur_BxS_tile_sz)
+            if w_dequant_scale == None:
+                # ── Standard path (MX with real scales, or no dequant needed) ──
+                if (bias_sb != None) and (prg_id == 0):
+                    # Slice and broadcast bias to match output shape
+                    bias_tile_view = bias_sb.slice(dim=0, start=0, end=cur_I_pdim_sz)
+                    if cfg.bias_t_shared_between_gate_up:
+                        gate_or_up_idx = 0 if cfg.bias_t_shared_base_offset == 0 else 1
+                        bias_tile_view = bias_tile_view.select(dim=1, index=gate_or_up_idx)
+                    bias_tile_view = bias_tile_view.slice(dim=1, start=i_I512_tile, end=i_I512_tile + 1)
+                    bias_tile_view = bias_tile_view.broadcast(dim=1, size=cur_BxS_tile_sz)
 
-                nisa.tensor_tensor(
-                    dst=out_sb[
-                        :cur_I_pdim_sz, i_I512_tile, cur_BxS_tile_offset : cur_BxS_tile_offset + cur_BxS_tile_sz, :
-                    ],
-                    data1=out_psum_lst[i_I512_tile].ap(
-                        [[_q_width * cur_BxS_tile_sz, cur_I_pdim_sz], [1, cur_BxS_tile_sz], [cur_BxS_tile_sz, _q_width]]
-                    ),  # strided read
-                    data2=bias_tile_view.get_view(),
-                    op=nl.add,
-                )
+                    nisa.tensor_tensor(
+                        dst=out_sb[
+                            :cur_I_pdim_sz, i_I512_tile, cur_BxS_tile_offset : cur_BxS_tile_offset + cur_BxS_tile_sz, :
+                        ],
+                        data1=out_psum_lst[i_I512_tile].ap(
+                            [
+                                [_q_width * cur_BxS_tile_sz, cur_I_pdim_sz],
+                                [1, cur_BxS_tile_sz],
+                                [cur_BxS_tile_sz, _q_width],
+                            ]
+                        ),
+                        data2=bias_tile_view.get_view(),
+                        op=nl.add,
+                    )
+                else:
+                    nisa.tensor_copy(
+                        dst=out_sb[
+                            :cur_I_pdim_sz, i_I512_tile, cur_BxS_tile_offset : cur_BxS_tile_offset + cur_BxS_tile_sz, :
+                        ],
+                        src=out_psum_lst[i_I512_tile].ap(
+                            [
+                                [_q_width * cur_BxS_tile_sz, cur_I_pdim_sz],
+                                [1, cur_BxS_tile_sz],
+                                [cur_BxS_tile_sz, _q_width],
+                            ]
+                        ),
+                    )
             else:
+                # ── Software quant path (STATIC_MX / ROW_MX): copy psum to sbuf first ──
                 nisa.tensor_copy(
                     dst=out_sb[
                         :cur_I_pdim_sz, i_I512_tile, cur_BxS_tile_offset : cur_BxS_tile_offset + cur_BxS_tile_sz, :
                     ],
                     src=out_psum_lst[i_I512_tile].ap(
                         [[_q_width * cur_BxS_tile_sz, cur_I_pdim_sz], [1, cur_BxS_tile_sz], [cur_BxS_tile_sz, _q_width]]
-                    ),  # strided read
+                    ),
                 )
 
     # Receive projection output from the other NC when LNC > 1
+    # IMPORTANT: LNC reduce must happen BEFORE dequant+bias to avoid double-counting bias
     if n_prgs > 1:
-        recv = nl.ndarray(out_sb.shape, dtype=out_sb.dtype, buffer=nl.sbuf)
+        recv = _sbm_alloc(
+            sbm,
+            out_sb.shape,
+            dtype=out_sb.dtype,
+            name=f"{name_prefix}_recv" if name_prefix else None,
+            align=SBUF_QUADRANT_SIZE,
+        )
         nisa.sendrecv(src=out_sb, dst=recv, send_to_rank=(1 - prg_id), recv_from_rank=(1 - prg_id), pipe_id=0)
         nisa.tensor_tensor(dst=out_sb, data1=out_sb, data2=recv, op=nl.add)
+
+    # ── Post-matmul dequant (STATIC_MX / ROW_MX): apply w_dequant_scale, input_dequant_scale, bias ──
+    # Applied AFTER LNC reduce so bias is added once and scale is applied to the full sum.
+    if w_dequant_scale != None:
+        # Pre-compute bias in 2D layout for per-slice access (shared by both paths)
+        bias_2d = None
+        if bias_sb != None:
+            bias_base = bias_sb.base_tensor if isinstance(bias_sb, TensorView) else bias_sb
+            bias_2d = bias_base.reshape((_pmax, cfg.n_total_I512_tile * _q_width))
+
+        if w_dequant_scale.shape[1] == 1:
+            # ── STATIC_MX: both scales are [_pmax, 1], pre-combine and broadcast ──
+            combined = pre_combine_dequant_scales(input_dequant_scale, w_dequant_scale)
+            if bias_2d != None:
+                # Fuse scale + bias: out = out * combined + bias
+                for i_tile in nl.affine_range(cfg.n_total_I512_tile):
+                    for i_q in nl.affine_range(_q_width):
+                        col_idx = i_tile * _q_width + i_q
+                        nisa.activation(
+                            dst=out_sb[:, i_tile, :, i_q],
+                            op=nl.copy,
+                            data=out_sb[:, i_tile, :, i_q],
+                            scale=combined,
+                            bias=bias_2d[:, col_idx],
+                        )
+            else:
+                nisa.activation(
+                    dst=out_sb,
+                    op=nl.copy,
+                    data=out_sb,
+                    scale=combined,
+                )
+        else:
+            # ── ROW_MX: per-row weight scale, then per-token input scale (+ optional bias) ──
+            # Fuse weight dequant × input dequant into a single scalar_tensor_tensor:
+            #   dst = data * w_dequant_scale[col] * input_dequant_scale[token]
+            # This halves the dequant instruction count vs two separate loops.
+            if bias_2d != None:
+                for i_tile in nl.affine_range(cfg.n_total_I512_tile):
+                    for i_q in nl.affine_range(_q_width):
+                        i_col = i_tile * _q_width + i_q
+                        nisa.scalar_tensor_tensor(
+                            dst=out_sb[:, i_tile, :, i_q],
+                            data=out_sb[:, i_tile, :, i_q],
+                            op0=nl.multiply,
+                            operand0=w_dequant_scale[:, i_col : i_col + 1],
+                            op1=nl.multiply,
+                            operand1=input_dequant_scale[:, :BxS, 0],
+                        )
+
+                        nisa.activation(
+                            dst=out_sb[:, i_tile, :, i_q],
+                            op=nl.copy,
+                            data=out_sb[:, i_tile, :, i_q],
+                            bias=bias_2d[:, i_col],
+                        )
+            else:
+                for i_tile in nl.affine_range(cfg.n_total_I512_tile):
+                    for i_q in nl.affine_range(_q_width):
+                        i_col = i_tile * _q_width + i_q
+                        nisa.scalar_tensor_tensor(
+                            dst=out_sb[:, i_tile, :, i_q],
+                            data=out_sb[:, i_tile, :, i_q],
+                            op0=nl.multiply,
+                            operand0=w_dequant_scale[:, i_col : i_col + 1],
+                            op1=nl.multiply,
+                            operand1=input_dequant_scale[:, :BxS, 0],
+                        )
 
     return out_sb
 
@@ -250,6 +399,9 @@ def process_fused_gate_up_projection_mxfp4(
     dims: MLPTKGConstantsDimensionSizes,
     gate_up_weights_E_offset: Optional[nl.ndarray],
     gate_up_bias_E_offset: Optional[nl.ndarray],
+    gate_dequant_scale: Optional[nl.ndarray] = None,
+    up_dequant_scale: Optional[nl.ndarray] = None,
+    input_dequant_scale: Optional[nl.ndarray] = None,
 ):
     """
     Process gate and up projection, including the activation of gate projection and the final elem-wise multiply:
@@ -264,6 +416,11 @@ def process_fused_gate_up_projection_mxfp4(
     :param output: bf16[_pmax, ceil(I/512), T, _q_width] @ SB.
     :param gate_up_weight_E_offset: int32[1, 1] @ SB. When this is provided, gate_up_weights has an additional leading E dim.
     :param gate_up_bias_E_offset: int32[1, 1] @ SB. When this is provided, gate_up_weights has an additional leading E dim.
+    :param gate_dequant_scale: Optional fp32 @ SB. Dequant scale for gate projection.
+        STATIC_MX: [_pmax, 1] combined (input * weight) scale. ROW_MX: [_pmax, n_I512*4] per-row weight scale.
+    :param up_dequant_scale: Optional fp32 @ SB. Dequant scale for up projection.
+        STATIC_MX: [_pmax, 1] combined (input * weight) scale. ROW_MX: [_pmax, n_I512*4] per-row weight scale.
+    :param input_dequant_scale: Optional fp32[_pmax, T, 1] @ SB. ROW_MX per-token input dequant scale.
 
     NOTE: In the fused weights/scales/bias above, idx 0 is for gate and idx 1 is for up.
     """
@@ -279,9 +436,9 @@ def process_fused_gate_up_projection_mxfp4(
     n_I512_tile = div_ceil(dims.I, (_pmax * _q_width))
 
     # Allocate and load weight sbuf shared between gate and up projection
-    base_weight = gate_up_weights.base_tensor
+    base_weight = TensorView(gate_up_weights).base_tensor
     weight_sb = nl.ndarray((_pmax, 2, n_H512_tile_sharded, dims.I), dtype=base_weight.dtype, buffer=nl.sbuf)
-    if gate_up_weights_E_offset is None:
+    if gate_up_weights_E_offset == None:
         nisa.dma_copy(
             dst=weight_sb,
             src=base_weight[:, :, shard_id : (shard_id + 1) * n_H512_tile_sharded, :],
@@ -294,38 +451,43 @@ def process_fused_gate_up_projection_mxfp4(
             .select(dim=0, index=gate_up_weights_E_offset)
             .slice(dim=2, start=shard_id * n_H512_tile_sharded, end=(shard_id + 1) * n_H512_tile_sharded)
         )
-        nisa.dma_copy(dst=weight_sb, src=gate_up_weights_view.get_view())
+        nisa.dma_copy(dst=weight_sb, src=gate_up_weights_view.get_view(), dge_mode=nisa.dge_mode.hwdge)
     weight_sb = weight_sb.view(gate_up_weights.dtype)
 
-    # Alloc and load weight scale, which needs zero padding in sbuf
-    scale_shape = gate_up_scale.shape
-    gup_scale_view = gate_up_scale.reshape(
-        (scale_shape[0] * scale_shape[1], scale_shape[2], scale_shape[3], scale_shape[4])
-    )  # [E * _pmax//_q_height, 2, n_H512_tiles, I]
+    # Alloc and load weight scale, which needs zero padding in sbuf.
+    # STATIC_MX/ROW_MX skips scale load; caller already memset 127.
+    if gate_dequant_scale == None:
+        scale_shape = gate_up_scale.shape
+        gup_scale_view = gate_up_scale.reshape(
+            (scale_shape[0] * scale_shape[1], scale_shape[2], scale_shape[3], scale_shape[4])
+        )  # [E * _pmax//_q_height, 2, n_H512_tiles, I]
 
-    token_indices_on_p = nl.ndarray(p_idx_vector.shape, dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=token_indices_on_p, src=p_idx_vector)
-    nisa.dma_copy(
-        dst=gate_up_scale_sb,
-        src=gup_scale_view.ap(
-            pattern=[
-                [2 * n_H512_tiles * dims.I, _pmax],
-                [n_H512_tiles * dims.I, 2],
-                [dims.I, n_H512_tile_sharded],
-                [1, dims.I],
-            ],
-            offset=(shard_id * n_H512_tile_sharded) * dims.I,
-            vector_offset=token_indices_on_p,
-            indirect_dim=0,
-        ),
-        oob_mode=oob_mode.skip,
-    )
+        token_indices_on_p = nl.ndarray(p_idx_vector.shape, dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=token_indices_on_p, src=p_idx_vector)
+        nisa.dma_copy(
+            dst=gate_up_scale_sb,
+            src=gup_scale_view.ap(
+                pattern=[
+                    [2 * n_H512_tiles * dims.I, _pmax],
+                    [n_H512_tiles * dims.I, 2],
+                    [dims.I, n_H512_tile_sharded],
+                    [1, dims.I],
+                ],
+                offset=(shard_id * n_H512_tile_sharded) * dims.I,
+                vector_offset=token_indices_on_p,
+                indirect_dim=0,
+            ),
+            oob_mode=oob_mode.skip,
+        )
 
     # Alloc and load bias, which needs zero padding if I < 512
-    bias_sb = nl.ndarray((_pmax, 2, n_I512_tile, _q_width), dtype=gate_up_bias.dtype, buffer=nl.sbuf)
-    if dims.I < 512:  # when I<512, gate/up bias HBM is not padded so pad it here
+    if gate_up_bias != None:
+        bias_sb = nl.ndarray((_pmax, 2, n_I512_tile, _q_width), dtype=gate_up_bias.dtype, buffer=nl.sbuf)
+    else:
+        bias_sb = None
+    if gate_up_bias != None and dims.I < 512:  # when I<512, gate/up bias HBM is not padded so pad it here
         nisa.memset(dst=bias_sb[:, :, 0, :], value=0.0)
-        if gate_up_weights_E_offset is None:
+        if gate_up_weights_E_offset == None:
             nisa.dma_copy(dst=bias_sb[: dims.I // 4, :, :, :], src=gate_up_bias, dge_mode=nisa.dge_mode.hwdge)
         else:
             nisa.dma_copy(
@@ -342,8 +504,8 @@ def process_fused_gate_up_projection_mxfp4(
                     indirect_dim=0,
                 ),
             )
-    else:
-        if gate_up_weights_E_offset is None:
+    elif gate_up_bias != None:
+        if gate_up_weights_E_offset == None:
             nisa.dma_copy(dst=bias_sb, src=gate_up_bias, dge_mode=nisa.dge_mode.hwdge)
         else:
             nisa.dma_copy(
@@ -401,8 +563,15 @@ def process_fused_gate_up_projection_mxfp4(
     hidden_scale_tv = TensorView(hidden_scale)
     weight_tv = TensorView(weight_sb)
     scale_tv = TensorView(gate_up_scale_sb)
-    bias_tv = TensorView(bias_sb)
+    is_static_quant = attrs.quant_params.is_quant_static_mx()
+    is_row_quant = attrs.quant_params.is_quant_row_mx()
+    # STATIC_MX: bias applied after dequant in this function (not inside projection kernel)
+    # ROW_MX/MX: bias applied inside projection kernel
+    # STATIC_MX: bias applied after dequant in this function, not inside projection kernel
+    bias_tv = (TensorView(bias_sb) if bias_sb != None else None) if not is_static_quant else None
 
+    # ROW_MX: pass weight dequant scales to underlying kernel (dispatches on shape internally)
+    # STATIC_MX: dequant applied after LNC reduce in this function (not inside kernel)
     gate_proj_out_sb = gate_up_projection_mx_tp_shard_H(
         hidden_qtz_sb=hidden_tv,
         hidden_scale_sb=hidden_scale_tv,
@@ -410,6 +579,8 @@ def process_fused_gate_up_projection_mxfp4(
         weight_scale=scale_tv.slice(dim=1, start=0, end=n_H512_tile_sharded),
         bias_sb=bias_tv,
         cfg=gate_proj_cfg,
+        w_dequant_scale=gate_dequant_scale if is_row_quant else None,
+        input_dequant_scale=input_dequant_scale,
     )  # bf16[_pmax, n_I512_tile, T, _q_width]
     up_proj_out_sb = gate_up_projection_mx_tp_shard_H(
         hidden_qtz_sb=hidden_tv,
@@ -418,6 +589,8 @@ def process_fused_gate_up_projection_mxfp4(
         weight_scale=scale_tv.slice(dim=1, start=n_H512_tile_sharded, end=2 * n_H512_tile_sharded),
         bias_sb=bias_tv,
         cfg=up_proj_cfg,
+        w_dequant_scale=up_dequant_scale if is_row_quant else None,
+        input_dequant_scale=input_dequant_scale,
     )  # bf16[_pmax, n_I512_tile, T, _q_width]
 
     # Perform SendRecv between two NCs to reduce/gather gate_proj results.
@@ -425,15 +598,31 @@ def process_fused_gate_up_projection_mxfp4(
     if num_shards > 1:
         _lnc_reduce_proj_out(gate_proj_out_sb, shard_id)
 
+    # STATIC_MX: post-matmul dequant + bias (ROW_MX dequant handled inside projection kernel)
+    # TODO: Fuse scale+bias into single scalarTensorTensor or pipeline them
+    if is_static_quant:
+        nisa.activation(dst=gate_proj_out_sb, op=nl.copy, data=gate_proj_out_sb, scale=gate_dequant_scale)
+        # TODO: Replace loop with single nisa.tensor_tensor + broadcast access pattern
+        if gate_up_bias != None:
+            for i_tile in range(n_I512_tile):
+                for i_q in range(_q_width):
+                    nisa.activation(
+                        dst=gate_proj_out_sb[:, i_tile, :, i_q],
+                        op=nl.copy,
+                        data=gate_proj_out_sb[:, i_tile, :, i_q],
+                        bias=bias_sb[:, 0, i_tile, i_q],
+                    )
+
     # Optionally perform clamping on gate projection results
-    nisa.tensor_scalar(
-        dst=gate_proj_out_sb,
-        data=gate_proj_out_sb,
-        op0=nl.minimum if attrs.gate_clamp_upper_limit is not None else None,
-        operand0=attrs.gate_clamp_upper_limit,
-        op1=nl.maximum if attrs.gate_clamp_lower_limit is not None else None,
-        operand1=attrs.gate_clamp_lower_limit,
-    )
+    if attrs.gate_clamp_upper_limit != None or attrs.gate_clamp_lower_limit != None:
+        nisa.tensor_scalar(
+            dst=gate_proj_out_sb,
+            data=gate_proj_out_sb,
+            op0=nl.minimum if attrs.gate_clamp_upper_limit != None else None,
+            operand0=attrs.gate_clamp_upper_limit,
+            op1=nl.maximum if attrs.gate_clamp_lower_limit != None else None,
+            operand1=attrs.gate_clamp_lower_limit,
+        )
 
     # Compute activation(gate): it is either silu(gate) or swish(gate), based on attrs.act_fnd
     nisa.activation(dst=gate_proj_out_sb, op=get_nl_act_fn_from_type(attrs.activation_fn), data=gate_proj_out_sb)
@@ -442,15 +631,29 @@ def process_fused_gate_up_projection_mxfp4(
     if num_shards > 1:
         _lnc_reduce_proj_out(up_proj_out_sb, shard_id)
 
+    # STATIC_MX: post-matmul dequant + bias (ROW_MX dequant handled inside projection kernel)
+    if is_static_quant:
+        nisa.activation(dst=up_proj_out_sb, op=nl.copy, data=up_proj_out_sb, scale=up_dequant_scale)
+        if gate_up_bias != None:
+            for i_tile in range(n_I512_tile):
+                for i_q in range(_q_width):
+                    nisa.activation(
+                        dst=up_proj_out_sb[:, i_tile, :, i_q],
+                        op=nl.copy,
+                        data=up_proj_out_sb[:, i_tile, :, i_q],
+                        bias=bias_sb[:, 1, i_tile, i_q],
+                    )
+
     # Optionally perform clamping on up projection results
-    nisa.tensor_scalar(
-        dst=up_proj_out_sb,
-        data=up_proj_out_sb,
-        op0=nl.minimum if attrs.up_clamp_upper_limit is not None else None,
-        operand0=attrs.up_clamp_upper_limit,
-        op1=nl.maximum if attrs.up_clamp_lower_limit is not None else None,
-        operand1=attrs.up_clamp_lower_limit,
-    )
+    if attrs.up_clamp_upper_limit != None or attrs.up_clamp_lower_limit != None:
+        nisa.tensor_scalar(
+            dst=up_proj_out_sb,
+            data=up_proj_out_sb,
+            op0=nl.minimum if attrs.up_clamp_upper_limit != None else None,
+            operand0=attrs.up_clamp_upper_limit,
+            op1=nl.maximum if attrs.up_clamp_lower_limit != None else None,
+            operand1=attrs.up_clamp_lower_limit,
+        )
 
     # Multiply gate and up projection outputs
     nisa.tensor_tensor(dst=output, data1=gate_proj_out_sb, data2=up_proj_out_sb, op=nl.multiply)

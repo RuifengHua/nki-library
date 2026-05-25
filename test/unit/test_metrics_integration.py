@@ -32,11 +32,10 @@ def test_metrics_collector_with_timers():
         collector.set_namespace("NeuronCompiler")
 
         emitter = MetricsEmitter(
-            collector=collector,
             output_mode=OutputMode.FILE,
-            output_dir=tmpdir,
         )
         collector.test_name = "test_example"
+        collector.set_output_dir(tmpdir)
 
         # Start test
         collector.start_test()
@@ -68,10 +67,10 @@ def test_metrics_collector_with_timers():
         )
 
         # Emit all metrics
-        emitter.emit()
+        emitter.emit(collector)
 
         # Verify metrics file was created
-        files = list(Path(tmpdir).glob("*.json"))
+        files = list(Path(tmpdir).joinpath('metrics').glob("*.json"))
         assert len(files) == 1
 
         # Verify metrics content
@@ -108,11 +107,10 @@ def test_metrics_collector_failure_status():
         collector.set_namespace("NeuronCompiler")
 
         emitter = MetricsEmitter(
-            collector=collector,
             output_mode=OutputMode.FILE,
-            output_dir=tmpdir,
         )
         collector.test_name = "test_failure"
+        collector.set_output_dir(tmpdir)
 
         collector.start_test()
 
@@ -133,9 +131,9 @@ def test_metrics_collector_failure_status():
         )
 
         # Emit with failure status
-        emitter.emit()
+        emitter.emit(collector)
 
-        files = list(Path(tmpdir).glob("*.json"))
+        files = list(Path(tmpdir).joinpath('metrics').glob("*.json"))
         assert len(files) == 1
 
         with open(files[0], "r") as f:

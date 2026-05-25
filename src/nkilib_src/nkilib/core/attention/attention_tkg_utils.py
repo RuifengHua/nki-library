@@ -163,7 +163,7 @@ def uses_batch_tiling(bs_per_nc: int, q_head: int, s_active: int, fa_tile_s_prio
 
 def is_fp8_e4m3(dtype) -> bool:
     """Check if dtype is FP8 E4M3 (handles both numpy dtype and compiler internal name)."""
-    return dtype == nl.float8_e4m3 or str(dtype) == "float8e4"
+    return dtype in [nl.float8_e4m3, nl.float8_e4m3fn] or str(dtype) == "float8e4"
 
 
 def is_fp8_e5m2(dtype) -> bool:

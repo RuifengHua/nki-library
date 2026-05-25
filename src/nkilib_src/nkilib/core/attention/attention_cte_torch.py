@@ -38,9 +38,12 @@ def attention_cte_torch_ref(
     tp_out=False,
     cache_softmax=False,
     softmax_dtype=torch.float32,
+    mm_out_dtype=torch.float32,
     cp_offset: torch.tensor = None,
     global_cp_deg: int = None,
     cp_strided_q_slicing: bool = False,
+    cp_striped_input: bool = False,
+    skip_output_normalization: bool = False,
     bound_min=None,
     bound_max=None,
 ):
@@ -70,19 +73,32 @@ def attention_cte_torch_ref(
         tp_out (bool, optional): Output transpose flag. Default: False
         cache_softmax (bool, optional): Whether to cache softmax statistics. Default: False
         softmax_dtype (torch.dtype, optional): Data type for softmax outputs. Default: torch.float32
+        mm_out_dtype (torch.dtype, optional): Matmul output dtype (unused in ref). Default: torch.float32
         cp_offset (torch.tensor, optional): Context parallel offset. Default: None
         global_cp_deg (int, optional): Global context parallel degree. Default: None
         cp_strided_q_slicing (bool, optional): Whether Q is strided. Default: False
+        bound_min (torch.tensor, optional): Per-query lower bound (inclusive) for
+            sequence packing. Shape [bs, seqlen_q, 1]. Default: None
+        bound_max (torch.tensor, optional): Per-query upper bound (exclusive) for
+            sequence packing. Shape [bs, seqlen_q, 1]. Default: None
 
     Returns:
-        torch.tensor: Attention output tensor
-        If cache_softmax is True, returns tuple of (output, neg_max, recip)
+        dict[str, torch.tensor]: Dictionary with key "out" for the attention output tensor.
+            If cache_softmax is True, also includes "out_cached_negative_max" and
+            "out_cached_sum_reciprocal".
 
     Notes:
         - All inputs are converted to float32 for CPU compatibility
         - Supports GQA by replicating K/V tensors
         - Implements flash attention statistics when cache_softmax=True
     """
+    # Resolve dtype arguments that may arrive as strings (e.g. "float32") from torch_ref_wrapper
+    _dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    if isinstance(softmax_dtype, str):
+        softmax_dtype = _dtype_map.get(softmax_dtype, torch.float32)
+    if isinstance(mm_out_dtype, str):
+        mm_out_dtype = _dtype_map.get(mm_out_dtype, torch.float32)
+
     # Process shapes and configs
     is_prefix_caching = k_prior is not None
 
@@ -145,18 +161,26 @@ def attention_cte_torch_ref(
     if sliding_window > 0:
         mask += torch.where(pos_diff <= -sliding_window, minus_inf_t, zero_t)
 
-    # Sequence packing mask: each query only attends to KV positions in [bound_min, bound_max)
-    if bound_min is not None and bound_max is not None:
-        bound_min_t = torch.tensor(bound_min, dtype=torch.int32).reshape(seqlen_q, 1)
-        bound_max_t = torch.tensor(bound_max, dtype=torch.int32).reshape(seqlen_q, 1)
-        kv_idx = torch.arange(prior_used_len + seqlen_k, dtype=torch.int32).unsqueeze(0)
-        seq_pack_mask = (kv_idx < bound_min_t) | (kv_idx >= bound_max_t)
-        mask = mask.masked_fill(seq_pack_mask, float("-inf"))
-
     # Compute QK, apply mask
     qk = q @ k  # [bs, seqlen_q, prior_used_len + seqlen_k]
     qk *= scale
     qk += mask[None, :, :]
+
+    # Sequence packing mask: each query only attends to KV positions in [bound_min, bound_max)
+    # bound_min/bound_max have shape [bs, seqlen_q, 1]
+    if bound_min is not None and bound_max is not None:
+        kernel_assert(
+            bound_min.shape == (bs, seqlen_q, 1),
+            f"bound_min shape mismatch: expected ({bs}, {seqlen_q}, 1), got {bound_min.shape}",
+        )
+        kernel_assert(
+            bound_max.shape == (bs, seqlen_q, 1),
+            f"bound_max shape mismatch: expected ({bs}, {seqlen_q}, 1), got {bound_max.shape}",
+        )
+        kv_len = prior_used_len + seqlen_k
+        kv_idx = torch.arange(kv_len, dtype=torch.int32).reshape(1, 1, -1)
+        seq_pack_mask = (kv_idx < bound_min) | (kv_idx >= bound_max)  # [bs, seqlen_q, kv_len]
+        qk = qk.masked_fill(seq_pack_mask, float("-inf"))
 
     # Concat sink
     if sink is not None:
@@ -188,20 +212,24 @@ def attention_cte_torch_ref(
             w = w[..., :-1]  # [bs, seqlen_q, seqlen_k]
 
         # Compute out, transpose if needed
-        out = w @ v  # [bs, seqlen_q, d]
+        if skip_output_normalization:
+            # Return unnormalized output: exp(scores - max) @ V
+            exp_w = exp_values[..., :-1] if sink is not None else exp_values
+            out = exp_w @ v
+        else:
+            out = w @ v  # [bs, seqlen_q, d]
         out = out.transpose(1, 2) if tp_out else out
 
-        # Reshape neg_max and recip to match the expected output format with tile_size=128
-        # The output format is [bs, 128, seq_grps] where seq_grps = seqlen_q // 128)
+        # Reshape neg_max and recip/sum to match [bs, 128, seq_grps]
         seq_grps = seqlen_q // tile_size
-        neg_max = neg_max.reshape(bs, seq_grps, tile_size).transpose(1, 2)  # [bs, tile_size, seq_grps]
-        recip = recip.reshape(bs, seq_grps, tile_size).transpose(1, 2)  # [bs, tile_size, seq_grps]
+        neg_max = neg_max.reshape(bs, seq_grps, tile_size).transpose(1, 2).to(softmax_dtype)
 
-        # Cast to softmax_dtype
-        neg_max = neg_max.to(softmax_dtype)
-        recip = recip.to(softmax_dtype)
+        if skip_output_normalization:
+            sum_stat = sum_exp.reshape(bs, seq_grps, tile_size).transpose(1, 2).to(softmax_dtype)
+        else:
+            sum_stat = recip.reshape(bs, seq_grps, tile_size).transpose(1, 2).to(softmax_dtype)
 
-        return out, neg_max, recip
+        return {"out": out, "out_cached_negative_max": neg_max, "out_cached_sum_reciprocal": sum_stat}
     else:
         w = torch.softmax(qk, dim=-1)
         if sink is not None:
@@ -209,4 +237,5 @@ def attention_cte_torch_ref(
 
         # Compute out, transpose if needed
         out = w @ v  # [bs, seqlen_q, d]
-        return out.transpose(1, 2) if tp_out else out
+        out = out.transpose(1, 2) if tp_out else out
+        return {"out": out}

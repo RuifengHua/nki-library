@@ -26,15 +26,13 @@ from .metrics_emitter import IMetricsEmitter, OutputMode
 class CompositeEmitter(IMetricsEmitter):
     """Emitter that fans out to multiple child emitters."""
 
-    def __init__(self, collector: IMetricsCollector, emitters: list[IMetricsEmitter]):
+    def __init__(self, emitters: list[IMetricsEmitter]):
         """
         Initialize composite emitter.
 
         Args:
-            collector: Shared MetricsCollector instance
             emitters: List of emitters to fan out to
         """
-        self._collector = collector
         self._emitters = emitters
         self._logger = logging.getLogger(__name__)
 
@@ -53,22 +51,13 @@ class CompositeEmitter(IMetricsEmitter):
         return None
 
     @override
-    def set_output_dir(self, output_dir: str) -> None:
-        for emitter in self._emitters:
-            emitter.set_output_dir(output_dir)
-
-    @override
-    def emit(self) -> None:
-        """Call emit() on all child emitters, log errors but don't fail."""
+    def emit(self, collector: IMetricsCollector) -> None:
+        """Call emit(collector) on all child emitters, log errors but don't fail."""
         for emitter in self._emitters:
             try:
-                emitter.emit()
+                emitter.emit(collector)
             except Exception as e:
                 self._logger.error(f"Emitter {type(emitter).__name__} failed: {e}")
-
-    @override
-    def get_collector(self) -> IMetricsCollector:
-        return self._collector
 
     def emit_run_complete(self, kernel_name: str, tests_passed: int, tests_total: int) -> None:
         """Fan out run_complete to emitters that support it."""

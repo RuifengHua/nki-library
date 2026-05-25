@@ -19,12 +19,6 @@ Tests the gate_up_projection_mx_tp_shard_H and down_projection_mx_shard_H sub-ke
 with LNC2 sharding on the H (hidden) dimension.
 """
 
-from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
-from test.utils.common_dataclasses import CompilerArgs, Platforms
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
 import neuron_dtypes as dt
@@ -33,15 +27,22 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.mlp.mlp_tkg.down_projection_mx_shard_H import down_projection_mx_shard_H
 from nkilib_src.nkilib.core.mlp.mlp_tkg.gate_up_projection_mx_shard_H import gate_up_projection_mx_tp_shard_H
-from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_proj_mxfp4_torch import (
-    down_proj_mxfp4_torch_ref,
-    gate_up_proj_mxfp4_torch_ref,
+from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_proj_mx_torch import (
+    down_proj_mx_torch_ref,
+    gate_up_proj_mx_torch_ref,
 )
 from nkilib_src.nkilib.core.mlp.mlp_tkg.projection_mx_constants import ProjConfig, _pmax, _q_height, _q_width
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
 from nkilib_src.nkilib.core.utils.tensor_view import TensorView
+from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # =============================================================================
 # Input Builders
@@ -285,10 +286,8 @@ DOWN_TEST_PARAMS = [(BxS, H, I, use_ssb) for BxS, H, I in MXFP4_PROJ_LNC2_TEST_V
 # =============================================================================
 
 
-@pytest_test_metadata(
-    name="MLP Projection MXFP4",
-    pytest_marks=["mlp", "mxfp4", "projection"],
-)
+@pytest_test_metadata(name="MLP Projection MXFP4")
+@pytest_marks(["mlp", "mxfp4", "projection"])
 @final
 @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
 class TestMlpProjMxfp4Kernel:
@@ -314,7 +313,7 @@ class TestMlpProjMxfp4Kernel:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=gate_up_proj_mxfp4_kernel,
-            torch_ref=torch_ref_wrapper(gate_up_proj_mxfp4_torch_ref),
+            torch_ref=torch_ref_wrapper(gate_up_proj_mx_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
         )
@@ -345,7 +344,7 @@ class TestMlpProjMxfp4Kernel:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=down_proj_mxfp4_kernel,
-            torch_ref=torch_ref_wrapper(down_proj_mxfp4_torch_ref),
+            torch_ref=torch_ref_wrapper(down_proj_mx_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
         )

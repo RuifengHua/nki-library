@@ -21,7 +21,9 @@ from typing import Optional
 import nki
 import nki.language as nl
 
+from ....core.utils.allocator import align_to, sizeinbytes
 from ....core.utils.kernel_assert import kernel_assert
+from ....core.utils.kernel_helpers import div_ceil
 
 
 @dataclass(frozen=True)
@@ -84,16 +86,12 @@ class ShardOption(Enum):
     Sharding strategies for blockwise backward kernel.
 
     Attributes:
-        AUTO: Automatically select best implementation based on dimensions.
-        SHARD_ON_HIDDEN: Shard across hidden dimension (simpler, no H-tiling).
-        SHARD_ON_INTERMEDIATE: Shard across intermediate dimension (better memory).
-        BASELINE_LNC1: Single-core baseline implementation.
+        SHARD_ON_FREE: Shard across the free (output) dimension of each matmul.
+        SHARD_ON_HIDDEN: Shard across hidden dimension for all functions.
     """
 
-    AUTO = 0
+    SHARD_ON_FREE = 0
     SHARD_ON_HIDDEN = 1
-    SHARD_ON_INTERMEDIATE = 2
-    BASELINE_LNC1 = 3
 
 
 class AffinityOption(Enum):
@@ -129,9 +127,59 @@ class DownProjOutputGradBlocking(nl.NKIObject):
 
     Args:
         block_h (int): Block size for hidden dimension.
+        buffer_degree (int): Number of multi-buffer sections for interleaved execution.
     """
 
     block_h: int = 8
+    buffer_degree: int = 4
+
+    def estimate_sbuf_usage(
+        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+    ):
+        """
+        Estimate peak SBUF bytes for _compute_down_projection_output_grad.
+
+        Computes persistent_bytes + buffer_degree * inner_section_bytes, mirroring
+        the allocation pattern: small per-token buffers persist across the loop,
+        while large H-blocked tiles cycle inside the interleave scope.
+
+        Args:
+            B (int): Block size.
+            H (int): Hidden dimension.
+            I_TP (int): Intermediate dimension (unused, kept for uniform interface).
+            num_shards (int): Number of LNC shards.
+            dtype: Compute data type.
+            shard_option: Unused, kept for uniform interface.
+            affinity_option: Unused, kept for uniform interface.
+            is_tensor_update_accumulating (bool): Unused, kept for uniform interface.
+
+        Returns:
+            int: Estimated peak SBUF bytes.
+        """
+        TILE_SIZE = 128
+        B_TILE_SIZE = min(TILE_SIZE, B)
+        H_TILE_SIZE = TILE_SIZE
+        H_BLOCK_SIZE = min(self.block_h * H_TILE_SIZE, H)
+        elem = sizeinbytes(dtype)
+        ALIGN = 32
+
+        # Persistent: buffer_degree × 6 buffers of (B_TILE_SIZE, 1)
+        # Each small allocation (2-4 bytes) gets 32-byte aligned by SbufManager,
+        # so effective size per allocation is align_to(bytes, 32).
+        # Types: ea_dtype(4) + fp32(4) + fp32(4) + dtype(elem) + int32(4) + int32(4)
+        persistent_bytes = self.buffer_degree * (
+            align_to(4, ALIGN)
+            + align_to(4, ALIGN)
+            + align_to(4, ALIGN)
+            + align_to(elem, ALIGN)
+            + align_to(4, ALIGN)
+            + align_to(4, ALIGN)
+        )
+
+        # Inner section: 4 tiles of (B_TILE_SIZE, H_BLOCK_SIZE) + ea_grad_local (B_TILE_SIZE, 1)
+        inner_section_bytes = 4 * H_BLOCK_SIZE * elem + align_to(4, ALIGN)
+
+        return persistent_bytes + self.buffer_degree * inner_section_bytes
 
 
 @dataclass
@@ -143,11 +191,97 @@ class GateUpOutputGradBlocking(nl.NKIObject):
         block_h (int): Block size for hidden dimension.
         block_b (int): Block size for batch dimension.
         block_i (int): Block size for intermediate dimension.
+        buffer_degree (int): Number of multi-buffer sections for interleaved execution.
     """
 
     block_h: int = 8
     block_b: int = 2
     block_i: int = 2
+    buffer_degree: int = 3
+
+    def estimate_sbuf_usage(
+        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+    ):
+        """
+        Estimate peak SBUF bytes for _compute_gate_up_projection_output_grad.
+
+        Args:
+            B (int): Block size.
+            H (int): Hidden dimension.
+            I_TP (int): Intermediate dimension.
+            num_shards (int): Number of LNC shards.
+            dtype: Compute data type.
+            shard_option (ShardOption): Sharding strategy.
+            affinity_option (AffinityOption): Affinity scaling dimension.
+            is_tensor_update_accumulating (bool): Unused, kept for uniform interface.
+
+        Returns:
+            int: Estimated peak SBUF bytes.
+        """
+        TILE_SIZE = 128
+        PSUM_SIZE = 512
+        elem = sizeinbytes(dtype)
+
+        is_shard_on_h = shard_option == ShardOption.SHARD_ON_HIDDEN if shard_option is not None else False
+
+        if is_shard_on_h:
+            H_SHARDED = H // num_shards
+            I_TP_SHARDED = I_TP
+        else:
+            H_SHARDED = H
+            I_TP_SHARDED = I_TP // num_shards
+
+        B_TILE_SIZE = min(TILE_SIZE, B)
+        H_TILE_SIZE = min(TILE_SIZE, H_SHARDED)
+        I_TP_TILE_SIZE = min(PSUM_SIZE, I_TP_SHARDED)
+
+        H_BLOCK_SIZE = min(self.block_h * H_TILE_SIZE, H_SHARDED)
+        I_TP_BLOCK_SIZE = min(self.block_i * I_TP_TILE_SIZE, I_TP_SHARDED)
+        B_BLOCK_SIZE = min(self.block_b * B_TILE_SIZE, B)
+
+        NUM_B_TILES = div_ceil(B_BLOCK_SIZE, B_TILE_SIZE)
+        NUM_H_TILES = div_ceil(H_BLOCK_SIZE, H_TILE_SIZE)
+        NUM_B_TILES_TOTAL = div_ceil(B, B_TILE_SIZE)
+
+        # SBUF bytes = free dims only (exclude partition dim shape[0])
+        # For (P, NUM_B_TILES, I_TP_BLOCK_SIZE): bytes = NUM_B_TILES * I_TP_BLOCK_SIZE * elem
+
+        # 6 persistent tensors: (B_TILE, NUM_B_TILES, I_TP_BLOCK_SIZE)
+        base_persistent = 6 * NUM_B_TILES * I_TP_BLOCK_SIZE * elem
+
+        # buffer_degree × (3 large + 1 weight_temp)
+        buffered = self.buffer_degree * (3 * NUM_B_TILES * I_TP_BLOCK_SIZE * elem + H_BLOCK_SIZE * elem)
+
+        # Affinity I adds significant persistent buffers
+        is_affinity_i = affinity_option == AffinityOption.AFFINITY_ON_I if affinity_option is not None else False
+        affinity_i_bytes = 0
+        if is_affinity_i:
+            affinity_i_bytes = (
+                self.buffer_degree * H_BLOCK_SIZE * elem  # grad_load_temp (P, H_BLOCK)
+                + NUM_B_TILES_TOTAL * 4  # recv_buf (P, 1) fp32
+                + NUM_B_TILES_TOTAL * elem  # ea_grad_reduced (P, 1)
+                + NUM_B_TILES_TOTAL * 4  # ea_grad_accum (P, 1) fp32
+                + I_TP_BLOCK_SIZE * 4  # ea_product_temp (P, I_TP_BLOCK) fp32
+                + 1 * 4  # ea_reduce_temp (P, 1) fp32
+                + I_TP_BLOCK_SIZE * elem  # scaled_gate_up_mult_tile (P, I_TP_BLOCK)
+                + NUM_B_TILES_TOTAL * 4  # ea_tiles_all (P, NUM_B_TILES_TOTAL) fp32
+                + NUM_B_TILES_TOTAL * 4  # ea_offsets_all (P, 1) int32 × NUM_B_TILES_TOTAL
+                + NUM_B_TILES_TOTAL * 4  # addr_tmp (P, 1) int32 × NUM_B_TILES_TOTAL
+                + NUM_B_TILES_TOTAL * 4  # ea_load (P, 1) fp32 × NUM_B_TILES_TOTAL
+            )
+
+        # Shard-on-H adds sendrecv buffer (P, b_tiles_per_core, I_TP_BLOCK_SIZE)
+        shard_h_bytes = 0
+        if is_shard_on_h:
+            b_tiles_per_core = max(1, NUM_B_TILES // num_shards)
+            shard_h_bytes = b_tiles_per_core * I_TP_BLOCK_SIZE * elem
+
+        persistent_bytes = base_persistent + buffered + affinity_i_bytes + shard_h_bytes
+
+        # Inner section: weight_transposed (H_TILE, NUM_H_TILES, I_TP_BLOCK) + grad_transposed (H_TILE, NUM_H_TILES, B_BLOCK)
+        inner_section_bytes = NUM_H_TILES * I_TP_BLOCK_SIZE * elem + NUM_H_TILES * B_BLOCK_SIZE * elem
+
+        return persistent_bytes + self.buffer_degree * inner_section_bytes
 
 
 @dataclass
@@ -159,11 +293,57 @@ class DownWeightGradBlocking(nl.NKIObject):
         block_h (int): Block size for hidden dimension.
         block_b (int): Block size for batch dimension.
         block_i (int): Block size for intermediate dimension.
+        buffer_degree (int): Number of multi-buffer sections for interleaved execution.
     """
 
     block_h: int = 2
     block_b: int = 4
     block_i: int = 8
+    buffer_degree: int = 3
+
+    def estimate_sbuf_usage(
+        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+    ):
+        """
+        Estimate peak SBUF bytes for _compute_down_projection_weight_grad.
+
+        Args:
+            B (int): Block size.
+            H (int): Hidden dimension.
+            I_TP (int): Intermediate dimension.
+            num_shards (int): Number of LNC shards.
+            dtype: Compute data type.
+            shard_option: Unused, kept for uniform interface.
+            affinity_option: Unused, kept for uniform interface.
+            is_tensor_update_accumulating (bool): Unused, kept for uniform interface.
+
+        Returns:
+            int: Estimated peak SBUF bytes.
+        """
+        TILE_SIZE = 128
+        PSUM_SIZE = 512
+        elem = sizeinbytes(dtype)
+
+        H_SHARDED = H // num_shards
+        B_TILE_SIZE = min(TILE_SIZE, B)
+        H_TILE_SIZE = min(PSUM_SIZE, H_SHARDED)
+        I_TP_TILE_SIZE = TILE_SIZE
+
+        H_BLOCK_SIZE = min(self.block_h * H_TILE_SIZE, H_SHARDED)
+        I_TP_BLOCK_SIZE = min(self.block_i * I_TP_TILE_SIZE, I_TP)
+        B_BLOCK_SIZE = min(self.block_b * B_TILE_SIZE, B)
+
+        NUM_I_TP_TILES = div_ceil(I_TP_BLOCK_SIZE, I_TP_TILE_SIZE)
+        NUM_B_TILES = div_ceil(B_BLOCK_SIZE, B_TILE_SIZE)
+
+        # Persistent: buffer_degree × (result_tiles + existing_weight_grad)
+        # Shape: (I_TP_TILE_SIZE, NUM_I_TP_TILES, H_BLOCK_SIZE) → free = NUM_I_TP_TILES * H_BLOCK_SIZE
+        persistent_bytes = 2 * self.buffer_degree * NUM_I_TP_TILES * H_BLOCK_SIZE * elem
+
+        # Inner section: lhs_tiles (B_TILE, NUM_B_TILES, I_TP_BLOCK) + rhs_tiles (B_TILE, NUM_B_TILES, H_BLOCK)
+        inner_section_bytes = NUM_B_TILES * (I_TP_BLOCK_SIZE + H_BLOCK_SIZE) * elem
+
+        return persistent_bytes + self.buffer_degree * inner_section_bytes
 
 
 @dataclass
@@ -175,11 +355,62 @@ class HiddenGradBlocking(nl.NKIObject):
         block_h (int): Block size for hidden dimension.
         block_b (int): Block size for batch dimension.
         block_i (int): Block size for intermediate dimension.
+        buffer_degree (int): Number of multi-buffer sections for interleaved execution.
     """
 
     block_h: int = 2
     block_b: int = 4
     block_i: int = 8
+    buffer_degree: int = 3
+
+    def estimate_sbuf_usage(
+        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+    ):
+        """
+        Estimate peak SBUF bytes for _compute_hidden_states_grad.
+
+        Args:
+            B (int): Block size.
+            H (int): Hidden dimension.
+            I_TP (int): Intermediate dimension.
+            num_shards (int): Number of LNC shards.
+            dtype: Compute data type.
+            shard_option: Unused, kept for uniform interface.
+            affinity_option: Unused, kept for uniform interface.
+            is_tensor_update_accumulating (bool): Whether accumulation buffers are allocated.
+
+        Returns:
+            int: Estimated peak SBUF bytes.
+        """
+        TILE_SIZE = 128
+        PSUM_SIZE = 512
+        elem = sizeinbytes(dtype)
+
+        H_SHARDED = H // num_shards
+        B_TILE_SIZE = min(TILE_SIZE, B)
+        H_TILE_SIZE = min(PSUM_SIZE, H_SHARDED)
+        I_TP_TILE_SIZE = min(TILE_SIZE, I_TP)
+
+        H_BLOCK_SIZE = min(self.block_h * H_TILE_SIZE, H_SHARDED)
+        I_TP_BLOCK_SIZE = min(self.block_i * I_TP_TILE_SIZE, I_TP)
+        B_BLOCK_SIZE = min(self.block_b * B_TILE_SIZE, B)
+
+        NUM_B_TILES = div_ceil(B_BLOCK_SIZE, B_TILE_SIZE)
+        NUM_I_TP_TILES = div_ceil(I_TP_BLOCK_SIZE, I_TP_TILE_SIZE)
+        NUM_H_INNER_TILES = div_ceil(H_TILE_SIZE, TILE_SIZE)
+
+        # Persistent: buffer_degree × (rhs_temp + result_tiles + optional existing_hidden_grad)
+        # rhs_temp: (TILE_SIZE, NUM_H_INNER_TILES, I_TP_BLOCK_SIZE) → free = NUM_H_INNER_TILES * I_TP_BLOCK_SIZE
+        # result_tiles: (B_TILE, NUM_B_TILES, H_BLOCK_SIZE) → free = NUM_B_TILES * H_BLOCK_SIZE
+        result_count = 2 if is_tensor_update_accumulating else 1
+        persistent_bytes = self.buffer_degree * (
+            NUM_H_INNER_TILES * I_TP_BLOCK_SIZE * elem + result_count * NUM_B_TILES * H_BLOCK_SIZE * elem
+        )
+
+        # Inner section: lhs_tiles (I_TP_TILE, NUM_I_TP_TILES, B_BLOCK) + rhs_tiles (I_TP_TILE, NUM_I_TP_TILES, H_BLOCK)
+        inner_section_bytes = NUM_I_TP_TILES * (B_BLOCK_SIZE + H_BLOCK_SIZE) * elem
+
+        return persistent_bytes + self.buffer_degree * inner_section_bytes
 
 
 @dataclass
@@ -191,11 +422,57 @@ class GateUpWeightGradBlocking(nl.NKIObject):
         block_h (int): Block size for hidden dimension.
         block_b (int): Block size for batch dimension.
         block_i (int): Block size for intermediate dimension.
+        buffer_degree (int): Number of multi-buffer sections for interleaved execution.
     """
 
     block_h: int = 4
     block_b: int = 4
     block_i: int = 4
+    buffer_degree: int = 3
+
+    def estimate_sbuf_usage(
+        self, B, H, I_TP, num_shards, dtype, shard_option=None, affinity_option=None, is_tensor_update_accumulating=True
+    ):
+        """
+        Estimate peak SBUF bytes for _compute_gate_up_projection_weight_grad.
+
+        Args:
+            B (int): Block size.
+            H (int): Hidden dimension.
+            I_TP (int): Intermediate dimension.
+            num_shards (int): Number of LNC shards.
+            dtype: Compute data type.
+            shard_option: Unused, kept for uniform interface.
+            affinity_option: Unused, kept for uniform interface.
+            is_tensor_update_accumulating (bool): Unused, kept for uniform interface.
+
+        Returns:
+            int: Estimated peak SBUF bytes.
+        """
+        TILE_SIZE = 128
+        PSUM_SIZE = 512
+        elem = sizeinbytes(dtype)
+
+        H_SHARDED = H // num_shards
+        B_TILE_SIZE = min(TILE_SIZE, B)
+        H_TILE_SIZE = min(TILE_SIZE, H_SHARDED)
+        I_TP_TILE_SIZE = min(PSUM_SIZE, I_TP)
+
+        H_BLOCK_SIZE = min(self.block_h * H_TILE_SIZE, H_SHARDED)
+        I_TP_BLOCK_SIZE = min(self.block_i * I_TP_TILE_SIZE, I_TP)
+        B_BLOCK_SIZE = min(self.block_b * B_TILE_SIZE, B)
+
+        NUM_H_TILES = div_ceil(H_BLOCK_SIZE, H_TILE_SIZE)
+        NUM_B_TILES = div_ceil(B_BLOCK_SIZE, B_TILE_SIZE)
+
+        # Persistent: buffer_degree × (weight_grad_accum + existing_weight_grad)
+        # Shape: (H_TILE, NUM_H_TILES, I_TP_BLOCK_SIZE) → free = NUM_H_TILES * I_TP_BLOCK_SIZE
+        persistent_bytes = 2 * self.buffer_degree * NUM_H_TILES * I_TP_BLOCK_SIZE * elem
+
+        # Inner section: gate_up_proj_output_grad (B_TILE, NUM_B_TILES, I_TP_BLOCK) + block_hidden_states (B_TILE, NUM_B_TILES, H_BLOCK)
+        inner_section_bytes = NUM_B_TILES * (I_TP_BLOCK_SIZE + H_BLOCK_SIZE) * elem
+
+        return persistent_bytes + self.buffer_degree * inner_section_bytes
 
 
 @dataclass
@@ -218,15 +495,15 @@ class MOEBwdDroplessBlockingParams(nl.NKIObject):
     gate_up_weight_grad: GateUpWeightGradBlocking = None
 
     def __post_init__(self):
-        if self.down_proj_output_grad is None:
+        if self.down_proj_output_grad == None:
             self.down_proj_output_grad = DownProjOutputGradBlocking()
-        if self.gate_up_output_grad is None:
+        if self.gate_up_output_grad == None:
             self.gate_up_output_grad = GateUpOutputGradBlocking()
-        if self.down_weight_grad is None:
+        if self.down_weight_grad == None:
             self.down_weight_grad = DownWeightGradBlocking()
-        if self.hidden_grad is None:
+        if self.hidden_grad == None:
             self.hidden_grad = HiddenGradBlocking()
-        if self.gate_up_weight_grad is None:
+        if self.gate_up_weight_grad == None:
             self.gate_up_weight_grad = GateUpWeightGradBlocking()
 
 
@@ -304,9 +581,12 @@ class MOEBwdParameters(nl.NKIObject):
     skip_dma: SkipMode = None
     compute_dtype: nki.dtype = nl.bfloat16
     is_tensor_update_accumulating: bool = True
+    skip_grad_initialization: bool = False
     clamp_limits: ClampLimits = None
     activation_type: ActFnType = ActFnType.SiLU
     blocking_params: MOEBwdDroplessBlockingParams = None
+    affinity_option: AffinityOption = AffinityOption.AFFINITY_ON_H
+    shard_option: ShardOption = ShardOption.SHARD_ON_FREE
 
     # Derived dimensions (computed in __post_init__)
     T: int = None
@@ -317,11 +597,11 @@ class MOEBwdParameters(nl.NKIObject):
 
     def __post_init__(self):
         """Initialize default values and derive dimensions from tensor shapes."""
-        if self.skip_dma is None:
+        if self.skip_dma == None:
             self.skip_dma = SkipMode()
-        if self.clamp_limits is None:
+        if self.clamp_limits == None:
             self.clamp_limits = ClampLimits()
-        if self.blocking_params is None:
+        if self.blocking_params == None:
             self.blocking_params = MOEBwdDroplessBlockingParams()
 
         # Derive dimensions from tensor shapes
@@ -344,6 +624,16 @@ class MOEBwdParameters(nl.NKIObject):
         )
         kernel_assert(self.I_TP % 2 == 0, f"I_TP must be divisible by 2, got {self.I_TP}")
         kernel_assert(self.H % 2 == 0, f"H must be divisible by 2, got {self.H}")
+        if self.affinity_option == AffinityOption.AFFINITY_ON_I:
+            kernel_assert(
+                self.down_proj_act_checkpoint == None,
+                "down_proj_act_checkpoint must be None for AFFINITY_ON_I",
+            )
+        if self.shard_option == ShardOption.SHARD_ON_HIDDEN:
+            kernel_assert(
+                self.affinity_option == AffinityOption.AFFINITY_ON_I,
+                "SHARD_ON_HIDDEN only supports AFFINITY_ON_I",
+            )
 
     def validate_sharding(self, num_shards: int):
         """
@@ -368,11 +658,13 @@ class MOEBwdParameters(nl.NKIObject):
         )
 
         sharded_i_tp = self.I_TP // num_shards
-        kernel_assert(
-            sharded_i_tp % 32 == 0,
-            f"I_TP dim when sharded by num_shards={num_shards} must be divisible by 32 for DMA transpose, "
-            f"got sharded I_TP as {sharded_i_tp}",
-        )
+        if self.shard_option != ShardOption.SHARD_ON_HIDDEN and sharded_i_tp % 32 != 0:
+            kernel_assert(
+                self.block_size == 128,
+                f"I_TP dim when sharded by num_shards={num_shards} must be divisible by 32. "
+                f"If not, block size must be 128 for DMA transpose. "
+                f"Got sharded I_TP={sharded_i_tp}, block_size={self.block_size}",
+            )
 
     def get_activation_ops(self):
         """

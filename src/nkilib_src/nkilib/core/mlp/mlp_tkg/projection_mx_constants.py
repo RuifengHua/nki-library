@@ -28,8 +28,18 @@ SBUF_QUADRANT_SIZE = 32
 _q_height = 8
 _q_width = 4
 
+# MX general dtype mapping
+MX_UNPACKED_DTYPES = [nl.float8_e4m3fn, nl.float8_e5m2]
+MX_PACKED_DTYPES = [nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4, nl.float8_e5m2_x4]
+MXFP8_PACKED_UNPACKED_MAP = {
+    nl.float8_e4m3fn_x4: nl.float8_e4m3fn,
+    nl.float8_e5m2_x4: nl.float8_e5m2,
+}
+MXFP8_UNPACKED_PACKED_MAP = {
+    nl.float8_e4m3fn: nl.float8_e4m3fn_x4,
+    nl.float8_e5m2: nl.float8_e5m2_x4,
+}
 # QMX config
-MX_DTYPES = [nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4, nl.float8_e5m2_x4]
 SUPPORTED_QMX_INPUT_DTYPES = [nl.float16, nl.bfloat16]
 SUPPORTED_QMX_OUTPUT_DTYPES = [nl.float8_e4m3fn_x4]
 MX_SCALE_DTYPE = nl.uint8
@@ -98,6 +108,12 @@ class ProjConfig(nl.NKIObject):
     dbg_hidden: bool = False
     dbg_weight: bool = False
 
+    # Zero unused partitions in gate/up projection output when I % 512 != 0
+    zero_unused_partitions: bool = True
+
+    # Name prefix for SBUF tensor names (unique naming in tile loops)
+    name_prefix: str = ""
+
     def check_shapes(self):
         kernel_assert(self.H % _pmax == 0, f"H={self.H} must be divisible by num partitions ({_pmax})")
         kernel_assert(self.H1 % self.n_prgs == 0, f"H1={self.H1=} must be disible by num shards ({self.n_prgs})")
@@ -107,8 +123,8 @@ class ProjConfig(nl.NKIObject):
         )
 
         kernel_assert(
-            self.r_I512_tile % (_q_width * _q_height) == 0,
-            f"MX4 MLP Proj requires I512 tile remainder ({self.r_I512_tile}) to be divisible by {_q_width * _q_height} for quantization",
+            self.r_I512_tile % _q_width == 0,
+            f"MX MLP Proj requires I512 tile remainder ({self.r_I512_tile}) to be divisible by {_q_width} for x4 tiling",
         )
 
         if self.out_p_offset != 0:

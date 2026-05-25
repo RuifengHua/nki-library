@@ -14,20 +14,21 @@
 
 """Tests for Conv1D kernel using UnitTestFramework."""
 
-from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import Optional, final
 
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.utils.common_types import ActFnType
 from nkilib_src.nkilib.experimental.conv.conv1d import conv1d
 from nkilib_src.nkilib.experimental.conv.conv1d_torch import conv1d_torch_ref
+from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def generate_conv1d_inputs(
@@ -166,10 +167,8 @@ CONV1D_ALL_PARAMS = CONV1D_BASIC_PARAMS + CONV1D_WHISPER_PARAMS
 # fmt: on
 
 
-@pytest_test_metadata(
-    name="Conv1D",
-    pytest_marks=["conv", "conv1d"],
-)
+@pytest_test_metadata(name="Conv1D")
+@pytest_marks(["conv", "conv1d"])
 @final
 class TestConv1DKernel:
     """Test class for Conv1D kernel validation using UnitTestFramework."""
@@ -179,6 +178,7 @@ class TestConv1DKernel:
     def test_conv1d_basic(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         batch: int,
         in_channels: int,
         out_channels: int,
@@ -196,6 +196,7 @@ class TestConv1DKernel:
         """Run basic Conv1D tests covering various convolution configurations."""
         self._run_conv1d_test(
             test_manager=test_manager,
+            platform_target=platform_target,
             batch=batch,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -216,6 +217,7 @@ class TestConv1DKernel:
     def test_conv1d_whisper(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         batch: int,
         in_channels: int,
         out_channels: int,
@@ -233,6 +235,7 @@ class TestConv1DKernel:
         """Run Whisper model Conv1D tests for Conv1 and Conv2 layer configurations."""
         self._run_conv1d_test(
             test_manager=test_manager,
+            platform_target=platform_target,
             batch=batch,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -252,6 +255,7 @@ class TestConv1DKernel:
     def test_conv1d_all(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         batch: int,
         in_channels: int,
         out_channels: int,
@@ -269,6 +273,7 @@ class TestConv1DKernel:
         """Run all Conv1D tests combining basic and Whisper configurations."""
         self._run_conv1d_test(
             test_manager=test_manager,
+            platform_target=platform_target,
             batch=batch,
             in_channels=in_channels,
             out_channels=out_channels,
@@ -287,6 +292,7 @@ class TestConv1DKernel:
     def _run_conv1d_test(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         batch: int,
         in_channels: int,
         out_channels: int,
@@ -359,7 +365,7 @@ class TestConv1DKernel:
 
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(),
+            compiler_args=CompilerArgs(platform_target=platform_target),
             rtol=rtol,
             atol=atol,
         )

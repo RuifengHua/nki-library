@@ -35,9 +35,7 @@ class TestMetricsEmitter:
             collector.set_namespace("NeuronCompiler")
 
             emitter = MetricsEmitter(
-                collector=collector,
                 output_mode=OutputMode.FILE,
-                output_dir=tmpdir,
             )
 
             # Create MetricsContext and add metric
@@ -47,10 +45,10 @@ class TestMetricsEmitter:
             context.put_metric(MetricName.COMPILATION_TIME, 5.234, "Seconds")
 
             # Emit directly
-            emitter._emit_metrics_context(context)
+            emitter._emit_metrics_context(context, tmpdir)
 
             # Verify file created
-            files = list(Path(tmpdir).glob("*.json"))
+            files = list(Path(tmpdir).joinpath('metrics').glob("*.json"))
             assert len(files) == 1
 
             # Verify file content
@@ -70,9 +68,7 @@ class TestMetricsEmitter:
             collector.set_namespace("NeuronCompiler")
 
             emitter = MetricsEmitter(
-                collector=collector,
                 output_mode=OutputMode.FILE,
-                output_dir=tmpdir,
             )
 
             # Create MetricsContext with multiple metrics
@@ -83,10 +79,10 @@ class TestMetricsEmitter:
             context.put_metric(MetricName.MBU_ESTIMATED_PERCENT, 78.5, "Percent")
 
             # Emit
-            emitter._emit_metrics_context(context)
+            emitter._emit_metrics_context(context, tmpdir)
 
             # Verify single file created with both metrics
-            files = list(Path(tmpdir).glob("*.json"))
+            files = list(Path(tmpdir).joinpath('metrics').glob("*.json"))
             assert len(files) == 1
 
             with open(files[0], "r") as f:
@@ -109,9 +105,7 @@ class TestMetricsEmitter:
             collector.set_namespace("NeuronCompiler")
 
             emitter = MetricsEmitter(
-                collector=collector,
                 output_mode=OutputMode.FILE,
-                output_dir=tmpdir,
             )
 
             # Create MetricsContext
@@ -121,9 +115,9 @@ class TestMetricsEmitter:
             context.put_metric("Latency", 123.45, "Milliseconds")
 
             # Emit
-            emitter._emit_metrics_context(context)
+            emitter._emit_metrics_context(context, tmpdir)
 
-            files = list(Path(tmpdir).glob("*.json"))
+            files = list(Path(tmpdir).joinpath('metrics').glob("*.json"))
             with open(files[0], "r") as f:
                 data = json.load(f)
 
@@ -156,9 +150,7 @@ class TestMetricsEmitter:
             collector.set_namespace("CustomNamespace")
 
             emitter = MetricsEmitter(
-                collector=collector,
                 output_mode=OutputMode.FILE,
-                output_dir=tmpdir,
             )
 
             # Create MetricsContext
@@ -167,9 +159,9 @@ class TestMetricsEmitter:
             context.put_metric("TestMetric", 42.0, "None")
 
             # Emit
-            emitter._emit_metrics_context(context)
+            emitter._emit_metrics_context(context, tmpdir)
 
-            files = list(Path(tmpdir).glob("*.json"))
+            files = list(Path(tmpdir).joinpath('metrics').glob("*.json"))
             with open(files[0], "r") as f:
                 data = json.load(f)
 

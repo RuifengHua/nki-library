@@ -20,6 +20,7 @@ import torch
 def dynamic_elementwise_add_torch_ref(
     input_a: torch.Tensor,
     input_b: torch.Tensor,
+    num_m_tiles: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of dynamic elementwise addition.
@@ -30,12 +31,9 @@ def dynamic_elementwise_add_torch_ref(
     Args:
         input_a (torch.Tensor): [M, H], First input tensor.
         input_b (torch.Tensor): [M, H], Second input tensor, same shape as input_a.
+        num_m_tiles: Unused. Present to match kernel signature for UnitTestFramework validation.
 
     Returns:
         torch.Tensor: [M, H], Elementwise sum of input_a and input_b.
-
-    Notes:
-        - The num_m_tiles parameter is not needed here since the torch reference
-          operates on the full tensors without tiling.
     """
     return input_a + input_b

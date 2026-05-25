@@ -1,0 +1,12 @@
+{
+    "vocab_size": 151936,
+    "max_seq_len": 4096,
+    "head_dim": 128,
+    "dim": 4096,
+    "n_layers": 36,
+    "n_heads": 32,
+    "n_kv_heads": 8,
+    "qk_norm": "True",
+    "hidden_dim": 12288,
+    "rope_theta": 1000000
+}

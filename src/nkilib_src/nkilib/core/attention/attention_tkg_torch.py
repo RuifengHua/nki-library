@@ -24,6 +24,7 @@ import torch
 from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
 from ..utils.lnc_subscriptable import LncSubscriptable
+from .attention_tkg import INACTIVE_BLOCK_IDX
 from .attention_tkg_utils import (
     AttnTKGConfig,
     get_total_n_prgs,
@@ -250,12 +251,13 @@ def _slice_and_reshape_kv_prior(k_prior, v_prior, cfg: AttnTKGConfig):
 
 
 def _gather_block_kv_to_flat(block_cache, active_blocks_table, batch, S_max_ctx, d_head, block_len):
-    '''Gather block cache to flat layout'''
+    '''Gather block cache to flat layout, skipping inactive blocks (INACTIVE_BLOCK_IDX).'''
     flat_cache = torch.zeros((batch, S_max_ctx, d_head), dtype=block_cache.dtype)
     for b in range(batch):
-        flat_cache[b][: active_blocks_table.shape[1] * block_len, :] = block_cache[active_blocks_table[b]].reshape(
-            (-1, d_head)
-        )
+        valid_mask = active_blocks_table[b] != INACTIVE_BLOCK_IDX
+        valid_indices = active_blocks_table[b][valid_mask]
+        num_valid_tokens = len(valid_indices) * block_len
+        flat_cache[b][:num_valid_tokens, :] = block_cache[valid_indices].reshape((-1, d_head))
     return flat_cache
 
 

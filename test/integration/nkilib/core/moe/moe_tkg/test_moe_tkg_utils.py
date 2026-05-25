@@ -13,18 +13,20 @@
 # limitations under the License.
 
 import math
-from test.integration.nkilib.core.mlp.test_mlp_common import gen_moe_mx_weights
-from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
-from test.integration.nkilib.utils.test_kernel_common import is_dtype_mx
 from typing import Callable
 
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
+
 from nkilib_src.nkilib.core.utils.common_types import (
     ExpertAffinityScaleMode,
+    MoEAllToAllVStrategy,
     QuantizationType,
 )
+from test.integration.nkilib.core.mlp.test_mlp_common import gen_moe_mx_weights
+from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
+from test.integration.nkilib.utils.test_kernel_common import is_dtype_mx
 
 # Constants
 _pmax = 128  # sbuf max partition dim
@@ -54,6 +56,7 @@ def build_moe_tkg(
     is_all_expert_dynamic: bool = False,
     routed_token_ratio: float = 1.0,
     block_size: int = None,
+    all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
 ):
     """Build input tensors for MoE TKG kernel testing.
 
@@ -82,9 +85,18 @@ def build_moe_tkg(
     else:
         exp_idx = dt.static_cast(np.random.randint(0, expert, size=(tokens, effective_top_k)), np.int32)
 
+    # Pre-generate expert affinities (needed for a2av concat)
+    expert_affinities = gen_expert_affinities(
+        tokens, expert, exp_idx, effective_top_k, routed_token_ratio, expert_affinities_dtype
+    )
+
     # Pre-generate weights if using MX quantization
     if is_mx_quant:
         mx_weights = gen_moe_mx_weights(hidden, intermediate, expert, quant_dtype)
+    else:
+        assert all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED, (
+            "all_to_all_v not supported when is_mx_quant=False"
+        )
 
     # Use custom tensor generator if not provided
     if tensor_generator is None:
@@ -95,26 +107,6 @@ def build_moe_tkg(
                 return dt.static_cast(exp_idx, inp.dtype)
             elif inp.name == "rank_id":
                 return np.array([[rank_id]], dtype=inp.dtype)
-            elif inp.name == "expert_affinities":
-                # Create [T, K] affinities and place them at expert_index positions
-                random_matrix = np.random.rand(tokens, effective_top_k)
-                normalized_matrix = random_matrix / random_matrix.sum(axis=1, keepdims=True)
-
-                # Determine which tokens are routed based on routed_token_ratio
-                num_routed = int(tokens * routed_token_ratio)
-                routed_mask = np.zeros(tokens, dtype=bool)
-                routed_mask[:num_routed] = True
-                np.random.shuffle(routed_mask)
-
-                # Create [T, E] with values at exp_idx positions only for routed tokens
-                res = np.zeros((tokens, expert), dtype=inp.dtype)
-                for i_t in range(tokens):
-                    if routed_mask[i_t]:
-                        for i_k in range(effective_top_k):
-                            i_e = exp_idx[i_t, i_k]
-                            res[i_t, i_e] = normalized_matrix[i_t, i_k]
-                return dt.static_cast(res, inp.dtype)
-
             elif inp.name in ("gate_up_b", "down_b"):
                 return rng.normal(size=inp.shape).astype(inp.dtype)
             elif inp.name == 'gate_up_w' and is_mx_quant:
@@ -127,15 +119,58 @@ def build_moe_tkg(
                 return mx_weights.down_w_scale
             elif inp.name == 'hidden_input' and is_mx_quant:
                 n_H512_tile = hidden // 512
-                hidden_states, _, _ = generate_stabilized_mx_data(
-                    mx_dtype=nl.float8_e4m3fn_x4, shape=(tokens * n_H512_tile * _pmax, _q_width), val_range=5
+                mx_dtype = nl.float8_e4m3fn_x4
+                mx_unpacked_dtype = nl.float8_e4m3fn
+                hidden_states, hidden_quant, hidden_scale_tmp = generate_stabilized_mx_data(
+                    mx_dtype=mx_dtype, shape=(tokens * n_H512_tile * _pmax, _q_width), val_range=5
                 )
-                hidden_states = (
-                    hidden_states.reshape(tokens, n_H512_tile, _pmax, _q_width)
-                    .transpose(0, 3, 1, 2)
-                    .reshape(tokens, hidden)
-                )
-                return dt.static_cast(hidden_states, inp.dtype)
+
+                # Non-a2av path: cast unquantized hidden states to inp.dtype
+                if all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
+                    hidden_states = (
+                        hidden_states.reshape(tokens, n_H512_tile, _pmax, _q_width)
+                        .transpose(0, 3, 1, 2)
+                        .reshape(tokens, hidden)
+                    )
+                    return dt.static_cast(hidden_states, inp.dtype)
+
+                # For a2av, build concatenated buffer [T, H + H/4 + 2 * E_L + 4] as float8_e4m3fn and mask/shuffle
+                else:
+                    # [T, H/512 * 128_H * 4_H]
+                    hidden_quant = hidden_quant.reshape(tokens, n_H512_tile * _pmax).view(mx_unpacked_dtype)
+
+                    # [T, H/512, 16_H] -> [16_H, H/512, T]
+                    hidden_scale_tmp = hidden_scale_tmp.reshape(tokens, n_H512_tile, _pmax // _q_height).transpose(
+                        2, 1, 0
+                    )
+                    # Stride groups of 4 scales across groups of 32 rows for SBUF layout, achieving [128_H, H/512, T]
+                    hidden_scale = np.zeros((_pmax, n_H512_tile, tokens), dtype=np.uint8)
+                    for quadrant in range(4):
+                        hidden_scale[32 * quadrant : 32 * quadrant + 4, :, :] = hidden_scale_tmp[
+                            quadrant * 4 : quadrant * 4 + 4, :, :
+                        ]
+
+                    # [128_H, H/512, T] -> [T, H/512 * 128_H]
+                    hidden_scale = hidden_scale.transpose(2, 1, 0).reshape(tokens, n_H512_tile * _pmax)
+
+                    # Bitcast expert affinities to [T, E_L * 2] fp8
+                    # NOTE: this test generates pre-sliced expert affinities. If build_moe_tkg ever distinguishes between global/local E, we need to use rank_id to slice here.
+                    expert_affinities_local = expert_affinities.view(mx_unpacked_dtype)
+
+                    # Initialize token indices, bitcast to [T, 4] fp8
+                    token_indices = np.arange(tokens, dtype=np.int32).reshape(tokens, 1).view(mx_unpacked_dtype)
+
+                    # Concat to [T, H + H/4 + 2 * E_L + 4]
+                    hidden_input = np.concatenate(
+                        (hidden_quant, hidden_scale, expert_affinities_local, token_indices), axis=1
+                    )
+
+                    # Zero out rows where tokens are not routed (all expert affinities are zero)
+                    unrouted_mask = np.all(expert_affinities == 0, axis=1)
+                    hidden_input[unrouted_mask] = 0
+
+                    return hidden_input
+
             else:
                 mean = 0.0
                 std = 1.0
@@ -186,9 +221,9 @@ def build_moe_tkg(
 
     # Create input tensors
     hidden_input = tensor_generator(TensorTemplate((tokens, hidden), hidden_dtype, "hidden_input"))
-    expert_affinities = tensor_generator(TensorTemplate((tokens, expert), expert_affinities_dtype, "expert_affinities"))
     # expert_index is always required now
     expert_index = tensor_generator(TensorTemplate((tokens, effective_top_k), nl.int32, "expert_index"))
+
     # rank_id for all-expert mode with affinity scaling
     rank_id_tensor = tensor_generator(TensorTemplate((1, 1), nl.uint32, "rank_id"))
     gate_up_w = tensor_generator(TensorTemplate(gate_up_w_shape, weight_dtype, "gate_up_w"))
@@ -207,15 +242,17 @@ def build_moe_tkg(
     gate_up_in_scale = None
     down_in_scale = None
     if quant_type == QuantizationType.STATIC:
-        gate_up_in_scale = tensor_generator(TensorTemplate((expert, 1), dtype=np.float32, name="gate_up_input_scale"))
-        down_in_scale = tensor_generator(TensorTemplate((expert, 1), dtype=np.float32, name="down_input_scale"))
+        gate_up_in_scale = tensor_generator(
+            TensorTemplate((expert, 1), dtype=np.float32, name="expert_gate_up_input_scale")
+        )
+        down_in_scale = tensor_generator(TensorTemplate((expert, 1), dtype=np.float32, name="expert_down_input_scale"))
 
     kernel_input = {
         "hidden_input": hidden_input,
         "expert_gate_up_weights": gate_up_w,
         "expert_down_weights": down_w,
-        "expert_affinities": expert_affinities,
-        "expert_index": expert_index,
+        "expert_affinities": expert_affinities if all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED else None,
+        "expert_index": expert_index if all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED else None,
         "is_all_expert": is_all_expert,
         "rank_id": rank_id_tensor
         if is_all_expert and expert_affinities_scaling_mode != ExpertAffinityScaleMode.NO_SCALE
@@ -225,8 +262,8 @@ def build_moe_tkg(
         "expert_down_bias": down_b,
         "expert_gate_up_weights_scale": gate_up_w_scale,
         "expert_down_weights_scale": down_w_scale,
-        "gate_up_input_scale": gate_up_in_scale,
-        "down_input_scale": down_in_scale,
+        "expert_gate_up_input_scale": gate_up_in_scale,
+        "expert_down_input_scale": down_in_scale,
         "expert_affinities_eager": None,
         "expert_affinities_scaling_mode": expert_affinities_scaling_mode,
         "activation_fn": act_fn,
@@ -237,8 +274,30 @@ def build_moe_tkg(
         "up_clamp_lower_limit": float(-6.0) if clamp else None,
         "is_all_expert_dynamic": is_all_expert_dynamic,
         "block_size": block_size,
+        "all_to_all_v_strategy": all_to_all_v_strategy,
     }
     return kernel_input
+
+
+def gen_expert_affinities(tokens, expert, exp_idx, effective_top_k, routed_token_ratio, expert_affinities_dtype):
+    # Create [T, K] affinities and place them at expert_index positions
+    random_matrix = np.random.rand(tokens, effective_top_k)
+    normalized_matrix = random_matrix / random_matrix.sum(axis=1, keepdims=True)
+
+    # Determine which tokens are routed based on routed_token_ratio
+    num_routed = int(tokens * routed_token_ratio)
+    routed_mask = np.zeros(tokens, dtype=bool)
+    routed_mask[:num_routed] = True
+    np.random.shuffle(routed_mask)
+
+    # Create [T, E] with values at exp_idx positions only for routed tokens
+    res = np.zeros((tokens, expert), dtype=expert_affinities_dtype)
+    for i_t in range(tokens):
+        if routed_mask[i_t]:
+            for i_k in range(effective_top_k):
+                i_e = exp_idx[i_t, i_k]
+                res[i_t, i_e] = normalized_matrix[i_t, i_k]
+    return dt.static_cast(res, expert_affinities_dtype)
 
 
 def get_expert_affinity_dtype(is_all_expert):

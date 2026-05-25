@@ -16,18 +16,10 @@ import math
 import os
 import pathlib
 from contextlib import nullcontext
-from test.integration.nkilib.utils.comparators import get_largest_abs_diff, maxAllClose
 from typing import Any, Union
 
 import numpy as np
 import numpy.typing as npt
-
-# Unpack functions for packed x4 MX dtypes → float32 numpy arrays for histogram visualization
-from nkilib_src.nkilib.core.utils.mx_torch_common import (
-    unpack_float4_x4,
-    unpack_float8_e4m3fn_x4,
-    unpack_float8_e5m2_x4,
-)
 
 from .common_dataclasses import (
     CustomValidatorWithOutputTensorData,
@@ -35,14 +27,24 @@ from .common_dataclasses import (
     LazyGoldenGenerator,
     PerRankLazyGoldenGenerator,
 )
+from .comparators import get_largest_abs_diff, maxAllClose
 from .metrics_collector import IMetricsCollector, MetricName
 from .tensor_histogram import TensorHistogram
 
-_X4_UNPACKERS = {
-    "float8_e4m3fn_x4": unpack_float8_e4m3fn_x4,
-    "float8_e5m2_x4": unpack_float8_e5m2_x4,
-    "float4_e2m1fn_x4": unpack_float4_x4,
-}
+
+def _get_x4_unpackers() -> dict:
+    """Lazy import of MX unpack functions to avoid pulling in neuron_dtypes at module load time."""
+    from nkilib_src.nkilib.core.utils.mx_torch_common import (
+        unpack_float4_x4,
+        unpack_float8_e4m3fn_x4,
+        unpack_float8_e5m2_x4,
+    )
+
+    return {
+        "float8_e4m3fn_x4": unpack_float8_e4m3fn_x4,
+        "float8_e5m2_x4": unpack_float8_e5m2_x4,
+        "float4_e2m1fn_x4": unpack_float4_x4,
+    }
 
 
 def load_output_tensor_as_bytes(filepath: Union[str, pathlib.Path]) -> npt.NDArray[np.uint8]:
@@ -72,8 +74,8 @@ class OutputValidator:
 
     def validate(self, logfile_path: str | None = None, enable_histograms: bool = False):
         """Validate outputs for all ranks."""
-        assert self.kernels_args.emitter
-        metrics_collector: IMetricsCollector = self.kernels_args.emitter.get_collector()
+        assert self.kernels_args.collector
+        metrics_collector: IMetricsCollector = self.kernels_args.collector
 
         params = self.kernels_args.validation_args
 
@@ -234,9 +236,9 @@ class OutputValidator:
         failed_keys = []
         rank_prefix = f"rank{rank_id}:" if rank_id is not None else ""
         for output_key, expected_value in golden_output.items():
-            assert (
-                output_key in actual_outputs
-            ), f"{rank_prefix}{output_key} was not emitted by neuron-profile capture. Double check the names of golden outputs and variable names of what {self.kernels_args.kernel_func.__name__} returns "
+            assert output_key in actual_outputs, (
+                f"{rank_prefix}{output_key} was not emitted by neuron-profile capture. Double check the names of golden outputs and variable names of what {self.kernels_args.kernel_func.__name__} returns "
+            )
 
             if isinstance(expected_value, CustomValidatorWithOutputTensorData):
                 expected_value_validator = expected_value.validator(logfile)
@@ -256,7 +258,7 @@ class OutputValidator:
                 except TypeError:
                     dtype_name = str(actual_outputs[output_key].dtype)
                     label = f"{rank_prefix}{output_key}"
-                    unpacker = _X4_UNPACKERS.get(dtype_name)
+                    unpacker = _get_x4_unpackers().get(dtype_name)
                     if unpacker is None:
                         if enable_histograms:
                             self.LOGGER.info(
@@ -295,6 +297,7 @@ class OutputValidator:
                     expected_output,
                     params.relative_accuracy,
                     params.absolute_accuracy,
+                    equal_nan_inf=params.equal_nan_inf,
                     verbose=1,
                     logfile=logfile,
                 )

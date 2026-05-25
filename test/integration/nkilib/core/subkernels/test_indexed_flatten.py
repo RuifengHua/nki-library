@@ -14,16 +14,16 @@
 
 """Integration tests for indexed_flatten kernel."""
 
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.subkernels.indexed_flatten import indexed_flatten
 from nkilib_src.nkilib.core.subkernels.indexed_flatten_torch import indexed_flatten_torch_ref
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def _generate_input_tensor(T: int, E: int) -> np.ndarray:
@@ -68,17 +68,34 @@ ROW_OFFSET_TEST_PARAMS = [
     (4096,  3, 128, 5,  1),
     (10240, 8, 128, 16, 8),
 ]
+
+SPARSE_ROUTING_PARAM_NAMES = \
+    "T, E, f_len, row_offsets_start, tokens_per_expert"
+SPARSE_ROUTING_TEST_PARAMS = [
+    # Empty expert: cross-NC race (expert 1 on NC0, expert 2 on NC1 share offset).
+    (256,  4, 16, 0,  [16, 0, 16, 16]),
+    # Empty expert: with row_offsets_start.
+    (256,  4, 16, 8,  [16, 0, 16, 16]),
+    # Multiple empty experts: cross-NC overlap.
+    (256,  4, 16, 0,  [0, 0, 16, 16]),
+    # Padding spill: T/f_len=32 but only 2-8 blocks allocated per expert.
+    (4096, 4, 128, 0,  [470, 252, 359, 775]),
+    # Padding spill: with row_offsets_start.
+    (4096, 4, 128, 8,  [470, 252, 359, 775]),
+    # Padding spill: minimal tokens — maximum spill.
+    (4096, 4, 128, 0,  [1, 1, 1, 1]),
+    # Mixed: empty expert + padding spill.
+    (4096, 4, 128, 0,  [128, 0, 200, 500]),
+]
 # fmt: on
 
 
-@pytest_test_metadata(
-    name="IndexedFlatten",
-    pytest_marks=["indexed_flatten"],
-)
+@pytest_test_metadata(name="IndexedFlatten")
+@pytest_marks(["indexed_flatten"])
 class TestIndexedFlattenKernel:
     """Test class for indexed_flatten kernel."""
 
-    def _run_test(self, test_manager: Orchestrator, input_generator):
+    def _run_test(self, test_manager: Orchestrator, platform_target: Platforms, input_generator):
         """Run indexed_flatten test with the given input generator."""
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -89,7 +106,7 @@ class TestIndexedFlattenKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=2),
+            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
             atol=0,
             rtol=0,
         )
@@ -99,6 +116,7 @@ class TestIndexedFlattenKernel:
     def test_indexed_flatten_fast(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         T: int,
         E: int,
         f_len: int,
@@ -119,13 +137,14 @@ class TestIndexedFlattenKernel:
                 "padding_val": -1,
             }
 
-        self._run_test(test_manager, input_generator)
+        self._run_test(test_manager, platform_target, input_generator)
 
     @pytest.mark.fast
     @pytest_parametrize(ROW_OFFSET_PARAM_NAMES, ROW_OFFSET_TEST_PARAMS)
     def test_indexed_flatten_row_offsets_start(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         T: int,
         E: int,
         f_len: int,
@@ -148,4 +167,64 @@ class TestIndexedFlattenKernel:
                 "padding_val": -1,
             }
 
-        self._run_test(test_manager, input_generator)
+        self._run_test(test_manager, platform_target, input_generator)
+
+    @pytest.mark.fast
+    @pytest_parametrize(SPARSE_ROUTING_PARAM_NAMES, SPARSE_ROUTING_TEST_PARAMS)
+    def test_indexed_flatten_sparse_token_routing(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        T: int,
+        E: int,
+        f_len: int,
+        row_offsets_start: int,
+        tokens_per_expert: list,
+    ):
+        """Test cross-NC correctness with empty experts and padding spill.
+
+        Covers two scenarios that cause cross-NC write conflicts with shared HBM:
+        1. Empty experts: zero-token experts produce duplicate row_offsets (prefix
+           sum doesn't advance), so two experts target the same output region.
+        2. Padding spill: each expert writes T/f_len blocks but only owns
+           ceil(tokens/f_len) blocks. Padding tail spills into neighboring
+           experts' regions on the other NC.
+        Both rely on max(-1, real_value) = real_value for correctness.
+        """
+        np.random.seed(42)
+
+        def input_generator(test_config):
+            partitions_per_row = T // f_len
+            N = row_offsets_start + E
+
+            # Build row_offsets as prefix sum of ceil(tokens/f_len) per expert
+            blocks_per_expert = [(t + f_len - 1) // f_len for t in tokens_per_expert]
+            row_offsets_list = []
+            block_pos = 0
+            for i in range(N):
+                row_offsets_list.append(block_pos)
+                local_idx = i - row_offsets_start
+                if 0 <= local_idx < E:
+                    block_pos += blocks_per_expert[local_idx]
+                else:
+                    block_pos += partitions_per_row
+
+            # Build input: real token IDs packed at front, padding at tail
+            input_tensor = np.full((E, T), -1, dtype=np.int32)
+            for e in range(E):
+                n_tokens = tokens_per_expert[e]
+                if n_tokens > 0:
+                    input_tensor[e, :n_tokens] = np.random.permutation(T)[:n_tokens]
+
+            output_len = (block_pos + partitions_per_row) * f_len
+            output_len = ((output_len + 127) // 128) * 128
+            return {
+                "input_tensor": input_tensor,
+                "f_len": f_len,
+                "output_len": output_len,
+                "row_offsets": np.array(row_offsets_list, dtype=np.int32),
+                "row_offsets_start": np.array([row_offsets_start], dtype=np.int32),
+                "padding_val": -1,
+            }
+
+        self._run_test(test_manager, platform_target, input_generator)

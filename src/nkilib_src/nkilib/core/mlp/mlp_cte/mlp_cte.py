@@ -38,6 +38,7 @@ from .mlp_cte_allocation import (
     allocate_down_projection_weights,
     allocate_hidden_tensor_tile,
     allocate_intermediate_tensor_tile,
+    allocate_src_projection_weights,
 )
 from .mlp_cte_constants import (
     MAX_AVAILABLE_SBUF_SIZE,
@@ -503,33 +504,14 @@ def _mlp_cte_single_shard(
             # Declare our SBUF tensor for the source projection weights.
             # Create "multiple buffers" using the 2nd dimension to facilitate overlapped loads.
             src_proj_weights_sbuf_list = []
-            weights_tensor_shape = (
-                (
-                    tile_info.mx_src_proj_hidden_dim_tile.subtile_dim_info.tile_count,  # 128
-                    tile_info.mx_intermediate_dim_tile.tile_count,  # I/512
-                    tile_info.mx_intermediate_dim_tile.subtile_dim_info.tile_size,  # 4
-                    tile_info.mx_intermediate_dim_tile.subtile_dim_info.tile_count,  # 128
-                    tile_info.mx_src_proj_hidden_dim_tile.subtile_dim_info.tile_size,  # 4
-                )
-                if mlp_params.quant_params.is_quant_static_mx()
-                else (
-                    tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_size,
-                    tile_info.src_proj_hidden_dim_tile.subtile_dim_info.tile_count,
-                    mlp_params.intermediate_size,
-                )
+            allocate_src_projection_weights(
+                mlp_params,
+                tile_info,
+                constants,
+                indices,
+                src_proj_weights_sbuf_list,
+                sbm,
             )
-            for weight_buffer_idx in range(constants.src_proj_weights_buffer_count):
-                weights_tensor = heap_alloc(
-                    weights_tensor_shape,
-                    dtype=(
-                        constants.src_proj_quant_data_type
-                        if mlpp_has_quantized_weights(mlp_params)
-                        else constants.compute_data_type
-                    ),
-                    buffer=nl.sbuf,
-                    name=indices.get_tensor_name("weights_tensor", f"buf{weight_buffer_idx}"),
-                )
-                src_proj_weights_sbuf_list.append(weights_tensor)
 
             # Perform transpose on the source tensor to prepare for up/gate projection matmuls
             # Apply norm weights (gamma) and norm bias on hidden normalized hidden tensor
@@ -579,7 +561,7 @@ def _mlp_cte_single_shard(
             )
 
             if sbm != None:
-                for weight_buffer_idx in range(constants.src_proj_weights_buffer_count):
+                for weight_buffer_idx in range(len(src_proj_weights_sbuf_list)):
                     sbm.pop_heap()  # src_proj_weights_sbuf
                 if mlpp_has_quantized_input(mlp_params):
                     for bxs_subtile_idx in range(len(hidden_tile_sbuf_list)):

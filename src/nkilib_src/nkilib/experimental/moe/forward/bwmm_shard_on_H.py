@@ -533,7 +533,7 @@ def store_block_output_shard(output, block_new, token_indices, dims, shard_id, s
         )
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def blockwise_mm_baseline_shard_hidden(
     hidden_states: nl.ndarray,
     expert_affinities_masked: nl.ndarray,

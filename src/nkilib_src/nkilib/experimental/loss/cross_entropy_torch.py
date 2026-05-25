@@ -19,9 +19,12 @@ import torch.nn.functional as F
 
 
 def cross_entropy_forward_torch_ref(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    logits_hbm: torch.Tensor,
+    targets_hbm: torch.Tensor,
+    positions_per_batch: int = 32,
+    chunk_size: int = 32768,
+    dtype=None,
+) -> dict[str, torch.Tensor]:
     """
     PyTorch reference implementation of cross entropy forward pass.
 
@@ -29,32 +32,34 @@ def cross_entropy_forward_torch_ref(
     It implements the same mathematical operation using PyTorch operations.
 
     Args:
-        logits: Input logits tensor of shape [num_positions, vocab_size]
-        targets: Target indices tensor of shape [num_positions]
+        logits_hbm: Input logits tensor of shape [num_positions, vocab_size]
+        targets_hbm: Target indices tensor of shape [num_positions]
+        positions_per_batch: Hardware param (ignored, included for signature matching)
+        chunk_size: Hardware param (ignored, included for signature matching)
+        dtype: Hardware param (ignored, included for signature matching)
 
     Returns:
-        loss: Cross entropy loss per position [num_positions]
-        lse: Log-sum-exp values per position [num_positions]
-
-    Note:
-        This implementation prioritizes clarity over performance.
-        Hardware-specific parameters (positions_per_batch, chunk_size, etc.)
-        are not included as they don't affect the mathematical result.
+        dict with keys:
+            loss_hbm: Cross entropy loss per position [num_positions]
+            lse_state_hbm: Log-sum-exp values per position [num_positions]
     """
-    # Compute cross entropy loss (no reduction to get per-position loss)
-    loss = F.cross_entropy(logits, targets, reduction='none')
-
+    targets = targets_hbm.long() if targets_hbm.dtype != torch.long else targets_hbm
+    loss = F.cross_entropy(logits_hbm, targets, reduction='none')
     # Compute log-sum-exp for backward pass
-    lse = torch.logsumexp(logits, dim=1)
-
-    return loss, lse
+    lse = torch.logsumexp(logits_hbm, dim=1)
+    return {"loss_hbm": loss, "lse_state_hbm": lse}
 
 
 def cross_entropy_backward_torch_ref(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
+    logits_hbm: torch.Tensor,
+    targets_hbm: torch.Tensor,
+    lse_state_hbm: torch.Tensor = None,
     reduction: str = "mean",
-) -> torch.Tensor:
+    positions_per_batch: int = 32,
+    chunk_size: int = 32768,
+    dtype=None,
+    inplace: bool = True,
+) -> dict[str, torch.Tensor]:
     """
     PyTorch reference implementation of cross entropy backward pass.
 
@@ -63,30 +68,24 @@ def cross_entropy_backward_torch_ref(
     to logits, which is guaranteed to be correct.
 
     Args:
-        logits: Input logits tensor of shape [num_positions, vocab_size]
-        targets: Target indices tensor of shape [num_positions]
-        reduction: How to reduce the loss. Options:
-            - 'mean': Average loss over all positions (most common, matches PyTorch default)
-            - 'sum': Sum loss over all positions
+        logits_hbm: Input logits tensor of shape [num_positions, vocab_size]
+        targets_hbm: Target indices tensor of shape [num_positions]
+        lse_state_hbm: LSE state from forward pass (ignored, included for signature matching)
+        reduction: 'mean' or 'sum'
+        positions_per_batch: Hardware param (ignored, included for signature matching)
+        chunk_size: Hardware param (ignored, included for signature matching)
+        dtype: Hardware param (ignored, included for signature matching)
+        inplace: Hardware param (ignored, included for signature matching)
 
     Returns:
-        grad_logits: Gradient with respect to logits [num_positions, vocab_size]
-
-    Note:
-        This implementation uses PyTorch's autograd for correctness and simplicity.
-        Hardware-specific parameters (positions_per_batch, chunk_size, etc.)
-        are not included as they don't affect the mathematical result.
+        dict with keys:
+            grad_logits_hbm: Gradient with respect to logits [num_positions, vocab_size]
     """
     if reduction not in ("mean", "sum"):
         raise ValueError(f"Unknown reduction: {reduction}. Use 'mean' or 'sum'.")
 
-    # Create a copy of logits with gradient tracking enabled
-    logits_copy = logits.detach().clone().requires_grad_(True)
-
-    # Forward pass: compute cross entropy loss with specified reduction
+    targets = targets_hbm.long() if targets_hbm.dtype != torch.long else targets_hbm
+    logits_copy = logits_hbm.detach().clone().requires_grad_(True)
     loss = F.cross_entropy(logits_copy, targets, reduction=reduction)
-
-    # Backward pass: compute gradients
     loss.backward()
-
-    return logits_copy.grad
+    return {"logits_hbm": logits_copy.grad}

@@ -60,7 +60,7 @@ class MoECTEImplementation(Enum):
 # =============================================================================
 
 
-@dataclass
+@dataclass(frozen=True)
 class QuantizationConfig(nl.NKIObject):
     """
     Configuration for quantization-related parameters in MoE CTE kernels.
@@ -178,10 +178,14 @@ class ShardOnIConfig(nl.NKIObject):
 # =============================================================================
 
 
-@dataclass
+@dataclass(frozen=True)
 class MoECTESpec(nl.NKIObject):
     """
-    Specification for MoE CTE kernel execution.
+    User-facing specification for MoE CTE kernel execution.
+
+    This is the primary interface for configuring MoE CTE kernels. Users create instances
+    of this class and pass them to moe_cte(). Internally, MoECTESpec is converted to
+    MoECTEShardingSpecs which handles default initialization based on the implementation.
 
     Uses composition pattern with two config objects based on sharding strategy:
         - shard_on_block: For block-sharding implementations (shard_on_block, shard_on_block_mx)
@@ -223,33 +227,79 @@ class MoECTESpec(nl.NKIObject):
             shard_on_I=ShardOnIConfig(num_static_block=100),
         )
 
-        # Simple usage (defaults auto-initialized)
+        # Simple usage (defaults auto-initialized internally)
         spec = MoECTESpec(implementation=MoECTEImplementation.shard_on_i)
     """
 
     implementation: MoECTEImplementation
-
     shard_on_block: Optional[ShardOnBlockConfig] = None
     shard_on_I: Optional[ShardOnIConfig] = None
 
-    def __post_init__(self):
-        """Initialize default configs based on implementation if not provided."""
-        # Block-sharding implementations
-        if self.implementation in (MoECTEImplementation.shard_on_block, MoECTEImplementation.shard_on_block_mx):
-            if self.shard_on_block is None:
-                self.shard_on_block = ShardOnBlockConfig()
 
-        # I-sharding implementations
-        elif self.implementation in (
-            MoECTEImplementation.shard_on_i,
-            MoECTEImplementation.shard_on_i_hybrid,
-            MoECTEImplementation.shard_on_i_dropping,
+@dataclass
+class MoECTEShardingSpecs(nl.NKIObject):
+    """
+    Internal specification with initialized defaults for MoE CTE kernel execution.
+
+    This class is used internally by moe_cte() to convert frozen, user-provided
+    MoECTESpec into a fully-initialized configuration. It ensures that the appropriate
+    config object (shard_on_block or shard_on_I) is populated with defaults based
+    on the selected implementation.
+
+    Users should not instantiate this class directly. Instead, create MoECTESpec
+    and pass it to moe_cte(), which handles the conversion internally.
+
+    Attributes:
+        implementation (MoECTEImplementation): Which implementation variant to use.
+            Copied from the input MoECTESpec.
+
+        shard_on_block (ShardOnBlockConfig, optional): Config for block-sharding implementations.
+            Initialized with ShardOnBlockConfig() defaults if the implementation is
+            shard_on_block or shard_on_block_mx and no config was provided.
+
+        shard_on_I (ShardOnIConfig, optional): Config for I-sharding implementations.
+            Initialized with ShardOnIConfig() defaults if the implementation is
+            shard_on_i, shard_on_i_hybrid, or shard_on_i_dropping and no config was provided.
+
+    Example:
+        # Internal usage within moe_cte():
+        def moe_cte(..., spec: MoECTESpec, ...):
+            sharding_spec = MoECTEShardingSpecs(spec)  # Converts and initializes defaults
+            if sharding_spec.implementation == MoECTEImplementation.shard_on_i:
+                cfg = sharding_spec.shard_on_I  # Guaranteed to be non-None
+                ...
+    """
+
+    implementation: MoECTEImplementation
+    shard_on_block: Optional[ShardOnBlockConfig] = None
+    shard_on_I: Optional[ShardOnIConfig] = None
+
+    def __init__(self, spec: MoECTESpec):
+        self.implementation = spec.implementation
+        self.shard_on_block = None
+        self.shard_on_I = None
+
+        if (
+            spec.implementation == MoECTEImplementation.shard_on_block
+            or spec.implementation == MoECTEImplementation.shard_on_block_mx
         ):
-            if self.shard_on_I is None:
+            if spec.shard_on_block is None:
+                self.shard_on_block = ShardOnBlockConfig()
+            else:
+                self.shard_on_block = spec.shard_on_block
+
+        elif (
+            spec.implementation == MoECTEImplementation.shard_on_i
+            or spec.implementation == MoECTEImplementation.shard_on_i_hybrid
+            or spec.implementation == MoECTEImplementation.shard_on_i_dropping
+        ):
+            if spec.shard_on_I is None:
                 self.shard_on_I = ShardOnIConfig()
+            else:
+                self.shard_on_I = spec.shard_on_I
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def moe_cte(
     hidden_states: nl.ndarray,
     expert_affinities_masked: nl.ndarray,
@@ -263,10 +313,12 @@ def moe_cte(
     gate_and_up_proj_bias: Optional[nl.ndarray] = None,
     down_proj_bias: Optional[nl.ndarray] = None,
     quantization_config: Optional[QuantizationConfig] = None,
+    gate_up_proj_scale: Optional[nl.ndarray] = None,
+    down_proj_scale: Optional[nl.ndarray] = None,
     gate_up_activations_T: Optional[nl.ndarray] = None,
     down_activations: Optional[nl.ndarray] = None,
     activation_function: ActFnType = ActFnType.SiLU,
-    skip_dma: SkipMode = SkipMode(False, False),
+    skip_dma: Optional[SkipMode] = None,
     compute_dtype: Any = nl.bfloat16,
     is_tensor_update_accumulating: bool = True,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
@@ -302,6 +354,11 @@ def moe_cte(
         gate_and_up_proj_bias (nl.ndarray, optional): Bias for gate/up projections
         down_proj_bias (nl.ndarray, optional): Bias for down projection
         quantization_config (QuantizationConfig, optional): Quantization scales configuration
+        gate_up_proj_scale (nl.ndarray, optional): Direct scale tensor for gate/up weights.
+            Takes precedence over quantization_config. Use for MX quantization to avoid
+            wrapping tensors in dataclass (NKI tracer limitation).
+        down_proj_scale (nl.ndarray, optional): Direct scale tensor for down weights.
+            Takes precedence over quantization_config.
         gate_up_activations_T (nl.ndarray, optional): Storage for gate/up activations
         down_activations (nl.ndarray, optional): Storage for down activations
         activation_function (ActFnType): Activation function type (default: SiLU)
@@ -338,16 +395,24 @@ def moe_cte(
         elif spec.implementation == shard_on_i_mx_hybrid:
             return blockwise_mm_shard_intermediate_mx_hybrid(...)
     """
-    print(f"spec: {spec}")
 
-    # Extract quantization scales from config
-    quant_cfg = quantization_config or QuantizationConfig()
-    gate_up_proj_scale = quant_cfg.gate_up_proj_scale
-    down_proj_scale = quant_cfg.down_proj_scale
+    if skip_dma is None:
+        skip_dma = SkipMode(False, False)
 
-    if spec.implementation == MoECTEImplementation.shard_on_block:
+    sharding_spec = MoECTEShardingSpecs(spec)
+    print(f"spec: {sharding_spec}")
+
+    # Extract quantization scales: direct params take precedence over config
+    if gate_up_proj_scale is None or down_proj_scale is None:
+        quant_cfg = quantization_config or QuantizationConfig()
+        if gate_up_proj_scale is None:
+            gate_up_proj_scale = quant_cfg.gate_up_proj_scale
+        if down_proj_scale is None:
+            down_proj_scale = quant_cfg.down_proj_scale
+
+    if sharding_spec.implementation == MoECTEImplementation.shard_on_block:
         print(f"bwmm_shard_block_branch")
-        cfg = spec.shard_on_block or ShardOnBlockConfig()
+        cfg = sharding_spec.shard_on_block or ShardOnBlockConfig()
         return bwmm_shard_on_block(
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
@@ -374,9 +439,9 @@ def moe_cte(
             block_sharding_strategy=cfg.block_sharding_strategy,
         )
 
-    elif spec.implementation == MoECTEImplementation.shard_on_i:
+    elif sharding_spec.implementation == MoECTEImplementation.shard_on_i:
         print(f"bwmm_shard_I_branch")
-        cfg = spec.shard_on_I or ShardOnIConfig()
+        cfg = sharding_spec.shard_on_I or ShardOnIConfig()
         return blockwise_mm_baseline_shard_intermediate(
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
@@ -402,9 +467,9 @@ def moe_cte(
             expert_affinity_multiply_on_I=cfg.expert_affinity_multiply_on_I,
         )
 
-    elif spec.implementation == MoECTEImplementation.shard_on_i_hybrid:
+    elif sharding_spec.implementation == MoECTEImplementation.shard_on_i_hybrid:
         print(f"bwmm_shard_I_hybrid_branch")
-        cfg = spec.shard_on_I or ShardOnIConfig()
+        cfg = sharding_spec.shard_on_I or ShardOnIConfig()
         return blockwise_mm_baseline_shard_intermediate_hybrid(
             conditions=conditions,
             hidden_states=hidden_states,
@@ -432,8 +497,8 @@ def moe_cte(
             up_clamp_upper_limit=up_clamp_upper_limit,
         )
 
-    elif spec.implementation == MoECTEImplementation.shard_on_i_dropping:
-        cfg = spec.shard_on_I or ShardOnIConfig()
+    elif sharding_spec.implementation == MoECTEImplementation.shard_on_i_dropping:
+        cfg = sharding_spec.shard_on_I or ShardOnIConfig()
         return blockwise_mm_shard_intermediate_dropping(
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
@@ -458,8 +523,8 @@ def moe_cte(
             up_clamp_upper_limit=up_clamp_upper_limit,
         )
 
-    elif spec.implementation == MoECTEImplementation.shard_on_block_mx:
-        cfg = spec.shard_on_block or ShardOnBlockConfig()
+    elif sharding_spec.implementation == MoECTEImplementation.shard_on_block_mx:
+        cfg = sharding_spec.shard_on_block or ShardOnBlockConfig()
         return bwmm_shard_on_block_mx(
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,

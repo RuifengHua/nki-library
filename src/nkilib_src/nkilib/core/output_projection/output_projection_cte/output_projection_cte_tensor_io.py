@@ -406,7 +406,7 @@ def load_mx_quantized_weights(
     curr_h_block_size = weight_view.shape[1]
     for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
         padded_size, actual_size = cfg.d_tile.get_bounds(d_tile_idx)
-        if quant_config.is_mxfp8_static_quantized:
+        if quant_config.is_mxfp8_static_quantized or quant_config.is_row_mxfp8_quantized:
             w_sbuf = nl.ndarray((padded_size, cfg.h_tile.tile_size, _q_width), dtype=weight_dtype, buffer=nl.sbuf)
         else:
             w_sbuf = nl.ndarray((padded_size, cfg.h_tile.tile_size), dtype=weight_dtype, buffer=nl.sbuf)
@@ -417,7 +417,7 @@ def load_mx_quantized_weights(
             start=d_tile_idx * cfg.d_tile.tile_info.tile_size,
             end=d_tile_idx * cfg.d_tile.tile_info.tile_size + actual_size,
         ).get_view()
-        if quant_config.is_mxfp8_static_quantized:
+        if quant_config.is_mxfp8_static_quantized or quant_config.is_row_mxfp8_quantized:
             nisa.dma_copy(dst=w_sbuf[:actual_size, :curr_h_block_size, :_q_width], src=w_slice)
             w_sbuf_list.append(w_sbuf.reshape((padded_size, cfg.h_tile.tile_size * _q_width)))
         else:
@@ -590,4 +590,28 @@ def create_constant_mx_scales(p_size: int, f_size: int, scale_value: int = 127) 
     """
     scale_sbuf = nl.ndarray((p_size, f_size), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.memset(dst=scale_sbuf, value=scale_value, engine=nisa.gpsimd_engine)
+    return scale_sbuf
+
+
+def load_row_weight_dequant_scales(
+    weight_scale_hbm: nl.ndarray,
+    h_start: int,
+    curr_h_block_size: int,
+    h_tile_size: int,
+) -> nl.ndarray:
+    """Load per-row weight dequant scales for ROW_MX quantization.
+
+    Args:
+        weight_scale_hbm: [P_MAX, H], Per-row weight dequant scales in HBM (pre-broadcast).
+        h_start: Start offset in H dimension for current h_block.
+        curr_h_block_size: Current H block size.
+        h_tile_size: Allocated H tile size.
+
+    Returns:
+        nl.ndarray: [P_MAX, h_tile_size], Weight dequant scales in SBUF.
+    """
+    P_MAX = nl.tile_size.pmax
+    scale_sbuf = nl.ndarray((P_MAX, h_tile_size), dtype=nl.float32, buffer=nl.sbuf)
+    scale_view = TensorView(weight_scale_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+    nisa.dma_copy(dst=scale_sbuf[:P_MAX, :curr_h_block_size], src=scale_view.get_view())
     return scale_sbuf

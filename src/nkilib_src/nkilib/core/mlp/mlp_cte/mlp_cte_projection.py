@@ -1040,7 +1040,7 @@ def project_standard_source_tensor_tile(
     int_tiles = TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size)
     for hidden_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):
         # Do the strided load of the weights for the current H tile
-        weights_buffer_idx = hidden_tile.index % constants.src_proj_weights_buffer_count
+        weights_buffer_idx = hidden_tile.index % len(weights_sbuf_list)
         hidden_subtiles = TiledRange(hidden_tile, H_SUBTILE_SIZE)
 
         # Strided load pattern
@@ -1099,6 +1099,7 @@ def project_quantized_source_tensor_tile(
     int_dim_tile = tile_info.src_proj_intermediate_dim_tile
     BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size
     H_SUBTILE_SIZE = hidden_dim_tile.subtile_dim_info.tile_size
+    H_SUBTILE_COUNT = hidden_dim_tile.subtile_dim_info.tile_count
     I = weights_tensor_hbm.shape[-1]
     I_SHARD_SIZE = int_dim_tile.tiled_dim_size
     I_SHARD_OFFSET = constants.get_intermediate_offset()
@@ -1111,22 +1112,22 @@ def project_quantized_source_tensor_tile(
     int_tiles = TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size)
     for hidden_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):
         # Do the strided load of the weights for the current H tile
-        weights_buffer_idx = hidden_tile.index % constants.src_proj_weights_buffer_count
+        weights_buffer_idx = hidden_tile.index % len(weights_sbuf_list)
         hidden_subtiles = TiledRange(hidden_tile, H_SUBTILE_SIZE)
 
         # Strided load pattern
         nisa.dma_copy(
             dst=weights_sbuf_list[weights_buffer_idx].ap(
                 pattern=[
-                    [I_SHARD_SIZE * len(hidden_subtiles), 128],
+                    [I_SHARD_SIZE * H_SUBTILE_COUNT, H_SUBTILE_SIZE],
                     [I_SHARD_SIZE, len(hidden_subtiles)],
                     [1, I_SHARD_SIZE],
                 ],
                 offset=0,
             ),
             src=weights_tensor_hbm.ap(
-                pattern=[[I, 128], [I * 128, len(hidden_subtiles)], [1, I_SHARD_SIZE]],
-                offset=hidden_tile.index * len(hidden_subtiles) * I * 128 + I_SHARD_OFFSET,
+                pattern=[[I, H_SUBTILE_SIZE], [I * H_SUBTILE_SIZE, len(hidden_subtiles)], [1, I_SHARD_SIZE]],
+                offset=hidden_tile.index * len(hidden_subtiles) * I * H_SUBTILE_SIZE + I_SHARD_OFFSET,
             ),
         )
 
@@ -1146,18 +1147,18 @@ def project_quantized_source_tensor_tile(
 
                     # Get hidden tensor slice
                     st_pattern = (
-                        [[mlp_params.hidden_size, 128], [bxs_subtile.size, 2], [1, bxs_subtile.size]]
+                        [[mlp_params.hidden_size, H_SUBTILE_SIZE], [bxs_subtile.size, 2], [1, bxs_subtile.size]]
                         if perform_doublerow_matmul
-                        else [[mlp_params.hidden_size, 128], [1, bxs_subtile.size]]
+                        else [[mlp_params.hidden_size, H_SUBTILE_SIZE], [1, bxs_subtile.size]]
                     )
-                    st_offset = (hidden_tile.index * 8 + hidden_subtile.index * 2) * bxs_subtile.size
+                    st_offset = (hidden_tile.index * H_SUBTILE_COUNT + hidden_subtile.index * 2) * bxs_subtile.size
                     hidden_mm_in = source_tile_sbuf_list[bxs_subtile.index].ap(pattern=st_pattern, offset=st_offset)
 
                     # Get weight tensor slice
                     mv_pattern = (
-                        [[I_SHARD_SIZE * 8, 128], [I_SHARD_SIZE, 2], [1, int_tile.size]]
+                        [[I_SHARD_SIZE * H_SUBTILE_COUNT, H_SUBTILE_SIZE], [I_SHARD_SIZE, 2], [1, int_tile.size]]
                         if perform_doublerow_matmul
-                        else [[I_SHARD_SIZE * 8, 128], [1, int_tile.size]]
+                        else [[I_SHARD_SIZE * H_SUBTILE_COUNT, H_SUBTILE_SIZE], [1, int_tile.size]]
                     )
                     mv_offset = hidden_subtile.index * I_SHARD_SIZE * 2 + int_dim_tile.tile_size * int_tile.index
                     weights_mm_in = weights_sbuf_list[weights_buffer_idx].ap(pattern=mv_pattern, offset=mv_offset)
@@ -1201,7 +1202,7 @@ def project_mx_source_tensor_tile(
 
     for hidden_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):  # 512 in H
         # Do the strided load of the weights for the current H tile
-        weights_buffer_idx = hidden_tile.index % constants.src_proj_weights_buffer_count
+        weights_buffer_idx = hidden_tile.index % len(weights_sbuf_list)
         hidden_subtiles = TiledRange(hidden_tile, H_SUBTILE_SIZE)
 
         weights_sbuf_view = weights_sbuf_list[weights_buffer_idx].reshape(

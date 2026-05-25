@@ -11,12 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from dataclasses import dataclass, fields
 from functools import cache
 
 import nki.language as nl
 import numpy as np
 import torch
+
+from nkilib_src.nkilib.core.attention.attention_tkg import INACTIVE_BLOCK_IDX
 from nkilib_src.nkilib.core.attention.attention_tkg_utils import AttnTKGConfig, is_batch_sharded
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
 
@@ -81,7 +84,7 @@ def generate_active_blocks_array(batch: int, S_ctx: int, block_len: int, assumed
     arr = (
         np.random.choice(assumed_num_cache_blocks, size=np.prod(table_shape), replace=False)
         .reshape(table_shape)
-        .astype(np.uint32)
+        .astype(np.int32)
     )
     return arr
 
@@ -94,7 +97,7 @@ def gen_deterministic_active_block_table(batch, S_ctx, S_tkg, pos_id, block_len,
     for b in range(batch):
         # Number of blocks covering active cache and active token.
         num_actual_active_blks = div_ceil(assumed_actual_ctx_lens[b] + S_tkg, block_len)
-        arr[b, num_actual_active_blks:] = 0
+        arr[b, num_actual_active_blks:] = INACTIVE_BLOCK_IDX
     return arr
 
 
@@ -132,7 +135,7 @@ def build_swa_positions(pos_id, bs, s_active, sliding_window, cache_len, block_l
         bs: Batch size.
         s_active: Number of active tokens.
         sliding_window: SWA window size.
-        cache_len: Total cache length (s_prior) for circular buffer modular arithmetic.
+        cache_len: Total cache length (s_prior).
         block_len: Block length (0 for flat cache).
 
     Returns:
@@ -141,6 +144,11 @@ def build_swa_positions(pos_id, bs, s_active, sliding_window, cache_len, block_l
     """
     rope_pos_ids = np.zeros((bs, s_active), dtype=np.float32)
     start_pos_ids = np.zeros((bs, s_active), dtype=np.float32)
+
+    # Flat KV circular buffer uses [0, cache_len - s_active) as usable slots.
+    # pos_ids (rope_pos_ids) is the raw position, which equals the modded slot
+    # index when cache_lens <= cache_len - s_active (the current test constraint).
+    circular_size = cache_len - s_active
 
     for b in range(bs):
         for i in range(s_active):
@@ -151,8 +159,8 @@ def build_swa_positions(pos_id, bs, s_active, sliding_window, cache_len, block_l
                 # Block KV uses a linear block table (not circular), so clamp to 0
                 start_pos_ids[b, i] = max(0, pos - sliding_window + 1)
             else:
-                # Flat KV uses a circular buffer, so wrap around with modular arithmetic
-                start_pos_ids[b, i] = (pos - sliding_window + 1) % cache_len
+                # Flat KV circular buffer: mod by usable region size
+                start_pos_ids[b, i] = (pos - sliding_window + 1) % circular_size
 
     return start_pos_ids, rope_pos_ids
 
@@ -197,3 +205,53 @@ def print_test_config(attn_cfg, test_cfg):
 
     out += "]"
     return out
+
+
+def generate_cache_lens(bs, s_ctx, s_tkg, mode="normal", mean_frac=0.5, stddev_frac=0.1):
+    """Generate per-batch cache lengths (pos_ids) for TKG attention tests.
+
+    Args:
+        bs: Batch size.
+        s_ctx: Context length (s_prior).
+        s_tkg: Number of active tokens.
+        mode: "normal" for values drawn from a normal distribution around a mean,
+                  simulating realistic traffic routing patterns.
+              "spread" for evenly spreading batches from 1 to s_prior (shuffled).
+                  E.g. bs=2 → [max_pos/3, 2*max_pos/3],
+                       bs=4 → [max_pos/5, 2*max_pos/5, 3*max_pos/5, 4*max_pos/5].
+              "random" for uniform random in [1, s_ctx - s_tkg].
+              "three_quarter" for the legacy formula that places tokens at ~75% of s_ctx.
+        mean_frac: Fraction of max_pos for the mean (used by "normal" mode). Default 0.5.
+        stddev_frac: Fraction of max_pos for the standard deviation (used by "normal" mode).
+            Default 0.1.
+
+    Returns:
+        cache_lens: np.ndarray of shape (bs, 1) with values in [1, s_ctx - s_tkg].
+    """
+    max_pos = s_ctx - s_tkg
+    assert max_pos > 0, f"s_ctx ({s_ctx}) must be > s_tkg ({s_tkg})"
+
+    if mode == "three_quarter":
+        # Note that this legacy mode was relevant for performance profiling when we had power
+        # of 2 bucketing along with DMA skipping.
+        # Now we use "spread" to get good coverage since we do not have bucketing.
+        cache_lens = ((np.arange(bs) * 3 + (s_ctx // 4 * 3)) % (max_pos + 1))[:, np.newaxis]
+        cache_lens = np.clip(cache_lens, 1, max_pos)
+    elif mode == "random":
+        cache_lens = np.random.randint(1, max_pos + 1, size=(bs, 1))
+    elif mode == "spread":
+        # Evenly space cache lens across [1, max_pos]: batch i gets ceil(i+1/(bs+1) * max_pos).
+        cache_lens = np.array([math.ceil(max_pos * (i + 1) / (bs + 1)) for i in range(bs)])
+        np.random.shuffle(cache_lens)
+        cache_lens = cache_lens[:, np.newaxis]
+    elif mode == "normal":
+        mean = max_pos * mean_frac
+        stddev = max_pos * stddev_frac
+        cache_lens = np.round(np.random.normal(mean, stddev, size=(bs, 1))).astype(int)
+        cache_lens = np.clip(cache_lens, 1, max_pos)
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}. Use 'spread', 'normal', 'random', or 'three_quarter'.")
+
+    assert cache_lens.min() >= 1
+    assert cache_lens.max() <= max_pos
+    return cache_lens

@@ -11,112 +11,152 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import os as _os
+if _os.environ.get("SKIP_MODEL_TESTS"):
+    raise ImportError("Model tests skipped via SKIP_MODEL_TESTS")
+
 """
 QKV CTE model configuration data.
 
-Config format: [vnc_degree, batch, seqlen, hidden_dim, n_q_heads, n_kv_heads, d_head,
-                norm_type, use_dma_transpose, fused_add, add_bias, norm_bias,
-                output_layout, eps]
+Generates configs for all models × quant_types × sharding × seqlens.
+Common params: (model_name, quant_type, batch, seqlen, hidden_dim,
+                n_q_heads, n_kv_heads, d_head, qkv_bias,
+                fused_rope, use_gamma, in_scale_shape, w_scale_shape)
 """
 
-from nkilib_src.nkilib.core.utils.common_types import NormType, QKVOutputLayout
+import math
 
-# Format: [vnc, batch, seqlen, hidden, n_q_heads, n_kv_heads, d_head,
-#           norm_type, use_dma_transpose, fused_add, add_bias, norm_bias, output_layout, eps]
-# fmt: off
-qkv_cte_model_configs = [
-    # ============ LLAMA3_70B CONFIGS ============
-    # --- Original Sequence Length 1024 ---
-    [2, 1, 1024, 8192, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=64, CP=1
-    [2, 1, 1024, 8192, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=16, TP=16, CP=1
-    [2, 1, 1024, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=8,  TP=8,  CP=1
-    [2, 1, 1024, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=4,  TP=4,  CP=1
-    [2, 1, 512, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=16, TP=8,  CP=2
-    [2, 1, 512, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=8,  TP=4,  CP=2
-    [2, 1, 256, 8192, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=16, CP=4
-    [2, 1, 128, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=8,  CP=8
-    [2, 1, 64, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=4,  CP=16
-    # --- Original Sequence Length 10240 ---
-    [2, 1, 10240, 8192, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=64, TP=64, CP=1
-    [2, 1, 10240, 8192, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=16, CP=1
-    [2, 1, 10240, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=8,  CP=1
-    [2, 1, 10240, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6], # WS=4,  TP=4,  CP=1
-    [2, 1, 5120, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=16, TP=8,  CP=2
-    [2, 1, 5120, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=4,  CP=2
-    [2, 1, 2560, 8192, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=16, CP=4
-    [2, 1, 1280, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=8,  CP=8
-    [2, 1, 640, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=4,  CP=16
-    # --- Original Sequence Length 32768 ---
-    [2, 1, 32768, 8192, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=64, TP=64, CP=1
-    [2, 1, 32768, 8192, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=16, CP=1
-    [2, 1, 32768, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=8,  CP=1
-    [2, 1, 32768, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6], # WS=4,  TP=4,  CP=1
-    [2, 1, 16384, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=8,  CP=2
-    [2, 1, 16384, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6], # WS=8,  TP=4,  CP=2
-    [2, 1, 8192, 8192, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=16, CP=4
-    [2, 1, 4096, 8192, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=8,  CP=8
-    [2, 1, 2048, 8192, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=64, TP=4,  CP=16
-    # ============ QWEN3_32B CONFIGS ============
-    # --- Original Sequence Length 1024 ---
-    [2, 1, 1024, 5120, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=64, CP=1
-    [2, 1, 1024, 5120, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=16, TP=16, CP=1
-    [2, 1, 1024, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=8,  TP=8,  CP=1
-    [2, 1, 1024, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=4,  TP=4,  CP=1
-    [2, 1, 512, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=16, TP=8,  CP=2
-    [2, 1, 512, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=8,  TP=4,  CP=2
-    [2, 1, 256, 5120, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=16, CP=4
-    [2, 1, 128, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=8,  CP=8
-    [2, 1, 64, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=4,  CP=16
-    # --- Original Sequence Length 10240 ---
-    [2, 1, 10240, 5120, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=64, TP=64, CP=1
-    [2, 1, 10240, 5120, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=16, CP=1
-    [2, 1, 10240, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=8,  CP=1
-    [2, 1, 10240, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6], # WS=4,  TP=4,  CP=1
-    [2, 1, 5120, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=16, TP=8,  CP=2
-    [2, 1, 5120, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=4,  CP=2
-    [2, 1, 2560, 5120, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=16, CP=4
-    [2, 1, 1280, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=8,  CP=8
-    [2, 1, 640, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=4,  CP=16
-    # --- Original Sequence Length 32768 ---
-    [2, 1, 32768, 5120, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=64, TP=64, CP=1
-    [2, 1, 32768, 5120, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=16, CP=1
-    [2, 1, 32768, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=8,  CP=1
-    [2, 1, 32768, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6], # WS=4,  TP=4,  CP=1
-    [2, 1, 16384, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=8,  CP=2
-    [2, 1, 16384, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6], # WS=8,  TP=4,  CP=2
-    [2, 1, 8192, 5120, 4, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=16, CP=4
-    [2, 1, 4096, 5120, 8, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=8,  CP=8
-    [2, 1, 2048, 5120, 16, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=64, TP=4,  CP=16
-    # ============ GEMMA3_27B CONFIGS ============
-    # --- Original Sequence Length 1024 ---
-    [2, 1, 1024, 5376, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=64, CP=1
-    [2, 1, 1024, 5376, 2, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=16, TP=16, CP=1
-    [2, 1, 1024, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=8,  TP=8,  CP=1
-    [2, 1, 1024, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=4,  TP=4,  CP=1
-    [2, 1, 512, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=16, TP=8,  CP=2
-    [2, 1, 512, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=8,  TP=4,  CP=2
-    [2, 1, 256, 5376, 2, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=16, CP=4
-    [2, 1, 128, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=8,  CP=8
-    [2, 1, 64, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],     # WS=64, TP=4,  CP=16
-    # --- Original Sequence Length 10240 ---
-    [2, 1, 10240, 5376, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=64, TP=64, CP=1
-    [2, 1, 10240, 5376, 2, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=16, CP=1
-    [2, 1, 10240, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=8,  CP=1
-    [2, 1, 10240, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=4,  TP=4,  CP=1
-    [2, 1, 5120, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=16, TP=8,  CP=2
-    [2, 1, 5120, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=8,  TP=4,  CP=2
-    [2, 1, 2560, 5376, 2, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=16, CP=4
-    [2, 1, 1280, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=8,  CP=8
-    [2, 1, 640, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],    # WS=64, TP=4,  CP=16
-    # --- Original Sequence Length 32768 ---
-    [2, 1, 32768, 5376, 1, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=64, TP=64, CP=1
-    [2, 1, 32768, 5376, 2, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=16, CP=1
-    [2, 1, 32768, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=8,  CP=1
-    [2, 1, 32768, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=4,  TP=4,  CP=1
-    [2, 1, 16384, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=16, TP=8,  CP=2
-    [2, 1, 16384, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],  # WS=8,  TP=4,  CP=2
-    [2, 1, 8192, 5376, 2, 1, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=16, CP=4
-    [2, 1, 4096, 5376, 4, 2, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=8,  CP=8
-    [2, 1, 2048, 5376, 8, 4, 128, NormType.NO_NORM, True, False, False, False, QKVOutputLayout.BSD, 1e-6],   # WS=64, TP=4,  CP=16
+from nkilib_src.nkilib.core.utils.common_types import QuantizationType
+
+MODELS = {
+    "llama3_70b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 128, "hidden": 8192, "bias": False},
+    "qwen3_32b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 128, "hidden": 5120, "bias": False},
+    "qwen3_235b": {"n_q_heads": 64, "n_kv_heads": 4, "d_head": 128, "hidden": 4096, "bias": False, "use_gamma": True},
+    "gemma3_27b": {"n_q_heads": 32, "n_kv_heads": 16, "d_head": 128, "hidden": 5376, "bias": False},
+    "gptoss_120b": {"n_q_heads": 64, "n_kv_heads": 8, "d_head": 64, "hidden": 3072, "bias": True},
+}
+
+_DEFAULT_TP_CP = [
+    (64, 64, 1),
+    (16, 16, 1),
+    (8, 8, 1),
+    (4, 4, 1),
+    (16, 8, 2),
+    (8, 4, 2),
+    (64, 16, 4),
+    (64, 8, 8),
+    (64, 4, 16),
 ]
-# fmt: on
+_DEFAULT_SEQLENS = [1024, 10240, 32768]
+
+OPTIMAL_CONFIGS = {
+    "llama3_70b": {"TP_CP_CONFIGS": _DEFAULT_TP_CP, "SEQLENS": _DEFAULT_SEQLENS},
+    "qwen3_32b": {"TP_CP_CONFIGS": _DEFAULT_TP_CP, "SEQLENS": _DEFAULT_SEQLENS},
+    "gemma3_27b": {"TP_CP_CONFIGS": _DEFAULT_TP_CP, "SEQLENS": _DEFAULT_SEQLENS},
+    "gptoss_120b": {"TP_CP_CONFIGS": _DEFAULT_TP_CP, "SEQLENS": _DEFAULT_SEQLENS},
+    "qwen3_235b": {
+        "TP_CP_CONFIGS": [(64, 4, 16), (32, 4, 8), (16, 4, 4), (8, 4, 2), (64, 64, 1)],
+        "SEQLENS": _DEFAULT_SEQLENS,
+    },
+}
+
+DEFAULT_QUANT_TYPES = [
+    QuantizationType.NONE,
+    QuantizationType.STATIC,
+    QuantizationType.STATIC_MX,
+]
+
+# Model → MX variant mapping
+QK_NORM_MODELS = {"gemma3_27b", "qwen3_235b"}
+STATIC_DEQUANT_MODELS = {"llama3_70b", "gptoss_120b"}
+FUSED_GAMMA_ROPE_MODELS = {"qwen3_32b"}
+
+
+def _get_sharded_head_counts(tp, n_q_heads, n_kv_heads):
+    padded_q = math.ceil(n_q_heads / tp) * tp
+    if n_q_heads == n_kv_heads:
+        padded_kv = padded_q
+    elif n_kv_heads < tp or n_kv_heads % tp != 0:
+        padded_kv = tp if tp % n_kv_heads == 0 else padded_q
+    else:
+        padded_kv = n_kv_heads
+    return padded_q // tp, padded_kv // tp
+
+
+def get_qkv_config(model_name, tp, cp, seqlen, quant_type):
+    """Return QKV config dict for a given model × sharding × seqlen × quant."""
+    m = MODELS.get(model_name)
+    if m is None:
+        return None
+    n_q, n_kv = _get_sharded_head_counts(tp, m["n_q_heads"], m["n_kv_heads"])
+    seqlen_cp = seqlen // cp
+    hidden_padded = math.ceil(m["hidden"] / 512) * 512
+    qt = quant_type.name if hasattr(quant_type, 'name') else quant_type
+
+    if model_name in STATIC_DEQUANT_MODELS:
+        fused_rope = seqlen_cp <= 96
+        in_scale_shape = [1, 1]
+        w_scale_shape = [1, 3]
+    else:
+        fused_rope = True
+        in_scale_shape = None
+        w_scale_shape = None
+
+    return {
+        "model_name": model_name,
+        "quant_type": qt,
+        "batch": 1,
+        "seqlen": seqlen_cp,
+        "hidden_dim": hidden_padded,
+        "n_q_heads": n_q,
+        "n_kv_heads": n_kv,
+        "d_head": m["d_head"],
+        "qkv_bias": m["bias"],
+        "fused_rope": fused_rope,
+        "use_gamma": m.get("use_gamma", False),
+        "in_scale_shape": in_scale_shape,
+        "w_scale_shape": w_scale_shape,
+    }
+
+
+def generate_qkv_configs(configs=None):
+    """Generate QKV configs for all models × quant_types × sharding × seqlens."""
+    if configs is None:
+        configs = OPTIMAL_CONFIGS
+    result = []
+    for model_name in configs:
+        c = configs[model_name]
+        for quant_type in c.get("QUANT_TYPES", DEFAULT_QUANT_TYPES):
+            for orig_seqlen in c.get("SEQLENS", _DEFAULT_SEQLENS):
+                for _ws, tp, cp in c.get("TP_CP_CONFIGS", _DEFAULT_TP_CP):
+                    d = get_qkv_config(model_name, tp, cp, orig_seqlen, quant_type)
+                    result.append(
+                        (
+                            d['model_name'],
+                            quant_type,
+                            d['batch'],
+                            d['seqlen'],
+                            d['hidden_dim'],
+                            d['n_q_heads'],
+                            d['n_kv_heads'],
+                            d['d_head'],
+                            d['qkv_bias'],
+                            d['fused_rope'],
+                            d['use_gamma'],
+                            tuple(d['in_scale_shape']) if d['in_scale_shape'] else None,
+                            tuple(d['w_scale_shape']) if d['w_scale_shape'] else None,
+                        )
+                    )
+    return result
+
+
+from test.utils.common_dataclasses import ModelTestType
+
+_all_optimal_configs = list(dict.fromkeys(generate_qkv_configs()))
+
+qkv_cte_model_configs: dict[ModelTestType, list] = {
+    ModelTestType.TIER0: [],
+    ModelTestType.OPTIMAL: _all_optimal_configs,
+    ModelTestType.GENERALITY: [],
+}

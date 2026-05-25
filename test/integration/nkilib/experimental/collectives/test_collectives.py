@@ -16,17 +16,7 @@ Tests for NKI collective operations.
 """
 
 from enum import Enum
-from test.utils.common_dataclasses import (
-    CompilerArgs,
-    InferenceArgs,
-    KernelArgs,
-    LazyGoldenGenerator,
-    PerRankLazyGoldenGenerator,
-    PerRankLazyInputGenerator,
-    ValidationArgs,
-)
-from test.utils.test_orchestrator import Orchestrator
-from typing import Optional
+from typing import Callable, Optional, final
 
 import nki
 import nki.collectives as ncc
@@ -35,7 +25,17 @@ import nki.language as nl
 import numpy as np
 import pytest
 from nki.collectives import ReplicaGroup
+
 from nkilib_src.nkilib.core.utils.tensor_view import TensorView
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    InferenceArgs,
+    Platforms,
+)
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import CollectiveUnitTestFramework
 
 # ==================== Basic Collective Kernels ====================
 # Test fundamental collective operations: all_reduce, all_gather, reduce_scatter, all_to_all
@@ -298,54 +298,80 @@ def attn_q_batch_shard(
     return q_out.reshape(final_shape)
 
 
+def make_golden_torch_ref(kernel_entry: Callable, golden_generator: Callable[[int], dict]):
+    """Build a (torch_ref, override) pair from a per-rank golden generator.
+
+    Migration convenience for collective tests that don't have a real torch_ref.
+    Uses functools.wraps to copy the kernel signature onto the torch_ref.
+    """
+    import functools
+
+    _state = {}
+
+    @functools.wraps(kernel_entry)
+    def _torch_ref(*args, **kwargs):
+        return golden_generator(_state["rank_id"])
+
+    def _override(rank_id, raw_input):
+        _state["rank_id"] = rank_id
+        return raw_input
+
+    return _torch_ref, _override
+
+
 # ==================== Test Class ====================
 
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from typing import final
+RANKS_LNC_PARAM_NAMES = "collective_ranks, logical_nc_config"
+RANKS_LNC_2RANK = [(2, 2), (2, 1)]
+# all_to_all requires Mesh algorithm: 4 ranks lnc2 or 8 ranks lnc1
+RANKS_LNC_A2A = [(4, 2), (8, 1)]
+_RANKS_LNC_ABBREVS = {"collective_ranks": "ranks", "logical_nc_config": "lnc"}
 
 
-@pytest_test_metadata(
-    name="Collectives",
-    pytest_marks=["collectives"],
-)
+@pytest_test_metadata(name="Collectives")
+@pytest_marks(["collectives"])
 @final
+@pytest.mark.high_rank
 class TestCollectives:
     """Test collective operations on multi-chip hardware."""
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(
-        "collective_ranks,logical_nc_config",
-        [(2, 2), (2, 1)],
-        ids=["2ranks_lnc2", "2ranks_lnc1"],
-    )
-    def test_all_reduce(self, test_manager: Orchestrator, collective_ranks: int, logical_nc_config: int):
+    @pytest_parametrize(RANKS_LNC_PARAM_NAMES, RANKS_LNC_2RANK, abbrevs=_RANKS_LNC_ABBREVS)
+    def test_all_reduce(
+        self, test_manager: Orchestrator, platform_target: Platforms, collective_ranks: int, logical_nc_config: int
+    ):
         """Test all_reduce with determinism check (same input all ranks)."""
         np.random.seed(42)
         x_in = np.random.randn(128, 512).astype(np.float32)
         replica_group = ReplicaGroup([list(range(collective_ranks))])
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=all_reduce_hbm_kernel,
-                compiler_input=CompilerArgs(logical_nc_config=logical_nc_config),
-                kernel_input={"input": x_in, "replica_group": replica_group},
-                inference_args=InferenceArgs(
-                    collective_ranks=collective_ranks, enable_determinism_check=True, num_runs=10
-                ),
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(output_ndarray={"out": x_in * collective_ranks}),
-                    relative_accuracy=1e-3,
-                    absolute_accuracy=1e-3,
-                ),
-            )
+
+        def create_inputs(rank_id: int):
+            return {"input": x_in, "replica_group": replica_group}
+
+        def create_golden(rank_id: int):
+            return {"out": x_in * collective_ranks}
+
+        torch_ref, ref_override = make_golden_torch_ref(all_reduce_hbm_kernel, create_golden)
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=all_reduce_hbm_kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+            per_rank_torch_ref_input_override=ref_override,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=logical_nc_config, platform_target=platform_target),
+            rtol=1e-3,
+            atol=1e-3,
+            inference_args=InferenceArgs(collective_ranks=collective_ranks, enable_determinism_check=True, num_runs=10),
         )
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(
-        "collective_ranks,logical_nc_config",
-        [(2, 2), (2, 1)],
-        ids=["2ranks_lnc2", "2ranks_lnc1"],
-    )
-    def test_all_gather(self, test_manager: Orchestrator, collective_ranks: int, logical_nc_config: int):
+    @pytest_parametrize(RANKS_LNC_PARAM_NAMES, RANKS_LNC_2RANK, abbrevs=_RANKS_LNC_ABBREVS)
+    def test_all_gather(
+        self, test_manager: Orchestrator, platform_target: Platforms, collective_ranks: int, logical_nc_config: int
+    ):
         """Test all_gather with per-rank inputs and outputs."""
         np.random.seed(42)
         H, W = 128, 512
@@ -360,27 +386,26 @@ class TestCollectives:
             # all_gather concatenates all ranks' data
             return {"out": x_global.reshape(collective_ranks * H, W)}
 
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=all_gather_hbm_kernel,
-                compiler_input=CompilerArgs(logical_nc_config=logical_nc_config),
-                kernel_input=PerRankLazyInputGenerator(create_inputs),
-                inference_args=InferenceArgs(collective_ranks=collective_ranks),
-                validation_args=ValidationArgs(
-                    golden_output=PerRankLazyGoldenGenerator(create_golden),
-                    relative_accuracy=1e-3,
-                    absolute_accuracy=1e-3,
-                ),
-            )
+        torch_ref, ref_override = make_golden_torch_ref(all_gather_hbm_kernel, create_golden)
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=all_gather_hbm_kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+            per_rank_torch_ref_input_override=ref_override,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=logical_nc_config, platform_target=platform_target),
+            rtol=1e-3,
+            atol=1e-3,
         )
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(
-        "collective_ranks,logical_nc_config",
-        [(2, 2), (2, 1)],
-        ids=["2ranks_lnc2", "2ranks_lnc1"],
-    )
-    def test_reduce_scatter(self, test_manager: Orchestrator, collective_ranks: int, logical_nc_config: int):
+    @pytest_parametrize(RANKS_LNC_PARAM_NAMES, RANKS_LNC_2RANK, abbrevs=_RANKS_LNC_ABBREVS)
+    def test_reduce_scatter(
+        self, test_manager: Orchestrator, platform_target: Platforms, collective_ranks: int, logical_nc_config: int
+    ):
         """Test reduce_scatter with per-rank inputs and outputs."""
         np.random.seed(42)
         H, W = 128 * collective_ranks, 512
@@ -397,107 +422,117 @@ class TestCollectives:
             summed = x_global.sum(axis=0)
             return {"out": summed[rank_id * chunk_size : (rank_id + 1) * chunk_size, :]}
 
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=reduce_scatter_hbm_kernel,
-                compiler_input=CompilerArgs(logical_nc_config=logical_nc_config),
-                kernel_input=PerRankLazyInputGenerator(create_inputs),
-                inference_args=InferenceArgs(collective_ranks=collective_ranks),
-                validation_args=ValidationArgs(
-                    golden_output=PerRankLazyGoldenGenerator(create_golden),
-                    relative_accuracy=1e-3,
-                    absolute_accuracy=1e-3,
-                ),
-            )
+        torch_ref, ref_override = make_golden_torch_ref(reduce_scatter_hbm_kernel, create_golden)
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=reduce_scatter_hbm_kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+            per_rank_torch_ref_input_override=ref_override,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=logical_nc_config, platform_target=platform_target),
+            rtol=1e-3,
+            atol=1e-3,
         )
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(
-        "collective_ranks,logical_nc_config",
-        # all_to_all requires Mesh algorithm: 4 ranks lnc2 or 8 ranks lnc1
-        [(4, 2), (8, 1)],
-        ids=["4ranks_lnc2", "8ranks_lnc1"],
-    )
-    def test_all_to_all(self, test_manager: Orchestrator, collective_ranks: int, logical_nc_config: int):
+    @pytest_parametrize(RANKS_LNC_PARAM_NAMES, RANKS_LNC_A2A, abbrevs=_RANKS_LNC_ABBREVS)
+    def test_all_to_all(
+        self, test_manager: Orchestrator, platform_target: Platforms, collective_ranks: int, logical_nc_config: int
+    ):
         """Test all_to_all (same input all ranks)."""
         np.random.seed(42)
         H, W = 128 * collective_ranks, 512
         x_in = np.random.randn(H, W).astype(np.float32)
         chunk_size = H // collective_ranks
         replica_group = ReplicaGroup([list(range(collective_ranks))])
-        # all_to_all with same input: each rank gets chunk i from all ranks = tiled chunk 0
-        golden = np.tile(x_in[:chunk_size, :], (collective_ranks, 1))
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=all_to_all_hbm_kernel,
-                compiler_input=CompilerArgs(logical_nc_config=logical_nc_config),
-                kernel_input={"input": x_in, "replica_group": replica_group},
-                inference_args=InferenceArgs(collective_ranks=collective_ranks),
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(output_ndarray={"out": golden}),
-                    relative_accuracy=1e-3,
-                    absolute_accuracy=1e-3,
-                ),
-            )
+
+        def create_inputs(rank_id: int):
+            return {"input": x_in, "replica_group": replica_group}
+
+        def create_golden(rank_id: int):
+            # all_to_all with same input: rank r receives chunk r from all ranks = tiled chunk r
+            chunk = x_in[rank_id * chunk_size : (rank_id + 1) * chunk_size, :]
+            return {"out": np.tile(chunk, (collective_ranks, 1))}
+
+        torch_ref, ref_override = make_golden_torch_ref(all_to_all_hbm_kernel, create_golden)
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=all_to_all_hbm_kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+            per_rank_torch_ref_input_override=ref_override,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=logical_nc_config, platform_target=platform_target),
+            rtol=1e-3,
+            atol=1e-3,
         )
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(
-        "collective_ranks,logical_nc_config",
-        [(2, 2), (2, 1)],
-        ids=["2ranks_lnc2", "2ranks_lnc1"],
-    )
-    def test_rank_id(self, test_manager: Orchestrator, collective_ranks: int, logical_nc_config: int):
+    @pytest_parametrize(RANKS_LNC_PARAM_NAMES, RANKS_LNC_2RANK, abbrevs=_RANKS_LNC_ABBREVS)
+    def test_rank_id(
+        self, test_manager: Orchestrator, platform_target: Platforms, collective_ranks: int, logical_nc_config: int
+    ):
         """Test ncc.rank_id() as scalar_offset: each rank selects its slice."""
         np.random.seed(42)
         G, H, W = collective_ranks, 128, 512
         in_tensor = np.random.randn(G, H, W).astype(np.float32)
 
+        def create_inputs(rank_id: int):
+            return {"in_tensor": in_tensor}
+
         def create_golden(rank_id: int):
             return {"out": in_tensor[rank_id]}
 
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=rank_id_kernel,
-                compiler_input=CompilerArgs(logical_nc_config=logical_nc_config),
-                kernel_input={"in_tensor": in_tensor},
-                inference_args=InferenceArgs(collective_ranks=collective_ranks),
-                validation_args=ValidationArgs(
-                    golden_output=PerRankLazyGoldenGenerator(create_golden),
-                    relative_accuracy=1e-3,
-                    absolute_accuracy=1e-3,
-                ),
-            )
+        torch_ref, ref_override = make_golden_torch_ref(rank_id_kernel, create_golden)
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=rank_id_kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+            per_rank_torch_ref_input_override=ref_override,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=logical_nc_config, platform_target=platform_target),
+            rtol=1e-3,
+            atol=1e-3,
         )
 
     @pytest.mark.fast
-    @pytest.mark.parametrize(
-        "collective_ranks,logical_nc_config",
-        [(2, 2), (2, 1)],
-        ids=["2ranks_lnc2", "2ranks_lnc1"],
-    )
-    def test_dma_copy_rank_id(self, test_manager: Orchestrator, collective_ranks: int, logical_nc_config: int):
+    @pytest_parametrize(RANKS_LNC_PARAM_NAMES, RANKS_LNC_2RANK, abbrevs=_RANKS_LNC_ABBREVS)
+    def test_dma_copy_rank_id(
+        self, test_manager: Orchestrator, platform_target: Platforms, collective_ranks: int, logical_nc_config: int
+    ):
         """Test rank_id loaded to SBUF via lookup table, then used as scalar_offset."""
         np.random.seed(42)
         G, H, W = collective_ranks, 128, 64
         in_tensor = np.random.randn(G, H, W).astype(np.float32)
         rank_id_lookup = np.arange(G, dtype=np.int32).reshape(1, G)
 
+        def create_inputs(rank_id: int):
+            return {"in_tensor": in_tensor, "rank_id_lookup": rank_id_lookup}
+
         def create_golden(rank_id: int):
             return {"out": in_tensor[rank_id]}
 
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=dma_copy_rank_id_kernel,
-                compiler_input=CompilerArgs(logical_nc_config=logical_nc_config),
-                kernel_input={"in_tensor": in_tensor, "rank_id_lookup": rank_id_lookup},
-                inference_args=InferenceArgs(collective_ranks=collective_ranks),
-                validation_args=ValidationArgs(
-                    golden_output=PerRankLazyGoldenGenerator(create_golden),
-                    relative_accuracy=1e-3,
-                    absolute_accuracy=1e-3,
-                ),
-            )
+        torch_ref, ref_override = make_golden_torch_ref(dma_copy_rank_id_kernel, create_golden)
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=dma_copy_rank_id_kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+            per_rank_torch_ref_input_override=ref_override,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=logical_nc_config, platform_target=platform_target),
+            rtol=1e-3,
+            atol=1e-3,
         )
 
     @pytest.mark.fast
@@ -516,6 +551,7 @@ class TestCollectives:
     def test_batch_shard_input(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         collective_ranks: int,
         logical_nc_config: int,
         layout: AttnQBatchShardLayout,
@@ -578,16 +614,17 @@ class TestCollectives:
             golden = Q_global[h0:h1, b0:b1, :, :] if is_nbsd else Q_global[h0:h1, :, b0:b1, :]
             return {"q_out": golden}
 
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=attn_q_batch_shard,
-                compiler_input=CompilerArgs(logical_nc_config=logical_nc_config),
-                kernel_input=PerRankLazyInputGenerator(create_inputs),
-                inference_args=InferenceArgs(collective_ranks=collective_ranks),
-                validation_args=ValidationArgs(
-                    golden_output=PerRankLazyGoldenGenerator(create_golden),
-                    relative_accuracy=1e-3,
-                    absolute_accuracy=1e-3,
-                ),
-            )
+        torch_ref, ref_override = make_golden_torch_ref(attn_q_batch_shard, create_golden)
+        CollectiveUnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attn_q_batch_shard,
+            torch_ref=torch_ref,
+            per_rank_input_generator=create_inputs,
+            collective_ranks=collective_ranks,
+            per_rank_torch_ref_input_override=ref_override,
+        ).run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=logical_nc_config, platform_target=platform_target),
+            rtol=1e-3,
+            atol=1e-3,
         )

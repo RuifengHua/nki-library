@@ -27,6 +27,7 @@ class TestStatus(str, Enum):
     INFERENCE_FAILURE = "INFERENCE_FAILURE"
     VALIDATION_FAILURE = "VALIDATION_FAILURE"
     EXPECTED_FAILURE = "EXPECTED_FAILURE"
+    TEST_EXECUTION_FAILURE = "TEST_EXECUTION_FAILURE"
 
 
 class RemoteExecutionException(Exception):
@@ -43,7 +44,7 @@ class RemoteFileTransferException(Exception):
 
 
 class LocalExecutionException(Exception):
-    def __init__(self, message: str, result: subprocess.CompletedProcess[bytes], *args: object) -> None:
+    def __init__(self, message: str, result: subprocess.CompletedProcess, *args: object) -> None:
         super().__init__(
             f"{message}\n===STDOUT===\n{result.stdout}\n===STDERR===\n{result.stderr}\n",
             *args,

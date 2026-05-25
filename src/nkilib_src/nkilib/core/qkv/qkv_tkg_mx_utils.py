@@ -51,6 +51,7 @@ class QKV_TKG_MXFP_UserInput(nl.NKIObject):
     quantization_type: QuantizationType = QuantizationType.MX
     is_h_dim_4h_transposed: bool = False
     weight_scales_hbm: Optional[nl.ndarray] = None
+    input_scale_hbm: Optional[nl.ndarray] = None
     output_in_sbuf: bool = False
     qkv_bias: Optional[nl.ndarray] = None
     norm_bias: Optional[nl.ndarray] = None
@@ -77,10 +78,29 @@ def _validate_user_inputs(args: QKV_TKG_MXFP_UserInput) -> None:
         H_packed == H // 4,
         f"[QKV TKG MXFP] weights_qtz_hbm.shape[0] must equal H//4, got {H_packed}, expected {H // 4}.",
     )
-    kernel_assert(
-        args.weight_scales_hbm.shape == (H // 32, I),
-        f"[QKV TKG MXFP] weight_scales_hbm.shape must be ({H // 32}, {I}), got {args.weight_scales_hbm.shape}.",
-    )
+    if args.quantization_type == QuantizationType.MX:
+        kernel_assert(
+            args.weight_scales_hbm != None,
+            "[QKV TKG MXFP] weight_scales_hbm must be provided for MX quantization.",
+        )
+        kernel_assert(
+            args.weight_scales_hbm.shape == (H // 32, I),
+            f"[QKV TKG MXFP] weight_scales_hbm.shape must be ({H // 32}, {I}), got {args.weight_scales_hbm.shape}.",
+        )
+    elif args.quantization_type == QuantizationType.STATIC_MX:
+        kernel_assert(
+            args.weight_scales_hbm != None,
+            "[QKV TKG MXFP] weight_scales_hbm (weight dequant scale) must be provided for STATIC_MX quantization.",
+        )
+        kernel_assert(
+            args.input_scale_hbm != None,
+            "[QKV TKG MXFP] input_scale_hbm must be provided for STATIC_MX quantization.",
+        )
+    elif args.quantization_type == QuantizationType.ROW_MX:
+        kernel_assert(
+            args.weight_scales_hbm != None,
+            "[QKV TKG MXFP] weight_scales_hbm (per-column weight dequant scale) must be provided for ROW_MX quantization.",
+        )
     kernel_assert(B * S <= P_MAX, f"[QKV TKG MXFP] BxS must be <= {P_MAX} for TKG, got BxS={B * S}.")
     kernel_assert(
         (B * S) % 4 == 0, f"[QKV TKG MXFP] BxS must be divisible by 4 for MXFP quantization, got BxS={B * S}."
@@ -91,10 +111,11 @@ def _validate_user_inputs(args: QKV_TKG_MXFP_UserInput) -> None:
         args.weights_qtz_hbm.dtype == nl.float8_e4m3fn_x4,
         f"[QKV TKG MXFP] weights_qtz_hbm.dtype must be nl.float8_e4m3fn_x4, got {args.weights_qtz_hbm.dtype}.",
     )
-    kernel_assert(
-        args.weight_scales_hbm.dtype == nl.uint8,
-        f"[QKV TKG MXFP] weight_scales_hbm.dtype must be nl.uint8, got {args.weight_scales_hbm.dtype}.",
-    )
+    if args.quantization_type == QuantizationType.MX:
+        kernel_assert(
+            args.weight_scales_hbm.dtype == nl.uint8,
+            f"[QKV TKG MXFP] weight_scales_hbm.dtype must be nl.uint8 for MX, got {args.weight_scales_hbm.dtype}.",
+        )
     # H pre-shuffle conditions.
     kernel_assert(args.is_h_dim_4h_transposed == True, f"[QKV TKG MXFP] is_h_dim_4h_transposed must be True for MXFP.")
     # QKV_MXFP does not support these at the moment:
@@ -112,10 +133,10 @@ def _validate_user_inputs(args: QKV_TKG_MXFP_UserInput) -> None:
         args.norm_type == NormType.NO_NORM or args.norm_type == NormType.RMS_NORM,
         f"[QKV TKG MXFP] Only NO_NORM / RMS_NORM is supported, got norm_type={args.norm_type}.",
     )
-    # Ensure quantization type is always MX
+    # Ensure quantization type is MX, STATIC_MX, or ROW_MX
     kernel_assert(
-        args.quantization_type == QuantizationType.MX,
-        f"[QKV TKG MXFP] quantization_type must be MX, got quantization_type={args.quantization_type}.",
+        args.quantization_type.is_mx(),
+        f"[QKV TKG MXFP] quantization_type must be MX, STATIC_MX, or ROW_MX, got quantization_type={args.quantization_type}.",
     )
     # norm_bias is not supported either
     kernel_assert(args.norm_bias is None, f"[QKV TKG MXFP] norm_bias is not supported.")
@@ -170,7 +191,15 @@ class QKV_TKG_MXFP_Config(nl.NKIObject):
 
     # Flags
     is_h_dim_4h_transposed: bool
+    is_static_quant: bool
+    is_row_quant: bool
+    quantization_type: QuantizationType
     force_lnc1: bool  # True if H too small to shard
+
+    # Head dimensions (for STATIC_MX per-Q/K/V dequant)
+    d_head: Optional[int]
+    num_q_heads: Optional[int]
+    num_kv_heads: Optional[int]
 
 
 def _build_config(args: QKV_TKG_MXFP_UserInput) -> QKV_TKG_MXFP_Config:
@@ -228,5 +257,11 @@ def _build_config(args: QKV_TKG_MXFP_UserInput) -> QKV_TKG_MXFP_Config:
         H1_packed_shard=H1_packed_shard,
         H_packed_shard=H_packed_shard,
         is_h_dim_4h_transposed=args.is_h_dim_4h_transposed,
+        is_static_quant=args.quantization_type == QuantizationType.STATIC_MX,
+        is_row_quant=args.quantization_type == QuantizationType.ROW_MX,
+        quantization_type=args.quantization_type,
         force_lnc1=force_lnc1,
+        d_head=args.d_head,
+        num_q_heads=args.num_q_heads,
+        num_kv_heads=args.num_kv_heads,
     )

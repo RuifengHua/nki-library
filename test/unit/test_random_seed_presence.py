@@ -23,15 +23,16 @@ Files can opt-out by including the comment @IGNORE_RANDOM_SEED anywhere in the f
 """
 
 import ast
+from typing import List, Set
+
+import pytest
+
 from test.utils.test_validation_utils import (
     IntegrationFileCollector,
     ParsedFileInfo,
     ValidationErrorReporter,
     ValidationViolation,
 )
-from typing import List, Set
-
-import pytest
 
 IGNORE_MARKER = "@IGNORE_RANDOM_SEED"
 

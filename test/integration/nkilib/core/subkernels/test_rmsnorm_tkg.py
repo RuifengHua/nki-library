@@ -14,16 +14,16 @@
 
 """Tests for RMSNorm TKG kernel using UnitTestFramework."""
 
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.subkernels.rmsnorm_tkg import rmsnorm_tkg
 from nkilib_src.nkilib.core.subkernels.rmsnorm_torch import rmsnorm_tkg_torch_ref, rmsnorm_tkg_torch_ref_lnc1
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def generate_inputs(batch, seqlen, hidden, hidden_actual, hidden_dim_tp, shard_on_h, dtype):
@@ -84,10 +84,8 @@ RMSNORM_TKG_TEST_CASES = [
 # fmt: on
 
 
-@pytest_test_metadata(
-    name="RMSNorm TKG",
-    pytest_marks=["rmsnorm", "tkg"],
-)
+@pytest_test_metadata(name="RMSNorm TKG")
+@pytest_marks(["rmsnorm", "tkg"])
 class TestRmsNormTKGKernel:
     """Test class for RMSNorm TKG kernel using UnitTestFramework."""
 
@@ -96,6 +94,7 @@ class TestRmsNormTKGKernel:
     def test_rmsnorm_tkg_unit(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         batch: int,
         seqlen: int,
@@ -125,7 +124,7 @@ class TestRmsNormTKGKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=lnc_degree),
+            compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target),
             rtol=2e-2,
             atol=1e-5,
         )

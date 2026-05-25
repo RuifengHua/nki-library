@@ -131,17 +131,12 @@ def nc_matmul_mx_golden(
     # The scale tensor may have more columns than needed (e.g., when stationary and moving scales are packed together).
     moving_scale_relevant = moving_scale[:, :MF0]
 
-    # Convert scale exponents to scale factors
+    # Convert scale exponents to scale factors and apply via broadcasting
+    # Each scale factor applies to an 8x1x4 block: [MSP, 1, MF0, 1] broadcasts to [MSP, 8, MF0, 4]
     moving_scale_factors = 2.0 ** (moving_scale_relevant - 127)  # Shape: [MSP, MF0]
-
-    # Expand scale factors to match moving tensor shape
-    # Each scale factor applies to an 8x1x4 block
-    moving_scale_expanded = np.repeat(moving_scale_factors[:, :, np.newaxis], 4, axis=2)  # Shape: [MSP, MF0, 4]
-    moving_scale_expanded = np.repeat(moving_scale_expanded[:, np.newaxis, :, :], 8, axis=1)  # Shape: [MSP, 8, MF0, 4]
-    moving_scale_expanded = moving_scale_expanded.reshape(MSP * 8, MF0, 4)  # Shape: [MP, MF0, 4]
-
-    # Apply scaling
-    moving *= moving_scale_expanded
+    moving = moving.reshape(MSP, 8, MF0, 4)
+    moving *= moving_scale_factors[:, np.newaxis, :, np.newaxis]
+    moving = moving.reshape(MP, MF0, 4)
 
     # Process stationary tensor
     stationary = static_cast(stationary_x4, np.float32)
@@ -160,36 +155,17 @@ def nc_matmul_mx_golden(
     # The scale tensor may have more columns than needed (e.g., when stationary and moving scales are packed together).
     stationary_scale_relevant = stationary_scale[:, :SF0]
 
-    # Convert scale exponents to scale factors
+    # Convert scale exponents to scale factors and apply via broadcasting
+    # Each scale factor applies to an 8x1x4 block: [SSP, 1, SF0, 1] broadcasts to [SSP, 8, SF0, 4]
     stationary_scale_factors = 2.0 ** (stationary_scale_relevant - 127)  # Shape: [SSP, SF0]
+    stationary = stationary.reshape(SSP, 8, SF0, 4)
+    stationary *= stationary_scale_factors[:, np.newaxis, :, np.newaxis]
+    stationary = stationary.reshape(SP, SF0, 4)
 
-    # Expand scale factors to match stationary tensor shape
-    # Each scale factor applies to an 8x1x4 block
-    stationary_scale_expanded = np.repeat(stationary_scale_factors[:, :, np.newaxis], 4, axis=2)  # Shape: [SSP, SF0, 4]
-    stationary_scale_expanded = np.repeat(
-        stationary_scale_expanded[:, np.newaxis, :, :], 8, axis=1
-    )  # Shape: [SSP, 8, SF0, 4]
-    stationary_scale_expanded = stationary_scale_expanded.reshape(SSP * 8, SF0, 4)  # Shape: [SP, SF0, 4]
-
-    # Apply scaling
-    stationary *= stationary_scale_expanded
-
-    golden = np.einsum("kiq,kjq->ij", stationary, moving)
+    # Contract over k (partition) and q (4-wide): einsum("kiq,kjq->ij") = [SF0, MF0]
+    # Reshape to [SF0, SP*4] and [MF0, MP*4], then matmul
+    golden = stationary.transpose(1, 0, 2).reshape(SF0, -1) @ moving.transpose(1, 0, 2).reshape(MF0, -1).T
     return golden
-
-
-def nc_matmul_mx_golden_physical_scale(
-    stationary_x4, moving_x4, stationary_scale, moving_scale, stationary_scale_p_offset=0, moving_scale_p_offset=0
-):
-    return nc_matmul_mx_golden(
-        stationary_x4,
-        moving_x4,
-        stationary_scale,
-        moving_scale,
-        use_contiguous_scale=False,
-        stationary_scale_p_offset=stationary_scale_p_offset,
-        moving_scale_p_offset=moving_scale_p_offset,
-    )
 
 
 def dequantize_mx_golden(mx_data_x4, mx_scale):

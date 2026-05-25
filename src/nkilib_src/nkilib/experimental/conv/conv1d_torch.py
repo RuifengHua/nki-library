@@ -90,6 +90,8 @@ def conv1d_torch_ref(
             output = F.gelu(output, approximate="tanh")
         elif activation_fn == ActFnType.Swish:
             output = F.silu(output)
+        elif activation_fn == ActFnType.ReLU:
+            output = F.relu(output)
         else:
             raise ValueError(f"Unsupported activation function: {activation_fn}")
 

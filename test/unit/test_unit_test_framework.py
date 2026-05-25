@@ -15,19 +15,36 @@
 """Unit tests for UnitTestFramework utilities."""
 
 import inspect
-from test.utils.unit_test_framework import (
-    UnitTestFramework,
-    check_unused_parameters,
-    torch_ref_wrapper,
-    validate_torch_ref_signature,
-)
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
 from neuron_dtypes import bfloat16 as np_bfloat16
+from neuron_dtypes import float8_e4m3fn as np_float8_e4m3fn
 from neuron_dtypes import static_cast as np_static_cast
+
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    CustomValidator,
+    CustomValidatorWithOutputTensorData,
+    InferenceArgs,
+    PerRankLazyGoldenGenerator,
+    PerRankLazyInputGenerator,
+    Platforms,
+    ValidationArgs,
+)
+from test.utils.unit_test_framework import (
+    CollectiveUnitTestFramework,
+    UnitTestFramework,
+    check_unused_parameters,
+    filter_kernel_input,
+    filter_ref_input,
+    torch_ref_wrapper,
+    validate_cross_rank_consistency,
+    validate_input_keys,
+    validate_torch_ref_signature,
+)
 
 
 class TestValidateTorchRefSignature:
@@ -558,6 +575,186 @@ class TestUnitTestFramework:
         )
         mock_collector.match_and_add_metadata_dimensions.assert_not_called()
 
+    def test_custom_comparator_receives_torch_ref_golden(self):
+        """custom_comparator should receive golden from torch_ref, not compute it independently."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a * 3}
+
+        received = {}
+
+        def comparator(golden_dict, output_tensors):
+            received.update(golden_dict)
+            return {
+                "out": CustomValidatorWithOutputTensorData(
+                    validator=type("V", (CustomValidator,), {"validate": lambda self, x: True}),
+                    output_ndarray=output_tensors["out"],
+                )
+            }
+
+        mock_manager = MagicMock()
+        framework = UnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            kernel_input_generator=lambda _: {"a": np.array([2.0])},
+            output_tensor_descriptor=lambda _: {"out": np.array([0.0])},
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock(), custom_comparator=comparator)
+
+        # Trigger lazy golden to invoke comparator
+        kernel_args = mock_manager.execute.call_args[0][0]
+        kernel_args.validation_args.golden_output.golden
+        np.testing.assert_array_equal(received["out"], [6.0])
+
+    def test_custom_comparator_result_used_as_validation(self):
+        """Framework should use comparator's returned CustomValidatorWithOutputTensorData."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        validator_cls = type("V", (CustomValidator,), {"validate": lambda self, x: True})
+
+        def comparator(golden_dict, output_tensors):
+            return {
+                "out": CustomValidatorWithOutputTensorData(
+                    validator=validator_cls,
+                    output_ndarray=np.zeros((2,)),
+                )
+            }
+
+        mock_manager = MagicMock()
+        framework = UnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            kernel_input_generator=lambda _: {"a": np.array([1.0, 2.0])},
+            output_tensor_descriptor=lambda _: {"out": np.zeros((2,))},
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock(), custom_comparator=comparator)
+
+        kernel_args = mock_manager.execute.call_args[0][0]
+        result = kernel_args.validation_args.golden_output.golden
+        assert isinstance(result["out"], CustomValidatorWithOutputTensorData)
+        assert result["out"].validator is validator_cls
+
+    def test_custom_comparator_and_custom_validation_args_exclusive(self):
+        """Passing both custom_comparator and custom_validation_args should raise."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        mock_manager = MagicMock()
+        framework = UnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            kernel_input_generator=lambda _: {"a": np.array([1.0])},
+            output_tensor_descriptor=lambda _: {"out": np.array([0.0])},
+        )
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            framework.run_test(
+                test_config=None,
+                compiler_args=MagicMock(),
+                custom_validation_args=MagicMock(spec=ValidationArgs),
+                custom_comparator=lambda g, o: {},
+            )
+
+    # ── trace_only mode ──
+
+    def test_trace_only_init_without_torch_ref(self):
+        """trace_only=True should allow torch_ref=None and output_tensor_descriptor=None."""
+
+        def kernel(a):
+            pass
+
+        mock_manager = MagicMock()
+        framework = UnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            kernel_input_generator=lambda x: {"a": 1},
+            trace_only=True,
+        )
+        assert framework.trace_only is True
+        assert framework.torch_ref is None
+        assert framework.output_tensor_descriptor is None
+
+    def test_trace_only_false_without_torch_ref_raises(self):
+        """trace_only=False (default) with torch_ref=None should raise."""
+
+        def kernel(a):
+            pass
+
+        mock_manager = MagicMock()
+        with pytest.raises(ValueError, match="torch_ref is required"):
+            UnitTestFramework(
+                test_manager=mock_manager,
+                kernel_entry=kernel,
+                kernel_input_generator=lambda x: {"a": 1},
+            )
+
+    def test_trace_only_false_without_output_tensor_descriptor_raises(self):
+        """trace_only=False with output_tensor_descriptor=None should raise."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        mock_manager = MagicMock()
+        with pytest.raises(ValueError, match="output_tensor_descriptor is required"):
+            UnitTestFramework(
+                test_manager=mock_manager,
+                kernel_entry=kernel,
+                torch_ref=torch_ref,
+                kernel_input_generator=lambda x: {"a": 1},
+            )
+
+    def test_trace_only_run_test_calls_execute(self):
+        """trace_only run_test should call test_manager.execute with no golden generator."""
+
+        def kernel(a):
+            pass
+
+        mock_manager = MagicMock()
+        framework = UnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            kernel_input_generator=lambda x: {"a": np.array([1.0])},
+            trace_only=True,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock())
+        mock_manager.execute.assert_called_once()
+        kernel_args = mock_manager.execute.call_args[0][0]
+        assert kernel_args.validation_args.golden_output.lazy_golden_generator is None
+
+    def test_trace_only_run_test_validates_input_keys(self):
+        """trace_only run_test should still validate kernel_input keys."""
+
+        def kernel(a):
+            pass
+
+        mock_manager = MagicMock()
+        framework = UnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            kernel_input_generator=lambda x: {"a": 1, "extra_typo": 2},
+            trace_only=True,
+        )
+        with pytest.raises(ValueError, match="extra_typo.*don't match"):
+            framework.run_test(test_config=None, compiler_args=MagicMock())
+
 
 class TestTorchRefWrapperPreserveLowerPrecision:
     """Tests for torch_ref_wrapper with preserve_lower_precision=True."""
@@ -623,9 +820,9 @@ class TestTorchRefWrapperPreserveLowerPrecision:
         wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
         result = wrapped(x=a, y=b)
 
-        assert np.array_equal(
-            expected.view(np.uint16), result["out"].view(np.uint16)
-        ), "Should be bit-identical to numpy bfloat16 arithmetic"
+        assert np.array_equal(expected.view(np.uint16), result["out"].view(np.uint16)), (
+            "Should be bit-identical to numpy bfloat16 arithmetic"
+        )
 
     def test_float32_input_unaffected(self):
         """preserve_lower_precision should not affect float32 inputs/outputs."""
@@ -685,3 +882,769 @@ class TestTorchRefWrapperPreserveLowerPrecision:
         bf16_array = np.array([1.0, 3.0]).astype(np_bfloat16)
         result = wrapped(x=bf16_array)
         assert str(result["out"].dtype) == "bfloat16"
+
+
+class TestTorchRefWrapperDtypeConverters:
+    """Tests for torch_ref_wrapper with input_dtype_converter and output_dtype_converter."""
+
+    def test_input_dtype_converter_called_for_bfloat16(self):
+        """input_dtype_converter should be called with numpy array for bfloat16 inputs."""
+        seen = {}
+
+        def converter(value):
+            seen['dtype_str'] = str(value.dtype)
+            seen['value_type'] = type(value)
+            return torch.from_numpy(value.astype(np.float32)).to(torch.bfloat16)
+
+        def ref_func(x):
+            assert x.dtype == torch.bfloat16
+            return x.float()
+
+        wrapped = torch_ref_wrapper(ref_func, input_dtype_converter=converter)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
+        wrapped(x=bf16_array)
+        assert seen['dtype_str'] == 'bfloat16'
+        assert seen['value_type'] == np.ndarray
+
+    def test_input_dtype_converter_none_falls_through(self):
+        """Returning None from input_dtype_converter should use default behavior."""
+
+        def converter(value):
+            return None  # fall through to default
+
+        def ref_func(x):
+            assert x.dtype == torch.float32, "Should be float32 (default behavior)"
+            return x
+
+        wrapped = torch_ref_wrapper(ref_func, input_dtype_converter=converter)
+        bf16_array = np.array([1.0]).astype(np_bfloat16)
+        wrapped(x=bf16_array)  # Should not raise
+
+    def test_input_dtype_converter_called_for_int32(self):
+        """input_dtype_converter is called for all numpy inputs; returning None falls back to default."""
+        called = {'count': 0}
+
+        def converter(value):
+            called['count'] += 1
+            return None
+
+        def ref_func(x):
+            return x.float()
+
+        wrapped = torch_ref_wrapper(ref_func, input_dtype_converter=converter)
+        int_array = np.array([1, 2, 3], dtype=np.int32)
+        wrapped(x=int_array)
+        assert called['count'] == 1
+
+    def test_output_dtype_converter_called_for_custom_dtype(self):
+        """output_dtype_converter should be called and its result used when non-None."""
+
+        def converter(tensor):
+            if tensor.dtype == torch.bfloat16:
+                return tensor.float().numpy().astype(np.float64)
+            return None
+
+        def ref_func(x):
+            return x.to(torch.bfloat16)
+
+        wrapped = torch_ref_wrapper(ref_func, output_dtype_converter=converter)
+        f32_array = np.array([1.0, 2.0], dtype=np.float32)
+        result = wrapped(x=f32_array)
+        assert result["out"].dtype == np.float64
+
+    def test_output_dtype_converter_none_falls_through(self):
+        """Returning None from output_dtype_converter should use default behavior."""
+
+        def converter(tensor):
+            return None
+
+        def ref_func(x):
+            return x
+
+        wrapped = torch_ref_wrapper(ref_func, output_dtype_converter=converter)
+        f32_array = np.array([1.0], dtype=np.float32)
+        result = wrapped(x=f32_array)
+        assert result["out"].dtype == np.float32
+
+    def test_output_dtype_converter_with_dict_output(self):
+        """output_dtype_converter should apply to each tensor in dict output."""
+        call_count = {'n': 0}
+
+        def converter(tensor):
+            call_count['n'] += 1
+            return None  # use default for all
+
+        def ref_func(x):
+            return {"a": x, "b": x * 2}
+
+        wrapped = torch_ref_wrapper(ref_func, output_dtype_converter=converter)
+        f32_array = np.array([1.0], dtype=np.float32)
+        wrapped(x=f32_array)
+        assert call_count['n'] == 2
+
+    def test_both_converters_together(self):
+        """input_dtype_converter and output_dtype_converter should work together."""
+
+        def in_converter(value):
+            if 'bfloat16' in str(value.dtype):
+                return torch.from_numpy(value.astype(np.float32)).to(torch.bfloat16)
+            return None
+
+        def out_converter(tensor):
+            if tensor.dtype == torch.bfloat16:
+                return np_static_cast(tensor.float().numpy(), np_bfloat16)
+            return None
+
+        def ref_func(x):
+            assert x.dtype == torch.bfloat16
+            return x * 2
+
+        wrapped = torch_ref_wrapper(ref_func, input_dtype_converter=in_converter, output_dtype_converter=out_converter)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
+        result = wrapped(x=bf16_array)
+        assert str(result["out"].dtype) == "bfloat16"
+
+
+class TestTorchRefWrapperBackwardCompat:
+    """Verify preserve_lower_precision behavior is unchanged when no custom converters are provided."""
+
+    def test_bfloat16_still_upcasts_to_f32_without_preserve(self):
+        """Without preserve_lower_precision, bf16 input should arrive as fp32."""
+
+        def ref_func(x):
+            assert x.dtype == torch.float32
+            return x
+
+        wrapped = torch_ref_wrapper(ref_func)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
+        wrapped(x=bf16_array)
+
+    def test_bfloat16_preserved_with_preserve_flag(self):
+        """With preserve_lower_precision, bf16 input should arrive as torch.bfloat16."""
+
+        def ref_func(x):
+            assert x.dtype == torch.bfloat16
+            return x
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
+        wrapped(x=bf16_array)
+
+    def test_bfloat16_output_castback_with_preserve_flag(self):
+        """With preserve_lower_precision, output should be cast back to bf16 numpy."""
+
+        def ref_func(x):
+            return x * 2
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        bf16_array = np.array([1.0, 2.0]).astype(np_bfloat16)
+        result = wrapped(x=bf16_array)
+        assert str(result["out"].dtype) == "bfloat16"
+
+    def test_fp8_still_upcasts_to_f32_without_converter(self):
+        """Without custom converter, fp8 input should arrive as fp32."""
+
+        def ref_func(x):
+            assert x.dtype == torch.float32
+            return x
+
+        wrapped = torch_ref_wrapper(ref_func)
+        fp8_array = np.array([1.0, 2.0]).astype(np_float8_e4m3fn)
+        wrapped(x=fp8_array)
+
+    def test_fp8_still_upcasts_to_f32_with_preserve_flag(self):
+        """With preserve_lower_precision but no converter, fp8 input should still be fp32."""
+
+        def ref_func(x):
+            assert x.dtype == torch.float32, f"Expected float32, got {x.dtype}"
+            return x
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        fp8_array = np.array([1.0, 2.0]).astype(np_float8_e4m3fn)
+        wrapped(x=fp8_array)
+
+    def test_fp8_output_castback_with_preserve_flag(self):
+        """With preserve_lower_precision, fp8 output should be cast back to fp8 numpy."""
+
+        def ref_func(x):
+            return x * 2
+
+        wrapped = torch_ref_wrapper(ref_func, preserve_lower_precision=True)
+        fp8_array = np.array([1.0, 0.5]).astype(np_float8_e4m3fn)
+        result = wrapped(x=fp8_array)
+        assert str(result["out"].dtype) == "float8_e4m3fn"
+
+
+class TestValidateInputKeys:
+    """Tests for validate_input_keys shared helper."""
+
+    def test_valid_keys_pass(self):
+        def kernel(a, b, c=None):
+            pass
+
+        validate_input_keys({"a": 1, "b": 2}, kernel)  # Should not raise
+
+    def test_extra_key_raises(self):
+        def kernel(a):
+            pass
+
+        with pytest.raises(ValueError, match="extra.*don't match"):
+            validate_input_keys({"a": 1, "extra": 2}, kernel)
+
+    def test_missing_required_raises(self):
+        def kernel(a, b):
+            pass
+
+        with pytest.raises(ValueError, match="missing required.*b"):
+            validate_input_keys({"a": 1}, kernel)
+
+    def test_optional_missing_ok(self):
+        def kernel(a, b=None):
+            pass
+
+        validate_input_keys({"a": 1}, kernel)  # Should not raise
+
+    def test_must_alias_input_accepted(self):
+        def kernel(a, output):
+            pass
+
+        validate_input_keys({"a": 1, "output.must_alias_input": 2}, kernel)
+
+    def test_must_alias_input_satisfies_required(self):
+        def kernel(a, output):
+            pass
+
+        # "output" is required but provided as "output.must_alias_input"
+        validate_input_keys({"a": 1, "output.must_alias_input": 2}, kernel)
+
+    def test_must_alias_input_unknown_base_raises(self):
+        def kernel(a):
+            pass
+
+        with pytest.raises(ValueError, match="unknown.must_alias_input.*don't match"):
+            validate_input_keys({"a": 1, "unknown.must_alias_input": 2}, kernel)
+
+
+class TestFilterKernelInput:
+    """Tests for filter_kernel_input shared helper."""
+
+    def test_filters_to_kernel_params(self):
+        def kernel(a, b):
+            pass
+
+        result = filter_kernel_input({"a": 1, "b": 2, "extra": 3}, kernel)
+        # extra is not in kernel params but validate_input_keys would catch it;
+        # filter_kernel_input just silently drops it
+        assert result == {"a": 1, "b": 2}
+
+    def test_preserves_must_alias_input(self):
+        def kernel(a, output):
+            pass
+
+        result = filter_kernel_input({"a": 1, "output.must_alias_input": 2}, kernel)
+        assert result == {"a": 1, "output.must_alias_input": 2}
+
+    def test_drops_unknown_must_alias(self):
+        def kernel(a):
+            pass
+
+        result = filter_kernel_input({"a": 1, "unknown.must_alias_input": 2}, kernel)
+        assert result == {"a": 1}
+
+
+class TestFilterRefInput:
+    """Tests for filter_ref_input shared helper."""
+
+    def test_filters_to_ref_params(self):
+        def torch_ref(a, b):
+            pass
+
+        result = filter_ref_input({"a": 1, "b": 2, "extra": 3}, torch_ref)
+        assert result == {"a": 1, "b": 2}
+
+    def test_must_alias_input_stripped_and_copied(self):
+        def torch_ref(a, output):
+            pass
+
+        arr = np.array([1.0, 2.0])
+        result = filter_ref_input({"a": 1, "output.must_alias_input": arr}, torch_ref)
+        assert "output" in result
+        # Should be a copy, not the same object
+        assert result["output"] is not arr
+        np.testing.assert_array_equal(result["output"], arr)
+
+    def test_non_copyable_must_alias_passed_through(self):
+        def torch_ref(a, scale):
+            pass
+
+        result = filter_ref_input({"a": 1, "scale.must_alias_input": 2.0}, torch_ref)
+        assert result == {"a": 1, "scale": 2.0}
+
+
+class TestValidateCrossRankConsistency:
+    """Tests for validate_cross_rank_consistency shared helper."""
+
+    def test_consistent_shapes_pass(self):
+        rank0 = {"a": np.zeros((2, 3)), "b": np.ones((4,))}
+
+        def gen(rank_id):
+            return {"a": np.zeros((2, 3)), "b": np.ones((4,))}
+
+        validate_cross_rank_consistency(gen, rank0, 2)  # Should not raise
+
+    def test_shape_mismatch_raises(self):
+        rank0 = {"a": np.zeros((2, 3))}
+
+        def gen(rank_id):
+            return {"a": np.zeros((2, 4))}
+
+        with pytest.raises(ValueError, match="'a'.*shape mismatch"):
+            validate_cross_rank_consistency(gen, rank0, 2)
+
+    def test_dtype_mismatch_raises(self):
+        rank0 = {"a": np.zeros((2,), dtype=np.float32)}
+
+        def gen(rank_id):
+            return {"a": np.zeros((2,), dtype=np.float16)}
+
+        with pytest.raises(ValueError, match="'a'.*dtype mismatch"):
+            validate_cross_rank_consistency(gen, rank0, 2)
+
+    def test_non_array_values_ignored(self):
+        rank0 = {"a": np.zeros((2,)), "scale": 1.0, "flag": True}
+
+        def gen(rank_id):
+            return {"a": np.zeros((2,)), "scale": 99.0, "flag": False}
+
+        validate_cross_rank_consistency(gen, rank0, 2)  # Should not raise
+
+    def test_mismatch_on_later_rank_raises(self):
+        rank0 = {"a": np.zeros((2, 3))}
+
+        def gen(rank_id):
+            if rank_id == 3:
+                return {"a": np.zeros((2, 4))}
+            return {"a": np.zeros((2, 3))}
+
+        with pytest.raises(ValueError, match="rank 0.*vs rank 3"):
+            validate_cross_rank_consistency(gen, rank0, 4)
+
+
+class TestCollectiveUnitTestFramework:
+    """Tests for CollectiveUnitTestFramework class."""
+
+    def test_init_validates_signature(self):
+        """Should validate kernel_entry <-> torch_ref signature on init."""
+
+        def kernel(a, b):
+            pass
+
+        def torch_ref(a, c):
+            pass
+
+        with pytest.raises(ValueError, match="Missing in torch_ref"):
+            CollectiveUnitTestFramework(
+                test_manager=MagicMock(),
+                kernel_entry=kernel,
+                torch_ref=torch_ref,
+                per_rank_input_generator=lambda rank_id: {},
+                collective_ranks=2,
+            )
+
+    def test_init_check_unused_params(self):
+        """Should check unused params when enabled."""
+
+        def kernel(a, unused):
+            return a
+
+        def torch_ref(a, unused):
+            return a
+
+        with pytest.raises(ValueError, match="unused.*may be unused"):
+            CollectiveUnitTestFramework(
+                test_manager=MagicMock(),
+                kernel_entry=kernel,
+                torch_ref=torch_ref,
+                per_rank_input_generator=lambda rank_id: {},
+                collective_ranks=2,
+                check_unused_params=True,
+            )
+
+    def test_run_test_validates_input_keys(self):
+        """Should validate rank-0 input keys against kernel_entry."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            pass
+
+        framework = CollectiveUnitTestFramework(
+            test_manager=MagicMock(),
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=lambda rank_id: {"a": 1, "extra": 2},
+            collective_ranks=2,
+        )
+
+        with pytest.raises(ValueError, match="extra.*don't match"):
+            framework.run_test(test_config=None, compiler_args=MagicMock())
+
+    def test_run_test_validates_cross_rank_consistency(self):
+        """Should check cross-rank shape consistency for collective_ranks >= 2."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            pass
+
+        def input_gen(rank_id):
+            shape = (2, 3) if rank_id == 0 else (4, 3)
+            return {"a": np.zeros(shape)}
+
+        framework = CollectiveUnitTestFramework(
+            test_manager=MagicMock(),
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=input_gen,
+            collective_ranks=2,
+        )
+
+        with pytest.raises(ValueError, match="shape mismatch"):
+            framework.run_test(test_config=None, compiler_args=MagicMock())
+
+    def test_run_test_skips_cross_rank_check_single_rank(self):
+        """Should skip cross-rank check when collective_ranks < 2."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        call_count = 0
+
+        def input_gen(rank_id):
+            nonlocal call_count
+            call_count += 1
+            return {"a": np.array([1.0])}
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=input_gen,
+            collective_ranks=1,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock())
+        # Only rank 0 should be called for validation (no rank 1 for cross-check)
+        assert call_count == 1
+        mock_manager.execute.assert_called_once()
+
+    def test_run_test_executes_with_correct_args(self):
+        """Should pass correct KernelArgs to test_manager.execute."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        def input_gen(rank_id):
+            return {"a": np.array([rank_id], dtype=np.float32)}
+
+        mock_manager = MagicMock()
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=Platforms.TRN2)
+
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=input_gen,
+            collective_ranks=4,
+        )
+        framework.run_test(test_config=None, compiler_args=compiler_args, rtol=0.01, atol=0.02)
+
+        mock_manager.execute.assert_called_once()
+        kernel_args = mock_manager.execute.call_args[0][0]
+        assert kernel_args.kernel_func is kernel
+        assert kernel_args.compiler_input is compiler_args
+        assert isinstance(kernel_args.kernel_input, PerRankLazyInputGenerator)
+        assert kernel_args.inference_args.collective_ranks == 4
+        assert isinstance(kernel_args.validation_args.golden_output, PerRankLazyGoldenGenerator)
+        assert kernel_args.validation_args.relative_accuracy == 0.01
+        assert kernel_args.validation_args.absolute_accuracy == 0.02
+
+    def test_run_test_sets_base_input_on_generator(self):
+        """PerRankLazyInputGenerator passed to execute should have .base_input set."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        rank0 = {"a": np.array([0.0])}
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=lambda rank_id: {"a": np.array([float(rank_id)])},
+            collective_ranks=2,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock())
+
+        kernel_args = mock_manager.execute.call_args[0][0]
+        assert hasattr(kernel_args.kernel_input, "base_input")
+        np.testing.assert_array_equal(kernel_args.kernel_input.base_input["a"], rank0["a"])
+
+    def test_run_test_filters_must_alias_input(self):
+        """Should filter .must_alias_input keys through to kernel input."""
+
+        def kernel(a, output):
+            pass
+
+        def torch_ref(a, output):
+            return {"out": a}
+
+        def input_gen(rank_id):
+            return {"a": np.array([1.0]), "output.must_alias_input": np.array([0.0])}
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=input_gen,
+            collective_ranks=2,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock())
+        mock_manager.execute.assert_called_once()
+
+        # Verify the filtered input generator works correctly
+        kernel_args = mock_manager.execute.call_args[0][0]
+        filtered = kernel_args.kernel_input.for_rank(0)
+        assert "a" in filtered
+        assert "output.must_alias_input" in filtered
+
+    def test_run_test_golden_via_torch_ref(self):
+        """Default golden should be generated via torch_ref per rank."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a * 2}
+
+        def input_gen(rank_id):
+            return {"a": np.array([float(rank_id + 1)])}
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=input_gen,
+            collective_ranks=2,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock())
+
+        kernel_args = mock_manager.execute.call_args[0][0]
+        golden_gen = kernel_args.validation_args.golden_output
+        # Rank 0: a=1.0 -> out=2.0
+        np.testing.assert_array_equal(golden_gen.for_rank(0)["out"], [2.0])
+        # Rank 1: a=2.0 -> out=4.0
+        np.testing.assert_array_equal(golden_gen.for_rank(1)["out"], [4.0])
+
+    def test_run_test_per_rank_torch_ref_input_override(self):
+        """per_rank_torch_ref_input_override should transform inputs before torch_ref."""
+
+        def kernel(a, KVDP):
+            pass
+
+        def torch_ref(a, KVDP):
+            return {"out": a * KVDP}
+
+        def input_gen(rank_id):
+            return {"a": np.array([1.0]), "KVDP": 4}
+
+        def override(rank_id, kernel_input):
+            modified = kernel_input.copy()
+            modified["KVDP"] = 1  # Golden uses KVDP=1
+            modified["a"] = np.array([float(rank_id + 1)])
+            return modified
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=input_gen,
+            collective_ranks=2,
+            per_rank_torch_ref_input_override=override,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock())
+
+        kernel_args = mock_manager.execute.call_args[0][0]
+        golden_gen = kernel_args.validation_args.golden_output
+        # Override sets KVDP=1 and a=rank_id+1, so out = a * 1
+        np.testing.assert_array_equal(golden_gen.for_rank(0)["out"], [1.0])
+        np.testing.assert_array_equal(golden_gen.for_rank(1)["out"], [2.0])
+
+    def test_run_test_custom_inference_args(self):
+        """inference_args should override default collective_ranks."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        custom_inference = InferenceArgs(collective_ranks=8)
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=lambda rank_id: {"a": np.array([1.0])},
+            collective_ranks=2,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock(), inference_args=custom_inference)
+
+        kernel_args = mock_manager.execute.call_args[0][0]
+        assert kernel_args.inference_args is custom_inference
+
+    def test_run_test_default_inference_args(self):
+        """Without inference_args, should use collective_ranks from init."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=lambda rank_id: {"a": np.array([1.0])},
+            collective_ranks=4,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock())
+
+        kernel_args = mock_manager.execute.call_args[0][0]
+        assert kernel_args.inference_args.collective_ranks == 4
+
+    def test_run_test_collector_with_metadata(self):
+        """Should call collector when metadata is provided."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a}
+
+        mock_manager = MagicMock()
+        mock_collector = MagicMock()
+        metadata_list = [{"test_settings": {"k": 1}}]
+
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=lambda rank_id: {"a": np.array([1.0])},
+            collective_ranks=2,
+            collector=mock_collector,
+        )
+
+        with patch("test.utils.unit_test_framework.load_model_configs", return_value=metadata_list):
+            framework.run_test(
+                test_config=None,
+                compiler_args=MagicMock(),
+                metadata={"config_name": "test_cfg", "key": {"k": 1}},
+            )
+        mock_collector.match_and_add_metadata_dimensions.assert_called_once()
+
+    def test_run_test_custom_comparator(self):
+        """custom_comparator should receive torch_ref golden and rank_id."""
+
+        def kernel(a):
+            pass
+
+        def torch_ref(a):
+            return {"out": a * 3}
+
+        received = {}
+
+        def comparator(rank_id, golden_dict):
+            received[rank_id] = golden_dict["out"].copy()
+            return {
+                "out": CustomValidatorWithOutputTensorData(
+                    validator=type("V", (CustomValidator,), {"validate": lambda self, x: True}),
+                    output_ndarray=golden_dict["out"],
+                )
+            }
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=lambda rank_id: {"a": np.array([float(rank_id + 1)])},
+            collective_ranks=2,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock(), custom_comparator=comparator)
+
+        kernel_args = mock_manager.execute.call_args[0][0]
+        golden_gen = kernel_args.validation_args.golden_output
+        result_r0 = golden_gen.for_rank(0)
+        result_r1 = golden_gen.for_rank(1)
+        # torch_ref(a=1.0) -> out=3.0, torch_ref(a=2.0) -> out=6.0
+        np.testing.assert_array_equal(received[0], [3.0])
+        np.testing.assert_array_equal(received[1], [6.0])
+        assert isinstance(result_r0["out"], CustomValidatorWithOutputTensorData)
+        assert isinstance(result_r1["out"], CustomValidatorWithOutputTensorData)
+
+    def test_run_test_custom_comparator_with_override(self):
+        """custom_comparator should work with per_rank_torch_ref_input_override."""
+
+        def kernel(a, scale):
+            pass
+
+        def torch_ref(a, scale):
+            return {"out": a * scale}
+
+        def override(rank_id, kernel_input):
+            modified = kernel_input.copy()
+            modified["scale"] = rank_id + 1
+            return modified
+
+        comparator_received = {}
+
+        def comparator(rank_id, golden_dict):
+            comparator_received[rank_id] = golden_dict["out"].copy()
+            return golden_dict
+
+        mock_manager = MagicMock()
+        framework = CollectiveUnitTestFramework(
+            test_manager=mock_manager,
+            kernel_entry=kernel,
+            torch_ref=torch_ref,
+            per_rank_input_generator=lambda rank_id: {"a": np.array([10.0]), "scale": 99},
+            collective_ranks=2,
+            per_rank_torch_ref_input_override=override,
+        )
+        framework.run_test(test_config=None, compiler_args=MagicMock(), custom_comparator=comparator)
+
+        kernel_args = mock_manager.execute.call_args[0][0]
+        golden_gen = kernel_args.validation_args.golden_output
+        golden_gen.for_rank(0)
+        golden_gen.for_rank(1)
+        # rank 0: scale=1, out=10*1=10; rank 1: scale=2, out=10*2=20
+        np.testing.assert_array_equal(comparator_received[0], [10.0])
+        np.testing.assert_array_equal(comparator_received[1], [20.0])

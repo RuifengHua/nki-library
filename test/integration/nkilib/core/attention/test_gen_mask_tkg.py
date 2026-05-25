@@ -26,19 +26,6 @@ covering all code paths:
 The golden function uses gen_mask_tkg_torch_ref from gen_mask_tkg_torch.py.
 """
 
-from test.integration.nkilib.core.attention.test_attention_tkg import build_active_attention_mask, build_swa_positions
-from test.utils.common_dataclasses import (
-    TKG_INFERENCE_ARGS,
-    CompilerArgs,
-    KernelArgs,
-    LazyGoldenGenerator,
-    ValidationArgs,
-)
-from test.utils.metrics_collector import MetricsCollector
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import Optional, final
 
 import nki.isa as nisa
@@ -46,6 +33,7 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
+
 from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
     AttnTKGConfig,
     is_s_prior_sharded,
@@ -59,6 +47,17 @@ from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import gen_mask_tkg_hbm
 from nkilib_src.nkilib.core.utils.allocator import SbufManager
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib_src.nkilib.core.utils.logging import Logger
+from test.integration.nkilib.core.attention.test_attention_tkg import build_active_attention_mask, build_swa_positions
+from test.utils.common_dataclasses import (
+    TKG_INFERENCE_ARGS,
+    CompilerArgs,
+    Platforms,
+)
+from test.utils.metrics_collector import MetricsCollector
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # Hardware constants
 P_MAX = 128
@@ -239,12 +238,97 @@ def gen_mask_tkg_torch_ref_adapter(
         return {"golden_mask": result}
 
 
+def gen_mask_tkg_hbm_torch_ref_adapter_factory(lnc: int):
+    """Create a torch ref adapter for gen_mask_tkg_hbm at a given LNC.
+
+    Returns a function matching the gen_mask_tkg_hbm kernel signature that
+    delegates to gen_mask_tkg_hbm_torch_ref[lnc].
+    """
+
+    def gen_mask_tkg_hbm_torch_ref_adapter(
+        pos_ids_hbm: torch.Tensor,
+        bs: int,
+        q_head: int,
+        s_active: int,
+        s_prior: int,
+        start_pos_hbm: torch.Tensor = None,
+        block_len: int = 0,
+        active_mask: torch.Tensor = None,
+        enable_fa_s_prior_tiling: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Torch ref adapter matching gen_mask_tkg_hbm kernel signature."""
+        mask = gen_mask_tkg_hbm_torch_ref[lnc](
+            pos_ids_hbm=pos_ids_hbm,
+            bs=bs,
+            q_head=q_head,
+            s_active=s_active,
+            s_prior=s_prior,
+            start_pos_hbm=start_pos_hbm,
+            block_len=block_len,
+            active_mask=active_mask,
+            enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+        )
+        return {"mask_out_hbm": mask}
+
+    return gen_mask_tkg_hbm_torch_ref_adapter
+
+
+def generate_gen_mask_hbm_inputs(
+    batch: int,
+    q_head: int,
+    s_ctx: int,
+    s_active: int,
+    block_len: int,
+    strided_mm1: bool,
+    sliding_window: int = 0,
+    include_active_mask: bool = False,
+    dtype=np.float32,
+):
+    """Build kernel inputs for gen_mask_tkg_hbm test, compatible with UnitTestFramework.
+
+    Generates SBUF-level inputs at lnc=1 and extracts HBM-level tensors
+    matching the gen_mask_tkg_hbm kernel signature.
+    """
+    resolved_strided_mm1 = strided_mm1 if strided_mm1 is not None else (block_len == 0)
+
+    sbuf_inp = generate_gen_mask_inputs(
+        batch=batch,
+        q_head=q_head,
+        s_ctx=s_ctx,
+        s_active=s_active,
+        block_len=block_len,
+        lnc=1,
+        strided_mm1=resolved_strided_mm1,
+        sliding_window=sliding_window,
+        include_active_mask=include_active_mask,
+        dtype=dtype,
+    )
+
+    s_prior = sbuf_inp["s_prior_per_shard"]  # lnc=1, no sharding
+
+    result = {
+        "pos_ids_hbm": sbuf_inp["pos_ids_hbm"][:1, :].copy(),
+        "bs": batch,
+        "q_head": q_head,
+        "s_active": s_active,
+        "s_prior": s_prior,
+        "block_len": block_len,
+    }
+
+    if "start_pos_hbm" in sbuf_inp:
+        result["start_pos_hbm"] = sbuf_inp["start_pos_hbm"][:1, :].copy()
+
+    if "active_mask_hbm" in sbuf_inp:
+        result["active_mask"] = sbuf_inp["active_mask_hbm"]
+
+    return result
+
+
 def create_pos_ids_tensor(
     cache_lens: np.ndarray,
     batch: int,
     s_active: int,
     dtype=np.float32,
-    per_active: bool = False,
 ) -> np.ndarray:
     """
     Create pos_ids tensor from cache lengths.
@@ -254,20 +338,15 @@ def create_pos_ids_tensor(
         batch: Batch size.
         s_active: Active sequence length.
         dtype: Output dtype.
-        per_active: If True, each s_active slot gets cache_lens[b] + i
-            (for SWA). If False, all slots get the same cache_lens[b] value.
 
     Returns:
         pos_ids: [P_MAX, batch * s_active] tensor where all partitions get
                  the same cache_len value (broadcasted).
     """
-    if per_active:
-        row = np.zeros(batch * s_active, dtype=dtype)
-        for b in range(batch):
-            for i in range(s_active):
-                row[b * s_active + i] = cache_lens[b] + i
-    else:
-        row = np.repeat(cache_lens, s_active).astype(dtype)  # [batch * s_active]
+    row = np.zeros(batch * s_active, dtype=dtype)
+    for b in range(batch):
+        for i in range(s_active):
+            row[b * s_active + i] = cache_lens[b] + i
     return np.broadcast_to(row[np.newaxis, :], (P_MAX, batch * s_active)).copy()
 
 
@@ -301,9 +380,9 @@ def generate_gen_mask_inputs(
 
     if fa_tile_size > 0:
         n_sprior_tile_per_shard = fa_tile_size // P_MAX
-        assert (
-            s_prior_offset + fa_tile_size <= s_prior_per_shard
-        ), f"FA tile (offset={s_prior_offset}, size={fa_tile_size}) exceeds s_prior_per_shard ({s_prior_per_shard})"
+        assert s_prior_offset + fa_tile_size <= s_prior_per_shard, (
+            f"FA tile (offset={s_prior_offset}, size={fa_tile_size}) exceeds s_prior_per_shard ({s_prior_per_shard})"
+        )
     else:
         n_sprior_tile_per_shard = s_prior_per_shard // P_MAX
 
@@ -322,22 +401,20 @@ def generate_gen_mask_inputs(
         )
         if fa_tile_size > 0:
             fold_size = adjusted_block_len * P_MAX
-            assert (
-                fa_tile_size % fold_size == 0
-            ), f"fa_tile_size ({fa_tile_size}) must be divisible by block_len * P_MAX ({fold_size})"
-            assert (
-                s_prior_offset % fold_size == 0
-            ), f"s_prior_offset ({s_prior_offset}) must be divisible by block_len * P_MAX ({fold_size})"
+            assert fa_tile_size % fold_size == 0, (
+                f"fa_tile_size ({fa_tile_size}) must be divisible by block_len * P_MAX ({fold_size})"
+            )
+            assert s_prior_offset % fold_size == 0, (
+                f"s_prior_offset ({s_prior_offset}) must be divisible by block_len * P_MAX ({fold_size})"
+            )
 
     np.random.seed(42)
-    if sliding_window > 0:
-        # SWA circular buffer invariant: pos_id must be < s_ctx - s_active
-        cache_lens = np.random.randint(1, s_ctx - s_active, size=(batch,)).astype(np.int32)
-    else:
-        cache_lens = np.random.randint(1, s_ctx, size=(batch,)).astype(np.int32)
+    # pos_ids[b, i] = cache_lens[b] + i, so cache_lens[b] + s_active - 1 <= s_ctx - 1
+    cache_lens = np.random.randint(1, s_ctx - s_active + 1, size=(batch,)).astype(np.int32)
+
+    pos_ids_data = create_pos_ids_tensor(cache_lens, batch, s_active, dtype)
 
     if sliding_window > 0:
-        pos_ids_data = create_pos_ids_tensor(cache_lens, batch, s_active, dtype, per_active=True)
         pos_id_2d = cache_lens.reshape(batch, 1)
         start_pos_ids, _ = build_swa_positions(
             pos_id=pos_id_2d,
@@ -350,7 +427,6 @@ def generate_gen_mask_inputs(
         start_pos_flat = start_pos_ids.reshape(batch * s_active).astype(dtype)
         start_pos_data = np.broadcast_to(start_pos_flat[np.newaxis, :], (P_MAX, batch * s_active)).copy()
     else:
-        pos_ids_data = create_pos_ids_tensor(cache_lens, batch, s_active, dtype)
         start_pos_data = None
 
     if lnc == 1:
@@ -360,7 +436,7 @@ def generate_gen_mask_inputs(
 
     result = {
         "pos_ids_hbm": pos_ids_data,
-        "mask_out_hbm.must_alias_input": mask_out_data,
+        "mask_out_hbm": mask_out_data,
         "bs": batch,
         "q_head": q_head,
         "s_active": s_active,
@@ -403,10 +479,8 @@ def generate_gen_mask_inputs(
     return result
 
 
-@pytest_test_metadata(
-    name="Gen Mask TKG",
-    pytest_marks=["attention", "tkg", "subkernel"],
-)
+@pytest_test_metadata(name="Gen Mask TKG")
+@pytest_marks(["attention", "tkg", "subkernel"])
 @final
 class TestGenMaskTkg:
     """
@@ -416,8 +490,9 @@ class TestGenMaskTkg:
     against the torch reference implementation (gen_mask_tkg_torch_ref).
     """
 
-    @staticmethod
-    def _run_test(test_manager, lnc, input_generator):
+    def _run_test(
+        self, test_manager: Orchestrator, collector: MetricsCollector, platform_target: Platforms, lnc, input_generator
+    ):
         def output_tensors(kernel_input):
             return {"golden_mask": kernel_input["mask_out_hbm"]}
 
@@ -427,8 +502,14 @@ class TestGenMaskTkg:
             torch_ref=torch_ref_wrapper(gen_mask_tkg_torch_ref_adapter),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
+            collector=collector,
         )
-        framework.run_test(test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc), rtol=0, atol=0)
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            rtol=0,
+            atol=0,
+        )
 
     # ============================================================================
     # FLAT KV CACHE TESTS (block_len = 0) - STRIDED MM1
@@ -464,6 +545,8 @@ class TestGenMaskTkg:
     def test_flat_kv_strided_mask_generation(
         self,
         test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -491,7 +574,7 @@ class TestGenMaskTkg:
                 sliding_window=sliding_window,
             )
 
-        self._run_test(test_manager, lnc, input_generator)
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ============================================================================
     # FLAT KV CACHE TESTS (block_len = 0) - NON-STRIDED MM1
@@ -518,6 +601,8 @@ class TestGenMaskTkg:
     def test_flat_kv_nonstrided_mask_generation(
         self,
         test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -545,7 +630,7 @@ class TestGenMaskTkg:
                 sliding_window=sliding_window,
             )
 
-        self._run_test(test_manager, lnc, input_generator)
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ============================================================================
     # BLOCK KV CACHE TESTS (block_len > 0)
@@ -576,6 +661,8 @@ class TestGenMaskTkg:
     def test_block_kv_mask_generation(
         self,
         test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -607,7 +694,7 @@ class TestGenMaskTkg:
                 sliding_window=sliding_window,
             )
 
-        self._run_test(test_manager, lnc, input_generator)
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ============================================================================
     # SWA (SLIDING WINDOW ATTENTION) TESTS
@@ -661,6 +748,8 @@ class TestGenMaskTkg:
     def test_swa_mask_generation(
         self,
         test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -692,7 +781,7 @@ class TestGenMaskTkg:
                 sliding_window=sliding_window,
             )
 
-        self._run_test(test_manager, lnc, input_generator)
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ============================================================================
     # ACTIVE MASK TESTS - Testing _load_active_mask code path
@@ -802,6 +891,8 @@ class TestGenMaskTkg:
     def test_flat_kv_with_active_mask(
         self,
         test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -838,7 +929,7 @@ class TestGenMaskTkg:
                 bs_full=bs_full,
             )
 
-        self._run_test(test_manager, lnc, input_generator)
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ============================================================================
     # BLOCK KV WITH ACTIVE MASK TESTS - Testing _load_active_mask_block_kv
@@ -892,6 +983,8 @@ class TestGenMaskTkg:
     def test_block_kv_with_active_mask(
         self,
         test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -929,7 +1022,7 @@ class TestGenMaskTkg:
                 bs_full=bs_full,
             )
 
-        self._run_test(test_manager, lnc, input_generator)
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
 
 # ============================================================================
@@ -937,10 +1030,7 @@ class TestGenMaskTkg:
 # ============================================================================
 
 
-@pytest_test_metadata(
-    name="Gen Mask TKG HBM",
-    pytest_marks=["attention", "tkg", "subkernel"],
-)
+@pytest_marks(["attention", "tkg", "subkernel"])
 class TestGenMaskTkgHbm:
     """
     Integration test suite for gen_mask_tkg_hbm HBM wrapper kernel.
@@ -951,88 +1041,35 @@ class TestGenMaskTkgHbm:
     internally, so tests only need to provide HBM-level inputs.
     """
 
-    def run_test(
+    def _run_test(
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
-        batch: int,
-        q_head: int,
-        s_ctx: int,
-        s_active: int,
-        block_len: int,
-        strided_mm1: bool,  # Can be None for auto-select tests
-        lnc: int = 1,
-        sliding_window: int = 0,
-        include_active_mask: bool = False,
-        dtype=np.float32,
+        platform_target: Platforms,
+        lnc: int,
+        input_generator,
     ):
-        # Generate SBUF-level inputs (lnc=1) to get pos_ids and optional SWA/active data
-        resolved_strided_mm1 = strided_mm1 if strided_mm1 is not None else (block_len == 0)
+        def output_tensors(kernel_input):
+            s_prior = kernel_input["s_prior"]
+            bs = kernel_input["bs"]
+            q_head = kernel_input["q_head"]
+            s_active = kernel_input["s_active"]
+            return {"mask_out_hbm": np.zeros((s_prior, bs, q_head, s_active), dtype=np.float32)}
 
-        sbuf_inp = generate_gen_mask_inputs(
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=block_len,
-            lnc=1,
-            strided_mm1=resolved_strided_mm1,
-            sliding_window=sliding_window,
-            include_active_mask=include_active_mask,
-            dtype=dtype,
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=gen_mask_tkg_hbm,
+            torch_ref=torch_ref_wrapper(gen_mask_tkg_hbm_torch_ref_adapter_factory(lnc)),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+            collector=collector,
         )
-
-        # Build HBM-level kernel input from SBUF inputs
-        kernel_input = {
-            "pos_ids_hbm": sbuf_inp["pos_ids_hbm"][:1, :].copy(),
-            "bs": batch,
-            "q_head": q_head,
-            "s_active": s_active,
-            "s_prior": sbuf_inp["s_prior_per_shard"],  # lnc=1, no sharding
-            "block_len": block_len,
-        }
-
-        if "start_pos_hbm" in sbuf_inp:
-            kernel_input["start_pos_hbm"] = sbuf_inp["start_pos_hbm"][:1, :].copy()
-
-        if "active_mask_hbm" in sbuf_inp:
-            kernel_input["active_mask"] = sbuf_inp["active_mask_hbm"]
-
-        s_prior = kernel_input["s_prior"]
-        output_placeholder = {"mask_out_hbm": np.zeros((s_prior, batch, q_head, s_active), dtype=dtype)}
-
-        def create_lazy_golden() -> dict[str, np.ndarray]:
-            golden_input = {
-                "pos_ids_hbm": torch.from_numpy(kernel_input["pos_ids_hbm"]).float(),
-                "bs": batch,
-                "q_head": q_head,
-                "s_active": s_active,
-                "s_prior": s_prior,
-                "block_len": block_len,
-            }
-            if "start_pos_hbm" in kernel_input:
-                golden_input["start_pos_hbm"] = torch.from_numpy(kernel_input["start_pos_hbm"]).float()
-            if "active_mask" in kernel_input:
-                golden_input["active_mask"] = torch.from_numpy(kernel_input["active_mask"]).float()
-
-            golden_mask = gen_mask_tkg_hbm_torch_ref[lnc](**golden_input)
-            return {"mask_out_hbm": golden_mask.numpy().astype(dtype)}
-
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=gen_mask_tkg_hbm,
-                compiler_input=CompilerArgs(logical_nc_config=lnc),
-                kernel_input=kernel_input,
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(
-                        output_ndarray=output_placeholder,
-                        lazy_golden_generator=create_lazy_golden,
-                    ),
-                    relative_accuracy=0,
-                    absolute_accuracy=0,
-                ),
-                inference_args=TKG_INFERENCE_ARGS,
-            )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            rtol=0,
+            atol=0,
+            inference_args=TKG_INFERENCE_ARGS,
         )
 
     # ========================================================================
@@ -1067,6 +1104,7 @@ class TestGenMaskTkgHbm:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -1075,17 +1113,18 @@ class TestGenMaskTkgHbm:
         lnc: int,
     ):
         """Test flat KV cache mask generation (block_len=0)."""
-        self.run_test(
-            test_manager=test_manager,
-            collector=collector,
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=0,
-            strided_mm1=strided_mm1,
-            lnc=lnc,
-        )
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=0,
+                strided_mm1=strided_mm1,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ========================================================================
     # BLOCK KV CACHE TESTS (block_len > 0)
@@ -1116,6 +1155,7 @@ class TestGenMaskTkgHbm:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -1124,17 +1164,18 @@ class TestGenMaskTkgHbm:
         lnc: int,
     ):
         """Test block KV cache mask generation (block_len>0)."""
-        self.run_test(
-            test_manager=test_manager,
-            collector=collector,
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=block_len,
-            strided_mm1=False,
-            lnc=lnc,
-        )
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=False,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ========================================================================
     # ACTIVE MASK TESTS
@@ -1174,6 +1215,7 @@ class TestGenMaskTkgHbm:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -1183,18 +1225,19 @@ class TestGenMaskTkgHbm:
         lnc: int,
     ):
         """Test mask generation with active_mask (cascaded attention)."""
-        self.run_test(
-            test_manager=test_manager,
-            collector=collector,
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=block_len,
-            strided_mm1=strided_mm1,
-            lnc=lnc,
-            include_active_mask=True,
-        )
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=strided_mm1,
+                include_active_mask=True,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ========================================================================
     # SWA (SLIDING WINDOW ATTENTION) TESTS
@@ -1228,6 +1271,7 @@ class TestGenMaskTkgHbm:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -1238,18 +1282,19 @@ class TestGenMaskTkgHbm:
         lnc: int,
     ):
         """Test SWA (sliding window attention) mask generation."""
-        self.run_test(
-            test_manager=test_manager,
-            collector=collector,
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=block_len,
-            strided_mm1=strided_mm1,
-            lnc=lnc,
-            sliding_window=sliding_window,
-        )
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=strided_mm1,
+                sliding_window=sliding_window,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ========================================================================
     # FA TILING TESTS (large configs triggering multiple tiles)
@@ -1279,6 +1324,7 @@ class TestGenMaskTkgHbm:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -1288,17 +1334,18 @@ class TestGenMaskTkgHbm:
         lnc: int,
     ):
         """Test FA tiling with large configs that trigger multiple tiles."""
-        self.run_test(
-            test_manager=test_manager,
-            collector=collector,
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=block_len,
-            strided_mm1=strided_mm1,
-            lnc=lnc,
-        )
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=strided_mm1,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ========================================================================
     # FA TILING + ACTIVE MASK TESTS
@@ -1327,6 +1374,7 @@ class TestGenMaskTkgHbm:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -1336,18 +1384,19 @@ class TestGenMaskTkgHbm:
         lnc: int,
     ):
         """Test FA tiling combined with active_mask."""
-        self.run_test(
-            test_manager=test_manager,
-            collector=collector,
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=block_len,
-            strided_mm1=strided_mm1,
-            lnc=lnc,
-            include_active_mask=True,
-        )
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=strided_mm1,
+                include_active_mask=True,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ========================================================================
     # SWA + ACTIVE MASK TESTS
@@ -1369,6 +1418,7 @@ class TestGenMaskTkgHbm:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -1379,26 +1429,27 @@ class TestGenMaskTkgHbm:
         lnc: int,
     ):
         """Test SWA mask generation combined with active_mask."""
-        self.run_test(
-            test_manager=test_manager,
-            collector=collector,
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=block_len,
-            strided_mm1=strided_mm1,
-            lnc=lnc,
-            sliding_window=sliding_window,
-            include_active_mask=True,
-        )
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=strided_mm1,
+                sliding_window=sliding_window,
+                include_active_mask=True,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)
 
     # ========================================================================
     # LNC SWEEP TESTS
     # ========================================================================
     # These tests verify that gen_mask_tkg_hbm produces correct masks at both
     # LNC=1 and LNC=2 by parametrizing lnc as a grid dimension and delegating
-    # to run_test (which compares kernel output against the torch reference).
+    # to _run_test (which compares kernel output against the torch reference).
     #
     # This catches the P_MAX-major HBM layout bug: when the mask was stored as
     # [P_MAX, n_sprior_tile, ...], LNC=2 shard boundaries did not align with
@@ -1432,6 +1483,7 @@ class TestGenMaskTkgHbm:
         self,
         test_manager: Orchestrator,
         collector: MetricsCollector,
+        platform_target: Platforms,
         batch: int,
         q_head: int,
         s_ctx: int,
@@ -1447,15 +1499,16 @@ class TestGenMaskTkgHbm:
         pair is validated independently against the torch reference, so any
         shard-boundary misalignment shows up as a mismatch.
         """
-        self.run_test(
-            test_manager=test_manager,
-            collector=collector,
-            batch=batch,
-            q_head=q_head,
-            s_ctx=s_ctx,
-            s_active=s_active,
-            block_len=block_len,
-            strided_mm1=strided_mm1,
-            lnc=lnc,
-            sliding_window=sliding_window,
-        )
+
+        def input_generator(test_config, input_tensor_def=None):
+            return generate_gen_mask_hbm_inputs(
+                batch=batch,
+                q_head=q_head,
+                s_ctx=s_ctx,
+                s_active=s_active,
+                block_len=block_len,
+                strided_mm1=strided_mm1,
+                sliding_window=sliding_window,
+            )
+
+        self._run_test(test_manager, collector, platform_target, lnc, input_generator)

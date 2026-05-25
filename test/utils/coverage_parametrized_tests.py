@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import inspect
 import itertools
 import random
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
@@ -23,7 +25,7 @@ import numpy as np
 from allpairspy import AllPairs
 
 # Re-export assert_negative_test_case for convenience
-from .ranged_test_harness import assert_negative_test_case as assert_negative_test_case
+from .negative_test_helpers import assert_negative_test_case as assert_negative_test_case
 
 
 class FilterResult(Enum):
@@ -411,45 +413,87 @@ def generate_parametrized_test_case(
     return all_tests
 
 
-def _format_param_value(val: Any) -> str:
+def format_param_value(val: Any, max_len: int = 40) -> str:
     """Format a parameter value for use in test IDs.
 
-    Handles special cases like type objects (np.float32, ml_dtypes.bfloat16)
-    to produce cleaner test IDs without special characters like < > '.
+    Produces folder-safe test IDs: no spaces, quotes, parentheses, braces, or brackets.
+    Lists/tuples are joined with '_'. Enum members use .value. Type objects use __name__.
+    Bools are converted to int (0/1). Values exceeding max_len are truncated with a
+    6-char hash suffix for uniqueness.
+
+    This is the single shared formatter used by both coverage_parametrize and
+    pytest_parametrize helpers.
 
     Args:
         val: Parameter value to format.
+        max_len: Maximum length for the formatted value. Longer values are
+            truncated and suffixed with a 6-char hash for uniqueness.
 
     Returns:
-        String representation suitable for test IDs.
+        Folder-safe string representation suitable for test IDs.
     """
+    if isinstance(val, bool):
+        return str(int(val))
     if isinstance(val, type):
         return val.__name__
-    return str(val)
+    if isinstance(val, Enum):
+        return str(val.value)
+    if isinstance(val, (list, tuple)):
+        s = "_".join(format_param_value(x, max_len) for x in val)
+    else:
+        s = str(val)
+    s = re.sub(r"[ '\"(){}\[\],:]", "", s)
+    if len(s) > max_len:
+        h = hashlib.md5(s.encode()).hexdigest()[:6]
+        return s[: max_len - 7] + "_" + h
+    return s
+
+
+# Linux NAME_MAX is 255 bytes for a single path component (e.g. directory or file name).
+# Test node IDs may be used as folder names in the format "test_func_name[param_id]".
+MAX_PATH_COMPONENT_LENGTH = 255
 
 
 def extract_parametrize_args(
     params: Dict[str, Any],
     test_cases: List[CoverageTestCase],
+    abbrev: Optional[Dict[str, str]] = None,
+    test_func_name: Optional[str] = None,
 ) -> tuple[List[str], List[tuple], List[str]]:
     """Extract pytest.parametrize arguments from test cases.
 
     Args:
         params: Original parameter dict (for extracting param names).
         test_cases: List of CoverageTestCase objects.
+        abbrev: Optional mapping of param names to shorter display names for test IDs.
+        test_func_name: Optional test function name for full path component length
+            validation. When provided, validates that ``len(test_func_name) + 2 +
+            len(param_id) <= 255`` (Linux NAME_MAX). When ``None``, only the param
+            ID portion is checked against the limit.
 
     Returns:
         Tuple of (param_names, values_list, ids_list) for pytest.parametrize.
         param_names includes "is_negative_test_case" appended.
     """
+    abbrev = abbrev or {}
+    display_names = [abbrev.get(name, name) for name in params.keys()]
+    # "test_func_name[param_id]" overhead
+    overhead = len(test_func_name) + 2 if test_func_name else 0
+
     param_names = list(params.keys()) + ["is_negative_test_case"]
     values_list = []
     ids_list = []
 
     for tc in test_cases:
         values_list.append(tc.values + (tc.is_negative,))
-        params_str = "-".join(_format_param_value(val) for val in tc.values)
+        params_str = "-".join(f"{dn}_{format_param_value(val)}" for dn, val in zip(display_names, tc.values))
         test_id = f"{tc.prefix}_{params_str}" if tc.prefix else params_str
+        full_len = overhead + len(test_id)
+        assert full_len <= MAX_PATH_COMPONENT_LENGTH, (
+            f"Test node ID length {full_len} exceeds {MAX_PATH_COMPONENT_LENGTH} "
+            f"(func={test_func_name!r}, id_len={len(test_id)}). "
+            f"Use abbrev to shorten parameter names. ID: {test_id}"
+        )
         ids_list.append(test_id)
 
     return param_names, values_list, ids_list

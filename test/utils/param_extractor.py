@@ -15,7 +15,45 @@ import json
 import typing
 from enum import Enum
 
-from .ranged_test_harness import RangeTestCase
+# Maps variant parameter names → canonical name for metrics normalization.
+# Only includes clear aliases of the same concept. Kernel-specific params
+# (S_tkg, S_ctx, BxS) are intentionally excluded — they carry distinct semantics.
+# Head count names normalize to n_* prefix (shorter, more common).
+# Note: this only normalizes pytest param names that flow into OpenSearch,
+# not kernel API keys like "num_q_heads" in kernel_input dicts.
+CANONICAL_PARAM_NAMES: dict[str, str] = {
+    # Batch dimension
+    "batch_size": "batch",
+    "bs": "batch",
+    "B": "batch",
+    # Sequence dimension
+    "seq_len": "seqlen",
+    "sequence_length": "seqlen",
+    "S": "seqlen",
+    # Hidden dimension
+    "hidden_size": "hidden",
+    "hidden_dim": "hidden",
+    "H": "hidden",
+    # Intermediate dimension
+    "I": "intermediate",
+    # Tokens dimension
+    "T": "tokens",
+    # Expert dimension
+    "E": "expert",
+    # Dtype aliases
+    "dtype_str": "dtype",
+    "quantization_type": "quant_type",
+    "q_dtype": "quant_dtype",
+    # Q heads — consolidate to n_q_heads
+    "num_q_heads": "n_q_heads",
+    "q_head": "n_q_heads",
+    "q_heads": "n_q_heads",
+    # KV heads — consolidate to n_kv_heads
+    "num_kv_heads": "n_kv_heads",
+    "nkv_heads": "n_kv_heads",
+    # Generic heads
+    "num_heads": "n_heads",
+}
 
 
 def _unwrap_kernel_func(kernel_func: typing.Callable) -> typing.Callable:
@@ -49,9 +87,12 @@ def normalize_param_value(value):
     # Convert type objects to their name (e.g., nl.bfloat16 -> "bfloat16")
     if isinstance(value, type):
         return value.__name__
-    # Stringify lists/tuples to avoid dynamic mapping conflicts from mixed-type
-    # arrays (e.g., n_chain containing both integers and booleans)
+    # For lists/tuples: keep homogeneous arrays as native arrays so OpenSearch
+    # maps them correctly. Only stringify mixed-type arrays to avoid mapping conflicts.
     if isinstance(value, (list, tuple)):
+        types = {type(v) for v in value if v is not None}
+        if len(types) <= 1:
+            return list(value)
         return json.dumps(value)
     # Handle other non-serializable types (objects with __dict__)
     if hasattr(value, "__dict__") and not isinstance(value, type):
@@ -173,20 +214,20 @@ def extract_pytest_params(params: dict) -> dict:
     for key, value in params.items():
         if value is None:
             continue
-        # Handle RangeTestCase objects by extracting tensor dimensions
-        if isinstance(value, RangeTestCase):
-            for tensor_name, dims in value.tensors.items():
-                for dim_name, dim_value in dims.items():
-                    normalized = normalize_param_value(dim_value)
-                    if normalized is not None:
-                        result[dim_name] = normalized
-            result["test_type"] = value.test_type
-            for k, v in value.additional_params.items():
-                normalized = normalize_param_value(v)
-                if normalized is not None:
-                    result[k] = normalized
-            continue
         normalized = normalize_param_value(value)
         if normalized is not None:
             result[key] = normalized
     return result
+
+
+def normalize_param_names(params: dict) -> dict:
+    """Normalize parameter names to canonical forms for consistent metrics.
+
+    Maps variant names (e.g., "batch_size", "seq_len") to their canonical
+    equivalents ("batch", "seqlen") so OpenSearch always receives consistent
+    field names regardless of which test file emitted the metric.
+
+    Only renames keys that have a mapping in CANONICAL_PARAM_NAMES.
+    If two source keys map to the same canonical name, the last one wins.
+    """
+    return {CANONICAL_PARAM_NAMES.get(k, k): v for k, v in params.items()}

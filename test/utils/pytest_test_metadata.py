@@ -19,81 +19,130 @@ that can be used for test discovery, filtering, and reporting.
 
 Example usage:
     @pytest_test_metadata(
-        description="Attention CTE Kernels",
+        name="Attention CTE Kernels",
         tags=["attention", "cte", "ranged"],
-        pytest_marks=["attention", "cte"]
     )
+    @pytest_marks(["attention", "cte"])
     class TestRangedAttentionCTEKernels:
         def test_something(self):
             pass
 
 The decorator:
 - Stores metadata as a class attribute (__pytest_test_metadata__)
-- Dynamically applies pytest marks to enable filtering with pytest -m
 - Supports regex parsing for external tools
+
+The pytest_marks decorator:
+- Dynamically applies pytest marks to enable filtering with pytest -m
 """
 
+from __future__ import annotations
+
+import ast
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from test.utils.test_validation_utils import (
-    IntegrationFileCollector,
-    get_decorator_kwargs,
-    get_decorator_name,
-)
 from typing import Any, Dict, List, Optional, Union
 
 import pytest
 
+from .test_validation_utils import (
+    IntegrationFileCollector,
+    get_decorator_args,
+    get_decorator_kwargs,
+    get_decorator_name,
+)
 
-def pytest_test_metadata(name: str, pytest_marks: Optional[List[str]] = None, **kwargs: Any):
+
+def pytest_marks(marks: List[str]):
     """
-    Decorator to add metadata to test classes and apply pytest marks.
+    Decorator to apply pytest marks to a test class.
 
-    This decorator serves two purposes:
-    1. Stores structured metadata as a class attribute for programmatic access
-    2. Dynamically applies pytest marks to enable test filtering
+    This decorator is the recommended way to apply dynamic pytest marks to test
+    classes. It should be used alongside @pytest_test_metadata (which handles
+    metadata only) to maintain clean separation of concerns.
 
     Args:
-        name: Human-readable name of the test
-        description: Human-readable description of what the test class covers
-        pytest_marks: List of pytest marker names to dynamically apply to the class
-        **kwargs: Additional custom metadata fields
+        marks: List of pytest marker names to apply to the class.
 
     Returns:
-        Decorated class with metadata and pytest marks applied
+        Decorated class with pytest marks applied.
 
     Example:
         @pytest_test_metadata(
-            name="MM Test"
-            pytest_marks=["matmul", "slow"],
-            category="core",
-            owners=["team-a"]
+            name="MM Test",
+            tags=["core"],
         )
+        @pytest_marks(["matmul", "slow"])
         class TestMatMul:
             pass
-
-        # Access metadata programmatically
-        print(TestMatMul.__pytest_test_metadata__)
 
         # Run tests with: pytest -m matmul
     """
 
     def decorator(cls):
-        # Store metadata as class attribute for programmatic access
-        cls.__pytest_test_metadata__ = {'name': name, 'pytest_marks': pytest_marks or [], **kwargs}
-
-        # Dynamically apply pytest marks to the class
-        # This allows using pytest -m <mark> to filter tests
-        if pytest_marks:
-            for mark_name in pytest_marks:
-                # Apply the mark using pytest's marker system
-                mark = getattr(pytest.mark, mark_name)
-                cls = mark(cls)
-
+        for mark_name in marks:
+            mark = getattr(pytest.mark, mark_name)
+            cls = mark(cls)
         return cls
 
     return decorator
+
+
+def pytest_test_metadata(name: str, **kwargs: Any):
+    """
+    Decorator to add metadata to test classes.
+
+    Stores structured metadata as a class attribute for programmatic access.
+    Use @pytest_marks for applying pytest marks.
+
+    Args:
+        name: Human-readable name of the test
+        **kwargs: Additional custom metadata fields
+
+    Returns:
+        Decorated class with metadata applied
+
+    Example:
+        @pytest_test_metadata(
+            name="MM Test",
+            category="core",
+            owners=["team-a"]
+        )
+        @pytest_marks(["matmul", "slow"])
+        class TestMatMul:
+            pass
+
+        # Access metadata programmatically
+        print(TestMatMul.__pytest_test_metadata__)
+    """
+
+    def decorator(cls):
+        cls.__pytest_test_metadata__ = {'name': name, **kwargs}
+        return cls
+
+    return decorator
+
+
+_TEST_PACKAGE_SEGMENT = ("integration", "nkilib")
+_CORE_FAMILY = "core"
+
+
+def derive_labeled_kernel_name(test_path: Path | str, metadata_name: str | None) -> str | None:
+    """Prepend the capitalized family folder to non-core kernels, to match the pipeline's KernelName."""
+    if not metadata_name:
+        return None
+    parts = Path(test_path).parts
+    try:
+        integration_idx = parts.index(_TEST_PACKAGE_SEGMENT[0])
+    except ValueError:
+        return metadata_name
+    family_idx = integration_idx + len(_TEST_PACKAGE_SEGMENT)
+    if family_idx + 1 >= len(parts) or parts[integration_idx + 1] != _TEST_PACKAGE_SEGMENT[-1]:
+        return metadata_name
+    family = parts[family_idx]
+    if family == _CORE_FAMILY:
+        return metadata_name
+    return f"{family.capitalize()} {metadata_name}"
 
 
 @dataclass
@@ -119,8 +168,7 @@ def extract_pytest_test_metadata_from_file(file_path: Union[str, Path]) -> List[
     Returns:
         List of TestMetadataInfo objects, one for each Test* class found.
         If a class has @pytest_test_metadata, the metadata field will be a dict
-        containing the decorator arguments (name, pytest_marks, etc.).
-        decorator arguments. Otherwise, metadata will be None.
+        containing the decorator arguments (name, etc.). Otherwise, metadata will be None.
 
     Example:
         >>> results = extract_pytest_test_metadata_from_file('test_example.py')
@@ -135,8 +183,6 @@ def extract_pytest_test_metadata_from_file(file_path: Union[str, Path]) -> List[
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-
-        import ast
 
         tree = ast.parse(content, filename=str(file_path))
 
@@ -167,10 +213,10 @@ def extract_pytest_test_metadata_from_file(file_path: Union[str, Path]) -> List[
 
 def discover_pytest_test_metadata_marks(test_root: Path) -> dict[str, str]:
     """
-    Auto-discover pytest marks from @pytest_test_metadata decorators in test files.
+    Auto-discover pytest marks from @pytest_marks decorators in test files.
 
-    Scans all test_*.py files recursively and extracts pytest_marks from
-    @pytest_test_metadata decorators using AST parsing.
+    Scans all test_*.py files recursively and extracts marks from
+    @pytest_marks decorators using AST parsing.
 
     Args:
         test_root: Root directory to search for test files
@@ -183,18 +229,30 @@ def discover_pytest_test_metadata_marks(test_root: Path) -> dict[str, str]:
     # Use TestFileCollector to find all test files
     collector = IntegrationFileCollector(test_root)
     for file_info in collector.collect():
-        # Extract test class metadata from each file
-        test_classes = extract_pytest_test_metadata_from_file(file_info.file_path)
-
-        # Process each test class that has metadata
-        for test_class in test_classes:
-            if test_class.metadata and 'pytest_marks' in test_class.metadata:
-                pytest_marks = test_class.metadata['pytest_marks']
-
-                # pytest_marks should be a list of strings
-                if isinstance(pytest_marks, list):
-                    for mark_name in pytest_marks:
-                        if isinstance(mark_name, str) and mark_name not in marks:
-                            marks[mark_name] = "Auto-discovered mark from @pytest_test_metadata"
+        # Extract pytest_marks from each file
+        for mark_name in _extract_pytest_marks_from_file(file_info.file_path):
+            if mark_name not in marks:
+                marks[mark_name] = "Auto-discovered mark from @pytest_marks"
 
     return marks
+
+
+def _extract_pytest_marks_from_file(file_path: Path) -> list[str]:
+    """Extract all mark names from @pytest_marks decorators in a file."""
+    try:
+        tree = ast.parse(file_path.read_text(encoding='utf-8'), filename=str(file_path))
+    except (SyntaxError, FileNotFoundError, PermissionError, UnicodeDecodeError) as e:
+        logging.debug(f"Could not parse {file_path} for pytest marks: {e}")
+        return []
+
+    result = []
+    for node in ast.iter_child_nodes(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name.startswith('Test')):
+            continue
+        for decorator in node.decorator_list:
+            if get_decorator_name(decorator) != 'pytest_marks':
+                continue
+            args = get_decorator_args(decorator)
+            if args and isinstance(args[0], list):
+                result.extend(m for m in args[0] if isinstance(m, str))
+    return result

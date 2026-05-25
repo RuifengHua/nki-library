@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .host_management import SshHost
+from .core_lock_client import DEFAULT_LOCK_TIMEOUT_SECONDS
 
 NEURON_RT_ENABLE_DGE_NOTIFICATIONS: str = "NEURON_RT_ENABLE_DGE_NOTIFICATIONS"
 
@@ -88,6 +88,8 @@ class ProfilerCommands:
         perf_analysis_enabled: bool = False,
         save_all_outputs: bool = False,
         force_clean_input_writes: bool = False,
+        separation_pass_enabled: bool = False,
+        explorer_binary_path: str = "neuron-explorer",
     ):
         """
         Build all neuron-profile commands for capture, show-session, and JSON generation.
@@ -107,6 +109,7 @@ class ProfilerCommands:
             force_clean_input_writes: Force neuron-profile to re-read all input tensors between N
                 executions, so that tensors from previous runs don't clobber subsequent executions.
                 Useful for kernels with aliased input tensors AND using tensor cache.
+            separation_pass_enabled: Whether separation pass is enabled (adds --ignore-exec-errors)
         """
         self.collective_ranks = collective_ranks
         self.expected_ntff_files = self._generate_expected_ntff_files(num_runs, profile_all_runs, profile_all_ranks)
@@ -114,7 +117,7 @@ class ProfilerCommands:
         collective_args = self._generate_collective_args(collective_ranks, profile_all_ranks)
 
         # Timeout should be less than lock timeout to avoid hanging past lock expiration
-        timeout_seconds = SshHost.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES * 60 - 5
+        timeout_seconds = DEFAULT_LOCK_TIMEOUT_SECONDS - 5
 
         # Build capture command
         capture_cmd_parts = [
@@ -125,6 +128,7 @@ class ProfilerCommands:
             "--save-output",
             "--neff file.neff",
             "--write-tensors-per-exec alias" if force_clean_input_writes else "",
+            "--ignore-exec-errors" if separation_pass_enabled else "",
             profiler_exec_args,
             collective_args,
             kernel_input_args,
@@ -178,29 +182,29 @@ class ProfilerCommands:
                 json_cmd_parts.append(f"({' '.join(json_parts)})")
         self.json_generation_cmd = " && ".join(json_cmd_parts)
 
-        # Build detailed JSON generation commands for perf analysis (neuron-profile view --output-format=json)
-        # Use --output-file= to write directly to the target filename, avoiding clobbering
-        # the summary ntff.json produced by the metrics step.
-        self.expected_detailed_json_files = []
-        detailed_json_cmd_parts = []
+        # Build detailed parquet generation commands for perf analysis (neuron-explorer view --output-format=parquet)
+        # neuron-explorer writes a folder for parquet format, so --output-file must be a folder path.
+        self.expected_detailed_parquet_dirs = []
+        detailed_parquet_cmd_parts = []
         if perf_analysis_enabled:
             for i, ntff_file in enumerate(self.expected_ntff_files):
                 if len(self.expected_ntff_files) == 1:
-                    json_file = "ntff_detailed.json"
+                    parquet_dir = "profiler_db"
                 else:
-                    json_file = f"ntff_detailed_{i}.json"
-                self.expected_detailed_json_files.append(json_file)
-                json_parts = [
-                    f"TIMEFORMAT='PROFILE_DETAILED_JSON_GENERATION_TIME_RUN_{i}: %R'; time",
-                    profiler_binary_path,
+                    parquet_dir = f"profiler_db_{i}"
+                self.expected_detailed_parquet_dirs.append(parquet_dir)
+                parquet_parts = [
+                    f"TIMEFORMAT='PROFILE_DETAILED_PARQUET_GENERATION_TIME_RUN_{i}: %R'; time",
+                    explorer_binary_path,
                     "view",
                     "-n file.neff",
                     f"-s {ntff_file}",
-                    "--output-format=json",
-                    f"--output-file={json_file}",
+                    "--output-format=parquet",
+                    f"--output-file={parquet_dir}",
+                    "--ingest-only",
                 ]
-                detailed_json_cmd_parts.append(f"({' '.join(json_parts)})")
-        self.detailed_json_generation_cmd = " && ".join(detailed_json_cmd_parts)
+                detailed_parquet_cmd_parts.append(f"({' '.join(parquet_parts)})")
+        self.detailed_parquet_generation_cmd = " && ".join(detailed_parquet_cmd_parts)
 
         # Build environment variables command if env_vars is not None
         if env_vars:
@@ -209,25 +213,14 @@ class ProfilerCommands:
         else:
             self.env_vars_cmd = ""
 
-    def get_complete_command(self) -> str:
-        """
-        Build complete profiler command by joining non-empty command parts.
-        Filters out empty commands (e.g., json_generation_cmd when metrics disabled).
+    def get_hardware_command(self) -> str:
+        """Commands that require Neuron hardware (must run inside core lock)."""
+        return " && ".join(filter(None, [self.env_vars_cmd, self.capture_cmd]))
 
-        Returns:
-            Complete command string ready for shell execution
-        """
+    def get_post_lock_command(self) -> str:
+        """Commands that do NOT require hardware (can run after core lock release)."""
         return " && ".join(
-            filter(
-                None,
-                [
-                    self.env_vars_cmd,
-                    self.capture_cmd,
-                    self.show_cmd,
-                    self.json_generation_cmd,
-                    self.detailed_json_generation_cmd,
-                ],
-            )
+            filter(None, [self.show_cmd, self.json_generation_cmd, self.detailed_parquet_generation_cmd])
         )
 
     def _generate_expected_ntff_files(

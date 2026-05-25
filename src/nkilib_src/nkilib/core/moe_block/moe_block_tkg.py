@@ -24,8 +24,10 @@ from ..moe.moe_tkg.moe_tkg import moe_tkg as _moe_tkg
 from ..router_topk.router_topk import XSBLayout_tp102__0, XSBLayout_tp201__2, XSBLayout_tp2013__1
 from ..router_topk.router_topk import router_topk as _router_topk
 from ..subkernels.rmsnorm_mx_quantize_tkg import rmsnorm_mx_quantize_tkg as _rmsnorm_mx_quantize_tkg
+from ..subkernels.rmsnorm_tkg import _rmsnorm_tkg_dloc
 from ..subkernels.rmsnorm_tkg import rmsnorm_tkg as _rmsnorm_tkg
-from ..utils.common_types import ActFnType, ExpertAffinityScaleMode, RouterActFnType
+from ..utils.common_types import ActFnType, ExpertAffinityScaleMode, MoEBlockIOLayout, RouterActFnType
+from ..utils.kernel_assert import kernel_assert
 from .moe_block_tkg_utils import (
     _pmax,
     _q_width,
@@ -72,6 +74,12 @@ def moe_block_tkg(
     is_all_expert: bool = False,
     rank_id: Optional[nl.ndarray] = None,
     residual: Optional[nl.ndarray] = None,
+    expert_gate_up_input_scale: Optional[nl.ndarray] = None,
+    expert_down_input_scale: Optional[nl.ndarray] = None,
+    is_all_expert_dynamic: bool = False,
+    block_size: Optional[int] = None,
+    inp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
+    outp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
 ):
     """
     Unified MoE Block kernel for token generation supporting selective-expert and all-expert modes.
@@ -90,7 +98,7 @@ def moe_block_tkg(
         K: Top K experts selected for each token
 
     Args:
-        inp (nl.ndarray): [B, S, H], Active input tensor on HBM.
+        inp (nl.ndarray): [B, S, H] or [128, n_prgs, H//128//n_prgs, B×S] depending on inp_layout.
         gamma (nl.ndarray): [1, H], Normalization weights on HBM.
         router_weights (nl.ndarray): [H, E], Router weights on HBM.
         expert_gate_up_weights (nl.ndarray): [E, H, 2, I] for bf16/fp16 OR [E, 128, 2, ceil(H/512), I] for MX,
@@ -135,9 +143,26 @@ def moe_block_tkg(
         rank_id (nl.ndarray): [1, 1], Worker rank for expert sharding. Required when is_all_expert=True.
         residual (nl.ndarray): [B, S, H] or [T, H], Optional residual tensor for fused residual add.
             Only supported for MXFP in all_expert mode.
+        expert_gate_up_input_scale (nl.ndarray, optional): [E_L, 1], Per-tensor FP8 activation dequantization
+            scale for gate/up projections. Required for STATIC and STATIC_MX quantization modes.
+            When provided together with expert_down_input_scale and MX weights, enables STATIC_MX mode.
+        expert_down_input_scale (nl.ndarray, optional): [E_L, 1], Per-tensor FP8 activation dequantization
+            scale for down projection. Required for STATIC and STATIC_MX quantization modes.
+        is_all_expert_dynamic (bool): If True, use dynamic control flow in all-expert mode.
+            Only valid when is_all_expert=True. (default: False)
+        block_size (int, optional): Block size for dynamic all-expert algorithm. Required when
+            is_all_expert_dynamic=True. Must evenly divide T into at least 2 blocks, and be
+            divisible by 8 and less than 32, divisible by 32 and less than 128, or divisible by 128.
+        inp_layout (MoEBlockIOLayout): Input tensor layout. B_S_H for standard [B, S, H],
+            _128_Nprgs_Hfree_T for [128, n_prgs, H//128//n_prgs, B×S]. _128_Nprgs_Hfree_T not
+            supported with MX quantization or selective expert with T > 1. Default is B_S_H.
+        outp_layout (MoEBlockIOLayout): Output tensor layout. B_S_H for standard [T, H],
+            _128_Nprgs_Hfree_T for [128, n_prgs, H//128//n_prgs, T]. _128_Nprgs_Hfree_T not
+            supported with MX quantization. Default is B_S_H.
 
     Returns:
-        out (nl.ndarray): [T, H], Output tensor of the kernel.
+        out (nl.ndarray): [T, H] when outp_layout=B_S_H, or [128, n_prgs, H//128//n_prgs, T]
+            when outp_layout=_128_Nprgs_Hfree_T. Output tensor of the kernel.
         router_logits (nl.ndarray): [T, E], Router logits. Returned when skip_router_logits is False.
         residual_out (nl.ndarray): [T, H], Residual output. Returned when residual is provided (all_expert mode).
 
@@ -169,8 +194,19 @@ def moe_block_tkg(
     """
 
     # Parse dimensions and validate inputs
+    _T_LAYOUT = MoEBlockIOLayout._128_Nprgs_Hfree_T
+
     dims, quant_config, expert_config = parse_moe_block_config(
-        inp, router_weights, expert_gate_up_weights, shared_expert_gate_w, top_k, hidden_actual, is_all_expert
+        inp,
+        router_weights,
+        expert_gate_up_weights,
+        shared_expert_gate_w,
+        top_k,
+        hidden_actual,
+        is_all_expert,
+        expert_gate_up_weights_scale=expert_gate_up_weights_scale,
+        expert_gate_up_input_scale=expert_gate_up_input_scale,
+        inp_layout=inp_layout,
     )
     validate_moe_block_inputs(
         dims,
@@ -188,6 +224,19 @@ def moe_block_tkg(
 
     # Convenience flags
     is_mxfp_all_expert = quant_config.is_moe_weight_mx and expert_config.is_all_expert
+    is_dynamic = is_mxfp_all_expert and is_all_expert_dynamic
+
+    # Transposed I/O validation
+    if inp_layout == _T_LAYOUT:
+        kernel_assert(not is_mxfp_all_expert, "inp_layout=_128_Nprgs_Hfree_T not supported with MX quantization")
+        kernel_assert(dims.T <= 128, "inp_layout=_128_Nprgs_Hfree_T not supported with T > 128")
+        kernel_assert(
+            expert_config.is_all_expert or dims.T <= 1,
+            "inp_layout=_128_Nprgs_Hfree_T not supported with selective expert and T > 1",
+        )
+    if outp_layout == _T_LAYOUT:
+        kernel_assert(not is_mxfp_all_expert, "outp_layout=_128_Nprgs_Hfree_T not supported with MX quantization")
+        kernel_assert(dims.T <= 128, "outp_layout=_128_Nprgs_Hfree_T not supported with T > 128")
 
     # Step 1: perform RMSNorm (with optional MX quantization for MXFP all-expert mode)
     rmsnorm_out = nl.ndarray((_pmax, dims.T, dims.H_free), dtype=inp.dtype, buffer=nl.sbuf)
@@ -195,14 +244,24 @@ def moe_block_tkg(
     rmsnorm_out_scale = None
     residual_out = None
 
-    if is_mxfp_all_expert:
-        # MXFP all-expert mode: use fused RMSNorm + MX quantization
+    input_dequant_scale_sb = None  # STATIC_MX: [_pmax, 1], ROW_MX: [_pmax, T, 1]
+    if is_mxfp_all_expert and not is_dynamic:
+        # MXFP all-expert mode (non-dynamic): use fused RMSNorm + MX/static quantization
         num_H512_tiles = dims.H // (_pmax * _q_width)
         quant_shape = (_pmax, num_H512_tiles, dims.T)
         rmsnorm_out_quant = nl.ndarray(quant_shape, dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
         rmsnorm_out_scale = nl.ndarray(quant_shape, dtype=nl.uint8, buffer=nl.sbuf)
         residual_out = nl.ndarray((dims.T, dims.H), dtype=inp.dtype, buffer=nl.shared_hbm) if residual != None else None
 
+        # Allocate SBUF buffer for input dequant scale
+        if quant_config.is_static_quant:
+            input_dequant_scale_sb = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+        elif quant_config.is_row_quant:
+            input_dequant_scale_sb = nl.ndarray((_pmax, dims.T, 1), dtype=nl.float32, buffer=nl.sbuf)
+
+        # Skip unquantized output gather when router_topk shards on tokens — each NC only
+        # needs its own T shard of rmsnorm_out. The quantized output gather (Step 5) is still
+        # needed for the MLP's SHARD_I path where each NC processes all tokens.
         _rmsnorm_mx_quantize_tkg(
             input=inp,
             gamma=gamma,
@@ -214,20 +273,48 @@ def moe_block_tkg(
             eps=eps,
             hidden_actual=dims.hidden_actual,
             hidden_dim_tp=True,
+            gate_up_in_scale=expert_gate_up_input_scale if quant_config.is_static_quant else None,
+            output_input_dequant_scale=input_dequant_scale_sb,
+            is_row_quant=quant_config.is_row_quant,
+            output_row_dequant_scale=input_dequant_scale_sb if quant_config.is_row_quant else None,
+            skip_output_gather=True,
+        )
+    elif is_mxfp_all_expert and is_dynamic:
+        # MXFP all-expert dynamic mode: use DLoC RMSNorm that produces both
+        # HBM [T, H] output and on-chip transposed [H0, T, H1] (each core fills its shard)
+        rmsnorm_out_hbm = nl.ndarray((dims.T, dims.H), dtype=inp.dtype, buffer=nl.shared_hbm)
+        _rmsnorm_tkg_dloc(
+            input_hbm=inp,
+            gamma=gamma,
+            output_hbm=rmsnorm_out_hbm,
+            output_sb=rmsnorm_out,
+            eps=eps,
+            hidden_actual=dims.hidden_actual,
+            sync_output=True,
         )
     else:
         # Non-MXFP or selective-expert mode: use standard RMSNorm
-        rmsnorm_out = _rmsnorm_tkg(
-            input=inp,
-            gamma=gamma,
-            output=rmsnorm_out,
-            eps=eps,
-            hidden_actual=dims.hidden_actual,
-            hidden_dim_tp=quant_config.is_moe_weight_mx,
-            single_core_forced=True
-            if (not quant_config.is_moe_weight_mx and not expert_config.is_all_expert and dims.T > 1)
-            else False,
-        )
+        if inp_layout == _T_LAYOUT:
+            rmsnorm_out = _rmsnorm_tkg(
+                input=inp,
+                gamma=gamma,
+                output=rmsnorm_out,
+                eps=eps,
+                hidden_actual=dims.hidden_actual,
+                inp_layout=inp_layout,
+            )
+        else:
+            rmsnorm_out = _rmsnorm_tkg(
+                input=inp,
+                gamma=gamma,
+                output=rmsnorm_out,
+                eps=eps,
+                hidden_actual=dims.hidden_actual,
+                hidden_dim_tp=quant_config.is_moe_weight_mx,
+                single_core_forced=True
+                if (not quant_config.is_moe_weight_mx and not expert_config.is_all_expert and dims.T > 1)
+                else False,
+            )
 
     router_in = rmsnorm_out
     if rmsnorm_out.dtype != router_mm_dtype:
@@ -248,9 +335,10 @@ def moe_block_tkg(
     # For all-expert mode, expert_affinities goes to HBM (moe_tkg handles slicing to local experts)
     # For selective-expert mode, expert_affinities stays in SBUF
     affinities_in_sbuf = not expert_config.is_all_expert
+    affinities_dtype = nl.float16 if is_dynamic else nl.float32
     expert_affinities = nl.ndarray(
         get_sbuf_tensor_shape(dims.T, dims.E, is_sbuf=affinities_in_sbuf),
-        dtype=nl.float32,
+        dtype=affinities_dtype,
         buffer=nl.sbuf if affinities_in_sbuf else nl.shared_hbm,
         name='expert_affinities',
     )
@@ -260,9 +348,9 @@ def moe_block_tkg(
         else None
     )
     # Determine x_sb_layout based on rmsnorm output layout
-    if quant_config.is_moe_weight_mx:
+    if quant_config.is_moe_weight_mx and not is_dynamic:
         router_x_sb_layout = XSBLayout_tp201__2
-    elif not expert_config.is_all_expert and dims.T > 1:
+    elif is_dynamic or (not expert_config.is_all_expert and dims.T > 1 and inp_layout != _T_LAYOUT):
         router_x_sb_layout = XSBLayout_tp102__0
     else:
         router_x_sb_layout = XSBLayout_tp2013__1
@@ -283,7 +371,7 @@ def moe_block_tkg(
         use_column_tiling=True,
         return_eager_affi=not expert_config.is_all_expert
         and quant_config.is_moe_weight_mx,  # Only needed for selective-expert mxfp mode
-        use_PE_broadcast_w_bias=is_mxfp_all_expert,
+        use_PE_broadcast_w_bias=is_mxfp_all_expert and not is_dynamic,
         shard_on_tokens=is_mxfp_all_expert or (not expert_config.is_all_expert and dims.T > 1),
         skip_store_expert_index=skip_store_expert_index,
         skip_store_router_logits=skip_router_logits,
@@ -298,20 +386,23 @@ def moe_block_tkg(
         pass
 
     # Step 4: compute expert MLPs
-    expert_mlp_in_scale = rmsnorm_out_scale if is_mxfp_all_expert else None
+    expert_mlp_in_scale = rmsnorm_out_scale if (is_mxfp_all_expert and not is_dynamic) else None
     # Determine if we're using shard_on_T for selective expert
     selective_expert_shard_on_T = not expert_config.is_all_expert and dims.T > 1
-    if is_mxfp_all_expert:
+    if is_mxfp_all_expert and is_dynamic:
+        # Dynamic all-expert: use unquantized HBM tensor; _moe_tkg handles quantization internally
+        expert_mlp_in = rmsnorm_out_hbm
+    elif is_mxfp_all_expert:
+        # Both regular MX and STATIC_MX: use pre-quantized SBUF output from fused rmsnorm
         expert_mlp_in = rmsnorm_out_quant
     elif quant_config.is_moe_weight_mx or selective_expert_shard_on_T:
         # MXFP selective-expert or shard_on_T mode: use full rmsnorm output
         expert_mlp_in = rmsnorm_out
     else:
         # Non-MXFP mode without shard_on_T: shard the hidden dimension
+        _h_free_shard_offset = dims.prg_id * (dims.H_free // dims.n_prgs)
         expert_mlp_in = nl.ndarray((_pmax, dims.T, dims.H_free_shard), dtype=inp.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(
-            dst=expert_mlp_in, src=rmsnorm_out[:, :, nl.ds(dims.prg_id * dims.H_free_shard, dims.H_free_shard)]
-        )
+        nisa.tensor_copy(dst=expert_mlp_in, src=rmsnorm_out[:, :, nl.ds(_h_free_shard_offset, dims.H_free_shard)])
 
     result = _moe_tkg(
         hidden_input=expert_mlp_in,
@@ -326,6 +417,9 @@ def moe_block_tkg(
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
         hidden_input_scale=expert_mlp_in_scale,
+        expert_gate_up_input_scale=expert_gate_up_input_scale,
+        expert_down_input_scale=expert_down_input_scale,
+        input_dequant_scale=input_dequant_scale_sb,
         # Only mask when router_topk doesn't perform masking (router_pre_norm=True, norm_topk_prob=False).
         # Otherwise, expert_affinities are already masked by router_topk's scatter operation.
         mask_unselected_experts=router_pre_norm and not norm_topk_prob,
@@ -337,6 +431,9 @@ def moe_block_tkg(
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
+        is_all_expert_dynamic=is_all_expert_dynamic,
+        block_size=block_size,
+        outp_layout=outp_layout,
     )
 
     # Process and return the output

@@ -19,31 +19,13 @@ except ImportError:
     attention_cte_model_configs = []
 
 from functools import lru_cache
-from test.integration.nkilib.utils.tensor_generators import np_random_sample
-from test.integration.nkilib.utils.test_kernel_common import convert_to_torch
-from test.utils.common_dataclasses import (
-    MODEL_TEST_TYPE,
-    CompilerArgs,
-    KernelArgs,
-    LazyGoldenGenerator,
-    ValidationArgs,
-)
-from test.utils.coverage_parametrized_tests import (
-    BoundedRange,
-    FilterResult,
-    assert_negative_test_case,
-)
-from test.utils.metadata_loader import load_model_configs
-from test.utils.metrics_collector import IMetricsCollector
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
 from typing import Any, Optional, final
 
 import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import pytest
-import torch
+
 from nkilib_src.nkilib.core.attention.attention_cte import (
     _MAX_BS,
     _MAX_BS_TIMES_SEQLEN_QK,
@@ -56,6 +38,26 @@ from nkilib_src.nkilib.core.attention.attention_cte import (
 from nkilib_src.nkilib.core.attention.attention_cte_torch import (
     attention_cte_torch_ref,
 )
+from test.integration.nkilib.utils.tensor_generators import np_random_sample
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    LazyGoldenGenerator,
+    ModelTestType,
+    Platforms,
+    ValidationArgs,
+    prepare_model_parametrize,
+)
+from test.utils.coverage_parametrized_tests import (
+    BoundedRange,
+    FilterResult,
+    assert_negative_test_case,
+)
+from test.utils.metadata_loader import load_model_configs
+from test.utils.metrics_collector import IMetricsCollector
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # the shape of q, k, v are interlinked, therefore
 # we pass in the config as one object
@@ -115,6 +117,7 @@ def build_attention_cte_input(
     mm_out_dtype=np.float32,
     n_packed_sequences=None,
 ):
+    """Generate kernel inputs as a dict matching the attention_cte kernel signature."""
     softmax_dtype = dtype_mapping[softmax_dtype]
     mm_out_dtype = dtype_mapping[mm_out_dtype]
 
@@ -134,39 +137,32 @@ def build_attention_cte_input(
         k_prior = random_gen(shape=(bs_kv, seqlen_kv_prior, d) if tp_k else (bs_kv, d, seqlen_kv_prior), dtype=dtype)
         v_prior = random_gen(shape=(bs_kv, seqlen_kv_prior, d), dtype=dtype)
         prior_used_len_t = dt.static_cast(np.full(shape=(1,), fill_value=prior_used_len, dtype=nl.int32), nl.int32)
+
     # Make sink a big value to be sensitive
     sink_t = dt.static_cast(np.random.uniform(low=15.0, high=25.0, size=(bs, 1)), nl.float32) if sink else None
 
-    # Generate output tensors (to be used in place of golden generation for negative test cases)
-    out = np.ndarray(shape=(bs, d, seqlen_q) if tp_out else (bs, seqlen_q, d), dtype=dtype)
-    outputs = {"out": out}
-    if cache_softmax:
-        padded_seq_grps = math.ceil(seqlen_q / 128.0)
-        neg_max = np.ndarray(shape=(bs, 128, padded_seq_grps), dtype=softmax_dtype)
-        recip = np.ndarray(shape=(bs, 128, padded_seq_grps), dtype=softmax_dtype)
-        outputs["out_cached_negative_max"] = neg_max
-        outputs["out_cached_sum_reciprocal"] = recip
-
     # Generate sequence packing bounds
+    # Each batch line gets its own random segment boundaries
     bound_min_arr, bound_max_arr = None, None
     if n_packed_sequences is not None:
         assert seqlen_q == seqlen_kv, "sequence packing requires seqlen_q == seqlen_kv"
-        partitions = np.sort(np.random.rand(n_packed_sequences - 1))
-        partitions = np.concatenate(([0], partitions, [1]))
-        seg_lens = np.round(np.diff(partitions) * seqlen_q).astype(int)
-        seg_lens[-1] += seqlen_q - seg_lens.sum()
-        cumsum = np.cumsum(seg_lens)
-        starts = np.concatenate(([0], cumsum[:-1]))
-        bound_min_vals = np.zeros(seqlen_q, dtype=np.int32)
-        bound_max_vals = np.zeros(seqlen_q, dtype=np.int32)
-        for seg_idx in range(n_packed_sequences):
-            s, e = starts[seg_idx], cumsum[seg_idx]
-            bound_min_vals[s:e] = s
-            bound_max_vals[s:e] = e
-        bound_min_arr = dt.static_cast(bound_min_vals.reshape(seqlen_q, 1), nl.float32)
-        bound_max_arr = dt.static_cast(bound_max_vals.reshape(seqlen_q, 1), nl.float32)
+        bound_min_vals = np.zeros((bs, seqlen_q, 1), dtype=np.int32)
+        bound_max_vals = np.zeros((bs, seqlen_q, 1), dtype=np.int32)
+        for b in range(bs):
+            partitions = np.sort(np.random.rand(n_packed_sequences - 1))
+            partitions = np.concatenate(([0], partitions, [1]))
+            seg_lens = np.round(np.diff(partitions) * seqlen_q).astype(int)
+            seg_lens[-1] += seqlen_q - seg_lens.sum()
+            cumsum = np.cumsum(seg_lens)
+            starts = np.concatenate(([0], cumsum[:-1]))
+            for seg_idx in range(n_packed_sequences):
+                s, e = starts[seg_idx], cumsum[seg_idx]
+                bound_min_vals[b, s:e, 0] = s
+                bound_max_vals[b, s:e, 0] = e
+        bound_min_arr = dt.static_cast(bound_min_vals, nl.float32)
+        bound_max_arr = dt.static_cast(bound_max_vals, nl.float32)
 
-    inputs = {
+    return {
         "q": q,
         "k": k,
         "v": v,
@@ -181,7 +177,7 @@ def build_attention_cte_input(
         "tp_k": tp_k,
         "tp_out": tp_out,
         "cp_offset": cp_offset,
-        "global_cp_deg": cp_degree,
+        "global_cp_deg": cp_degree if use_cp else None,
         "cp_strided_q_slicing": cp_strided_q_slicing,
         "cache_softmax": cache_softmax,
         "softmax_dtype": softmax_dtype,
@@ -190,48 +186,26 @@ def build_attention_cte_input(
         "bound_max": bound_max_arr,
     }
 
-    return inputs, outputs
 
+def _output_tensors(kernel_input):
+    """Generate output tensor descriptors from kernel inputs."""
+    q = kernel_input["q"]
+    tp_q = kernel_input["tp_q"]
+    tp_out = kernel_input["tp_out"]
+    cache_softmax = kernel_input["cache_softmax"]
 
-def attention_cte_forward_golden(
-    inps,
-    dtype,
-    softmax_dtype=np.float32,
-):
-    dtype_mapping_torch_np = {
-        np.float32: torch.float32,
-    }
-    out = attention_cte_torch_ref(
-        q=convert_to_torch(inps["q"]),
-        k=convert_to_torch(inps["k"]),
-        v=convert_to_torch(inps["v"]),
-        scale=inps["scale"],
-        causal_mask=inps["causal_mask"],
-        k_prior=convert_to_torch(inps.get("k_prior", None)),
-        v_prior=convert_to_torch(inps.get("v_prior", None)),
-        prior_used_len=convert_to_torch(inps.get("prior_used_len", None)),
-        sink=convert_to_torch(inps.get("sink", None)),
-        sliding_window=inps["sliding_window"],
-        tp_q=inps["tp_q"],
-        tp_k=inps["tp_k"],
-        tp_out=inps["tp_out"],
-        cache_softmax=inps["cache_softmax"],
-        softmax_dtype=dtype_mapping_torch_np[softmax_dtype],
-        cp_offset=convert_to_torch(inps.get("cp_offset", None)),
-        global_cp_deg=inps["global_cp_deg"],
-        cp_strided_q_slicing=inps["cp_strided_q_slicing"],
-        bound_min=inps.get("bound_min", None),
-        bound_max=inps.get("bound_max", None),
-    )
-    if inps["cache_softmax"]:
-        out_golden, neg_max, recip = out
-        return {
-            "out": dt.static_cast(out_golden.numpy(), dtype),
-            "out_cached_negative_max": dt.static_cast(neg_max.numpy(), softmax_dtype),
-            "out_cached_sum_reciprocal": dt.static_cast(recip.numpy(), softmax_dtype),
-        }
-    else:
-        return {"out": dt.static_cast(out.numpy(), dtype)}
+    bs = q.shape[0]
+    seqlen_q = q.shape[1] if tp_q else q.shape[2]
+    d = q.shape[2] if tp_q else q.shape[1]
+    dtype = q.dtype
+
+    out_shape = (bs, d, seqlen_q) if tp_out else (bs, seqlen_q, d)
+    outputs = {"out": np.ndarray(shape=out_shape, dtype=dtype)}
+    if cache_softmax:
+        padded_seq_grps = math.ceil(seqlen_q / 128.0)
+        outputs["out_cached_negative_max"] = np.ndarray(shape=(bs, 128, padded_seq_grps), dtype=np.float32)
+        outputs["out_cached_sum_reciprocal"] = np.ndarray(shape=(bs, 128, padded_seq_grps), dtype=np.float32)
+    return outputs
 
 
 @lru_cache(maxsize=1)
@@ -239,7 +213,47 @@ def _get_attention_cte_metadata():
     return load_model_configs("test_attention_cte")
 
 
-@pytest_test_metadata(name="Attention CTE", pytest_marks=["attention", "cte"], tag=["model"])
+_ATTN_CTE_ABBREVS = {
+    "vnc_degree": "vnc",
+    "lnc_degree": "lnc",
+    "bs": "b",
+    "bs_kv": "bkv",
+    "gqa_factor": "gqa",
+    "seqlen": "s",
+    "seqlen_q": "sq",
+    "seqlen_kv": "skv",
+    "seqlen_kv_prior": "skv_p",
+    "q_seqlen_partial": "sq_p",
+    "kv_seqlen": "kvs",
+    "kv_seqlen_prior": "kvs_p",
+    "prior_len": "pl",
+    "prior_used_len": "pul",
+    "kv_prior_used_len": "kpul",
+    "d": "d",
+    "softmax_scale": "sc",
+    "causal_mask": "cm",
+    "sliding_window": "sw",
+    "n_packed_sequences": "nps",
+    "cp_degree": "cpd",
+    "cp_rank_id": "cpr",
+}
+
+
+# (bs, gqa_factor, seqlen_kv, seqlen_kv_prior, prior_used_len, seqlen_q, d, sliding_window) keys for full-only tests (excluded from fast suite)
+_FULL_ONLY_KEYS = {
+    (4, 2, 15000, 1092, 1000, 16384, 128, 0),
+    (2, 1, 32768, None, None, 32768, 128, 3),
+    (2, 1, 32768, None, None, 32768, 64, 2048),
+    (1, 1, 16384, 16384, 0, 16384, 128, 0),
+    (2, 1, 32768, None, None, 32768, 64, 1),
+    (1, 1, 32768, None, None, 32768, 64, 128),
+    (1, 1, 16384, 16384, 15873, 16384, 128, 1),
+    (1, 1, 32768, None, None, 32768, 128, 2),
+}
+
+
+@pytest_test_metadata(name="Attention CTE", tags=["model"])
+@pytest_marks(["attention", "cte", "mx"])
 @final
 class TestRangedAttentionCTEKernels:
     def run_range_attention_cte_test(
@@ -408,55 +422,61 @@ class TestRangedAttentionCTEKernels:
         if bs * seqlen_q * seqlen_kv_total > _MAX_BS_TIMES_SEQLEN_QK_VALIDATE:
             skip_validation = True
 
-        kernel_input, placeholder_output = build_attention_cte_input(
-            bs=bs,
-            bs_kv=bs_kv,
-            d=d,
-            dtype=dtype,
-            seqlen_kv=seqlen_kv,
-            seqlen_q=seqlen_q,
-            is_prefix_caching=seqlen_kv_prior is not None,
-            seqlen_kv_prior=seqlen_kv_prior,
-            prior_used_len=prior_used_len,
-            tp_q=bool_dims[TP_Q_DIM_NAME],
-            tp_k=bool_dims[TP_K_DIM_NAME],
-            tp_out=bool_dims[TP_OUT_DIM_NAME],
-            sink=bool_dims[SINK_DIM_NAME],
-            softmax_scale=softmax_scale,
-            causal_mask=bool_dims[CAUSAL_MASK_DIM_NAME],
-            sliding_window=sliding_window,
-            use_cp=use_cp,
-            cp_strided_q_slicing=cp_strided_q_slicing,
-            cp_degree=cp_degree,
-            cp_rank_id=cp_rank_id,
-            cache_softmax=cache_softmax,
-            softmax_dtype=softmax_dtype,
-            mm_out_dtype=mm_out_dtype,
-            n_packed_sequences=n_packed_sequences,
-        )
-
-        # Create lazy golden generator - captures local variables via closure
-        def create_attention_cte_golden():
-            return attention_cte_forward_golden(
-                inps=kernel_input,
+        def input_generator(test_config):
+            return build_attention_cte_input(
+                bs=bs,
+                bs_kv=bs_kv,
+                d=d,
                 dtype=dtype,
+                seqlen_kv=seqlen_kv,
+                seqlen_q=seqlen_q,
+                is_prefix_caching=seqlen_kv_prior is not None,
+                seqlen_kv_prior=seqlen_kv_prior,
+                prior_used_len=prior_used_len,
+                tp_q=bool_dims[TP_Q_DIM_NAME],
+                tp_k=bool_dims[TP_K_DIM_NAME],
+                tp_out=bool_dims[TP_OUT_DIM_NAME],
+                sink=bool_dims[SINK_DIM_NAME],
+                softmax_scale=softmax_scale,
+                causal_mask=bool_dims[CAUSAL_MASK_DIM_NAME],
+                sliding_window=sliding_window,
+                use_cp=use_cp,
+                cp_strided_q_slicing=cp_strided_q_slicing,
+                cp_degree=cp_degree,
+                cp_rank_id=cp_rank_id,
+                cache_softmax=cache_softmax,
                 softmax_dtype=softmax_dtype,
+                mm_out_dtype=mm_out_dtype,
+                n_packed_sequences=n_packed_sequences,
             )
 
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=attention_cte,
-                kernel_input=kernel_input,
-                compiler_input=compiler_args,
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(
-                        lazy_golden_generator=create_attention_cte_golden if not skip_validation else None,
-                        output_ndarray=placeholder_output,
-                    ),
-                    relative_accuracy=2e-2,
-                    absolute_accuracy=1e-5,
+        # Build custom validation args when skipping validation for large configs
+        custom_validation = None
+        if skip_validation:
+            kernel_input = input_generator(None)
+            custom_validation = ValidationArgs(
+                golden_output=LazyGoldenGenerator(
+                    lazy_golden_generator=None,
+                    output_ndarray=_output_tensors(kernel_input),
                 ),
+                relative_accuracy=2e-2,
+                absolute_accuracy=1e-5,
             )
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_cte,
+            torch_ref=torch_ref_wrapper(attention_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_tensors,
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+            custom_validation_args=custom_validation,
         )
 
     # fmt: off
@@ -503,11 +523,12 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_no_cp_unit_params, attention_cte_no_cp_unit_perms)
+    @pytest_parametrize(attention_cte_no_cp_unit_params, attention_cte_no_cp_unit_perms, abbrevs=_ATTN_CTE_ABBREVS)
     def test_attention_cte_no_cp_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         seqlen_kv,
         seqlen_q,
@@ -519,7 +540,7 @@ class TestRangedAttentionCTEKernels:
         tp_out,
         tpbSgCyclesSum,  # FIXME: use qor once framework supports
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -608,11 +629,16 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_no_cp_vnc_apc_klr_unit_params, attention_cte_no_cp_vnc_apc_klr_unit_perms)
+    @pytest_parametrize(
+        attention_cte_no_cp_vnc_apc_klr_unit_params,
+        attention_cte_no_cp_vnc_apc_klr_unit_perms,
+        abbrevs=_ATTN_CTE_ABBREVS,
+    )
     def test_attention_cte_no_cp_vnc_apc_klr_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         vnc_degree,
         bs,
         seqlen_kv,
@@ -630,7 +656,7 @@ class TestRangedAttentionCTEKernels:
         sliding_window,
         tpbSgCyclesSum,
     ):
-        compiler_args = CompilerArgs(logical_nc_config=vnc_degree)
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -736,11 +762,14 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_no_cp_vnc_param_unit_params, attention_cte_no_cp_vnc_param_unit_perms)
+    @pytest_parametrize(
+        attention_cte_no_cp_vnc_param_unit_params, attention_cte_no_cp_vnc_param_unit_perms, abbrevs=_ATTN_CTE_ABBREVS
+    )
     def test_attention_cte_no_cp_vnc_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         vnc_degree,
         bs,
         seqlen_kv,
@@ -755,7 +784,7 @@ class TestRangedAttentionCTEKernels:
         sliding_window,
         tpbSgCyclesSum,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -817,11 +846,14 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_no_cp_vnc_gqa_unit_params, attention_cte_no_cp_vnc_gqa_unit_perms)
+    @pytest_parametrize(
+        attention_cte_no_cp_vnc_gqa_unit_params, attention_cte_no_cp_vnc_gqa_unit_perms, abbrevs=_ATTN_CTE_ABBREVS
+    )
     def test_attention_cte_no_cp_vnc_gqa_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         vnc_degree,
         bs,
         bs_kv,
@@ -840,7 +872,7 @@ class TestRangedAttentionCTEKernels:
         sliding_window,
         tpbSgCyclesSum,
     ):
-        compiler_args = CompilerArgs(logical_nc_config=vnc_degree)
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -883,11 +915,14 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_no_cp_vnc_barameter_params, attention_cte_no_cp_vnc_barometer_perms)
+    @pytest_parametrize(
+        attention_cte_no_cp_vnc_barameter_params, attention_cte_no_cp_vnc_barometer_perms, abbrevs=_ATTN_CTE_ABBREVS
+    )
     def test_attention_cte_no_cp_vnc_barometer_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         vnc_degree,
         bs,
         bs_kv,
@@ -906,7 +941,7 @@ class TestRangedAttentionCTEKernels:
         sliding_window,
         tpbSgCyclesSum,
     ):
-        compiler_args = CompilerArgs(logical_nc_config=vnc_degree)
+        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -958,12 +993,13 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_cp_apc_klr_params, attention_cte_cp_apc_klr_perms)
+    @pytest_parametrize(attention_cte_cp_apc_klr_params, attention_cte_cp_apc_klr_perms, abbrevs=_ATTN_CTE_ABBREVS)
     @pytest.mark.parametrize("cp_strided_q_slicing", [False, True])
     def test_attention_cte_cp_apc_klr_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         q_seqlen_partial,
         kv_seqlen,
@@ -982,7 +1018,7 @@ class TestRangedAttentionCTEKernels:
         qor,
         cp_strided_q_slicing,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1053,12 +1089,13 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_cp_bk_klr_params, attention_cte_cp_bk_klr_perms)
+    @pytest_parametrize(attention_cte_cp_bk_klr_params, attention_cte_cp_bk_klr_perms, abbrevs=_ATTN_CTE_ABBREVS)
     @pytest.mark.parametrize("cp_strided_q_slicing", [False, True])
     def test_attention_cte_cp_bk_klr_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         q_seqlen_partial,
         kv_seqlen,
@@ -1075,7 +1112,7 @@ class TestRangedAttentionCTEKernels:
         qor,
         cp_strided_q_slicing,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1134,12 +1171,13 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_cp_gqa_klr_params, attention_cte_cp_gqa_klr_perms)
+    @pytest_parametrize(attention_cte_cp_gqa_klr_params, attention_cte_cp_gqa_klr_perms, abbrevs=_ATTN_CTE_ABBREVS)
     @pytest.mark.parametrize("cp_strided_q_slicing", [False, True])
     def test_attention_cte_cp_gqa_klr_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         bs_kv,
         q_seqlen_partial,
@@ -1159,7 +1197,7 @@ class TestRangedAttentionCTEKernels:
         qor,
         cp_strided_q_slicing,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1200,12 +1238,15 @@ class TestRangedAttentionCTEKernels:
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_cp_barometer_klr_params, attention_cte_cp_barometer_klr_perms)
+    @pytest_parametrize(
+        attention_cte_cp_barometer_klr_params, attention_cte_cp_barometer_klr_perms, abbrevs=_ATTN_CTE_ABBREVS
+    )
     @pytest.mark.parametrize("cp_strided_q_slicing", [False, True])
     def test_attention_cte_cp_barometer_klr_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         bs_kv,
         q_seqlen_partial,
@@ -1225,7 +1266,7 @@ class TestRangedAttentionCTEKernels:
         qor,
         cp_strided_q_slicing,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1454,6 +1495,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         softmax_scale,
         bs,
         gqa,
@@ -1478,7 +1520,7 @@ class TestRangedAttentionCTEKernels:
         # Calculate bs_kv based on GQA factor
         bs_kv = bs // gqa if bs % gqa == 0 else bs
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
 
         self.run_attention_cte_test(
             test_manager=test_manager,
@@ -1518,6 +1560,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         gqa,
         d,
@@ -1550,7 +1593,7 @@ class TestRangedAttentionCTEKernels:
             SLIDING_WINDOW_DIM_NAME: sw,
         }
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1572,6 +1615,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         gqa,
         d,
@@ -1604,7 +1648,7 @@ class TestRangedAttentionCTEKernels:
             SEQLEN_KV_PRIOR_DIM_NAME: s_kv_prior,
         }
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1661,7 +1705,7 @@ class TestRangedAttentionCTEKernels:
             SEQLEN_KV_PRIOR_DIM_NAME: s_kv_prior,
         }
 
-        compiler_args = CompilerArgs(logical_nc_config=lnc_degree)
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
         self.run_range_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1683,6 +1727,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         gqa,
         d,
@@ -1715,7 +1760,7 @@ class TestRangedAttentionCTEKernels:
             CP_STRIDED_Q_DIM_NAME: cp_strided,
         }
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1737,6 +1782,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         gqa,
         d,
@@ -1771,7 +1817,7 @@ class TestRangedAttentionCTEKernels:
             SLIDING_WINDOW_DIM_NAME: sw,
         }
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1793,6 +1839,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         gqa,
         d,
@@ -1827,7 +1874,7 @@ class TestRangedAttentionCTEKernels:
             SEQLEN_KV_PRIOR_DIM_NAME: s_kv_prior,
         }
 
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_range_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1850,6 +1897,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         lnc_degree,
         bs,
         gqa,
@@ -1887,7 +1935,7 @@ class TestRangedAttentionCTEKernels:
             SEQLEN_KV_PRIOR_DIM_NAME: s_kv_prior,
         }
 
-        compiler_args = CompilerArgs(logical_nc_config=lnc_degree)
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
         self.run_range_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -1903,9 +1951,7 @@ class TestRangedAttentionCTEKernels:
         "bs, gqa_factor, seqlen_kv, seqlen_kv_prior, prior_used_len, seqlen_q, d, sliding_window, causal_mask, tp_q, tp_k, tp_out, sink"
     attn_cte_sweep_manual_nocp_perms = [
     # BATCH, GQA_FACTOR, SEQLEN_KV,  SEQLEN_KV_PRIOR,  PRIOR_USED_LEN,  SEQLEN_Q,  D,  SLIDING_WINDOW, CAUSAL_MASK,  TP_Q, TP_K, TP_OUT, SINK
-      [8,     2,          16384,      None,             None,           16384,    128,  0,            True,         True, True, True,   True],
       [4,     2,          15000,      1092,             1000,           16384,    128,  0,            True,         True, True, True,   True],
-      [2,     2,          32768,      None,             None,           32768,    128,  0,            False,        False,False,False,  False],
       [2,     1,          32768,      None,             None,           32768,    64,   1,            True,         True,False, False,  False],
       [1,     1,          32768,      None,             None,           32768,    128,  2,            True,         False,True, False,  False],
       [2,     1,          32768,      None,             None,           32768,    128,  3,            True,         False,False,True,   False],
@@ -1916,16 +1962,29 @@ class TestRangedAttentionCTEKernels:
       [2,     2,          123,        30909,            30000,          123,      128,  0,            True,         False,True, False,  True],
       [2,     1,          123,        30909,            1,              123,      128,  10000,        True,         True, True, True,   False],
     ]
+
+    # Slow-compile cases
+    attn_cte_sweep_manual_nocp_perms_slow = [
+      [2,     2,          32768,      None,             None,           32768,    128,  0,            False,        False,False,False,  False],
+      [8,     2,          16384,      None,             None,           16384,    128,  0,            True,         True, True, True,   True],
+    ]
     # fmt: on
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize(attn_cte_sweep_manual_nocp_params, attn_cte_sweep_manual_nocp_perms)
+    attn_cte_sweep_manual_nocp_perms_all = [
+        pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:8]) not in _FULL_ONLY_KEYS else c
+        for c in attn_cte_sweep_manual_nocp_perms
+    ] + attn_cte_sweep_manual_nocp_perms_slow
+
+    @pytest_parametrize(
+        attn_cte_sweep_manual_nocp_params, attn_cte_sweep_manual_nocp_perms_all, abbrevs=_ATTN_CTE_ABBREVS
+    )
     @pytest.mark.parametrize("lnc_degree", [2])  # keep lnc 2 onlt
     @pytest.mark.parametrize("cache_softmax", [True])  # keep only cache_softmax true case
     def test_ranged_attn_cte_sweep_nocp_manual(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         gqa_factor,
         seqlen_kv,
@@ -1945,7 +2004,7 @@ class TestRangedAttentionCTEKernels:
         is_negative_test_case = False
         if seqlen_q % 128 != 0 and cache_softmax:
             is_negative_test_case = True
-        compiler_args = CompilerArgs(logical_nc_config=lnc_degree)
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
         with assert_negative_test_case(is_negative_test_case):
             self.run_attention_cte_test(
                 test_manager=test_manager,
@@ -1977,9 +2036,8 @@ class TestRangedAttentionCTEKernels:
     # fmt: off
     attn_cte_sweep_manual_cp_params = \
         "bs, gqa_factor, seqlen_kv, seqlen_kv_prior, prior_used_len, cp_degree, cp_rank_id, d, sliding_window, causal_mask, tp_q, tp_k, tp_out, sink"
-    attn_cte_sweep_manual_cp_perms = [
+    attn_cte_sweep_manual_cp_perms_fast = [
     # BATCH, GQA_FACTOR, SEQLEN_KV,  SEQLEN_KV_PRIOR,  PRIOR_USED_LEN,  CP_DEGREE, CP_RANK_ID,  D,  SLIDING_WINDOW, CAUSAL_MASK,  TP_Q, TP_K, TP_OUT, SINK
-      [2,     2,          32768,      None,             None,           2,          1,          128,  0,            True,         False,True, True,   True],
       [2,     1,          32768,      None,             None,           8,          0,          128,  1024,         True,         True, False,True,   True],
       [2,     2,          32768,      None,             None,           32,         16,         128,  0,            True,         True, True, False,  True],
       [1,     1,          32768,      None,             None,           32,         10,         128,  0,            True,         False,False,False,  False],
@@ -1989,10 +2047,16 @@ class TestRangedAttentionCTEKernels:
       [3,     3,          25600,      5000,             4500,           5,          2,          63,   128,          True,         False,False,False,  False],
       [3,     3,          17000,      15000,            500,            17,         16,         127,  0,            True,         True, True, True,   True],
     ]
+    attn_cte_sweep_manual_cp_perms_slow = [
+      [2,     2,          32768,      None,             None,           2,          1,          128,  0,            True,         False,True, True,   True],
+    ]
     # fmt: on
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize(attn_cte_sweep_manual_cp_params, attn_cte_sweep_manual_cp_perms)
+    attn_cte_sweep_manual_cp_perms_all = [
+        pytest.param(*c, marks=pytest.mark.fast) for c in attn_cte_sweep_manual_cp_perms_fast
+    ] + attn_cte_sweep_manual_cp_perms_slow
+
+    @pytest_parametrize(attn_cte_sweep_manual_cp_params, attn_cte_sweep_manual_cp_perms_all, abbrevs=_ATTN_CTE_ABBREVS)
     @pytest.mark.parametrize("lnc_degree", [1, 2])
     @pytest.mark.parametrize("cp_strided_q_slicing", [False, True])
     @pytest.mark.parametrize("cache_softmax", [False, True])
@@ -2000,6 +2064,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         bs,
         gqa_factor,
         seqlen_kv,
@@ -2022,7 +2087,7 @@ class TestRangedAttentionCTEKernels:
         is_negative_test_case = False
         if seqlen_q % 128 != 0 and cache_softmax:
             is_negative_test_case = True
-        compiler_args = CompilerArgs(logical_nc_config=lnc_degree)
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
         with assert_negative_test_case(is_negative_test_case):
             self.run_attention_cte_test(
                 test_manager=test_manager,
@@ -2053,105 +2118,70 @@ class TestRangedAttentionCTEKernels:
             )
 
     # fmt: off
-    attention_cte_model_config_params = "bs, gqa_factor, seqlen_kv, seqlen_kv_prior, prior_used_len, cp_degree, cp_rank_id, d, sliding_window, causal_mask, tp_q, tp_k, tp_out, sink"
-    attention_cte_model_test_ids = [
-        f"{MODEL_TEST_TYPE}_" + "-".join(str(p.value) if hasattr(p, "value") else str(p) for p in params)
-        for params in attention_cte_model_configs
-    ]
-    # fmt: on
-
-    @pytest.mark.parametrize(
-        attention_cte_model_config_params, attention_cte_model_configs, ids=attention_cte_model_test_ids
-    )
-    def test_attention_cte_model(
-        self,
-        test_manager: Orchestrator,
-        collector: IMetricsCollector,
-        bs,
-        gqa_factor,
-        seqlen_kv,
-        seqlen_kv_prior,
-        prior_used_len,
-        cp_degree,
-        cp_rank_id,
-        d,
-        sliding_window,
-        causal_mask,
-        tp_q,
-        tp_k,
-        tp_out,
-        sink,
-    ):
-        test_metadata_key = {k: v for k, v in locals().items() if k not in _METADATA_EXCLUDE_KEYS}
-
-        seqlen_q = seqlen_kv // cp_degree
-        attention_cte_metadata_list = _get_attention_cte_metadata()
-        collector.match_and_add_metadata_dimensions(test_metadata_key, attention_cte_metadata_list)
-
-        compiler_args = CompilerArgs(logical_nc_config=1)
-        self.run_attention_cte_test(
-            test_manager=test_manager,
-            compiler_args=compiler_args,
-            collector=collector,
-            bool_dims={
-                CAUSAL_MASK_DIM_NAME: causal_mask,
-                TP_Q_DIM_NAME: tp_q,
-                TP_K_DIM_NAME: tp_k,
-                TP_OUT_DIM_NAME: tp_out,
-                SINK_DIM_NAME: sink,
-            },
-            bs=bs,
-            bs_kv=bs // gqa_factor,
-            cache_softmax=False,
-            cp_degree=cp_degree,
-            d=d,
-            dtype=nl.bfloat16,
-            seqlen_kv=seqlen_kv,
-            seqlen_kv_prior=seqlen_kv_prior,
-            prior_used_len=prior_used_len,
-            seqlen_q=seqlen_q,
-            sliding_window=sliding_window,
-            softmax_scale=1.0,
-            cp_rank_id=cp_rank_id,
-            use_cp=True,
-            cp_strided_q_slicing=False,
-        )
-
-    # fmt: off
-    attention_cte_seq_pack_unit_params = "lnc_degree, bs, bs_kv, seqlen, d, softmax_scale, dtype, causal_mask, tp_q, tp_out, sliding_window, n_packed_sequences"
+    attention_cte_seq_pack_unit_params = "lnc_degree, bs, bs_kv, seqlen, d, softmax_scale, dtype, causal_mask, tp_q, tp_k, tp_out, sliding_window, n_packed_sequences"
     attention_cte_seq_pack_unit_perms = [
-        # No causal mask (MHA)
-        [1, 1, 1, 2048, 96, 1.0, np.float32, False, True, False, 0, 4],
-        [1, 1, 1, 2048, 96, 1.0, np.float32, False, True, False, 0, 8],
-        [1, 1, 1, 4096, 128, 1.0, nl.bfloat16, False, False, True, 0, 4],
-        [2, 2, 2, 2048, 96, 1.0, nl.bfloat16, False, False, True, 0, 4],
+        # ── No causal mask (MHA) ──────────────────────────────────────────
+        [1, 1, 1, 2048, 96,  1.0, np.float32,   False, True,  False, False, 0,   4],
+        [1, 1, 1, 2048, 96,  1.0, np.float32,   False, True,  False, False, 0,   8],
+        [1, 1, 1, 4096, 128, 1.0, nl.bfloat16,  False, False, False, True,  0,   4],
+        [2, 2, 2, 2048, 96,  1.0, nl.bfloat16,  False, False, False, True,  0,   4],
 
-        # With causal mask (MHA)
-        [1, 1, 1, 2048, 96, 1.0, np.float32, True, True, False, 0, 4],
-        [1, 1, 1, 2048, 96, 1.0, np.float32, True, True, False, 0, 8],
-        [1, 1, 1, 512, 128, 1.0, nl.bfloat16, True, False, True, 0, 4],
-        [2, 2, 2, 2048, 96, 1.0, nl.bfloat16, True, False, True, 0, 4],
+        # ── With causal mask (MHA) ────────────────────────────────────────
+        [1, 1, 1, 2048, 96,  1.0, np.float32,   True,  True,  False, False, 0,   4],
+        [1, 1, 1, 2048, 96,  1.0, np.float32,   True,  True,  False, False, 0,   8],
+        [1, 1, 1, 512,  128, 1.0, nl.bfloat16,  True,  False, False, True,  0,   4],
+        [2, 2, 2, 2048, 96,  1.0, nl.bfloat16,  True,  False, False, True,  0,   4],
 
-        # GQA (bs_kv < bs)
-        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16, False, False, True, 0, 4],
-        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16, True, True, False, 0, 4],
-        [2, 6, 2, 2048, 96, 1.0, nl.bfloat16, True, False, True, 0, 4],
+        # ── GQA (bs_kv < bs) ─────────────────────────────────────────────
+        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16,  False, False, False, True,  0,   4],
+        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16,  True,  True,  False, False, 0,   4],
+        [2, 6, 2, 2048, 96,  1.0, nl.bfloat16,  True,  False, False, True,  0,   4],
 
-        # SWA (sliding_window > 0, requires causal_mask)
-        [1, 1, 1, 2048, 96, 1.0, np.float32, True, True, False, 512, 4],
-        [1, 1, 1, 2048, 128, 1.0, nl.bfloat16, True, False, True, 256, 4],
+        # ── SWA (sliding_window > 0, requires causal_mask) ────────────────
+        [1, 1, 1, 2048, 96,  1.0, np.float32,   True,  True,  False, False, 512, 4],
+        [1, 1, 1, 2048, 128, 1.0, nl.bfloat16,  True,  False, False, True,  256, 4],
 
-        # GQA + SWA
-        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16, True, False, True, 512, 4],
-        [2, 4, 2, 2048, 96, 1.0, nl.bfloat16, True, True, False, 256, 4],
+        # ── GQA + SWA ────────────────────────────────────────────────────
+        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16,  True,  False, False, True,  512, 4],
+        [2, 4, 2, 2048, 96,  1.0, nl.bfloat16,  True,  True,  False, False, 256, 4],
+
+        # ── VE GQA ───────────────────────────────────────────────────────
+        [1, 2, 1, 2048, 128, 1.0, nl.bfloat16,  False, True,  False, False, 0,   4],
+        [1, 4, 1, 2048, 128, 1.0, nl.bfloat16,  False, True,  False, True,  0,   4],
+        [1, 4, 2, 2048, 128, 1.0, nl.bfloat16,  False, False, False, True,  0,   4],
+        [1, 6, 2, 1024, 96,  1.0, nl.bfloat16,  False, True,  False, False, 0,   4],
+        [1, 9, 3, 2048, 128, 1.0, nl.bfloat16,  False, True,  True,  True,  0,   4],
+        [2, 4, 1, 2048, 128, 1.0, nl.bfloat16,  False, True,  False, True,  0,   4],
+        [2, 6, 2, 2048, 96,  1.0, nl.bfloat16,  False, True,  False, False, 0,   8],
+        [2, 8, 1, 4096, 128, 1.0, nl.bfloat16,  False, True,  True,  True,  0,   4],
+
+        # ── VE Vision (Llama4 / ViT-like) ────────────────────────────────
+        [2, 1, 1, 4096,  128, 1.0, nl.bfloat16, False, True,  False, True,  0,   4],
+        [2, 1, 1, 10240, 128, 1.0, nl.bfloat16, False, True,  False, True,  0,   4],
+        [2, 1, 1, 10240, 128, 1.0, nl.bfloat16, False, False, False, False, 0,   8],
+        [2, 2, 1, 4096,  128, 1.0, nl.bfloat16, False, True,  False, True,  0,   4],
+        [2, 8, 1, 4096,  128, 1.0, nl.bfloat16, False, True,  False, True,  0,   4],
+        [2, 8, 1, 4096,  128, 1.0, nl.bfloat16, False, True,  True,  True,  0,   4],
+        [2, 2, 2, 896,   128, 1.0, nl.bfloat16, False, True,  True,  True,  0,   4],
+        [2, 3, 3, 896,   128, 1.0, nl.bfloat16, False, True,  True,  True,  0,   4],
+
+        # ── VE Many packed sequences ─────────────────────────────────────
+        [1, 1, 1, 2048, 128, 1.0, nl.bfloat16,  False, True,  False, False, 0,   16],
+        [1, 1, 1, 2048, 128, 1.0, nl.bfloat16,  False, True,  False, False, 0,   32],
+        [1, 1, 1, 4096, 128, 1.0, nl.bfloat16,  False, True,  False, True,  0,   16],
+        [2, 1, 1, 4096, 128, 1.0, nl.bfloat16,  False, True,  False, True,  0,   32],
+        [2, 2, 2, 2048, 96,  1.0, nl.bfloat16,  False, False, False, False, 0,   16],
     ]
     # fmt: on
 
-    @pytest.mark.parametrize(attention_cte_seq_pack_unit_params, attention_cte_seq_pack_unit_perms)
+    @pytest_parametrize(
+        attention_cte_seq_pack_unit_params, attention_cte_seq_pack_unit_perms, abbrevs=_ATTN_CTE_ABBREVS
+    )
     def test_attention_cte_seq_pack_unit(
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         lnc_degree,
         bs,
         bs_kv,
@@ -2161,12 +2191,13 @@ class TestRangedAttentionCTEKernels:
         dtype,
         causal_mask,
         tp_q,
+        tp_k,
         tp_out,
         sliding_window,
         n_packed_sequences,
     ):
         np.random.seed(42)
-        compiler_args = CompilerArgs(logical_nc_config=lnc_degree)
+        compiler_args = CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
         self.run_attention_cte_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -2175,7 +2206,7 @@ class TestRangedAttentionCTEKernels:
                 CAUSAL_MASK_DIM_NAME: causal_mask,
                 TP_Q_DIM_NAME: tp_q,
                 TP_OUT_DIM_NAME: tp_out,
-                TP_K_DIM_NAME: False,
+                TP_K_DIM_NAME: tp_k,
                 SINK_DIM_NAME: False,
             },
             bs=bs,
@@ -2193,3 +2224,88 @@ class TestRangedAttentionCTEKernels:
             use_cp=False,
             n_packed_sequences=n_packed_sequences,
         )
+
+
+@pytest_marks(["attention", "cte", "model", "mx"])
+@final
+class TestAttentionCteModel:
+    """Model-driven tests for Attention CTE kernel, organized by tier."""
+
+    _ATTN_MODEL_PARAMS = "bs, gqa_factor, seqlen_kv, seqlen_kv_prior, prior_used_len, cp_degree, cp_rank_id, d, sliding_window, causal_mask, tp_q, tp_k, tp_out, sink"
+
+    _OPTIMAL_PARAMS, _OPTIMAL_IDS = (
+        prepare_model_parametrize({ModelTestType.OPTIMAL: attention_cte_model_configs.get(ModelTestType.OPTIMAL, [])})
+        if attention_cte_model_configs
+        else ([], [])
+    )
+
+    def _run_model_test(self, **kwargs):
+        """Common test logic for model tiers."""
+        test_manager = kwargs["test_manager"]
+        collector = kwargs["collector"]
+        platform_target = kwargs["platform_target"]
+        bs = kwargs["bs"]
+        gqa_factor = kwargs["gqa_factor"]
+        seqlen_kv = kwargs["seqlen_kv"]
+        cp_degree = kwargs["cp_degree"]
+        cp_rank_id = kwargs["cp_rank_id"]
+        d = kwargs["d"]
+        sliding_window = kwargs["sliding_window"]
+
+        seqlen_q = seqlen_kv // cp_degree
+        use_cp = cp_degree > 1
+        cp_strided_q_slicing = cp_degree > 1
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        TestRangedAttentionCTEKernels().run_attention_cte_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            collector=collector,
+            bool_dims={
+                CAUSAL_MASK_DIM_NAME: kwargs["causal_mask"],
+                TP_Q_DIM_NAME: kwargs["tp_q"],
+                TP_K_DIM_NAME: kwargs["tp_k"],
+                TP_OUT_DIM_NAME: kwargs["tp_out"],
+                SINK_DIM_NAME: kwargs["sink"],
+            },
+            bs=bs,
+            bs_kv=bs // gqa_factor,
+            cache_softmax=False,
+            cp_degree=cp_degree,
+            d=d,
+            dtype=nl.bfloat16,
+            seqlen_kv=seqlen_kv,
+            seqlen_kv_prior=kwargs["seqlen_kv_prior"],
+            prior_used_len=kwargs["prior_used_len"],
+            seqlen_q=seqlen_q,
+            sliding_window=sliding_window,
+            softmax_scale=1.0,
+            cp_rank_id=cp_rank_id,
+            use_cp=use_cp,
+            cp_strided_q_slicing=cp_strided_q_slicing,
+        )
+
+    @pytest.mark.optimal
+    @pytest.mark.parametrize(_ATTN_MODEL_PARAMS, _OPTIMAL_PARAMS, ids=_OPTIMAL_IDS)
+    def test_optimal(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        gqa_factor,
+        seqlen_kv,
+        seqlen_kv_prior,
+        prior_used_len,
+        cp_degree,
+        cp_rank_id,
+        d,
+        sliding_window,
+        causal_mask,
+        tp_q,
+        tp_k,
+        tp_out,
+        sink,
+    ):
+        """OPTIMAL: Performance-optimized model configs."""
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        self._run_model_test(**kwargs)

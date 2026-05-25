@@ -151,10 +151,14 @@ def moe_cte_torch_ref(
         local_hidden = hidden_work[local_ids].float()
         local_affinities = affinities_2d[local_ids, expert_idx].unsqueeze(1).to(hidden_states.dtype)
 
-        if expert_affinities_scaling_mode in [
-            ExpertAffinityScaleMode.PRE_SCALE,
-            ExpertAffinityScaleMode.PRE_SCALE_DELAYED,
-        ]:
+        if (
+            expert_affinities_scaling_mode
+            in [
+                ExpertAffinityScaleMode.PRE_SCALE,
+                ExpertAffinityScaleMode.PRE_SCALE_DELAYED,
+            ]
+            and not expert_affinity_multiply_on_I
+        ):
             local_hidden = local_affinities * local_hidden
 
         if expert_idx >= E:
@@ -191,6 +195,10 @@ def moe_cte_torch_ref(
         # Activation + element-wise multiply
         intermediate = torch_act_fn(gate_act, activation_function) * up_act
 
+        # Apply affinity on intermediate if multiply_on_I
+        if expert_affinity_multiply_on_I:
+            intermediate = intermediate * local_affinities
+
         # Down projection: [B, I_TP] @ [I_TP_padded, H] -> [B, H]
         down_act = torch.matmul(intermediate, down_w[expert_idx])
 
@@ -203,13 +211,17 @@ def moe_cte_torch_ref(
 
         # Apply down bias
         if down_proj_bias is not None:
-            down_act += down_proj_bias[expert_idx]
+            if expert_affinity_multiply_on_I:
+                # When affinity is applied on I, bias must also be scaled by affinity
+                down_act += down_proj_bias[expert_idx] * local_affinities
+            else:
+                down_act += down_proj_bias[expert_idx]
 
         if do_checkpoint:
             ckpt_down[b_idx] = down_act
 
         # Apply expert affinity scaling
-        if expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
+        if expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE and not expert_affinity_multiply_on_I:
             scaled = down_act * local_affinities
         else:
             scaled = down_act
@@ -240,3 +252,186 @@ def moe_cte_torch_ref(
         if not expert_affinity_multiply_on_I:
             result["down_activations"] = ckpt_down
     return result
+
+
+def moe_cte_unified_torch_ref(
+    hidden_states,
+    expert_affinities_masked,
+    gate_up_proj_weight,
+    down_proj_weight,
+    token_position_to_id,
+    block_to_expert,
+    block_size: int,
+    spec,
+    conditions=None,
+    gate_and_up_proj_bias=None,
+    down_proj_bias=None,
+    quantization_config=None,
+    gate_up_proj_scale=None,
+    down_proj_scale=None,
+    gate_up_activations_T=None,
+    down_activations=None,
+    activation_function: ActFnType = ActFnType.SiLU,
+    skip_dma: SkipMode = SkipMode(False, False),
+    compute_dtype=None,
+    is_tensor_update_accumulating: bool = True,
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
+    gate_clamp_upper_limit=None,
+    gate_clamp_lower_limit=None,
+    up_clamp_upper_limit=None,
+    up_clamp_lower_limit=None,
+) -> dict:
+    """
+    PyTorch reference for the unified moe_cte() entry point.
+
+    Signature matches moe_cte() exactly. Extracts implementation-specific params
+    from spec and quantization_config, then delegates to moe_cte_torch_ref.
+
+    Args:
+        spec: MoECTESpec with implementation type and config
+        quantization_config: QuantizationConfig with optional scales
+        (all other args match moe_cte() signature)
+
+    Returns:
+        dict with 'output' and optionally 'gate_up_activations_T', 'down_activations'
+    """
+    from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import BWMMFunc
+
+    from .moe_cte import MoECTEImplementation
+
+    # Map MoECTEImplementation -> BWMMFunc
+    impl_to_bwmm = {
+        MoECTEImplementation.shard_on_block: BWMMFunc.SHARD_ON_BLOCK,
+        MoECTEImplementation.shard_on_i: BWMMFunc.SHARD_ON_INTERMEDIATE,
+        MoECTEImplementation.shard_on_i_hybrid: BWMMFunc.SHARD_ON_INTERMEDIATE_HW,
+        MoECTEImplementation.shard_on_i_dropping: BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING,
+    }
+
+    # Extract scales: direct params take precedence over quantization_config
+    if gate_up_proj_scale is None and quantization_config is not None:
+        gate_up_proj_scale = quantization_config.gate_up_proj_scale
+    if down_proj_scale is None and quantization_config is not None:
+        down_proj_scale = quantization_config.down_proj_scale
+    # Convert numpy arrays to torch tensors (torch_ref_wrapper doesn't recurse into dataclasses)
+    import numpy as np
+
+    if isinstance(gate_up_proj_scale, np.ndarray):
+        gate_up_proj_scale = torch.from_numpy(gate_up_proj_scale.astype(np.float32))
+    if isinstance(down_proj_scale, np.ndarray):
+        down_proj_scale = torch.from_numpy(down_proj_scale.astype(np.float32))
+
+    # Extract config from spec
+    checkpoint_activation = False
+    expert_affinity_multiply_on_I = False
+    if spec.shard_on_I is not None:
+        checkpoint_activation = spec.shard_on_I.checkpoint_activation
+        expert_affinity_multiply_on_I = spec.shard_on_I.expert_affinity_multiply_on_I
+
+    impl = spec.implementation
+
+    # MX path: dequantize weights to fp32, then delegate to existing torch ref
+    if impl in (
+        MoECTEImplementation.shard_on_block_mx,
+        MoECTEImplementation.shard_on_i_mx,
+        MoECTEImplementation.shard_on_i_mx_hybrid,
+    ):
+        import numpy as np
+
+        from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import _mx_internal_data
+
+        internal = _mx_internal_data.get(id(spec))
+        if internal is None:
+            raise ValueError("MX path requires '_internal' in _mx_internal_data (set by input generator)")
+
+        # Get fp32 weights stored during input generation (exact dequantized equivalents)
+        gup_fp32 = internal['gate_up_proj_weights_fp32']  # (E*128, 2*n_H512_tile*I_TP*4)
+        down_fp32 = internal['down_proj_weights_fp32']  # (E*I_TP_par_dim, n_I512_tile*H*4)
+
+        E = gate_up_proj_weight.shape[0]
+        H = hidden_states.shape[-1] if isinstance(hidden_states, torch.Tensor) else hidden_states.shape[-1]
+        # Infer I_TP from fp32 weight size: total = E*2*I_TP*H
+        total_gup = gup_fp32.size
+        I_TP = total_gup // (E * 2 * H)
+
+        # Reshape to standard layout [E, H, 2, I_TP]
+        gup_reshaped = gup_fp32.reshape(E, H, 2 * I_TP).reshape(E, H, 2, I_TP)
+        gup_torch = torch.from_numpy(gup_reshaped.astype(np.float32))
+
+        # Down: total = E*I_TP*H elements
+        down_reshaped = down_fp32.reshape(E, I_TP, H)
+        down_torch = torch.from_numpy(down_reshaped.astype(np.float32))
+
+        # Map to BWMMFunc for torch ref
+        mx_to_bwmm = {
+            MoECTEImplementation.shard_on_block_mx: BWMMFunc.SHARD_ON_BLOCK,
+            MoECTEImplementation.shard_on_i_mx: BWMMFunc.SHARD_ON_INTERMEDIATE,
+            MoECTEImplementation.shard_on_i_mx_hybrid: BWMMFunc.SHARD_ON_INTERMEDIATE_HW,
+        }
+        bwmm_func = mx_to_bwmm[impl]
+        top_k = 2 if is_tensor_update_accumulating else 1
+
+        return moe_cte_torch_ref(
+            hidden_states=hidden_states,
+            expert_affinities_masked=expert_affinities_masked,
+            gate_up_proj_weight=gup_torch,
+            down_proj_weight=down_torch,
+            token_position_to_id=token_position_to_id,
+            block_to_expert=block_to_expert,
+            block_size=block_size,
+            bwmm_func=bwmm_func,
+            lnc_degree=2,
+            conditions=conditions,
+            gate_and_up_proj_bias=None,  # MX bias has different layout, skip for now
+            down_proj_bias=None,
+            gate_up_proj_scale=None,
+            down_proj_scale=None,
+            activation_function=activation_function,
+            skip_dma=skip_dma,
+            compute_dtype=compute_dtype,
+            is_tensor_update_accumulating=is_tensor_update_accumulating,
+            expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+            gate_clamp_upper_limit=gate_clamp_upper_limit,
+            gate_clamp_lower_limit=gate_clamp_lower_limit,
+            up_clamp_upper_limit=up_clamp_upper_limit,
+            up_clamp_lower_limit=up_clamp_lower_limit,
+            checkpoint_activation=checkpoint_activation,
+            expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
+            top_k=top_k,
+        )
+
+    # Non-MX path: delegate to existing torch ref
+    bwmm_func = impl_to_bwmm.get(impl)
+    if bwmm_func is None:
+        raise ValueError(f"No BWMMFunc mapping for {impl}")
+
+    # Infer top_k for torch ref: exact value doesn't matter, only whether > 1
+    top_k = 2 if is_tensor_update_accumulating else 1
+
+    return moe_cte_torch_ref(
+        hidden_states=hidden_states,
+        expert_affinities_masked=expert_affinities_masked,
+        gate_up_proj_weight=gate_up_proj_weight,
+        down_proj_weight=down_proj_weight,
+        token_position_to_id=token_position_to_id,
+        block_to_expert=block_to_expert,
+        block_size=block_size,
+        bwmm_func=bwmm_func,
+        lnc_degree=2,
+        conditions=conditions,
+        gate_and_up_proj_bias=gate_and_up_proj_bias,
+        down_proj_bias=down_proj_bias,
+        gate_up_proj_scale=gate_up_proj_scale,
+        down_proj_scale=down_proj_scale,
+        activation_function=activation_function,
+        skip_dma=skip_dma,
+        compute_dtype=compute_dtype,
+        is_tensor_update_accumulating=is_tensor_update_accumulating,
+        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
+        checkpoint_activation=checkpoint_activation,
+        expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
+        top_k=top_k,
+    )

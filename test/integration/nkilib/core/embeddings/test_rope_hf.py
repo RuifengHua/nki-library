@@ -17,18 +17,19 @@ Tests for rope_hf kernel (HuggingFace format) implementation
 with various batch sizes, head configurations, and dtypes.
 """
 
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.embeddings.rope_hf import rope_hf
 from nkilib_src.nkilib.core.embeddings.rope_hf_torch import rope_hf_torch_ref
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # Constants
 PMAX = 128  # nl.tile_size.pmax
@@ -86,10 +87,8 @@ def _generate_inputs(batch_size, num_q_heads, num_kv_heads, seq_len, head_dim, d
 
 
 @final
-@pytest_test_metadata(
-    name="RoPE HF Format",
-    pytest_marks=["embeddings", "rope", "hf_format"],
-)
+@pytest_test_metadata(name="RoPE HF Format")
+@pytest_marks(["embeddings", "rope", "hf_format"])
 class TestRopeHFKernel:
     """Test class for rope kernel with HuggingFace format."""
 
@@ -99,6 +98,7 @@ class TestRopeHFKernel:
     def test_rope_hf_lnc(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         batch_size,
         num_q_heads,
         num_kv_heads,
@@ -131,7 +131,9 @@ class TestRopeHFKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(enable_birsim=False, logical_nc_config=lnc_count),
+            compiler_args=CompilerArgs(
+                enable_birsim=False, logical_nc_config=lnc_count, platform_target=platform_target
+            ),
             rtol=1e-6,
             atol=1e-6,
             is_negative_test=is_negative,
@@ -141,6 +143,7 @@ class TestRopeHFKernel:
     def test_rope_hf_cache(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         batch_size,
         num_q_heads,
         num_kv_heads,
@@ -173,7 +176,9 @@ class TestRopeHFKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(enable_birsim=False, logical_nc_config=lnc_count),
+            compiler_args=CompilerArgs(
+                enable_birsim=False, logical_nc_config=lnc_count, platform_target=platform_target
+            ),
             rtol=1e-6,
             atol=1e-6,
             is_negative_test=is_negative,

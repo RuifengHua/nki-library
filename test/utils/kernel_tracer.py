@@ -17,19 +17,16 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 import numpy as np
-from nki.compiler.frontend import NKIFrontend, ParserFrontend
+from nki.compiler.driver import compile_to_bir
+from nki.compiler.frontend import ParserFrontend, TracerFrontend
+from nki.compiler.ncc_driver import CompileOptions, compile_bir_to_neff
 
-# from neuronxcc.nki_standalone import (
-#     NKI_IR_VERSION,
-#     _compile_nki_ir_to_tensorizer_ir,
-#     _write_tensorizer_ir,
-#     compile_nki_ir_kernel_to_neff,
-# )
 from .common_dataclasses import (
     CompilerArgs,
     CustomValidatorWithOutputTensorData,
     GoldenTensorDict,
     KernelArgs,
+    NKICompilationMode,
     PerRankLazyInputGenerator,
     SeparationPassMode,
     TraceMode,
@@ -43,7 +40,7 @@ DEFAULT_COMPILER_DEBUG_FLAGS = [
 ]
 
 DUMP_AFTER_LOWERING_FLAGS = [
-    "--internal-backend-options='--print-format=condensed --print-after=translate_nki_ast_to_bir,lower_klir_kernel'",
+    "--internal-backend-options=--print-format=condensed --print-after=translate_nki_ast_to_bir,lower_klir_kernel",
 ]
 
 DEFAULT_COMPILER_FLAGS = [
@@ -67,7 +64,7 @@ def __construct_additional_arguments__(
         rtol = validation_args.relative_accuracy if validation_args else ValidationArgs.relative_accuracy
         rtol_percent = 100 * rtol
         birsim_flags = [
-            f"--internal-backend-options='--enable-birsim=True --enable-birsim-at-begin=False --enable-birsim-after-all=False --enable-birsim-at-end=True --birsim-output-tolerance {rtol_percent},{atol}'"
+            f"--internal-backend-options=--enable-birsim=True --enable-birsim-at-begin=False --enable-birsim-after-all=False --enable-birsim-at-end=True --birsim-output-tolerance {rtol_percent},{atol}"
         ]
         additional_args.extend(birsim_flags)
 
@@ -167,30 +164,12 @@ def compile_kernel_to_neff(kernel_under_test: KernelArgs, output_directory: str)
     )
 
 
-# def trace_kernel(
-#     kernel_under_test: KernelArgs,
-#     mode: TraceMode,
-#     output_directory,
-# ):
-#     if mode == TraceMode.TraceOnly:
-#         trace_kernel_only(kernel_under_test, output_directory)
-#     elif mode in (TraceMode.CompileOnly, TraceMode.CompileAndInfer):
-#         compile_kernel_to_neff(kernel_under_test, output_directory)
-#     else:  # Simulator
-#         assert (
-#             False
-#         ), f"Simulator mode not yet supported. Please use {TraceMode.CompileOnly} or {TraceMode.CompileAndInfer}"
-#         # kwargs.update(kernel_input)
-#         # return simulate_kernel(kernel_func, **kwargs)
-
-
 def trace_kernel(
     kernel_under_test: KernelArgs,
     mode: TraceMode,
     output_directory,
     *,
-    frontend: NKIFrontend = ParserFrontend(),
-    dump_python_ast: bool = False,
+    frontendMode,
     output_names: list[str] | None = None,
 ) -> Optional[object]:
     """Compile NKI kernel to MLIR, and optionally to NEFF.
@@ -201,7 +180,17 @@ def trace_kernel(
 
     Returns a CompiledKernel for CompileAndInfer mode, None otherwise.
     """
-    assert isinstance(frontend, ParserFrontend), "must use ParserFrontend for now!"
+    if frontendMode == NKICompilationMode.parser:
+        frontend = ParserFrontend()
+    elif frontendMode == NKICompilationMode.tracer:
+        frontend = TracerFrontend()
+    else:
+        raise RuntimeError(f"Unrecognized NKI compilation mode: {frontendMode}, only valid modes are tracer and parser")
+
+    enable_device_dump = kernel_under_test.compiler_input.enable_device_dump
+    if enable_device_dump:
+        # ParserFrontend doesn't support device_dump, switch to TracerFrontend
+        frontend = TracerFrontend()
 
     # Build cleaned input dict (strip .must_alias_input suffixes)
     cleaned_input = {}
@@ -215,42 +204,44 @@ def trace_kernel(
     platform_target = str(kernel_under_test.compiler_input.platform_target.get_compile_target())
     grid = kernel_under_test.compiler_input.logical_nc_config
 
-    # Python → MLIR via NKIFrontend.compile()
-    result = frontend.compile(
-        kernel_under_test.kernel_func,
-        inputs=cleaned_input,
-        target=platform_target,
-        lnc=grid,
-        artifacts_dir=output_directory,
-        dump_python_ast=dump_python_ast,
-        output_names=output_names,
-    )
-
-    # Write MLIR artifact in debug mode
+    test_additional_cmd_args = list(kernel_under_test.compiler_input.additional_cmd_args)
     if kernel_under_test.compiler_input.enable_debugging:
-        mlir_path = os.path.join(output_directory, "module.mlir")
-        with open(mlir_path, "w") as f:
-            result.module.operation.print(file=f, enable_debug_info=True, use_local_scope=True)
+        test_additional_cmd_args.extend(DEFAULT_COMPILER_DEBUG_FLAGS)
+    if kernel_under_test.compiler_input.separation_pass_mode != SeparationPassMode.NONE:
+        test_additional_cmd_args.append(
+            f"--internal-enable-separate-load-and-compute={kernel_under_test.compiler_input.separation_pass_mode.value}"
+        )
+    if kernel_under_test.compiler_input.dump_after_lowering:
+        test_additional_cmd_args.extend(DUMP_AFTER_LOWERING_FLAGS)
 
-    if mode not in (TraceMode.CompileOnly, TraceMode.CompileAndInfer):
-        return None
-
-    # MLIR → NEFF via CompiledKernel.from_frontend()
-    from nki.compiler.ncc_driver import CompiledKernel, CompileOptions
-
-    logging.info("Compiling MLIR to NEFF for hardware execution")
-
-    test_additional_cmd_args = kernel_under_test.compiler_input.additional_cmd_args
     compile_opts = CompileOptions(
         target=platform_target,
         lnc=grid,
         output_path=os.path.join(output_directory, "file.neff"),
         artifacts_dir=os.path.join(output_directory, "artifacts"),
         neuronx_cc_args=tuple(test_additional_cmd_args),
+        enable_device_dump=enable_device_dump,
     )
     compile_opts = compile_opts.disable_backend_optimizations()
 
-    compiled = CompiledKernel.from_frontend(result, compile_opts)
+    result = compile_to_bir(
+        kernel_func=kernel_under_test.kernel_func,
+        frontend=frontend,
+        inputs=cleaned_input,
+        compile_opts=compile_opts,
+        output_names=output_names,
+    )
+
+    if mode not in (TraceMode.CompileOnly, TraceMode.CompileAndInfer, TraceMode.Debugger):
+        return None
+
+    argument_names = [s.name for s in result.descriptor.input_specs]
+    output_arg_names = [s.name for s in result.descriptor.output_specs]
+
+    compiled = compile_bir_to_neff(compile_opts, result, [], argument_names, output_arg_names)
+
+    logging.info("MLIR to BIR compiled in %.2fs", compiled.mlir_time)
+    logging.info("BIR to NEFF compiled in %.2fs", compiled.neuronx_cc_time)
 
     if not os.path.exists(compiled.neff_path):
         raise RuntimeError(f"NEFF file not found at {compiled.neff_path}")

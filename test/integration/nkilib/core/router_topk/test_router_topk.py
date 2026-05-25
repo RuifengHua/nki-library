@@ -16,19 +16,9 @@
 
 import itertools
 import random
-from test.integration.nkilib.core.router_topk.test_router_topk_common import (
-    generate_router_topk_inputs,
-    router_topk_kernel_wrapper,
-    router_topk_torch_wrapper,
-)
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 import pytest
+
 from nkilib_src.nkilib.core.router_topk.router_topk import (
     XHBMLayout_H_T__0,
     XHBMLayout_T_H__1,
@@ -37,6 +27,17 @@ from nkilib_src.nkilib.core.router_topk.router_topk import (
     XSBLayout_tp2013__1,
 )
 from nkilib_src.nkilib.core.utils.common_types import RouterActFnType
+from test.integration.nkilib.core.router_topk.test_router_topk_common import (
+    generate_router_topk_inputs,
+    router_topk_kernel_wrapper,
+    router_topk_torch_wrapper,
+)
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def _generate_test_cases():
@@ -222,10 +223,8 @@ def filter_illegal_combinations(
     return FilterResult.VALID
 
 
-@pytest_test_metadata(
-    name="Router Top-K",
-    pytest_marks=["router_topk", "moe"],
-)
+@pytest_test_metadata(name="Router Top-K")
+@pytest_marks(["router_topk", "moe"])
 class TestRouterTopkKernel:
     """Test class for router_topk using UnitTestFramework."""
 
@@ -234,6 +233,7 @@ class TestRouterTopkKernel:
     def test_router_topk(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         T: int,
         H: int,
         E: int,
@@ -301,7 +301,7 @@ class TestRouterTopkKernel:
 
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(),
+            compiler_args=CompilerArgs(platform_target=platform_target),
             rtol=2e-2,
             atol=1e-5,
         )
@@ -324,10 +324,12 @@ class TestRouterTopkKernel:
         shard_on_tokens=[True, False],
         filter=filter_illegal_combinations,
         coverage="pairs",
+        abbrev=_ABBREVS,
     )
     def test_router_topk_sweep(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         T,
         H,
         E,
@@ -397,7 +399,7 @@ class TestRouterTopkKernel:
 
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(),
+            compiler_args=CompilerArgs(platform_target=platform_target),
             rtol=2e-2,
             atol=1e-5,
             is_negative_test=is_negative_test_case,

@@ -62,6 +62,7 @@ from .moe_cte_mx_utils import (
     _psum_fmax,
     _q_height,
     _q_width,
+    apply_clamp,
     compute_hidden_index_vector,
     convert_to_mxfp_dtype,
     load_and_quantize_hidden_states,
@@ -92,7 +93,7 @@ MAX_BLOCK_SIZE = 1024
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def blockwise_mm_shard_intermediate_mx(
     hidden_states: nl.ndarray,
     expert_affinities_masked: nl.ndarray,
@@ -385,6 +386,7 @@ def blockwise_mm_shard_intermediate_mx(
             prj_cfg=prj_cfg,
             buffers=buffers,
             shard_id=SHARD_ID,
+            name_prefix=f"b{block_idx}_",
         )
 
         # Synchronize across shards (only needed for multi-shard)
@@ -397,7 +399,7 @@ def blockwise_mm_shard_intermediate_mx(
     return output
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def blockwise_mm_shard_intermediate_mx_hybrid(
     conditions: nl.ndarray,
     hidden_states: nl.ndarray,
@@ -702,6 +704,7 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
             buffers=buffers,
             shard_id=SHARD_ID,
             is_dynamic=False,
+            name_prefix=f"sb{block_idx}_",
         )
 
         # Synchronize across shards
@@ -746,6 +749,7 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
             buffers=buffers,
             shard_id=SHARD_ID,
             is_dynamic=True,
+            name_prefix="dynamic_",
         )
 
         # Synchronize across shards
@@ -804,6 +808,7 @@ def compute_one_block_mx(
     prj_cfg: ProjConfig,
     shard_id: Any,
     is_dynamic: bool = False,
+    name_prefix: str = "",
 ):
     """
     Process one block through the complete MXFP4/MXFP8 MoE MLP pipeline.
@@ -883,7 +888,12 @@ def compute_one_block_mx(
     # Step 4: Load MXFP4/MXFP8 weights and scales for assigned expert
     gate_and_up_weights, gate_and_up_scales, gup_bias, gup_token_indices_on_p, gup_n_quadrants_needed = (
         load_gup_weights_scales_shard_on_intermediate_mx(
-            inps, block_expert, dims, prj_cfg=prj_cfg, skip_dma=kernel_cfg.skip_dma
+            inps,
+            block_expert,
+            dims,
+            prj_cfg=prj_cfg,
+            skip_dma=kernel_cfg.skip_dma,
+            name_prefix=name_prefix,
         )
     )
 
@@ -896,8 +906,11 @@ def compute_one_block_mx(
         kernel_cfg.skip_dma,
         gup_token_indices_on_p=gup_token_indices_on_p,
         gup_n_quadrants_needed=gup_n_quadrants_needed,
+        name_prefix=name_prefix,
     )
-    down_bias_broadcasted = nl.ndarray((_pmax, dims.H), dtype=down_bias_sb.dtype, buffer=nl.sbuf)
+    down_bias_broadcasted = None
+    if down_bias_sb is not None:
+        down_bias_broadcasted = nl.ndarray((_pmax, dims.H), dtype=down_bias_sb.dtype, buffer=nl.sbuf)
     flatten_free_dim = prj_cfg.n_total_I512_tile_lnc_sharded * dims.B * _q_width
 
     if is_dynamic:
@@ -919,11 +932,13 @@ def compute_one_block_mx(
     # ═══════════════════════════════════════════════════════════════════════════
     gup_weights_reshaped = gate_and_up_weights.reshape((_pmax, 2 * prj_cfg.n_H512_tile, dims.I_lnc_sharded))
     gup_scales_reshaped = gate_and_up_scales.reshape((_pmax, 2 * prj_cfg.n_H512_tile, dims.I_lnc_sharded))
-    gup_bias_reshaped = gup_bias.reshape((_pmax, dims.num_shards * prj_cfg.n_total_I512_tile_lnc_sharded, _q_width))
+    gate_bias_view = None
+    if gup_bias:
+        gup_bias_reshaped = gup_bias.reshape((_pmax, dims.num_shards * prj_cfg.n_total_I512_tile_lnc_sharded, _q_width))
 
-    # Use TensorView to slice bias without tensor_copy
-    gup_bias_view = TensorView(gup_bias_reshaped)
-    gate_bias_view = gup_bias_view.slice(dim=1, start=0, end=prj_cfg.n_total_I512_tile_lnc_sharded)
+        # Use TensorView to slice bias without tensor_copy
+        gup_bias_view = TensorView(gup_bias_reshaped)
+        gate_bias_view = gup_bias_view.slice(dim=1, start=0, end=prj_cfg.n_total_I512_tile_lnc_sharded)
 
     gate_proj_out_sb = gate_up_projection_mx_tp_shard_I(
         hidden_qtz_sb=buffers.hidden_qtz_sb[:, :, :],
@@ -947,9 +962,11 @@ def compute_one_block_mx(
     # Step 6: UP PROJECTION - hidden @ up_weight + bias
     # ═══════════════════════════════════════════════════════════════════════════
     # Use TensorView to slice bias without tensor_copy
-    up_bias_view = gup_bias_view.slice(
-        dim=1, start=prj_cfg.n_total_I512_tile_lnc_sharded, end=2 * prj_cfg.n_total_I512_tile_lnc_sharded
-    )
+    up_bias_view = None
+    if gup_bias:
+        up_bias_view = gup_bias_view.slice(
+            dim=1, start=prj_cfg.n_total_I512_tile_lnc_sharded, end=2 * prj_cfg.n_total_I512_tile_lnc_sharded
+        )
 
     up_proj_out_sb = gate_up_projection_mx_tp_shard_I(
         hidden_qtz_sb=buffers.hidden_qtz_sb,
@@ -982,7 +999,8 @@ def compute_one_block_mx(
                 use_dma_transpose=True,
             )
             # TODO: Consider using PE broadcast instead of stream_shuffle_broadcast for better performance
-            stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
+            if down_bias_sb is not None:
+                stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
         else:
             load_hidden_states_mx(
                 inps,
@@ -993,7 +1011,8 @@ def compute_one_block_mx(
                 use_dma_transpose=False,
             )
             # TODO: Consider using PE broadcast instead of stream_shuffle_broadcast for better performance
-            stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
+            if down_bias_sb is not None:
+                stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
             sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims)
 
         buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
@@ -1001,7 +1020,8 @@ def compute_one_block_mx(
 
     else:
         # TODO: Consider using PE broadcast instead of stream_shuffle_broadcast for better performance
-        stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
+        if down_bias_sb is not None:
+            stream_shuffle_broadcast(src=down_bias_sb, dst=down_bias_broadcasted)
         buffers.hidden_qtz_sb = buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
         buffers.hidden_scale_sb = buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
 
@@ -1073,7 +1093,12 @@ def compute_one_block_mx(
 
 
 def load_gup_weights_scales_shard_on_intermediate_mx(
-    inps: InputTensors, block_expert: nl.ndarray, dims: BWMMMXDimensionSizes, prj_cfg: ProjConfig, skip_dma: SkipMode
+    inps: InputTensors,
+    block_expert: nl.ndarray,
+    dims: BWMMMXDimensionSizes,
+    prj_cfg: ProjConfig,
+    skip_dma: SkipMode,
+    name_prefix: str = "",
 ):
     """
     Load gate and up projection weights, scales, and biases for current expert.
@@ -1166,6 +1191,7 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
         scale_factor=scale_shape[1],
         n_quadrants_needed=gup_n_quadrants_needed,
         n_remaining_partition=0,
+        name_prefix=f"{name_prefix}gup_eiv",
     )
     # gup_scale_view shape: (E*16, 2, n_H512_tile, I) - use FULL source tensor dimensions for strides
     # The source tensor has full n_H512_tile, we only load n_H512_tile elements
@@ -1195,56 +1221,59 @@ def load_gup_weights_scales_shard_on_intermediate_mx(
     """
     ## TODO: handle edge case when prj_cfg.n_I512_tile_lnc_sharded is odd
 
-    gup_bias_sb = nl.ndarray(
-        (_pmax, 2, prj_cfg.n_I512_tile_lnc_sharded, _q_width), dtype=inps.gate_and_up_proj_bias.dtype, buffer=nl.sbuf
-    )
+    gup_bias_sb = None
+    if inps.gate_and_up_proj_bias:
+        gup_bias_sb = nl.ndarray(
+            (_pmax, 2, prj_cfg.n_I512_tile_lnc_sharded, _q_width),
+            dtype=inps.gate_and_up_proj_bias.dtype,
+            buffer=nl.sbuf,
+        )
 
-    if dims.I < _pmax * _q_width:  # when I<512, gate/up bias HBM is not padded so pad it here
-        nisa.memset(dst=gup_bias_sb[:, :, 0, :], value=0.0)
-        # gate_and_up_proj_bias shape: (E, I_par_dim, 2, n_total_I512_tile, _q_width) where I_par_dim = I//4
-        I_par_dim = dims.I // 4
-        bias_stride_dim0 = 2 * prj_cfg.n_total_I512_tile * _q_width  # stride for I_par_dim
-        bias_stride_dim1 = prj_cfg.n_total_I512_tile * _q_width  # stride for gate/up (2)
-        bias_stride_dim2 = _q_width  # stride for n_total_I512_tile
-        static_offset = prj_cfg.n_I512_tile_lnc_sharded * bias_stride_dim2 * dims.shard_id
-        nisa.dma_copy(
-            dst=gup_bias_sb[:I_par_dim, :, :, :],
-            src=inps.gate_and_up_proj_bias.ap(
-                pattern=[
-                    [bias_stride_dim0, I_par_dim],
-                    [bias_stride_dim1, 2],
-                    [bias_stride_dim2, prj_cfg.n_I512_tile_lnc_sharded],
-                    [1, _q_width],
-                ],
-                offset=static_offset,
-                scalar_offset=block_expert,
-                indirect_dim=0,
-            ),
-            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
-        )
-    else:
-        # gate_and_up_proj_bias shape: (E, _pmax, 2, n_total_I512_tile, _q_width)
-        # Strides: dim1=2*n_total_I512_tile*_q_width, dim2=n_total_I512_tile*_q_width, dim3=_q_width, dim4=1
-        bias_stride_dim1 = 2 * prj_cfg.n_total_I512_tile * _q_width
-        bias_stride_dim2 = prj_cfg.n_total_I512_tile * _q_width
-        static_offset = _q_width * prj_cfg.n_I512_tile_lnc_sharded * dims.shard_id
-        nisa.dma_copy(
-            dst=gup_bias_sb,
-            src=inps.gate_and_up_proj_bias.ap(
-                pattern=[
-                    [bias_stride_dim1, _pmax],
-                    [bias_stride_dim2, 2],
-                    [_q_width, prj_cfg.n_I512_tile_lnc_sharded],
-                    [1, _q_width],
-                ],
-                offset=static_offset,
-                scalar_offset=block_expert,
-                indirect_dim=0,
-            ),
-            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-            dge_mode=dge_mode.hwdge,
-        )
+        if dims.I < _pmax * _q_width:  # when I<512, gate/up bias HBM is not padded so pad it here
+            nisa.memset(dst=gup_bias_sb[:, :, 0, :], value=0.0)
+            # gate_and_up_proj_bias shape: (E, I_par_dim, 2, n_total_I512_tile, _q_width) where I_par_dim = I//4
+            I_par_dim = dims.I // 4
+            bias_stride_dim0 = 2 * prj_cfg.n_total_I512_tile * _q_width  # stride for I_par_dim
+            bias_stride_dim1 = prj_cfg.n_total_I512_tile * _q_width  # stride for gate/up (2)
+            bias_stride_dim2 = _q_width  # stride for n_total_I512_tile
+            static_offset = prj_cfg.n_I512_tile_lnc_sharded * bias_stride_dim2 * dims.shard_id
+            nisa.dma_copy(
+                dst=gup_bias_sb[:I_par_dim, :, :, :],
+                src=inps.gate_and_up_proj_bias.ap(
+                    pattern=[
+                        [bias_stride_dim0, I_par_dim],
+                        [bias_stride_dim1, 2],
+                        [bias_stride_dim2, prj_cfg.n_I512_tile_lnc_sharded],
+                        [1, _q_width],
+                    ],
+                    offset=static_offset,
+                    scalar_offset=block_expert,
+                    indirect_dim=0,
+                ),
+                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+                dge_mode=dge_mode.hwdge,
+            )
+        else:
+            # gate_and_up_proj_bias shape: (E, _pmax, 2, n_total_I512_tile, _q_width)
+            bias_stride_dim1 = 2 * prj_cfg.n_total_I512_tile * _q_width
+            bias_stride_dim2 = prj_cfg.n_total_I512_tile * _q_width
+            static_offset = _q_width * prj_cfg.n_I512_tile_lnc_sharded * dims.shard_id
+            nisa.dma_copy(
+                dst=gup_bias_sb,
+                src=inps.gate_and_up_proj_bias.ap(
+                    pattern=[
+                        [bias_stride_dim1, _pmax],
+                        [bias_stride_dim2, 2],
+                        [_q_width, prj_cfg.n_I512_tile_lnc_sharded],
+                        [1, _q_width],
+                    ],
+                    offset=static_offset,
+                    scalar_offset=block_expert,
+                    indirect_dim=0,
+                ),
+                oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+                dge_mode=dge_mode.hwdge,
+            )
 
     return gup_weights_qtz_sb, inps.gup_scales_sb, gup_bias_sb, token_indices_on_p, gup_n_quadrants_needed
 
@@ -1258,6 +1287,7 @@ def load_down_proj_weights_shard_on_intermediate_mx(
     skip_dma: SkipMode,
     gup_token_indices_on_p: nl.ndarray = None,
     gup_n_quadrants_needed: int = None,
+    name_prefix: str = "",
 ):
     """
     Load down projection weights, scales, and biases for current expert.
@@ -1365,6 +1395,7 @@ def load_down_proj_weights_shard_on_intermediate_mx(
             scale_factor=scale_shape[1],
             n_quadrants_needed=down_n_quadrants_needed,
             n_remaining_partition=n_remaining_partition,
+            name_prefix=f"{name_prefix}down_eiv",
         )
     # down_scale_view shape: (E*16, n_total_I512_tile, H)
     # accumulated shape to right of dim 0: n_total_I512_tile * H
@@ -1387,15 +1418,17 @@ def load_down_proj_weights_shard_on_intermediate_mx(
 
     # load bias
     # down_proj_bias shape: (E, H)
-    down_bias_sb = nl.ndarray((1, dims.H), dtype=inps.down_proj_bias.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(
-        src=inps.down_proj_bias.ap(
-            pattern=[[dims.H, 1], [1, dims.H]], offset=0, scalar_offset=block_expert, indirect_dim=0
-        ),
-        dst=down_bias_sb,
-        oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
-        dge_mode=dge_mode.hwdge,
-    )
+    down_bias_sb = None
+    if inps.down_proj_bias:
+        down_bias_sb = nl.ndarray((1, dims.H), dtype=inps.down_proj_bias.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(
+            src=inps.down_proj_bias.ap(
+                pattern=[[dims.H, 1], [1, dims.H]], offset=0, scalar_offset=block_expert, indirect_dim=0
+            ),
+            dst=down_bias_sb,
+            oob_mode=oob_mode.skip if skip_dma.skip_weight else oob_mode.error,
+            dge_mode=dge_mode.hwdge,
+        )
 
     return down_scale_sb, down_bias_sb
 
@@ -1884,35 +1917,6 @@ def down_projection_mx_shard_I(
                     )
 
     return out_sb
-
-
-def apply_clamp(tensor, upper_limit, lower_limit):
-    """Apply optional upper and/or lower clamping to a tensor."""
-    p_dim, f_dim = tensor.shape
-
-    if upper_limit is not None and lower_limit is not None:
-        nisa.tensor_scalar(
-            dst=tensor[0:p_dim, 0:f_dim],
-            data=tensor[0:p_dim, 0:f_dim],
-            op0=nl.minimum,
-            operand0=upper_limit,
-            op1=nl.maximum,
-            operand1=lower_limit,
-        )
-    elif upper_limit is not None:
-        nisa.tensor_scalar(
-            dst=tensor[0:p_dim, 0:f_dim],
-            data=tensor[0:p_dim, 0:f_dim],
-            op0=nl.minimum,
-            operand0=upper_limit,
-        )
-    elif lower_limit is not None:
-        nisa.tensor_scalar(
-            dst=tensor[0:p_dim, 0:f_dim],
-            data=tensor[0:p_dim, 0:f_dim],
-            op0=nl.maximum,
-            operand0=lower_limit,
-        )
 
 
 def _down_proj_prep_inter_and_weights(

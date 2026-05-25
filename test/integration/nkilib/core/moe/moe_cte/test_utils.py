@@ -20,32 +20,26 @@ matrix multiplication kernel with MXFP4/MXFP8 quantization.
 """
 
 import hashlib
+import math
 import os
 import pickle
-from test.integration.nkilib.core.mlp.test_mlp_common import (
-    _down_proj_golden_mx,
-    _gate_up_proj_golden_mx,
-)
-from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
-    generate_token_position_to_id_and_experts,
-    get_n_blocks,
-    map_skip_mode,
-)
-from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
-from test.integration.nkilib.utils.test_kernel_common import (
-    act_fn_type2func,
-)
-from test.utils.mx_utils import is_mx_quantize
 from typing import Optional
 
 import nki.language as nl
 import numpy as np
+
 from nkilib_src.nkilib.core.moe.moe_cte.moe_cte_utils import SkipMode
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
     ExpertAffinityScaleMode,
 )
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
+from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
+    generate_token_position_to_id_and_experts,
+    get_n_blocks,
+    map_skip_mode,
+)
+from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
 
 # MXFP4 quantization block dimensions
 _q_width = 4  # quantization width
@@ -217,7 +211,195 @@ def _compute_golden_cache_key(
     return hashlib.sha256(key_str.encode()).hexdigest()[:16]
 
 
+def _generate_token_experts_by_count(
+    T: int,
+    E: int,
+    num_non_zero: int,
+    alpha: np.float32 = None,
+) -> np.ndarray:
+    """Generate a [T, E] binary matrix with exactly num_non_zero ones.
+
+    Args:
+        T: Number of tokens.
+        E: Number of experts.
+        num_non_zero: Total number of nonzero (token, expert) entries to place.
+        alpha: Skew parameter for expert selection. Larger alpha = more skewed. None = uniform.
+
+    Returns:
+        token_experts: [T, E] binary ndarray.
+    """
+    assert num_non_zero <= T * E, f"num_non_zero ({num_non_zero}) cannot exceed T*E ({T * E})"
+
+    np.random.seed(0)
+    token_experts = np.zeros((T, E))
+
+    if alpha is not None and alpha > 0:
+        expert_probs = np.random.dirichlet(np.ones(E) * (1.0 / alpha))
+    else:
+        expert_probs = np.ones(E) / E
+
+    placed = 0
+    while placed < num_non_zero:
+        t = np.random.randint(0, T)
+        e = np.random.choice(E, p=expert_probs)
+        if token_experts[t, e] == 0:
+            token_experts[t, e] = 1
+            placed += 1
+
+    return token_experts
+
+
 # Input Builder
+def build_moe_bwmm_mx_cte_from_model_test_config(
+    H: int,
+    T: int,
+    E: int,
+    B: int,
+    I_TP: int,
+    skewness_pct: float,
+    global_top_k: int,
+    ep_degree: int,
+    dtype=nl.bfloat16,
+    weight_dtype=nl.float4_e2m1fn_x4,
+    skip_mode: int = 0,
+    bias: bool = False,
+    activation_function: ActFnType = ActFnType.SiLU,
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
+    is_dynamic: bool = True,
+    vnc_degree: int = 2,
+    gate_clamp_upper_limit: Optional[float] = None,
+    gate_clamp_lower_limit: Optional[float] = None,
+    up_clamp_upper_limit: Optional[float] = None,
+    up_clamp_lower_limit: Optional[float] = None,
+    alpha: Optional[float] = None,
+    is_shard_on_I: bool = False,
+) -> dict:
+    """Build input tensors for MoE BWMM MX CTE model test configs using skewness-based routing.
+
+    Unlike build_moe_bwmm_mx_cte which uses TOPK-based routing, this function uses
+    skewness_pct, global_top_k, and ep_degree to control expert affinity distribution,
+    simulating realistic model routing patterns.
+
+    Args:
+        H: Hidden dimension size
+        T: Total number of tokens
+        E: Number of local experts (after EP sharding)
+        B: Block size (tokens per block)
+        I_TP: Intermediate size per TP degree
+        skewness_pct: Float in [0.0, 1.0] that interpolates between the best-case and
+            worst-case number of nonzero expert affinities:
+
+                num_non_zero = best + skewness_pct * (worst - best)
+
+            where:
+                best  = T * global_top_k / ep_degree   (perfectly balanced across EP shards)
+                worst = T * min(E, global_top_k)        (all tokens routed to every local expert)
+
+            Examples (T=4096, global_top_k=8, total_experts=128):
+                EP64 (E=2):
+                    best=512, worst=8192
+                    skew 0.0 → 512,  skew 0.5 → 4352,  skew 1.0 → 8192
+                EP8 (E=16):
+                    best=4096, worst=32768
+                    skew 0.0 → 4096, skew 1.0 → 32768
+        global_top_k: Global top-K experts per token before EP sharding
+        ep_degree: Expert parallelism degree
+        dtype: Data type for activations
+        weight_dtype: Data type for weights
+        skip_mode: DMA skip mode (0-3)
+        bias: Whether to include bias tensors
+        activation_function: Activation function type
+        expert_affinities_scaling_mode: Expert affinity scaling mode
+        is_dynamic: Whether to use dynamic loop
+        vnc_degree: LNC sharding degree
+        gate_clamp_upper_limit: Upper clamp limit for gate projection
+        gate_clamp_lower_limit: Lower clamp limit for gate projection
+        up_clamp_upper_limit: Upper clamp limit for up projection
+        up_clamp_lower_limit: Lower clamp limit for up projection
+        alpha: Expert distribution skew parameter for _generate_token_experts_by_count
+        is_shard_on_I: Whether to use shard-on-I variant
+
+    Returns:
+        Dictionary with all kernel input tensors and parameters
+    """
+    np.random.seed(0)
+
+    dma_skip = map_skip_mode(skip_mode)
+    is_block_parallel = not is_shard_on_I
+
+    # Compute N (total blocks) for skewness-based routing
+    n_block_per_iter_eff = vnc_degree if is_block_parallel else 1
+    N = math.ceil((T * min(E, global_top_k) - (E - 1)) / B) + E - 1
+    N = n_block_per_iter_eff * math.ceil(N / n_block_per_iter_eff)
+
+    # Compute num_non_zero expert affinities based on skewness
+    best = T * global_top_k // ep_degree
+    worst = T * min(E, global_top_k)
+    num_non_zero = int(best + skewness_pct * (worst - best))
+
+    # Generate token-expert assignments using count-based method
+    token_experts = _generate_token_experts_by_count(T, E, num_non_zero, alpha)
+
+    blocks_per_expert = np.ceil(token_experts.sum(0) / B).astype(np.int32)
+    n_padding_block = N - np.sum(blocks_per_expert)
+    blocks_per_expert[E - 1] += n_padding_block
+
+    cumulative_blocks_per_expert = np.cumsum(blocks_per_expert)
+    block_to_expert = np.arange(E).repeat(blocks_per_expert).astype(np.int32)
+
+    token_position_by_id_and_expert = np.cumsum(token_experts, axis=0)
+    expert_block_offsets = cumulative_blocks_per_expert * B
+    token_position_by_id_and_expert[:, 1:] += expert_block_offsets[:-1]
+    token_position_by_id_and_expert = np.where(token_experts, token_position_by_id_and_expert, 0).astype(np.int32)
+
+    if dma_skip.skip_token:
+        token_position_to_id = np.full((int(N * B + 1),), -1)
+    else:
+        token_position_to_id = np.full((int(N * B + 1),), T)
+
+    tokens_ids = np.arange(T)
+    token_position_to_id[token_position_by_id_and_expert] = np.expand_dims(tokens_ids, 1)
+    token_position_to_id = token_position_to_id[1:]
+    token_position_to_id = token_position_to_id.astype(np.int32)
+
+    # Generate conditions
+    if not is_block_parallel:
+        conditions = np.ones((N + 1,), dtype=np.int32)
+        conditions[-(n_padding_block + 1) :] = 0
+    else:
+        conditions = np.ones((N + 2,), dtype=np.int32)
+        conditions[-(n_padding_block + 2) :] = 0
+
+    num_static_block = math.ceil(math.ceil(T * global_top_k / ep_degree) / B)
+
+    return _build_kernel_input_from_routing(
+        H=H,
+        T=T,
+        E=E,
+        B=B,
+        I_TP=I_TP,
+        expert_masks=token_experts,
+        token_position_to_id=token_position_to_id,
+        block_to_expert=block_to_expert,
+        conditions=conditions,
+        N=N,
+        dma_skip=dma_skip,
+        dtype=dtype,
+        weight_dtype=weight_dtype,
+        bias=bias,
+        activation_function=activation_function,
+        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        is_tensor_update_accumulating=min(E, global_top_k) > 1,
+        is_dynamic=is_dynamic,
+        is_shard_on_I=is_shard_on_I,
+        n_static_blocks=num_static_block,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
+    )
+
+
 def build_moe_bwmm_mx_cte(
     H: int,
     T: int,
@@ -324,6 +506,80 @@ def build_moe_bwmm_mx_cte(
         quantize=weight_dtype,
     )
 
+    kernel_input = _build_kernel_input_from_routing(
+        H=H,
+        T=T,
+        E=E,
+        B=B,
+        I_TP=I_TP,
+        expert_masks=expert_masks,
+        token_position_to_id=token_position_to_id,
+        block_to_expert=block_to_expert,
+        conditions=conditions,
+        N=N,
+        dma_skip=dma_skip,
+        dtype=dtype,
+        weight_dtype=weight_dtype,
+        bias=bias,
+        activation_function=activation_function,
+        expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        is_tensor_update_accumulating=TOPK != 1,
+        is_dynamic=is_dynamic,
+        is_shard_on_I=is_shard_on_I,
+        n_dynamic_blocks=n_dynamic_blocks,
+        n_static_blocks=n_static_blocks,
+        gate_clamp_upper_limit=gate_clamp_upper_limit,
+        gate_clamp_lower_limit=gate_clamp_lower_limit,
+        up_clamp_upper_limit=up_clamp_upper_limit,
+        up_clamp_lower_limit=up_clamp_lower_limit,
+    )
+
+    # Cache the generated inputs for future reuse
+    if use_cache:
+        try:
+            os.makedirs(_GOLDEN_CACHE_DIR, exist_ok=True)
+            with open(cache_file, 'wb') as f:
+                pickle.dump(kernel_input, f)
+            print(f"Cached inputs saved to {cache_file}")
+        except Exception as e:
+            print(f"Warning: Failed to cache inputs to {cache_file}: {e}")
+
+    return kernel_input
+
+
+def _build_kernel_input_from_routing(
+    *,
+    H: int,
+    T: int,
+    E: int,
+    B: int,
+    I_TP: int,
+    expert_masks,
+    token_position_to_id,
+    block_to_expert,
+    conditions,
+    N: int,
+    dma_skip: SkipMode,
+    dtype,
+    weight_dtype,
+    bias: bool,
+    activation_function: ActFnType,
+    expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+    is_tensor_update_accumulating: bool,
+    is_dynamic: bool,
+    is_shard_on_I: bool,
+    n_dynamic_blocks: int = 55,
+    n_static_blocks: Optional[int] = None,
+    gate_clamp_upper_limit: Optional[float] = None,
+    gate_clamp_lower_limit: Optional[float] = None,
+    up_clamp_upper_limit: Optional[float] = None,
+    up_clamp_lower_limit: Optional[float] = None,
+) -> dict:
+    """Build kernel input tensors and dict from pre-computed routing assignments.
+
+    This is the shared implementation used by both build_moe_bwmm_mx_cte (TOPK routing)
+    and build_moe_bwmm_mx_cte_from_model_test_config (skewness routing).
+    """
     # Calculate MXFP4 tensor dimensions
     kernel_assert(H % (_pmax * _q_width) == 0, f"H must be divisible by {_pmax * _q_width}, got {H}")
     n_H512_tile = H // (_pmax * _q_width)
@@ -403,7 +659,7 @@ def build_moe_bwmm_mx_cte(
         'block_to_expert': block_to_expert,
         'skip_dma': dma_skip,
         'compute_dtype': dtype,
-        'is_tensor_update_accumulating': TOPK != 1,
+        'is_tensor_update_accumulating': is_tensor_update_accumulating,
         'expert_affinities_scaling_mode': expert_affinities_scaling_mode,
     }
 
@@ -414,6 +670,7 @@ def build_moe_bwmm_mx_cte(
             kernel_input['num_static_block'] = n_static_blocks
         else:
             kernel_input['n_static_blocks'] = n_static_blocks
+
     # Add clamp limits only if they have non-None values
     if gate_clamp_upper_limit is not None:
         kernel_input['gate_clamp_upper_limit'] = gate_clamp_upper_limit
@@ -442,6 +699,9 @@ def build_moe_bwmm_mx_cte(
         down_proj_bias = np.random.uniform(-1.632, 1.4375, size=[E, H]).astype(dtype)
         kernel_input['gate_and_up_proj_bias'] = gate_and_up_proj_bias
         kernel_input['down_proj_bias'] = down_proj_bias
+    else:
+        kernel_input['gate_and_up_proj_bias'] = None
+        kernel_input['down_proj_bias'] = None
 
     # Add scale tensors AFTER bias (matches build_blockwise_mm order)
     kernel_input['gate_up_proj_scale'] = gate_up_proj_scale
@@ -458,419 +718,4 @@ def build_moe_bwmm_mx_cte(
         'I_TP_par_dim': I_TP_par_dim,
     }
 
-    # Cache the generated inputs for future reuse
-    if use_cache:
-        try:
-            os.makedirs(_GOLDEN_CACHE_DIR, exist_ok=True)
-            with open(cache_file, 'wb') as f:
-                pickle.dump(kernel_input, f)
-            print(f"Cached inputs saved to {cache_file}")
-        except Exception as e:
-            print(f"Warning: Failed to cache inputs to {cache_file}: {e}")
-
     return kernel_input
-
-
-def generate_blockwise_numpy_golden(
-    test_config,
-    expert_affinities,
-    down_proj_weights,
-    token_position_to_id,
-    block_to_expert,
-    gate_and_up_proj_weights,
-    hidden_states,
-    T,
-    H,
-    B,
-    N,
-    E,
-    I_TP,
-    dtype,
-    dma_skip: SkipMode,
-    quantize=False,
-    quantize_strategy=5,
-    expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
-    activation_function=ActFnType.SiLU,
-    gate_up_proj_bias=None,
-    down_proj_bias=None,
-    gate_up_proj_scale=np.empty([]),
-    down_proj_scale=np.empty([]),
-    checkpoint_activation=False,
-    separate_outputs=False,
-    conditions=None,
-    n_block_per_iter=1,
-    gate_clamp_upper_limit=None,
-    gate_clamp_lower_limit=None,
-    up_clamp_lower_limit=None,
-    up_clamp_upper_limit=None,
-    DBG_KERNEL=False,
-    kernel_input=None,
-):
-    DBG_golden_tensors = {}
-
-    lnc_degree = 1 if test_config.target_instance_family == 'trn1' else 2
-    output_shape = [lnc_degree, T + 1, H] if separate_outputs else [T + 1, H]
-    output_np = np.zeros(output_shape).astype(dtype)
-    token_position_to_id = token_position_to_id.reshape(N, B)
-
-    if checkpoint_activation:
-        gate_up_activations_T = np.zeros([N, 2, I_TP, B]).astype(dtype)
-        down_activations = np.zeros([N, B, H]).astype(dtype)
-
-    if dma_skip.skip_weight:
-        is_weight_same_as_prev = np.zeros((N))
-        is_weight_same_as_prev[1:] = block_to_expert[1:] == block_to_expert[:-1]
-        is_weight_same_as_prev = is_weight_same_as_prev.astype(np.uint8)
-
-    gate_up_weights = None
-    down_weights = None
-    if quantize and quantize_strategy == 5:
-        # FAL should write the down scales to 128, H//128 in column major order so our load is faster
-        down_proj_scale = np.transpose(down_proj_scale.reshape((E, 128, H // 128)), (0, 2, 1)).reshape((E, 1, H))
-
-    if not is_mx_quantize(quantize):
-        E_local = gate_and_up_proj_weights.shape[0]
-        gate_and_up_proj_weights = gate_and_up_proj_weights.reshape(E_local, H, 2 * I_TP).astype(np.float32)
-        down_proj_weights = down_proj_weights.astype(np.float32)
-
-    for b in range(N):
-        if conditions is not None and conditions[b] == 0:
-            break
-
-        local_token_position_to_id = token_position_to_id[b, :]
-        # [B, H]
-        if dma_skip.skip_token:
-            zeros_hidden = np.zeros((1, H)).astype(dtype)
-            hidden_states = np.concatenate([hidden_states, zeros_hidden], axis=0)
-            zeros_exaf = np.zeros((1, E)).astype(dtype)
-            expert_affinities = np.concatenate([expert_affinities, zeros_exaf], axis=0)
-
-        local_hidden_states = hidden_states[local_token_position_to_id[:], :].astype(np.float32)
-        if DBG_KERNEL and b == 0:
-            """
-            1. MoE kernel will load and transpose the input tensor,
-            2. Input layout in HBM: [T, 4_H, H/512, 16_H, 8_H] 
-            3. Load input to SBUF: [32_T * 4_H (P), T/32, H/512, 16_H * 8_H]
-            4. T/32 * H/512 number of transpose operations will be performed to swap the outermost and innermost dims of above SBUF layout
-            5. Obtaining the swizzle layout: [16_H * 8_H(P), H/512, T/32, 32_T * 4_H]
-            """
-
-            # hidden = hidden.reshape(BxS, _q_width, H // _pmax // _q_width, _pmax).transpose(3, 2, 0, 1).reshape(_pmax, -1)
-            DBG_golden_tensors['dbg_hidden_states'] = (
-                local_hidden_states.reshape(
-                    -1,  # 0: T_div_32
-                    32 * _q_width,  # 1: 128
-                    H // _pmax // _q_width,  # 2: H_div_512
-                    _pmax,  # 3: 128
-                )
-                .transpose(3, 2, 0, 1)
-                .astype(dtype)
-            )
-
-        expert_idx = block_to_expert[b]
-        local_expert_affinities = expert_affinities[local_token_position_to_id, expert_idx].reshape(-1, 1).astype(dtype)
-
-        if expert_affinities_scaling_mode in [
-            ExpertAffinityScaleMode.PRE_SCALE,
-            ExpertAffinityScaleMode.PRE_SCALE_DELAYED,
-        ]:
-            local_hidden_states = local_expert_affinities * local_hidden_states
-
-        if dma_skip.skip_weight:
-            expert_idx = E if is_weight_same_as_prev[b] else expert_idx
-
-        # Select expert weights, scale, and bias
-        if expert_idx < E:  # weight skip
-            # [H, 2, I]
-            gate_up_weights = gate_and_up_proj_weights[expert_idx]
-            # [H, I]
-            down_weights = down_proj_weights[expert_idx, :, :]
-            if (quantize and gate_up_proj_scale.shape[0] == E) or is_mx_quantize(quantize):
-                gup_scale = gate_up_proj_scale[expert_idx]
-                down_scale = down_proj_scale[expert_idx]
-            if gate_up_proj_bias is not None:
-                gate_up_bias = gate_up_proj_bias[expert_idx]
-
-            if down_proj_bias is not None:
-                down_bias = down_proj_bias[expert_idx]
-
-        if is_mx_quantize(quantize):
-
-            class SimpleConfig:
-                def __init__(self, H, I, BxS):
-                    self.H = H
-                    self.I = I
-                    self.BxS = BxS
-
-            # Use original MXFP4 tensors directly, not logical layout
-            gate_up_weights_mxfp4 = kernel_input['gate_up_proj_weight'][expert_idx]  # [_pmax, 2, n_H512_tile, I_TP]
-            gup_scale_mxfp4 = kernel_input['gate_up_proj_scale'][expert_idx]  # [_pmax//8, 2, n_H512_tile, I_TP]
-
-            gate_activation = _gate_up_proj_golden_mx(
-                hidden=local_hidden_states,
-                hidden_scale=None,
-                weight=gate_up_weights_mxfp4[:, 0, :, :],  # [_pmax, n_H512_tile, I_TP]
-                weight_scale=gup_scale_mxfp4[:, 0, :, :],
-                bias=gate_up_bias[:, 0, :, :] if gate_up_proj_bias is not None else None,
-                cfg=SimpleConfig(H, I_TP, B),
-            )
-            up_activation = _gate_up_proj_golden_mx(
-                hidden=local_hidden_states,
-                hidden_scale=None,
-                weight=gate_up_weights_mxfp4[:, 1, :, :],  # [_pmax, n_H512_tile, I_TP]
-                weight_scale=gup_scale_mxfp4[:, 1, :, :],
-                bias=gate_up_bias[:, 1, :, :] if gate_up_proj_bias is not None else None,
-                cfg=SimpleConfig(H, I_TP, B),
-            )
-        else:
-            # [B, 2, I]
-            gate_up_activation = np.matmul(local_hidden_states, gate_up_weights).reshape(B, 2, I_TP)
-            gate_activation = gate_up_activation[:, 0, :]
-            up_activation = gate_up_activation[:, 1, :]
-
-        """
-        Compute intermediate state = 
-        silu(dequantize(gate_proj) + gate_bias) * (dequantize(up_proj) + up_bias) #when activation function is silu
-        or
-        swiglu(dequantize(gate_proj) + gate_bias) * (dequantize(up_proj) + up_bias) #when activation function is swiglu
-        Note that we expect (up_bias = up_bias + 1) (ie FAL should have added 1 to it before calling the kernel)
-        """
-        if not is_mx_quantize(quantize):  # Dequantization and bias are done in _gate_up_proj_golden_mx.
-            # [B, I_TP] - Dequantize before adding bias
-            if quantize and gate_up_proj_scale.shape[0] == 1:
-                gate_activation *= gate_up_proj_scale.squeeze()[:I_TP]
-                up_activation *= gate_up_proj_scale.squeeze()[I_TP:]
-            elif quantize and gate_up_proj_scale.shape[0] == E:
-                gate_activation *= gup_scale[0, :I_TP]
-                up_activation *= gup_scale[0, I_TP:]
-
-            # Add bias
-            if gate_up_proj_bias is not None:
-                gate_activation += gate_up_bias[0, :]
-                up_activation += gate_up_bias[1, :]
-
-        if gate_clamp_lower_limit is not None or gate_clamp_upper_limit is not None:
-            np.clip(gate_activation, a_min=gate_clamp_lower_limit, a_max=gate_clamp_upper_limit, out=gate_activation)
-        if up_clamp_lower_limit is not None or up_clamp_upper_limit is not None:
-            np.clip(up_activation, a_min=up_clamp_lower_limit, a_max=up_clamp_upper_limit, out=up_activation)
-
-        # Debug goldens for gate_proj and up_proj (after clipping)
-        if DBG_KERNEL and b == 0:
-            n_I512_tile = max(1, I_TP // (_pmax * _q_width))
-            flatten_free_dim = n_I512_tile * B * _q_width
-            DBG_golden_tensors['dbg_gate_proj'] = gate_activation.reshape(_pmax, flatten_free_dim).astype(dtype)
-            DBG_golden_tensors['dbg_up_proj'] = up_activation.reshape(_pmax, flatten_free_dim).astype(dtype)
-
-        if checkpoint_activation:
-            assert not is_mx_quantize(quantize)
-            gate_up_activations_T[b] = gate_up_activation.transpose(1, 2, 0)
-
-        act_res = act_fn_type2func[activation_function](gate_activation)
-
-        # Debug golden for gate_after_act
-        if DBG_KERNEL and b == 0:
-            pass
-
-        multiply_1 = act_res * up_activation
-
-        if is_mx_quantize(quantize):
-            # Use original MXFP4 tensors directly for down projection
-            down_weights_mxfp4 = kernel_input['down_proj_weight'][expert_idx]  # [I_TP_par_dim, n_I512_tile, H]
-            down_scale_mxfp4 = kernel_input['down_proj_scale'][expert_idx]  # [I_TP_par_dim//8, n_I512_tile, H]
-
-            down_activation = _down_proj_golden_mx(
-                multiply_1,
-                down_weights_mxfp4,
-                down_scale_mxfp4,
-                down_bias if down_proj_bias is not None else None,
-                SimpleConfig(H, I_TP, B),
-            )
-        else:
-            down_activation = np.matmul(multiply_1, down_weights)
-
-        """
-        dequantize and add bias to down projection
-        """
-        if not is_mx_quantize(quantize):  # Dequantization and bias are done in _down_proj_golden_mx.
-            # dequantize before adding bias
-            if quantize and gate_up_proj_scale.shape[0] == 1:
-                # [B, H]
-                # Quantize down proj before expert affinities
-                down_activation = down_activation * down_proj_scale.squeeze()
-            elif quantize and gate_up_proj_scale.shape[0] == E:
-                down_activation = down_activation * down_scale[0, :]
-
-            # add bias
-            if down_proj_bias is not None:
-                down_activation += down_bias
-
-        # Debug golden for down_proj (after bias)
-        if DBG_KERNEL and b == 0:
-            n_B128_tiles = (B + _pmax - 1) // _pmax
-            DBG_golden_tensors['dbg_down_proj'] = (
-                down_activation.reshape(n_B128_tiles, _pmax, H).transpose(1, 0, 2).astype(dtype)
-            )
-
-        if checkpoint_activation:
-            down_activations[b] = down_activation
-
-        if expert_affinities_scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
-            scale = down_activation * local_expert_affinities
-        else:
-            scale = down_activation
-
-        if separate_outputs:
-            output_np[0, local_token_position_to_id[:], :] += scale.astype(output_np.dtype)
-        else:
-            output_np[local_token_position_to_id[:], :] += scale.astype(output_np.dtype)
-
-    if separate_outputs:
-        out_return = output_np[:, :T, :] if dma_skip.skip_token else output_np
-    else:
-        out_return = output_np[:T, :] if dma_skip.skip_token else output_np
-
-    if checkpoint_activation:
-        return out_return, gate_up_activations_T, down_activations
-
-    return out_return, DBG_golden_tensors
-
-
-def golden_moe_bwmm_mx_cte(
-    kernel_input: dict,
-    dtype,
-    lnc_degree: int = 2,
-    use_cache: bool = False,
-    is_shard_on_I: bool = False,
-) -> dict:
-    """
-    Compute golden output for MoE BWMM MXFP4/MXFP8 CTE kernel.
-
-    Uses generate_blockwise_numpy_golden from the original framework
-    to ensure 100% matching behavior.
-
-    Args:
-        kernel_input: Dictionary with kernel input tensors (from build_moe_bwmm_mx_cte)
-        dtype: Data type for output
-        lnc_degree: LNC sharding degree
-        use_cache: Whether to use cached goldens if available (default: False)
-
-    Returns:
-        Dictionary with golden output tensors
-    """
-    # Compute cache key from kernel_input parameters
-    internal = kernel_input['_internal']
-    E = kernel_input['gate_up_proj_weight'].shape[0]
-    H = kernel_input['hidden_states'].shape[1]
-    I_TP = kernel_input['gate_up_proj_weight'].shape[-1]
-    T_dim = kernel_input['hidden_states'].shape[0]
-    T = T_dim if kernel_input['skip_dma'].skip_token else T_dim - 1
-    B = kernel_input['block_size']
-
-    cache_key = _compute_golden_cache_key(
-        H,
-        T,
-        E,
-        B,
-        TOPK=4 if kernel_input.get('is_tensor_update_accumulating', False) else 1,  # Infer TOPK
-        I_TP=I_TP,
-        dtype=dtype,
-        weight_dtype=kernel_input['gate_up_proj_weight'].dtype,
-        skip_mode=(1 if kernel_input['skip_dma'].skip_token else 0)
-        + (2 if kernel_input['skip_dma'].skip_weight else 0),
-        bias='gate_and_up_proj_bias' in kernel_input,
-        activation_function=kernel_input['activation_function'],
-        expert_affinities_scaling_mode=kernel_input['expert_affinities_scaling_mode'],
-        is_dynamic='conditions' in kernel_input,
-        vnc_degree=lnc_degree,
-        gate_clamp_upper_limit=kernel_input.get('gate_clamp_upper_limit'),
-        gate_clamp_lower_limit=kernel_input.get('gate_clamp_lower_limit'),
-        up_clamp_upper_limit=kernel_input.get('up_clamp_upper_limit'),
-        up_clamp_lower_limit=kernel_input.get('up_clamp_lower_limit'),
-        alpha=None,  # Not stored in kernel_input
-    )
-    cache_file = os.path.join(_GOLDEN_CACHE_DIR, f"golden_{cache_key}.pkl")
-
-    if use_cache and os.path.exists(cache_file):
-        print(f"Found cached golden in {cache_file}, reusing...")
-        with open(cache_file, 'rb') as f:
-            return pickle.load(f)
-
-    # Create mock test_config
-    class MockTestConfig:
-        def __init__(self, lnc_degree):
-            self.target_instance_family = 'trn1' if lnc_degree == 1 else 'trn2'
-
-    test_config = MockTestConfig(lnc_degree)
-
-    # Extract data from kernel_input
-    internal = kernel_input['_internal']
-
-    E = kernel_input['gate_up_proj_weight'].shape[0]
-    H = kernel_input['hidden_states'].shape[1]
-    I_TP = kernel_input['gate_up_proj_weight'].shape[-1]
-
-    # For MXFP4, don't convert to logical layout - use original tensors directly
-    # The golden function expects MXFP4 format when is_mx_quantize() is true
-    gate_and_up_proj_weights_for_golden = kernel_input['gate_up_proj_weight']  # Keep MXFP4 format
-    down_proj_weights_for_golden = kernel_input['down_proj_weight']  # Keep MXFP4 format
-
-    # Determine dimensions
-    T_dim = kernel_input['hidden_states'].shape[0]
-    T = T_dim if kernel_input['skip_dma'].skip_token else T_dim - 1
-    B = kernel_input['block_size']
-    N = internal['N']
-    is_accumulating = kernel_input.get('is_tensor_update_accumulating', False)
-
-    # Call the original golden function
-    output_np, dbg_tensors = generate_blockwise_numpy_golden(
-        test_config=test_config,
-        expert_affinities=kernel_input['expert_affinities_masked'].reshape(-1, E),
-        down_proj_weights=down_proj_weights_for_golden,
-        token_position_to_id=kernel_input['token_position_to_id'],
-        block_to_expert=kernel_input['block_to_expert'],
-        gate_and_up_proj_weights=gate_and_up_proj_weights_for_golden,
-        hidden_states=kernel_input['hidden_states'],
-        T=T,
-        H=H,
-        B=B,
-        N=N,
-        E=E,
-        I_TP=I_TP,
-        dtype=dtype,
-        dma_skip=kernel_input['skip_dma'],
-        quantize=kernel_input['gate_up_proj_weight'].dtype,  # MXFP4 quantization
-        quantize_strategy=6,  # Strategy 6 for MXFP4
-        expert_affinities_scaling_mode=kernel_input['expert_affinities_scaling_mode'],
-        activation_function=kernel_input['activation_function'],
-        gate_up_proj_bias=kernel_input.get('gate_and_up_proj_bias'),
-        down_proj_bias=kernel_input.get('down_proj_bias'),
-        gate_up_proj_scale=kernel_input['gate_up_proj_scale'],
-        down_proj_scale=kernel_input['down_proj_scale'],
-        checkpoint_activation=False,
-        separate_outputs=is_accumulating and not is_shard_on_I,
-        conditions=kernel_input.get('conditions'),
-        n_block_per_iter=1,
-        gate_clamp_upper_limit=kernel_input.get('gate_clamp_upper_limit'),
-        gate_clamp_lower_limit=kernel_input.get('gate_clamp_lower_limit'),
-        up_clamp_lower_limit=kernel_input.get('up_clamp_lower_limit'),
-        up_clamp_upper_limit=kernel_input.get('up_clamp_upper_limit'),
-        DBG_KERNEL=False,
-        kernel_input=kernel_input,
-    )
-
-    # Return golden output with debug tensors
-    golden_output = {'output': output_np}
-    for key, value in dbg_tensors.items():
-        golden_output[key] = value
-
-    # Cache the generated golden for future reuse
-    if use_cache:
-        try:
-            os.makedirs(_GOLDEN_CACHE_DIR, exist_ok=True)
-            with open(cache_file, 'wb') as f:
-                pickle.dump(golden_output, f)
-            print(f"Cached golden saved to {cache_file}")
-        except Exception as e:
-            print(f"Warning: Failed to cache golden to {cache_file}: {e}")
-
-    return golden_output

@@ -23,18 +23,39 @@ from ...mlp.mlp_parameters import MLPParameters
 from ...mlp.mlp_tkg.projection_mx_constants import (
     MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM,
     MIN_MATMULT_MX_P_DIM,
-    MX_DTYPES,
+    MX_PACKED_DTYPES,
+    MX_SCALE_DTYPE,
+    MX_UNPACKED_DTYPES,
     SUPPORTED_QMX_INPUT_DTYPES,
     _q_width,
 )
-from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
+from ...utils.common_types import ActFnType, ExpertAffinityScaleMode, MoEAllToAllVStrategy, MoELNCShardingStrategy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 
 # Constants
-_NUM_H4_FOLDS_PER_COLUMN = 32
-_NUM_DYNAMIC_ALGO_STATIC_BLOCKS = 1
-_NONZERO_WITH_COUNT_PAD_VAL = -1  # We pad indices with -1s to utilize DMA skipping
+NUM_H4_FOLDS_PER_COLUMN = 32
+NUM_DYNAMIC_ALGO_STATIC_BLOCKS = 1
+NONZERO_WITH_COUNT_PAD_VAL = -1  # We pad indices with -1s to utilize DMA skipping
+UINT8_TP_VIEW_DTYPE = nl.float8_e5m2  # Used with bitcast for uint8 transposes, since PE does not support uint8 input
+FP8X4_TP_VIEW_DTYPE = (
+    nl.float32
+)  # Used with bitcast for float8_x4 transposes, since PE does not support float8_x4 input
+
+# Dtype packing conversions
+FP8_PER_BF16 = 2
+FP8_PER_FP32 = 4
+FP8_PER_INT32 = 4
+BF16_PER_INT32 = 2
+FP8_PER_FP8X4 = 4
+BF16_PER_FP32 = 2
+
+# Supported sharding strategies for all-expert MX kernel
+SUPPORTED_MOE_SHARDING_STRATEGIES = [
+    MoELNCShardingStrategy.NO_SHARD,
+    MoELNCShardingStrategy.SHARD_I,
+    MoELNCShardingStrategy.SHARD_T,
+]
 
 
 @dataclass
@@ -51,6 +72,10 @@ class AllExpertMXInputTensors(nl.NKIObject):
     hidden_input_scale: nl.ndarray
     gate_up_weights_bias: nl.ndarray
     down_weights_bias: nl.ndarray
+    # STATIC_MX: per-tensor FP8 dequant scales for activations (float32)
+    gate_up_in_scale: nl.ndarray = None  # [E_L, 1] or [1, 1]
+    down_in_scale: nl.ndarray = None  # [E_L, 1] or [1, 1]
+    input_dequant_scale: nl.ndarray = None  # [pmax, 1] in SBUF, broadcast input dequant scale
 
 
 @dataclass
@@ -66,6 +91,9 @@ class AllExpertMXKernelConfig(nl.NKIObject):
     input_in_sbuf: bool
     output_in_sbuf: bool
     activation_compute_dtype: nki.dtype = nl.bfloat16
+    expert_affinities_dtype: nki.dtype = nl.bfloat16
+    is_static_quant: bool = False
+    is_row_quant: bool = False
 
 
 @dataclass
@@ -77,6 +105,7 @@ class AllExpertMXDimensions(nl.NKIObject):
     E_L: int  # Number of local experts
     I: int  # Intermediate dimension size
     H: int  # Hidden dimension size
+    H_concat: int  # Size of dim1 of input tensor when [input_hidden, input_scale, expert_affinities, token_idx] is concatenated
 
     def __post_init__(self):
         """Derive tiling strategy from tensor dimensions."""
@@ -88,17 +117,32 @@ class AllExpertMXDimensions(nl.NKIObject):
 
         # Shared tiling strategy
         self.n_tiles_in_T = div_ceil(self.T, self.pmax)
-        self.n_T32_tiles = div_ceil(self.T, _NUM_H4_FOLDS_PER_COLUMN)
+        self.n_T32_tiles = div_ceil(self.T, NUM_H4_FOLDS_PER_COLUMN)
         self.n_H512_tiles = div_ceil(self.H, MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM)
         self.tile_T = min(self.T, self.pmax)
         self.tile_H = self.H // self.n_H512_tiles // _q_width
         self.T32_H4 = self.pmax
 
-        # LNC sharding strategy
+        # LNC sharding strategy decision
         total_I512_tiles = div_ceil(self.I, MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM)
-        self.shard_on_I = total_I512_tiles >= self.n_prgs
+        can_shard_on_I = total_I512_tiles >= self.n_prgs
+        T_local_candidate = self.T // self.n_prgs if self.n_prgs > 1 else self.T
+        can_shard_on_T = (
+            self.n_prgs > 1
+            and self.T % self.n_prgs == 0
+            and T_local_candidate >= NUM_H4_FOLDS_PER_COLUMN  # HBM layout adapter requires T_local >= 32
+        )
 
-        if self.shard_on_I:
+        # Determine sharding strategy (I-sharding takes priority over T-sharding)
+        if can_shard_on_I:
+            self.sharding_strategy = MoELNCShardingStrategy.SHARD_I
+        elif can_shard_on_T:
+            self.sharding_strategy = MoELNCShardingStrategy.SHARD_T
+        else:
+            self.sharding_strategy = MoELNCShardingStrategy.NO_SHARD
+
+        # Apply configuration based on sharding strategy
+        if self.sharding_strategy == MoELNCShardingStrategy.SHARD_I:
             tiles_per_nc = div_ceil(total_I512_tiles, self.n_prgs) if self.n_prgs > 1 else total_I512_tiles
             self.n_I512_tiles_local = (
                 min(tiles_per_nc, total_I512_tiles - self.prg_id * tiles_per_nc)
@@ -109,35 +153,30 @@ class AllExpertMXDimensions(nl.NKIObject):
             self.I_offset = self.tile_start * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
             self.I_local = min(self.I - self.I_offset, self.n_I512_tiles_local * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM)
             self.I_local_padded = div_ceil(self.I_local, MIN_MATMULT_MX_P_DIM) * MIN_MATMULT_MX_P_DIM
-            self.shard_on_T = False
             self.T_local = self.T
             self.T_offset = 0
             self.t32_tile_offset = 0
-        else:
+        elif self.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
             self.n_I512_tiles_local = total_I512_tiles
             self.tile_start = 0
             self.I_offset = 0
             self.I_local = self.I
             self.I_local_padded = div_ceil(self.I_local, MIN_MATMULT_MX_P_DIM) * MIN_MATMULT_MX_P_DIM
-
-            T_local_candidate = self.T // self.n_prgs if self.n_prgs > 1 else self.T
-            if (
-                self.n_prgs > 1
-                and self.T % self.n_prgs == 0
-                and T_local_candidate >= _NUM_H4_FOLDS_PER_COLUMN  # HBM layout adapter requires T_local >= 32
-            ):
-                self.shard_on_T = True
-                self.T_local = T_local_candidate
-                self.T_offset = self.prg_id * self.T_local
-                self.t32_tile_offset = self.T_offset // _NUM_H4_FOLDS_PER_COLUMN
-                self.n_tiles_in_T = div_ceil(self.T_local, self.pmax)
-                self.n_T32_tiles = div_ceil(self.T_local, _NUM_H4_FOLDS_PER_COLUMN)
-                self.tile_T = min(self.T_local, self.pmax)
-            else:
-                self.shard_on_T = False
-                self.T_local = self.T
-                self.T_offset = 0
-                self.t32_tile_offset = 0
+            self.T_local = T_local_candidate
+            self.T_offset = self.prg_id * self.T_local
+            self.t32_tile_offset = self.T_offset // NUM_H4_FOLDS_PER_COLUMN
+            self.n_tiles_in_T = div_ceil(self.T_local, self.pmax)
+            self.n_T32_tiles = div_ceil(self.T_local, NUM_H4_FOLDS_PER_COLUMN)
+            self.tile_T = min(self.T_local, self.pmax)
+        else:  # NO_SHARD
+            self.n_I512_tiles_local = total_I512_tiles
+            self.tile_start = 0
+            self.I_offset = 0
+            self.I_local = self.I
+            self.I_local_padded = div_ceil(self.I_local, MIN_MATMULT_MX_P_DIM) * MIN_MATMULT_MX_P_DIM
+            self.T_local = self.T
+            self.T_offset = 0
+            self.t32_tile_offset = 0
 
 
 @dataclass
@@ -145,12 +184,13 @@ class AllExpertMXDynamismConfig(nl.NKIObject):
     """Dynamic control flow config for all-expert MX kernel."""
 
     is_all_expert_dynamic: bool = False
+    all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED
     block_size: int = None
 
     def __post_init__(self):
         """Derive dynamic algorithm constants from block_size."""
         self.n_blocks = 0
-        self.n_static_blocks = _NUM_DYNAMIC_ALGO_STATIC_BLOCKS
+        self.n_static_blocks = NUM_DYNAMIC_ALGO_STATIC_BLOCKS
         self.n_dynamic_blocks = 0
         self.T_plus_1 = 0
         self.n_dynamic_blocks_plus_1 = 0
@@ -179,10 +219,10 @@ class AllExpertMXDynamismConfig(nl.NKIObject):
         self.blk_tile_T = min(pmax, self.block_size)
         self.blk_n_T_x4_tiles = div_ceil(self.blk_T_x4, pmax)
         self.blk_n_T_tiles = div_ceil(self.block_size, pmax)
-        self.blk_n_T32_tiles = div_ceil(self.block_size, _NUM_H4_FOLDS_PER_COLUMN)
+        self.blk_n_T32_tiles = div_ceil(self.block_size, NUM_H4_FOLDS_PER_COLUMN)
 
-        # Misc - use _NONZERO_WITH_COUNT_PAD_VAL for DMA skipping
-        self.nonzero_with_count_pad_val = _NONZERO_WITH_COUNT_PAD_VAL
+        # Misc - use NONZERO_WITH_COUNT_PAD_VAL for DMA skipping
+        self.nonzero_with_count_pad_val = NONZERO_WITH_COUNT_PAD_VAL
 
 
 @dataclass
@@ -198,14 +238,16 @@ class ExpertWeightsSBUF(nl.NKIObject):
     gate_bias_sb: nl.ndarray
     up_bias_sb: nl.ndarray
     down_bias_sb: nl.ndarray
+    # STATIC_MX: per-expert combined dequant scales (input_scale * weight_scale)
+    gate_dequant_scale_sb: nl.ndarray = None
+    up_dequant_scale_sb: nl.ndarray = None
+    down_dequant_scale_sb: nl.ndarray = None
 
 
 def init_all_expert_mx_configs(
     mlp_params: MLPParameters,
     output: nl.ndarray,
     activation_compute_dtype: nki.dtype = nl.bfloat16,
-    is_all_expert_dynamic: bool = False,
-    block_size: int = None,
 ) -> tuple[AllExpertMXInputTensors, AllExpertMXKernelConfig, AllExpertMXDimensions, AllExpertMXDynamismConfig]:
     """
     Initialize all sub-configs for the all-expert MX kernel from MLPParameters.
@@ -214,8 +256,6 @@ def init_all_expert_mx_configs(
         mlp_params (MLPParameters): Source parameters.
         output (nl.ndarray): Output tensor.
         activation_compute_dtype: Compute dtype for activations.
-        is_all_expert_dynamic: Whether to use dynamic control flow.
-        block_size: Block size for dynamic control flow algorithm.
 
     Returns:
         tuple: (AllExpertMXInputTensors, AllExpertMXKernelConfig, AllExpertMXDimensions, AllExpertMXDynamismConfig)
@@ -238,12 +278,25 @@ def init_all_expert_mx_configs(
     E_L = gate_up_weights.shape[0]
     I = gate_up_weights.shape[-1]
     H = down_weights.shape[-1]
+    H_concat = (
+        H if mlp_params.expert_params.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED else hidden_input.shape[-1]
+    )
 
     # Set block_size to T if not in all-expert dynamic mode
-    effective_block_size = block_size if block_size != None else T
+    effective_block_size = mlp_params.expert_params.block_size if mlp_params.expert_params.block_size != None else T
 
     # Derive output_in_sbuf from output buffer location
     output_in_sbuf = output.buffer == nl.sbuf
+
+    is_static_quant = mlp_params.quant_params.is_quant_static_mx()
+    is_row_quant = mlp_params.quant_params.is_quant_row_mx()
+
+    # When using all_to_all_v, affinity dtype is hardcoded to bf16
+    expert_affinities_dtype = (
+        mlp_params.expert_params.expert_affinities.dtype
+        if mlp_params.expert_params.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED
+        else nl.bfloat16
+    )
 
     input_tensors = AllExpertMXInputTensors(
         hidden_input=hidden_input,
@@ -256,6 +309,9 @@ def init_all_expert_mx_configs(
         hidden_input_scale=hidden_input_scale,
         gate_up_weights_bias=(mlp_params.bias_params.gate_proj_bias_tensor if mlp_params.bias_params else None),
         down_weights_bias=(mlp_params.bias_params.down_proj_bias_tensor if mlp_params.bias_params else None),
+        gate_up_in_scale=mlp_params.quant_params.gate_up_in_scale if is_static_quant else None,
+        down_in_scale=mlp_params.quant_params.down_in_scale if is_static_quant else None,
+        input_dequant_scale=mlp_params.input_dequant_scale,
     )
     kernel_cfg = AllExpertMXKernelConfig(
         expert_affinities_scaling_mode=mlp_params.expert_params.expert_affinities_scaling_mode,
@@ -267,15 +323,20 @@ def init_all_expert_mx_configs(
         input_in_sbuf=mlp_params.input_in_sbuf,
         output_in_sbuf=output_in_sbuf,
         activation_compute_dtype=activation_compute_dtype,
+        expert_affinities_dtype=expert_affinities_dtype,
+        is_static_quant=is_static_quant,
+        is_row_quant=is_row_quant,
     )
     dims = AllExpertMXDimensions(
         T=T,
         E_L=E_L,
         I=I,
         H=H,
+        H_concat=H_concat,
     )
     dynamism_cfg = AllExpertMXDynamismConfig(
-        is_all_expert_dynamic=is_all_expert_dynamic,
+        is_all_expert_dynamic=mlp_params.expert_params.is_all_expert_dynamic,
+        all_to_all_v_strategy=mlp_params.expert_params.all_to_all_v_strategy,
         block_size=effective_block_size,
     )
     dynamism_cfg.derive_from_dims(dims)
@@ -283,9 +344,7 @@ def init_all_expert_mx_configs(
     return input_tensors, kernel_cfg, dims, dynamism_cfg
 
 
-# =============================================================================
 # Validation helpers
-# =============================================================================
 
 
 def validate_all_expert_mx_inputs(
@@ -302,22 +361,33 @@ def validate_all_expert_mx_inputs(
         kernel_cfg (AllExpertMXKernelConfig): Scalar parameters.
         dims (AllExpertMXDimensions): Dimension parameters.
         dynamism_cfg (AllExpertMXDynamismConfig): Dynamism parameters.
+
+    Returns:
+        None. Raises AssertionError via kernel_assert if validation fails.
     """
 
     # Validate input dtype based on quantization state
-    if input_tensors.hidden_input_scale == None:
+    # Not pre-quantized, no A2A-v
+    if dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED and input_tensors.hidden_input_scale == None:
         kernel_assert(
             input_tensors.hidden_input.dtype in SUPPORTED_QMX_INPUT_DTYPES,
             f"Expected input dtype in {SUPPORTED_QMX_INPUT_DTYPES}, got {input_tensors.hidden_input.dtype=}.",
         )
-    else:
+    # Pre-quantized, no A2A-v
+    elif dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
         kernel_assert(
-            input_tensors.hidden_input.dtype in MX_DTYPES,
-            f"Expected quantized input dtype in {MX_DTYPES}, got {input_tensors.hidden_input.dtype=}",
+            input_tensors.hidden_input.dtype in MX_PACKED_DTYPES,
+            f"Expected quantized input dtype in {MX_PACKED_DTYPES}, got {input_tensors.hidden_input.dtype=}",
         )
         kernel_assert(
-            input_tensors.hidden_input_scale.dtype == nl.uint8,
-            f"Expected hidden_input_scale dtype = nl.uint8, got {input_tensors.hidden_input_scale.dtype=}",
+            input_tensors.hidden_input_scale.dtype == MX_SCALE_DTYPE,
+            f"Expected hidden_input_scale.dtype={MX_SCALE_DTYPE} with all_to_all_v_strategy=DISABLED, got {input_tensors.hidden_input_scale.dtype=}",
+        )
+    # A2A-v must have pre-quantized hidden input
+    else:
+        kernel_assert(
+            input_tensors.hidden_input.dtype in MX_UNPACKED_DTYPES,
+            f"Expected quantized input dtype in {MX_UNPACKED_DTYPES} with all_to_all_v_strategy!=DISABLED, got {input_tensors.hidden_input.dtype=}, {dynamism_cfg.all_to_all_v_strategy=}",
         )
 
     # Validate T size based on input state
@@ -327,24 +397,25 @@ def validate_all_expert_mx_inputs(
             f"Expected T divisible by 32, got T={dims.T}. "
             "To use T divisible by 4, provide prequantized input and hidden_input_scale.",
         )
-        if dims.shard_on_T:
+        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
             kernel_assert(
                 dims.T_local % 32 == 0,
-                f"Expected T_local divisible by 32 for shard_on_T with HBM input, got T_local={dims.T_local}.",
+                f"Expected T_local divisible by 32 for SHARD_T with HBM input, got T_local={dims.T_local}.",
             )
     else:
         kernel_assert(dims.T % 4 == 0, f"Expected T divisible by 4, got T={dims.T}")
-        if dims.shard_on_T:
+        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
             kernel_assert(
                 dims.T_local % 4 == 0,
-                f"Expected T_local divisible by 4 for shard_on_T with pre-quantized input, got T_local={dims.T_local}.",
+                f"Expected T_local divisible by 4 for SHARD_T with pre-quantized input, got T_local={dims.T_local}.",
             )
 
-    # Validate expert affinities shape
-    kernel_assert(
-        len(input_tensors.expert_affinities_masked.shape) in (2, 3),
-        f"Expected 2D or 3D expert_affinities_masked, got {input_tensors.expert_affinities_masked.shape=}",
-    )
+    # Validate expert affinities shape (affinities are packed when using all_to_all_v)
+    if dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
+        kernel_assert(
+            len(input_tensors.expert_affinities_masked.shape) in (2, 3),
+            f"Expected 2D or 3D expert_affinities_masked, got {input_tensors.expert_affinities_masked.shape=}",
+        )
 
     # Validate output location
     kernel_assert(
@@ -360,12 +431,13 @@ def validate_all_expert_mx_inputs(
             f"got {input_tensors.hidden_input.dtype=} {input_tensors.hidden_input_scale=}",
         )
 
-    # Algorithm-specific constraints
+    # Dynamism constraints
     if dynamism_cfg.is_all_expert_dynamic:
-        kernel_assert(
-            input_tensors.expert_affinities_masked.buffer != nl.sbuf,
-            f"Expected expert_affinities_masked in HBM, got {input_tensors.expert_affinities_masked.buffer=}",
-        )
+        if dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
+            kernel_assert(
+                input_tensors.expert_affinities_masked.buffer != nl.sbuf,
+                f"Expected expert_affinities_masked in HBM, got {input_tensors.expert_affinities_masked.buffer=}",
+            )
         kernel_assert(
             dims.E_L == 1,
             f"All-expert MX kernel does not support E_L>1 with is_all_expert_dynamic=True, but got {dims.E_L=}",
@@ -375,6 +447,27 @@ def validate_all_expert_mx_inputs(
             f"Invalid block_size: expected (1) nonzero block_size (2) block_size that evenly divides T, (3) block_size at most T/2, "
             f"and (4) block_size<32 and divisible by 8, block_size<128 and divisible by 32, or block_size divisible by 128; "
             f"but got {dynamism_cfg.block_size=}, {dims.T=}",
+        )
+    # all_to_all_v requires is_all_expert_dynamic
+    else:
+        kernel_assert(
+            dynamism_cfg.all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED,
+            f"all_to_all_v_strategy != DISABLED is only supported with is_all_expert_dynamic=True, but got {dynamism_cfg.is_all_expert_dynamic=}, {dynamism_cfg.all_to_all_v_strategy=}",
+        )
+
+    # Validate all_to_all_v input shape
+    if dynamism_cfg.all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED:
+        kernel_assert(
+            dims.H_concat == dims.H + dims.H // _q_width + dims.E_L * FP8_PER_BF16 + FP8_PER_INT32,
+            f"Expected {dims.H + dims.H // _q_width + dims.E_L * FP8_PER_BF16 + FP8_PER_INT32=} columns in hidden_input with all_to_all_v_strategy!=DISABLED, but got {input_tensors.hidden_input.shape=}, {dynamism_cfg.all_to_all_v_strategy=}",
+        )
+        kernel_assert(
+            input_tensors.hidden_input.dtype in MX_UNPACKED_DTYPES,
+            f"Expected hidden_input.dtype in {MX_UNPACKED_DTYPES}, but got {input_tensors.hidden_input.dtype=}",
+        )
+        kernel_assert(
+            input_tensors.expert_affinities_masked == None,
+            f"Expected expert affinities packed into hidden_input and expert_affinities_masked=None when all_to_all_v_strategy!=DISABLED, but got {input_tensors.expert_affinities_masked=}, {dynamism_cfg.all_to_all_v_strategy=}",
         )
 
 

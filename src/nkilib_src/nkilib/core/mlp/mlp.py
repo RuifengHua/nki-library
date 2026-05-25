@@ -20,8 +20,9 @@ import nki.language as nl
 
 # common utils
 from ..utils.allocator import BufferManager, SbufManager
-from ..utils.common_types import ActFnType, NormType, QuantizationType
-from ..utils.logging import Logger
+from ..utils.common_types import ActFnType, ComputationMode, NormType, QuantizationType
+from ..utils.kernel_helpers import get_verified_program_sharding_info
+from ..utils.logging import get_logger
 
 # MLP utils
 from .mlp_cte.mlp_cte import mlp_cte
@@ -75,7 +76,11 @@ def mlp(
     up_clamp_upper_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     force_cte_mode: bool = False,
+    mode: ComputationMode = ComputationMode.AUTO,
     sbm: Optional[BufferManager] = None,
+    mx_dummy_scale_hbm: Optional[nl.ndarray] = None,
+    transposed_in: bool = False,
+    transposed_out: bool = False,
 ) -> list[nl.ndarray]:
     """
     MLP (Multi-Layer Perceptron) Kernel implementation.
@@ -104,7 +109,8 @@ def mlp(
         output = down_proj_out
 
     Args:
-        hidden_tensor (nl.ndarray): Input hidden states tensor with shape [B, S, H] or SBUF layout.
+        hidden_tensor (nl.ndarray): Input hidden states tensor with shape [B, S, H], SBUF layout,
+            or transposed HBM layout [H0, n_prgs, H1_shard, BxS] when transposed_in=True.
         gate_proj_weights_tensor (nl.ndarray): Gate projection weight matrix with shape [H, I].
         up_proj_weights_tensor (nl.ndarray): Up projection weight matrix with shape [H, I].
         down_proj_weights_tensor (nl.ndarray, optional): Down projection weight matrix with shape [I, H].
@@ -170,12 +176,26 @@ def mlp(
         up_clamp_upper_limit (float): upper bound value to clamp on up projection results, does not perform clamping if the value is set to None
         up_clamp_lower_limit (float): lower bound value to clamp on up projection results, does not perform clamping if the value is set to None
         force_cte_mode (bool): If True, forces the use of CTE mode. (default: False)
+        mode (ComputationMode): Computation mode to use (default = AUTO)
+            Supported values:
+            - AUTO (default): automatically choose the more performant computation mode. Does not support fused normalization and quantization
+            - PREFILL: use prefill computation mode, does not support fused quantization, but support quantized input.
+            - DECDOE: use decode computation mode, not performant for large T, supported fused normalization and quantization.
         sbm (BufferManager): Optional BufferManager for HBM tensor allocation with consistent naming.
+        transposed_in (bool): When True, input is in transposed HBM layout [H0, n_prgs, H1_shard, BxS]
+            instead of [B, S, H]. Enables contiguous per-NC DMA loads. Only supported in TKG mode
+            with NONE, STATIC, or ROW quantization. Not compatible with fused add or SBUF input.
+            (default: False)
+        transposed_out (bool): When True, output is in transposed HBM layout [H0, n_prgs, H1_shard, BxS]
+            instead of [B, S, H]. Each NC DMAs its shard directly without transpose_store.
+            Only supported in TKG mode. Not compatible with down_proj column tiling or SBUF output.
+            (default: False)
 
     Returns:
         list:
             The MLP output tensor(s):
             - HBM output: Tensor with shape [B, S, H].
+            - HBM transposed output (transposed_out=True): Tensor with shape [H0, n_prgs, H1_shard, BxS].
             - SBUF output: Shape depends on the mode setting.
                 - CTE : Not applicable
                 - TKG when `use_tkg_down_proj_column_tiling` is True = [BxS, H]
@@ -199,6 +219,10 @@ def mlp(
         - FP8 quantization (tensor-wise and row-wise)
         - Standard matrix multiplication layouts
     """
+
+    # If output_dtype is not provided, use the same dtype as the hidden tensor
+    if output_dtype == None:
+        output_dtype = hidden_tensor.dtype
 
     # Build MLP parameter object with all relevant weights, biases, and config
     mlp_params = MLPParameters(
@@ -234,6 +258,10 @@ def mlp(
         up_clamp_lower_limit=up_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         force_cte_mode=force_cte_mode,
+        mx_dummy_scale_hbm=mx_dummy_scale_hbm,
+        mode=mode,
+        transposed_in=transposed_in,
+        transposed_out=transposed_out,
     )
 
     # Validate MLP arguments
@@ -241,17 +269,29 @@ def mlp(
 
     # Create local sbm if not provided
     if sbm is None:
-        sbm = SbufManager(0, 200 * 1024, Logger("mlp"))
+        sbm = SbufManager(0, 200 * 1024, get_logger("mlp"))
         sbm.set_name_prefix("mlp_")
     # Allocate output tensor in shared HBM memory
     output_tensors = []
     out = None
-    if not store_output_in_sbuf:
+    if not store_output_in_sbuf and not transposed_out:
         out = sbm.alloc(
             (mlp_params.batch_size, mlp_params.sequence_len, mlp_params.hidden_size),
             dtype=mlp_params.output_dtype,
             buffer=nl.shared_hbm,
             name="output_tensor_hbm",
+        )
+    elif transposed_out:
+        # Allocate shared transposed output: [H0, n_prgs, H1_shard, T]
+        _, n_prgs, _ = get_verified_program_sharding_info("mlp", (0, 1))
+        H0 = 128
+        H1_shard = mlp_params.hidden_size // (H0 * n_prgs)
+        T = mlp_params.batch_size * mlp_params.sequence_len
+        out = sbm.alloc(
+            (H0, n_prgs, H1_shard, T),
+            dtype=mlp_params.output_dtype,
+            buffer=nl.shared_hbm,
+            name="output_tensor_hbm_transposed",
         )
     output_tensors.append(out)
 
@@ -267,8 +307,6 @@ def mlp(
         output_tensors.append(fused_add_out)
 
     # Determine if MLP should be invoked in token-generation (TKG) mode or context encoding (CTE) mode
-    # If batch size × sequence length <= TKG_BS_SEQLEN_THRESHOLD(currently at 96), the kernel runs in TKG mode.
-    # TODO: update TKG_BS_SEQLEN_THRESHOLD to 128
     if is_mlp_tkg(mlp_params):
         if mlp_params.quant_params.is_dtype_mx():
             # mlp_tkg_mx does not use sbm

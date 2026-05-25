@@ -16,6 +16,7 @@ Unit tests for TiledRange and TiledRangeIterator classes.
 """
 
 import pytest
+
 from nkilib_src.nkilib.core.utils.tiled_range import (
     TiledRange,
     TiledRangeIterator,
