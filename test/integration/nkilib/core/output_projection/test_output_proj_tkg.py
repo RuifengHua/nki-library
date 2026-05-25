@@ -13,33 +13,40 @@
 # limitations under the License.
 
 import enum
-from test.integration.nkilib.utils.tensor_generators import (
-    FP8_E4M3_MAX,
-    gaussian_tensor_generator,
-    np_random_sample,
-    static_cast,
-)
-from test.utils.common_dataclasses import (
-    TKG_INFERENCE_ARGS,
-    CompilerArgs,
-)
-from test.utils.coverage_parametrized_tests import FilterResult
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
+from typing import Optional
 
+import neuron_dtypes as dt
+import nki
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.output_projection.output_projection_tkg import (
     output_projection_tkg,
 )
 from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import (
     output_projection_tkg_torch_ref,
 )
+from nkilib_src.nkilib.core.utils.allocator import BufferManager, Logger
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
+from test.integration.nkilib.utils.tensor_generators import (
+    FP8_E4M3_MAX,
+    gaussian_tensor_generator,
+    generate_stabilized_mx_data,
+    np_random_sample,
+    static_cast,
+)
+from test.utils.common_dataclasses import (
+    TKG_INFERENCE_ARGS,
+    CompilerArgs,
+    Platforms,
+)
+from test.utils.coverage_parametrized_tests import FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # Hardware constants - must match values in output_projection_tkg.py
 F_MAX = 512  # Free dimension size for PSUM/GEMM operations
@@ -67,10 +74,74 @@ class TkgOutputProjClassification(enum.Enum):
         return self.name
 
 
+@nki.jit
+def output_proj_tkg_wrapper(
+    attention: nl.ndarray,
+    weight: nl.ndarray,
+    bias: Optional[nl.ndarray] = None,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    weight_scale: Optional[nl.ndarray] = None,
+    input_scale: Optional[nl.ndarray] = None,
+    TRANSPOSE_OUT: bool = False,
+    OUT_IN_SB: bool = False,
+    # Placeholder param to match torch-ref/kernel signature
+    sbm: Optional[BufferManager] = None,
+) -> nl.ndarray:
+    sbm = BufferManager(
+        0,
+        nl.tile_size.total_available_sbuf_size,
+        logger=Logger("test_output_projection_tkg"),
+        use_auto_alloc=False,
+    )
+
+    return output_projection_tkg(
+        attention, weight, bias, quantization_type, weight_scale, input_scale, TRANSPOSE_OUT, OUT_IN_SB, sbm
+    )
+
+
 def build_output_proj_tkg_input(lnc_degree, d_head, B, n_heads, S_tkg, quantization_type, H, test_bias, transpose_out):
     dtype = nl.bfloat16
+    _q_width = 4
 
-    if quantization_type == QuantizationType.STATIC:
+    if quantization_type == QuantizationType.STATIC_MX:
+        FP8_E4M3FN_MAX = 448.0
+        N_D = d_head * n_heads
+        random_gen = np_random_sample()
+
+        def convert_to_range(max_val, unif_tensor):
+            return (2 * max_val * unif_tensor - max_val).astype(unif_tensor.dtype)
+
+        attention = convert_to_range(1, random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention"))
+        in_scale = (np.abs(attention).max() / FP8_E4M3FN_MAX) * np.random.uniform(0.995, 1.005)
+
+        # Generate scalar fp8 weights, then repack to x4 matching generate_stabilized_mx_data convention.
+        weight_bf16 = convert_to_range(1, random_gen(shape=(N_D, H), dtype=dtype, name="weight"))
+        w_scale = np.abs(weight_bf16).max() / FP8_E4M3FN_MAX
+        weight_scalar_fp8 = static_cast(weight_bf16 / w_scale, nl.float8_e4m3fn)
+        # Pack: [N_D, H] → [N_D//4, 4, H] → transpose → [N_D//4, H, 4] → flatten → [N_D//4, H*4] → x4 → [N_D//4, H]
+        flat = (
+            weight_scalar_fp8.reshape(N_D // _q_width, _q_width, H)
+            .transpose(0, 2, 1)
+            .reshape(N_D // _q_width, H * _q_width)
+        )
+        weight = dt.static_cast(flat.astype(np.float32), nl.float8_e4m3fn_x4)
+
+        '''
+        # Alternative: Using generate_stabilized_mx_data directly (commented out) ---
+        # Chose to generate BF16 tensor and pack it manually to compare golden accuracy to the regualar STATIC golden.
+
+         _, weights_qtz, _ = generate_stabilized_mx_data(
+             mx_dtype=nl.float8_e4m3fn_x4,
+             shape=(N_D // _q_width, H * _q_width),
+        )
+        base_scale = 1.0 / FP8_E4M3FN_MAX
+        w_scale = base_scale * np.random.uniform(0.995, 1.005).astype(np.float32)
+        weight = weights_qtz
+        '''
+
+        weight_scale = np.broadcast_to(np.array([[w_scale]], dtype=np.float32), (128, 1))
+        input_scale = np.broadcast_to(np.array([[in_scale]], dtype=np.float32), (128, 1))
+    elif quantization_type == QuantizationType.STATIC:
         random_gen = np_random_sample()
 
         def convert_to_range(max_val, unif_tensor):
@@ -184,6 +255,14 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [1024, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
     [64, 8, 1, 128, 8192, QuantizationType.ROW, True, False],
     [64, 8, 1, 128, 8192, QuantizationType.ROW, True, True],
+    # STATIC_MX quantization tests (requires H % 512 == 0, N*D % 4 == 0, TRN3 only)
+    [32, 3, 4, 128, 4096, QuantizationType.STATIC_MX, True, False],
+    [32, 1, 2, 128, 2048, QuantizationType.STATIC_MX, True, False],
+    [64, 4, 2, 128, 3072, QuantizationType.STATIC_MX, True, False],
+    [64, 4, 2, 128, 8192, QuantizationType.STATIC_MX, True, False],
+    [64, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
+    [128, 8, 1, 128, 8192, QuantizationType.STATIC_MX, False, False],
+    [128, 2, 1, 128, 8192, QuantizationType.STATIC_MX, False, False],
 )
 
 # Manual sweep cases: H=602 (not divisible by 128) for negative test coverage
@@ -245,10 +324,8 @@ def _filter_sweep_params(B, n_heads=None, S_tkg=None, d_head=None, H=None, trans
     return FilterResult.INVALID
 
 
-@pytest_test_metadata(
-    name="Output Projection TKG",
-    pytest_marks=["output_projection", "tkg"],
-)
+@pytest_test_metadata(name="Output Projection TKG")
+@pytest_marks(["output_projection", "tkg"])
 class TestOutputProjTkgKernel:
     def run_output_proj_tkg_test(
         self,
@@ -290,7 +367,7 @@ class TestOutputProjTkgKernel:
 
         framework = UnitTestFramework(
             test_manager=test_manager,
-            kernel_entry=output_projection_tkg,
+            kernel_entry=output_proj_tkg_wrapper,
             torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
@@ -309,6 +386,7 @@ class TestOutputProjTkgKernel:
     def test_output_proj_tkg_unit(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         B: int,
         n_heads: int,
         S_tkg: int,
@@ -318,7 +396,10 @@ class TestOutputProjTkgKernel:
         test_bias: bool,
         transpose_out: bool,
     ):
-        compiler_args = CompilerArgs()
+        if quantization_type == QuantizationType.STATIC_MX and not platform_target.is_trn3():
+            pytest.skip("STATIC_MX quantization is only supported on TRN3.")
+
+        compiler_args = CompilerArgs(platform_target=platform_target)
         self.run_output_proj_tkg_test(
             test_manager=test_manager,
             compiler_args=compiler_args,
@@ -339,6 +420,7 @@ class TestOutputProjTkgKernel:
     def test_output_proj_tkg_sweep_manual(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         B: int,
         n_heads: int,
         S_tkg: int,
@@ -348,7 +430,7 @@ class TestOutputProjTkgKernel:
         test_bias: bool,
         transpose_out: bool,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         lnc_degree = compiler_args.logical_nc_config
 
         # H=602 is not divisible by 128*lnc_degree, so this is a negative test
@@ -372,16 +454,13 @@ class TestOutputProjTkgKernel:
             is_negative_test=is_negative,
         )
 
-    # Sweep test: replaces old RangeTestConfig with coverage_parametrize.
-    # Old config generated 195 cases (6 random + 128 monotonic + 2 manual + 59 product_monotonic).
-    # coverage_parametrize with "pairs" coverage generates deterministic 2-way interaction coverage
-    # over the same parameter space. The value lists below are supersets of the unique values
-    # from the old sweep generators.
+    # Sweep test: coverage_parametrize with "pairs" coverage generates deterministic
+    # 2-way interaction coverage. The value lists below cover the full parameter space.
     #
-    # Old dimension ranges:
-    #   d_head: 1..128 (monotonic steps of ~13, product steps of ~26)
-    #   B:      1..512 (product constraint: B*S_tkg <= 4096 for tp=0, <= 512 for tp=1)
-    #   n_heads: 1..64 (product constraint: n_heads*d_head <= 4096)
+    # Dimension ranges:
+    #   d_head: 1..128
+    #   B:      1..512 (constraint: B*S_tkg <= 4096 for tp=0, <= 512 for tp=1)
+    #   n_heads: 1..64 (constraint: n_heads*d_head <= 4096)
     #   S_tkg:  1..8
     #   H:      128..16384 (multiple_of=128, plus 602 for negative test)
     #   transpose_out: 0 or 1
@@ -401,6 +480,7 @@ class TestOutputProjTkgKernel:
     def test_output_proj_tkg_sweep(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         B: int,
         n_heads: int,
         S_tkg: int,
@@ -409,7 +489,7 @@ class TestOutputProjTkgKernel:
         transpose_out: bool,
         is_negative_test_case: bool,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         lnc_degree = compiler_args.logical_nc_config
 
         # Additional negative test check: H divisibility by lnc_degree * P_MAX for transpose_out
@@ -451,6 +531,7 @@ class TestOutputProjTkgKernel:
     def test_output_proj_tkg_fp8_sweep(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         B: int,
         n_heads: int,
         S_tkg: int,
@@ -459,7 +540,7 @@ class TestOutputProjTkgKernel:
         transpose_out: bool,
         is_negative_test_case: bool,
     ):
-        compiler_args = CompilerArgs()
+        compiler_args = CompilerArgs(platform_target=platform_target)
         lnc_degree = compiler_args.logical_nc_config
 
         H_divis_requirement = P_MAX if transpose_out else 1
@@ -480,4 +561,91 @@ class TestOutputProjTkgKernel:
             test_bias=True,
             transpose_out=transpose_out,
             is_negative_test=is_negative_test_case,
+        )
+
+    # MX quantization test cases
+    @pytest.mark.fast
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest.mark.parametrize(
+        "batch, n_heads, seqlen, d_head, hidden, add_bias, transpose_out, quantization_type",
+        [
+            [32, 3, 4, 128, 4096, True, False, QuantizationType.MX],
+            [32, 1, 2, 128, 2048, True, False, QuantizationType.MX],
+            [64, 4, 2, 128, 3072, True, False, QuantizationType.MX],
+            [64, 4, 2, 128, 8192, True, False, QuantizationType.MX],
+            [64, 2, 1, 128, 4096, False, False, QuantizationType.MX],
+            [128, 8, 1, 128, 8192, False, False, QuantizationType.MX],
+            [128, 2, 1, 128, 8192, False, False, QuantizationType.MX],
+        ],
+    )
+    def test_output_proj_tkg_mxfp(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch: int,
+        n_heads: int,
+        seqlen: int,
+        d_head: int,
+        hidden: int,
+        add_bias: bool,
+        transpose_out: bool,
+        quantization_type: QuantizationType,
+    ):
+        ################## Build kernel input tensors ####################
+
+        kernel_assert(quantization_type == QuantizationType.MX, "This input test generator assumes MX dtype.")
+        kernel_assert((batch * seqlen % 4) == 0, "[test_output_proj_tkg_mxfp] requires BxS to be divisible by 4.")
+        kernel_assert((hidden % 512) == 0, "")
+        dtype = nl.bfloat16
+        np.random.seed(42)
+
+        # Generate input/attention (BF16 dtype), to be quantized online inside kernel.
+        # TKG out_proj kernel assumes [D,B,N,S] input layout.
+        attention = gaussian_tensor_generator()(shape=(d_head, batch, n_heads, seqlen), dtype=dtype, name="attention")
+
+        # Generate pre-quantized weights using stabilized MX data
+        # weights_qtz has [n_heads * d_head // 4, hidden] shape.
+        _, weights_qtz, weight_scales = generate_stabilized_mx_data(
+            mx_dtype=nl.float8_e4m3fn_x4,
+            shape=((n_heads * d_head) // 4, hidden * 4),
+        )
+        weight_scales = weight_scales.reshape((n_heads * d_head) // 32, hidden)
+
+        bias = gaussian_tensor_generator(std=100)(shape=(1, hidden), dtype=dtype, name="bias") if add_bias else None
+
+        # Dictionary of inputs to be passed to both torch reference and the kernel
+        # Names match kernel parameters exactly
+        kernel_inputs = {
+            "attention": attention,
+            "weight": weights_qtz,
+            "bias": bias,
+            "quantization_type": quantization_type,
+            "weight_scale": weight_scales,
+            "input_scale": None,
+            "TRANSPOSE_OUT": transpose_out,
+            "OUT_IN_SB": False,
+        }
+
+        def input_generator(test_config):
+            return kernel_inputs
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch * seqlen, hidden), dtype=dtype)}
+
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        # input_generator (=kernel_inputs) passed to both torch_ref and the kernel.
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_tkg,
+            torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=5e-2,
+            atol=1e-3,
+            inference_args=TKG_INFERENCE_ARGS,
         )

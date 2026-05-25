@@ -12,65 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-NkiCpuSimulator integration - all simulator-dependent code in one place.
+nki.simulate integration - all simulator-dependent code in one place.
 
-This module is only imported when simulation mode is active. If NkiCpuSimulator
-is not available, imports will fail with a clear error message.
+This module is only imported when simulation mode is active.
 """
 
-import builtins
 import logging
 import os
-import sys
 
 import numpy as np
-
-# NkiCpuSimulator is optional - if not installed, simulation mode will fail gracefully.
-# This is expected when running on systems without the simulator package.
-try:
-    import nki_cpu_simulator.nki.builtin as sim_builtin
-    import nki_cpu_simulator.nki.compiler as sim_ncc
-    import nki_cpu_simulator.nki.isa as sim_nisa
-    import nki_cpu_simulator.nki.isa.constants as sim_nisa_constants
-    import nki_cpu_simulator.nki.language as sim_nl
-    import nki_cpu_simulator.nki.language.dtypes as sim_dtypes
-    import nki_cpu_simulator.nki.tensor as sim_ntensor
-    import nki_cpu_simulator.nki.typing as sim_nt
-    from nki_cpu_simulator import nki as sim_nki
-
-    SIMULATOR_AVAILABLE = True
-except ImportError as e:
-    SIMULATOR_AVAILABLE = False
-    _IMPORT_ERROR = e
 
 from .common_dataclasses import GoldenTensorDict, normalize_golden_output
 from .simulation_constants import SIMULATION_RUN_ALL_ENV_VAR
 
 # Patterns to identify tests with large shapes that are slow on CPU simulation
-_LARGE_SHAPE_PATTERNS = ("4096", "5120", "8192", "16384", "32768", "36864")
+_LARGE_SHAPE_PATTERNS = ("4096", "5120", "7168", "8192", "10240", "16384", "32768", "36864")
 
 
 def setup_simulation_mode():
-    """Setup simulation mode: alias nki modules and configure environment."""
-    if not SIMULATOR_AVAILABLE:
-        raise ImportError(f"NkiCpuSimulator not available: {_IMPORT_ERROR}")
+    """Setup simulation mode"""
 
     # Limit BLAS threading in xdist workers to avoid contention
     if "PYTEST_XDIST_WORKER" in os.environ:
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("MKL_NUM_THREADS", "1")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-
-    # Alias nki modules to use NkiCpuSimulator
-    builtins.builtin = sim_builtin
-    sys.modules["nki"] = sim_nki
-    sys.modules["nki.language"] = sim_nl
-    sys.modules["nki.isa"] = sim_nisa
-    sys.modules["nki.isa.constants"] = sim_nisa_constants
-    sys.modules["nki.typing"] = sim_nt
-    sys.modules["nki.compiler"] = sim_ncc
-    sys.modules["nki.dtype"] = sim_dtypes
-    sys.modules["nki.tensor"] = sim_ntensor
 
 
 def skip_slow_simulation_tests(items, skip_marker):
@@ -83,13 +49,13 @@ def skip_slow_simulation_tests(items, skip_marker):
 
 
 def simulate_kernel(kernel_func, kernel_input: dict, lnc_count: int) -> list:
-    """Execute kernel using NkiCpuSimulator."""
-    import nki
+    """Execute kernel using nki.simulator.simulate_kernel."""
+    from nki.simulator import simulate_kernel as _simulate_kernel
 
     # Strip ".must_alias_input" suffix from parameter names - this suffix is added
-    # for the graph compiler but NkiCpuSimulator expects original param names
+    # for the graph compiler but simulate_kernel expects original param names
     cleaned_input = {k.removesuffix(".must_alias_input"): v for k, v in kernel_input.items()}
-    result = nki.cpu_simulate(kernel_func)[lnc_count](**cleaned_input)
+    result = _simulate_kernel(kernel_func, args=[], kwargs=cleaned_input, _lnc=lnc_count)
 
     if result is None:
         return []
@@ -100,11 +66,11 @@ def simulate_kernel(kernel_func, kernel_input: dict, lnc_count: int) -> list:
 
 
 def run_simulator_inference(kernel_under_test) -> dict[str, np.ndarray]:
-    """Run kernel using NkiCpuSimulator and return outputs.
+    """Run kernel using nki.simulate and return outputs.
 
     Returns dict mapping output names to numpy arrays, ready for dumping/validation.
     """
-    logging.info("Running kernel via NkiCpuSimulator")
+    logging.info("Running kernel via nki.simulate")
 
     os.environ["NKI_NC_VERSION"] = kernel_under_test.compiler_input.platform_target.get_nc_gen()
     kernel_outputs = simulate_kernel(

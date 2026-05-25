@@ -174,31 +174,35 @@ The attention_block_tkg kernel with KV data parallelism wraps the standard atten
 │      │ (optional)      │   │ (optional)      │   │ to FP8 (opt.)   │                           │
 │      └─────────────────┘   └─────────────────┘   └────────┬────────┘                           │
 │                                                           v                                    │
-│  ╔════════════════════════════════════════════════════════════════════════════════════╗        │
-│  ║                       KV DATA PARALLELISM INPUT GATHER                             ║        │
-│  ║  ┌─────────────────────────────────────────────────────────────────────────────┐   ║        │
-│  ║  │ 1. all_gather Q heads: (q_heads, B, S, d) -> (KVDP*q_heads, B, S, d)        │   ║        │
-│  ║  │ 2. Slice Q batch:  (KVDP*q_heads, B, S, d) -> (KVDP*q_heads, B/KVDP, S, d)  │   ║        │
-│  ║  │ 3. Slice K,V batch: (B, S, d) -> (B/KVDP, S, d)                             │   ║        │
-│  ║  └─────────────────────────────────────────────────────────────────────────────┘   ║        │
-│  ╚════════════════════════════════════════════════════════════════════════════════════╝        │
+│  ╔════════════════════════════════════════════════════════════════════════════════════════╗    │
+│  ║                       KV DATA PARALLELISM INPUT COLLECTIVES                            ║    │
+│  ║  ┌─────────────────────────────────────────────────────────────────────────────────┐   ║    │
+│  ║  │ 1. Rearrange Q: (q_heads, B, S, d) -> (KVDP*q_heads, B/KVDP, S, d)              │   ║    │
+│  ║  │ 2. all_to_all Q dim=0: (KVDP*q_heads, B/KVDP, S, d) — all heads, local batch    │   ║    │
+│  ║  │ 3. Transpose back to SBUF: (d, B_attn*q_heads_attn*S)                           │   ║    │
+│  ║  │ K: Slice batch to SBUF: (d, B/KVDP*S)                                           │   ║    │
+│  ║  │ V: Slice batch in HBM: (B/KVDP, 1, S, d)                                        │   ║    │
+│  ║  └─────────────────────────────────────────────────────────────────────────────────┘   ║    │
+│  ╚════════════════════════════════════════════════════════════════════════════════════════╝    │
 │                                                       │                                        │
 │                                                       v                                        │
 │                   ┌──────────────────────────────────────────────────────────┐                 │
 │                   │                    ATTENTION TKG                         │                 │
-│                   │  Q: (B/KVDP, KVDP*q_heads, S, d)  KV: (B/KVDP, S_ctx, d) │                 │
+│                   │  Q: (d, B_attn*q_heads_attn*S) @ SBUF                    │                 │
+│                   │  K: (d, B_attn*S) @ SBUF    V: (B_attn, 1, S, d) @ HBM   │                 │
 │                   │  softmax(Q @ K^T / sqrt(d)) @ V                          │                 │
-│                   │  Output: (B/KVDP, KVDP*q_heads, d, S)                    │                 │
+│                   │  Output: (d, B_attn*q_heads_attn*S) @ SBUF               │                 │
 │                   └───────────────────────────────────┬──────────────────────┘                 │
 │                                                       │                                        │
 │                                                       v                                        │
-│  ╔══════════════════════════════════════════════════════════════════════════════════════╗      │
-│  ║                       KV DATA PARALLELISM OUTPUT GATHER                              ║      │
-│  ║  ┌───────────────────────────────────────────────────────────────────────────────┐   ║      │
-│  ║  │ 1. all_gather batch: (B/KVDP, KVDP*q_heads, d, S) -> (B, KVDP*q_heads, d, S)  │   ║      │
-│  ║  │ 2. Slice heads:  (B, KVDP*q_heads, d, S) -> (B, q_heads, d, S)                │   ║      │
-│  ║  └───────────────────────────────────────────────────────────────────────────────┘   ║      │
-│  ╚══════════════════════════════════════════════════════════════════════════════════════╝      │
+│  ╔════════════════════════════════════════════════════════════════════════════════════════╗    │
+│  ║                       KV DATA PARALLELISM OUTPUT COLLECTIVES                           ║    │
+│  ║  ┌───────────────────────────────────────────────────────────────────────────────────┐ ║    │
+│  ║  │ 1. Rearrange attn: (B/KVDP, KVDP*q_heads, d, S) -> (KVDP*q_heads, B/KVDP, d, S)   │ ║    │
+│  ║  │ 2. all_to_all attn dim=0: (KVDP*q_heads, B/KVDP, d, S) — local heads, all batches │ ║    │
+│  ║  │ 3. Rearrange back: (KVDP*q_heads, B/KVDP, d, S) -> (B, q_heads, d, S)             │ ║    │
+│  ║  └───────────────────────────────────────────────────────────────────────────────────┘ ║    │
+│  ╚════════════════════════════════════════════════════════════════════════════════════════╝    │
 │                                                       │                                        │
 │                                                       v                                        │
 │                   ┌───────────────────────────────────────────────────────────┐                │
@@ -216,7 +220,84 @@ The attention_block_tkg kernel with KV data parallelism wraps the standard atten
 └────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Collective Operations
+### Configuration Parameters
+
+| Parameter              | Type                | Description                                                       |
+|------------------------|---------------------|-------------------------------------------------------------------|
+| `KVDP`                 | int                 | KV data parallelism degree (1 = disabled)                         |
+| `KVDP_replica_group`   | ReplicaGroup        | Rank group for collectives                                        |
+| `KVDP_collective_mode` | KVDPCollectiveMode  | Collective mode: `ALL_TO_ALL` (default) or `ALL_GATHER_SLICE`     |
+
+### Collective Modes
+
+The `KVDP_collective_mode` parameter selects the collective operation strategy for Q input and attention output redistribution:
+
+- **ALL_TO_ALL (default):** Single `all_to_all` collective that combines gather and slice in one step. Requires Mesh algorithm (≥4 ranks lnc2 or ≥8 ranks lnc1).
+- **ALL_GATHER_SLICE:** `all_gather` on heads/batch followed by a `rank_id`-based slice. Works with any rank count (≥2).
+
+Note: K/V batch slicing still uses `rank_id` in both modes (local slice, not a collective).
+
+### Collective Operations: ALL_TO_ALL
+
+The implementation uses a single `all_to_all` collective that combines gather and slice in one step.
+Rearranges are required to put KVDP batch/head groups on dim=0 for all_to_all chunking.
+
+**Input Collectives (before attention):**
+
+    SBUF Input               Rearrange + Transpose to HBM                  all_to_all                       Transpose + Rearrange to SBUF
+    ──────────               ─────────────────────────────                  ──────────                       ─────────────────────────────
+    Q (q==1): (d, B*S)       rearrange in HBM (KVDP, d, B/KVDP*S)          (KVDP, d, B/KVDP*S)              rearrange to (d, B*S) @ SBUF
+    Q (q>1):  (d, B*q*S)     rearrange SBUF (d, KVDP*q, B/KVDP*S)          (KVDP*q, B/KVDP, S, d)           (d, B*q*S) @ SBUF
+                             tiled transpose to HBM (KVDP*q, B/KVDP, S, d)                                  tiled transpose + rearrange
+    K: (d, B*S)              slice in HBM                                  -                                (d, B/KVDP*S) @ SBUF
+    V: (B, 1, S, d)          slice in HBM                                  -                                stays in HBM
+
+When q_heads==1, the Q path avoids transpose entirely: d stays on partition dim, rearrange in HBM only.
+
+**Output Collectives (after attention):**
+
+    SBUF Input                 Rearrange + Transpose to HBM                  all_to_all                       Transpose + Rearrange to SBUF
+    ──────────                 ─────────────────────────────                 ──────────                       ─────────────────────────────
+    attn: (d, B*q*S)           rearrange SBUF (d, KVDP*q, B/KVDP*S)          (KVDP*q, B/KVDP, d, S)           (d, B*q*S) @ SBUF
+                               tiled transpose to HBM (KVDP*q, B/KVDP, d, S)                                  tiled transpose + rearrange
+
+**Example with KVDP=4, q_heads=1, B=8, S_tkg=1, d_head=64:**
+
+    Input Collectives (B/KVDP=2, q_heads*KVDP=4):
+        Q @ SBUF:  (64, 8)           - d_head=64, B*q_heads*S_tkg=8
+        Q @ HBM:   (64, 8)           - copy to HBM (q_heads=1, no transpose)
+        Rearranged:(4, 64, 2)        - (KVDP=4, d_head=64, B/KVDP*S=2) — KVDP groups on dim 0
+        After a2a: (4, 64, 2)        - rank i gets chunk i from all ranks
+        Q @ SBUF:  (64, 8)           - rearrange (q_attn=4, d=64, B_attn=2, S=1) → (d=64, B_attn*q_attn*S=8)
+
+    Output Collectives:
+        attn @ SBUF: (64, 8)         - d_head=64, B*q_heads*S_tkg=8
+        Rearranged:  (64, 8)         - rearrange (d, B_attn, q_attn, S) → (d, q_attn, B_attn, S)
+        attn @ HBM:  (4, 2, 64, 1)   - tiled transpose: (q_attn=4, B_attn=2, d=64, S=1)
+        After a2a:   (4, 2, 64, 1)   - rank i gets q_heads from all KVDP ranks
+        attn @ SBUF: (64, 8)         - tiled transpose + rearrange (d, KVDP, q, B_attn, S) → (d, B*q*S)
+
+**Example with KVDP=4, q_heads=2, B=8, S_tkg=1, d_head=64 (q_heads>1 path):**
+
+    Input Collectives (B_attn=B/KVDP=2, q_heads_attn=KVDP*q_heads=8):
+        Q @ SBUF:  (64, 16)          - (d=64, B*q*S=8*2*1=16)
+        Rearrange: (64, 16)          - rearrange SBUF (d, B, q, S)=(64,8,2,1) → (d, KVDP, q, B_attn, S)=(64,4,2,2,1)
+        Q @ HBM:   (8, 64, 2, 1)     - tiled transpose: (KVDP*q=8, d=64, B_attn=2, S=1)
+        After a2a: (8, 64, 2, 1)     - rank i gets chunk i (q=2 heads) from all 4 ranks
+        Transpose: (64, 16)          - tiled transpose back: (d=64, q_attn*B_attn*S=8*2*1=16)
+        Rearrange: (64, 16)          - rearrange SBUF (d, q_attn, B_attn, S)=(64,8,2,1) → (d, B_attn, q_attn, S)=(64,2,8,1)
+        Q @ SBUF:  (64, 16)          - (d=64, B_attn*q_attn*S=16)
+
+    Output Collectives:
+        attn @ SBUF: (64, 16)        - (d=64, B_attn*q_attn*S=2*8*1=16)
+        Rearrange:   (64, 16)        - rearrange SBUF (d, B_attn, q_attn, S)=(64,2,8,1) → (d, q_attn, B_attn, S)=(64,8,2,1)
+        attn @ HBM:  (8, 2, 64, 1)   - tiled transpose: (q_attn=8, B_attn=2, d=64, S=1)
+        After a2a:   (8, 2, 64, 1)   - rank i gets q=2 heads from all 4 ranks
+        Transpose:   (64, 16)        - tiled transpose back: (d=64, q_attn*B_attn*S=16)
+        Rearrange:   (64, 16)        - rearrange SBUF (d, KVDP, q, B_attn, S)=(64,4,2,2,1) → (d, KVDP, B_attn, q, S)=(64,4,2,2,1)
+        attn @ SBUF: (64, 16)        - (d=64, B*q*S=8*2*1=16)
+
+### Collective Operations: ALL_GATHER_SLICE
 
 The implementation uses `all_gather` on heads + `slice` on batch. Transposes are required to move the
 collective dimension to dim=0 for all_gather.
@@ -225,7 +306,7 @@ collective dimension to dim=0 for all_gather.
 
     SBUF Input               Transpose to HBM              all_gather                  slice batch                      Transpose to SBUF
     ──────────               ────────────────              ──────────                  ───────────                      ─────────────────
-    Q: (d, B*q_heads*S)      (q_heads, B, S, d) @ HBM      (KVDP*q_heads, B, S, d)     (KVDP*q_heads, B/KVDP, S, d)     (d, B/KVDP*KVDP*q_heads*S) @ SBUF
+    Q: (d, B*q_heads*S)      (q_heads, B, S, d) @ HBM      (KVDP*q_heads, B, S, d)     (KVDP*q_heads, B/KVDP, S, d)     (d, B*q_heads*S) @ SBUF
     K: (d, B*S)              slice in HBM                  -                           (d, B/KVDP*S)                    (d, B/KVDP*S) @ SBUF
     V: (B, 1, S, d)          slice in HBM                  -                           (B/KVDP, 1, S, d)                stays in HBM
 
@@ -233,9 +314,9 @@ When q_heads==1, the Q transpose can be skipped: all_gather directly on d_head d
 
 **Output Collectives (after attention):**
 
-    SBUF Input                           Transpose to HBM                 all_gather                 slice heads              Transpose to SBUF
-    ──────────                           ────────────────                 ──────────                 ───────────              ─────────────────
-    attn: (d, B/KVDP*KVDP*q_heads*S)     (B/KVDP, KVDP*q_heads, d, S)     (B, KVDP*q_heads, d, S)    (B, q_heads, d, S)       (d, B*q_heads*S) @ SBUF
+    SBUF Input                 Transpose to HBM                 all_gather                 slice heads              Transpose to SBUF
+    ──────────                 ────────────────                 ──────────                 ───────────              ─────────────────
+    attn: (d, B*q_heads*S)     (B/KVDP, KVDP*q_heads, d, S)     (B, KVDP*q_heads, d, S)    (B, q_heads, d, S)       (d, B*q_heads*S) @ SBUF
 
 **Example with KVDP=4, q_heads=1, B=8, S_tkg=1, d_head=64:**
 
@@ -244,31 +325,42 @@ When q_heads==1, the Q transpose can be skipped: all_gather directly on d_head d
         Q @ HBM:   (64, 8)           - no transpose needed (q_heads=1 optimization)
         Gathered:  (256, 8)          - KVDP*d_head=256, B*S_tkg=8
         Sliced:    (4, 64, 2, 1)     - KVDP*q_heads=4, d_head=64, B/KVDP=2, S_tkg=1
-        Q @ SBUF:  (64, 8)           - d_head=64, B/KVDP*KVDP*q_heads*S_tkg=8
+        Q @ SBUF:  (64, 8)           - d_head=64, B*q_heads*S_tkg=8
 
     Output Collectives:
-        attn @ SBUF: (64, 8)         - d_head=64, B/KVDP*KVDP*q_heads*S_tkg=8
+        attn @ SBUF: (64, 8)         - d_head=64, B*q_heads*S_tkg=8
         attn @ HBM:  (2, 4, 64, 1)   - B/KVDP=2, KVDP*q_heads=4, d_head=64, S_tkg=1
         Gathered:    (8, 4, 64, 1)   - B=8, KVDP*q_heads=4, d_head=64, S_tkg=1
         Sliced:      (8, 1, 64, 1)   - B=8, q_heads=1, d_head=64, S_tkg=1
         attn @ SBUF: (64, 8)         - d_head=64, B*q_heads*S_tkg=8
 
+**Example with KVDP=4, q_heads=2, B=8, S_tkg=1, d_head=64 (q_heads>1 path):**
+
+    Input Collectives (B_attn=B/KVDP=2, q_heads_attn=KVDP*q_heads=8):
+        Q @ SBUF:  (64, 16)          - (d=64, B*q*S=8*2*1=16)
+        Rearrange: (64, 16)          - rearrange SBUF (d, B, q, S)=(64,8,2,1) → (d, q, B, S)=(64,2,8,1)
+        Q @ HBM:   (2, 8, 1, 64)     - tiled transpose: (q=2, B=8, S=1, d=64)
+        Gathered:  (8, 8, 1, 64)     - all_gather dim=0: (KVDP*q=8, B=8, S=1, d=64)
+        Sliced:    (8, 2, 1, 64)     - rank_id slice on batch: (KVDP*q=8, B_attn=2, S=1, d=64)
+        Transpose: (64, 16)          - tiled transpose back: (d=64, q_attn*B_attn*S=8*2*1=16)
+        Rearrange: (64, 16)          - rearrange SBUF (d, q_attn, B_attn, S)=(64,8,2,1) → (d, B_attn, q_attn, S)=(64,2,8,1)
+        Q @ SBUF:  (64, 16)          - (d=64, B_attn*q_attn*S=16)
+
+    Output Collectives:
+        attn @ SBUF: (64, 16)        - (d=64, B_attn*q_attn*S=2*8*1=16)
+        attn @ HBM:  (2, 8, 64, 1)   - tiled transpose: (B_attn=2, q_attn=8, d=64, S=1)
+        Gathered:    (8, 8, 64, 1)   - all_gather dim=0: (B=8, q_attn=8, d=64, S=1)
+        Sliced:      (8, 2, 64, 1)   - rank_id slice on heads: (B=8, q=2, d=64, S=1)
+        attn @ SBUF: (64, 16)        - tiled transpose back: (d=64, B*q*S=8*2*1=16)
+
 See `_KVDP_attention_input_collectives` and `_KVDP_attention_output_collectives` docstrings for pseudocode.
 
-### Configuration Parameters
-
-| Parameter            | Type         | Description                              |
-|----------------------|--------------|------------------------------------------|
-| `KVDP`               | int          | KV data parallelism degree (1 = disabled)|
-| `KVDP_replica_group` | ReplicaGroup | Rank group for collectives               |
 
 ## Future Optimizations
 
-1. **all2all instead of all_gather + slice**: Current implementation uses all_gather on Q heads followed by a rank_id-based batch slice. A single all2all collective could replace this.
+1. **KV projection for batch slice**: Currently each rank computes Q, K, V for all B batches (fused QKV kernel), then slices K/V to B/KVDP for cache update. The extra K/V compute is small relative to attention and avoids unfusing the QKV projection. 
 
-2. **KV projection for batch slice**: Currently each rank computes Q, K, V for all B batches (fused QKV kernel), then slices K/V to B/KVDP for cache update. The extra K/V compute is small relative to attention and avoids unfusing the QKV projection. 
-
-3. **SB2SB collectives**: The current implementation round-trips through HBM for all_gather (SBUF -> HBM -> all_gather -> HBM -> SBUF). The all_gather collective supports SBUF tensors as src/dst, which would eliminate the HBM round-trips and reduce latency for the input and output collectives.
+2. **SB2SB collectives**: Both modes round-trip through HBM for collectives (SBUF → HBM → collective → HBM → SBUF). NKI collectives support SBUF tensors as src/dst, which would eliminate the HBM round-trips and reduce latency.
 
 ## Context Parallelism (Future)
 

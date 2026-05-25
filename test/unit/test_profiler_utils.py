@@ -531,7 +531,7 @@ def test_save_nth_output():
 
 
 def test_perf_analysis_uses_output_file_flag():
-    """Perf analysis detailed JSON uses --output-file= to avoid clobbering summary ntff.json."""
+    """Perf analysis detailed parquet uses --output-file= to avoid clobbering summary ntff.json."""
     cmds = ProfilerCommands(
         num_runs=1,
         profile_all_runs=False,
@@ -544,7 +544,8 @@ def test_perf_analysis_uses_output_file_flag():
     # Summary ntff.json should still be generated via redirect
     assert "> ntff.json" in cmds.json_generation_cmd
 
-    # Detailed command should use --output-file= instead of mv, so ntff.json is not clobbered
-    assert "--output-file=ntff_detailed.json" in cmds.detailed_json_generation_cmd
-    assert "mv ntff.json" not in cmds.detailed_json_generation_cmd
-    assert cmds.expected_detailed_json_files == ["ntff_detailed.json"]
+    # Detailed command should use neuron-explorer with --output-format=parquet and a folder path
+    assert "neuron-explorer" in cmds.detailed_parquet_generation_cmd
+    assert "--output-format=parquet" in cmds.detailed_parquet_generation_cmd
+    assert "--output-file=profiler_db" in cmds.detailed_parquet_generation_cmd
+    assert cmds.expected_detailed_parquet_dirs == ["profiler_db"]

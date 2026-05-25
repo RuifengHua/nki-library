@@ -14,12 +14,14 @@
 
 """Utility functions for normalization kernels in token generation mode."""
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import nki.isa as nisa
 import nki.language as nl
 
-from ..utils.allocator import SbufManager
+from ..utils.allocator import SbufManager, sizeinbytes
+from ..utils.interleave_copy import interleave_copy
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.tensor_view import TensorView
@@ -36,6 +38,97 @@ _CONTIGUOUS_LOAD_H_THRESHOLD = 2048
 
 # Alignment constants for nc_transpose
 _PSUM_ALIGNMENT_BYTES = 4
+
+# MX config
+_SUPPORTED_QMX_OUTPUT_DTYPES = [nl.float8_e4m3fn_x4, nl.float8_e5m2_x4]
+_QMX_UNPACKED_OUTPUT_DTYPES = [nl.float8_e4m3fn, nl.float8_e5m2]
+_MX_SCALE_DTYPE = nl.uint8
+_MX_UNPACKED_PACKED_MAP = {
+    nl.float8_e4m3fn: nl.float8_e4m3fn_x4,
+    nl.float8_e5m2: nl.float8_e5m2_x4,
+}
+
+# Transpose config
+_UINT8_TP_VIEW_DTYPE = nl.float8_e5m2
+_1B_XPOSE_PSUM_STEP = 2
+
+# rmsnorm_mx_quantize_tkg BxS sharding threshold
+_RMSNORM_QMX_SHARDING_THRESHOLD = 4
+
+
+def pe_transpose(
+    src,
+    dst,
+    tile_size: int,
+    dtype,
+    sbm: SbufManager,
+    psum_bank_base: int = 0,
+):
+    """
+    Transpose 3D [P, tile_size, num_tiles] → 3D [tile_size, P, num_tiles] through PSUM.
+    Ex: [T, H0, H2] -> [H0, T, H2]
+
+    For each tile index i, extracts src[:, :, i] of shape [P, tile_size],
+    transposes it to [tile_size, P] via nc_transpose, and writes to dst[:, :, i].
+
+    Packs multiple tiles per PSUM bank when P is small, cycling across
+    banks for scalar/vector engine interleaving.
+
+
+    Args:
+        src: 3D SBUF tensor or TensorView [P, tile_size, num_tiles].
+        dst: 3D SBUF TensorView [tile_size, P, num_tiles].
+        tile_size: partition dimension size of each transposed tile.
+        dtype: tensor data type.
+        sbm: SbufManager for PSUM address control.
+        psum_bank_base: starting PSUM bank index offset, cycled modulo _PSUM_BANK_COUNT.
+    """
+    _psum_fmax = nl.tile_size.psum_fmax
+
+    src_view = TensorView(src) if not isinstance(src, TensorView) else src
+    dst_view = TensorView(dst) if not isinstance(dst, TensorView) else dst
+
+    P = src_view.shape[0]
+    num_tiles = src_view.shape[2]
+
+    dtype_size = sizeinbytes(dtype)
+    # PSUM alignment: compute padded size for 4-byte alignment
+    padded_tile_size = div_ceil(P * dtype_size, _PSUM_ALIGNMENT_BYTES) * _PSUM_ALIGNMENT_BYTES // dtype_size
+    tiles_per_psum = _psum_fmax // padded_tile_size
+
+    # dst is [tile_size, P, num_tiles] → permute to [tile_size, num_tiles, P] for contiguous tile writes
+    dst_permuted = dst_view.permute(dims=[0, 2, 1])
+
+    for psum_tile in TiledRange(num_tiles, tiles_per_psum):
+        psum_bank_idx = (psum_tile.index + psum_bank_base) % _PSUM_BANK_COUNT
+        cur_tiles_per_psum = psum_tile.size
+
+        tp_psum = nl.ndarray(
+            (tile_size, cur_tiles_per_psum * padded_tile_size),
+            dtype=dtype,
+            buffer=nl.psum,
+            address=None if sbm.is_auto_alloc() else (0, psum_bank_idx * _psum_fmax * 4),
+        )
+
+        for i in range(cur_tiles_per_psum):
+            tile_idx = psum_tile.start_offset + i
+            col_offset = i * padded_tile_size
+            tile_src = src_view.slice(dim=2, start=tile_idx, end=tile_idx + 1).squeeze_dim(dim=2)  # [P, tile_size]
+            nisa.nc_transpose(
+                dst=tp_psum[0:tile_size, col_offset : col_offset + P],
+                data=tile_src.get_view(),
+            )
+
+        tp_psum_view = (
+            TensorView(tp_psum)
+            .reshape_dim(dim=1, shape=[cur_tiles_per_psum, padded_tile_size])
+            .slice(dim=2, start=0, end=P)
+        )
+        interleave_copy(
+            index=psum_bank_idx,
+            dst=dst_permuted.slice(dim=1, start=psum_tile.start_offset, end=psum_tile.end_offset).get_view(),
+            src=tp_psum_view.get_view(),
+        )
 
 
 def validate_shapes(
@@ -159,6 +252,9 @@ def contiguous_load_transpose(
     More efficient than dma_copy for small H dimensions. Loads data contiguously
     to SBUF, then uses nc_transpose to rearrange into the target layout.
 
+    Supports unbalanced sharding: when H1 is not evenly divisible by num_H_shards,
+    earlier shards get floor(H1/num_H_shards) tiles and the last shard gets the remainder.
+
     Args:
         input_hbm (TensorView): [BxS, H], Input tensor view in HBM
         input_sb (TensorView): [H0, BxS, H1], Output buffer in SBUF
@@ -170,32 +266,20 @@ def contiguous_load_transpose(
 
     Notes:
         Data Layout:
-            HBM input:  [BxS, H] where H = num_H_shards * H0 * H2
-                        Logical view: [BxS, num_H_shards, H0, H2] (row-major)
-                        Memory order: for each bxs, data is [shard0{H0*H2}, shard1{H0*H2}, ...]
-                                      within each shard: [h0_0*H2 elements, h0_1*H2 elements, ...]
+            HBM input:  [BxS, H] where H = sum of per-shard H0 * H2_shard
+                        Memory order: for each bxs, data is [shard0{H0*H2_0}, shard1{H0*H2_1}, ...]
 
-            SBUF output: [H0, BxS, H1] where H1 = num_H_shards * H2
-                         Logical view: [H0, BxS, num_H_shards, H2]
+            SBUF output: [H0, BxS, H1] where H1 = sum of H2_shard
+                         Logical view: [H0, BxS, shard0_H2 | shard1_H2 | ...]
     """
     H0 = nl.tile_size.pmax
-    _psum_fmax = nl.tile_size.psum_fmax
 
     BxS, H = input_hbm.shape
     H1 = H // H0
-    H2 = H1 // num_H_shards
+    H2_base = H1 // num_H_shards
 
     output_H1 = input_sb.shape[2]
-    output_H2 = output_H1 // num_H_shards
-
-    # Reshape output [H0, BxS, output_H1] -> [H0, BxS, num_H_shards, output_H2]
-    output_reshaped = input_sb.reshape_dim(dim=2, shape=[num_H_shards, output_H2])
-
-    # Total (shard, h2) tiles to process per BxS tile
-    total_h_tiles = num_H_shards * H2
-
-    # PSUM alignment: compute padded size for 4-byte alignment
-    dtype_size = 2 if input_hbm.dtype in [nl.float16, nl.bfloat16] else 4
+    output_H2_base = output_H1 // num_H_shards
 
     for bxs_tile in TiledRange(BxS, H0):
         # Load [bxs_tile.size, H] from HBM to SBUF
@@ -210,59 +294,37 @@ def contiguous_load_transpose(
         )  # [bxs_tile.size, H]
         nisa.dma_copy(src=input_hbm_tile.get_view(), dst=input_sbuf_temp, dge_mode=_DGE_MODE_NONE)
 
-        # Reshape [bxs_tile.size, H] -> [bxs_tile.size, num_H_shards, H0, H2]
-        input_temp_view = TensorView(input_sbuf_temp).reshape_dim(dim=1, shape=[num_H_shards, H0, H2])
+        input_temp_view = TensorView(input_sbuf_temp)
 
-        # Compute padded tile size for PSUM alignment
-        padded_tile_size = (
-            div_ceil(bxs_tile.size * dtype_size, _PSUM_ALIGNMENT_BYTES) * _PSUM_ALIGNMENT_BYTES // dtype_size
-        )
+        src_h_offset = 0
+        dst_h_offset = 0
+        for shard_idx in range(num_H_shards):
+            # Unbalanced sharding: last shard gets the remainder
+            shard_H2 = H2_base if shard_idx < num_H_shards - 1 else H1 - H2_base * (num_H_shards - 1)
+            shard_output_H2 = (
+                output_H2_base if shard_idx < num_H_shards - 1 else output_H1 - output_H2_base * (num_H_shards - 1)
+            )
 
-        tiles_per_psum = _psum_fmax // padded_tile_size
+            # src: slice [bxs_tile.size, H0 * shard_H2] from flat H, reshape to [bxs_tile.size, H0, shard_H2]
+            src_view = input_temp_view.slice(dim=1, start=src_h_offset, end=src_h_offset + H0 * shard_H2).reshape_dim(
+                dim=1, shape=[H0, shard_H2]
+            )
 
-        for psum_tile in TiledRange(total_h_tiles, tiles_per_psum):
-            psum_bank_idx = psum_tile.index % _PSUM_BANK_COUNT
-            tiles_this_psum = psum_tile.size
+            # dst: [H0, bxs_tile.size, shard_output_H2]
+            dst_view = input_sb.slice(dim=1, start=bxs_tile.start_offset, end=bxs_tile.end_offset).slice(
+                dim=2, start=dst_h_offset, end=dst_h_offset + shard_output_H2
+            )
 
-            # Allocate PSUM [H0, tiles_this_psum * padded_tile_size]
-            tp_psum = nl.ndarray(
-                (H0, tiles_this_psum * padded_tile_size),
+            pe_transpose(
+                src=src_view,
+                dst=dst_view,
+                tile_size=H0,
                 dtype=input_hbm.dtype,
-                buffer=nl.psum,
-                address=None if sbm.is_auto_alloc() else (0, psum_bank_idx * _psum_fmax * 4),
+                sbm=sbm,
             )
 
-            # Transpose each (shard, h2) tile into PSUM
-            for tile_in_psum in range(tiles_this_psum):
-                h_tile_idx = psum_tile.start_offset + tile_in_psum
-                shard_idx, h2_idx = divmod(h_tile_idx, H2)
-                col_offset = tile_in_psum * padded_tile_size
-
-                # Extract [bxs_tile.size, H0] for this (shard, h2)
-                src_view = (
-                    input_temp_view.slice(dim=1, start=shard_idx, end=shard_idx + 1)
-                    .squeeze_dim(dim=1)
-                    .slice(dim=2, start=h2_idx, end=h2_idx + 1)
-                    .squeeze_dim(dim=2)
-                )
-                # Transpose [bxs_tile.size, H0] -> [H0, bxs_tile.size] in PSUM
-                nisa.nc_transpose(dst=tp_psum[0:H0, col_offset : col_offset + bxs_tile.size], data=src_view.get_view())
-
-            # Copy PSUM -> SBUF
-            dst_view = (
-                output_reshaped.slice(dim=1, start=bxs_tile.start_offset, end=bxs_tile.end_offset)
-                .flatten_dims(start_dim=2, end_dim=3)  # [H0, bxs_tile.size, H1]
-                .permute(dims=[0, 2, 1])  # [H0, H1, bxs_tile.size]
-                .slice(dim=1, start=psum_tile.start_offset, end=psum_tile.end_offset)
-            )
-
-            # Create PSUM view that skips padding
-            tp_psum_view = (
-                TensorView(tp_psum)
-                .reshape_dim(dim=1, shape=[tiles_this_psum, padded_tile_size])
-                .slice(dim=2, start=0, end=bxs_tile.size)
-            )
-            nisa.tensor_copy(dst=dst_view.get_view(), src=tp_psum_view.get_view())
+            src_h_offset += H0 * shard_H2
+            dst_h_offset += shard_output_H2
 
         sbm.pop_heap()
 
@@ -312,7 +374,7 @@ def load_input_to_sbuf(
         nisa.dma_transpose(dst=input_sb_view.get_view(), src=input_hbm_view.get_view())
     elif shard_on_h:
         if use_contiguous_load:
-            kernel_assert(sbm is not None, "sbm required for contiguous load path")
+            kernel_assert(sbm != None, "sbm required for contiguous load path")
             contiguous_load_transpose(input_hbm, input_sb, 1, sbm)
         else:
             # (BxS, sharded_H) -> (BxS, H0, H1) -> (H0, BxS, H1)
@@ -325,16 +387,38 @@ def load_input_to_sbuf(
     else:
         # (BxS, H) -> (BxS, num_H_shards, H0, H2) -> (H0, BxS, num_H_shards, H2)
         if use_contiguous_load:
-            kernel_assert(sbm is not None, "sbm required for contiguous load path")
+            kernel_assert(sbm != None, "sbm required for contiguous load path")
             contiguous_load_transpose(input_hbm, input_sb, num_H_shards, sbm)
         else:
-            input_hbm_view = input_hbm.reshape_dim(dim=1, shape=[num_H_shards, H0, H2]).permute(dims=[2, 0, 1, 3])
-            input_sb_view = input_sb.reshape_dim(dim=2, shape=[num_H_shards, H2])  # (H0, BxS, num_H_shards, H2)
-            nisa.dma_copy(
-                dst=input_sb_view.get_view(),
-                src=input_hbm_view.get_view(),
-                dge_mode=_DGE_MODE_NONE,
-            )
+            if H1 % num_H_shards == 0:
+                # Balanced sharding: single vectorized reshape
+                input_hbm_view = input_hbm.reshape_dim(dim=1, shape=[num_H_shards, H0, H2]).permute(dims=[2, 0, 1, 3])
+                input_sb_view = input_sb.reshape_dim(dim=2, shape=[num_H_shards, H2])  # (H0, BxS, num_H_shards, H2)
+                nisa.dma_copy(
+                    dst=input_sb_view.get_view(),
+                    src=input_hbm_view.get_view(),
+                    dge_mode=_DGE_MODE_NONE,
+                )
+            else:
+                # Unbalanced sharding: load each shard separately
+                src_h_offset = 0
+                dst_h_offset = 0
+                for shard_idx in range(num_H_shards):
+                    shard_H2 = H2 if shard_idx < num_H_shards - 1 else H1 - H2 * (num_H_shards - 1)
+                    # [BxS, shard_H2 * H0] -> [BxS, H0, shard_H2] -> [H0, BxS, shard_H2]
+                    src_view = (
+                        input_hbm.slice(dim=1, start=src_h_offset, end=src_h_offset + H0 * shard_H2)
+                        .reshape_dim(dim=1, shape=[H0, shard_H2])
+                        .permute(dims=[1, 0, 2])
+                    )
+                    dst_view = input_sb.slice(dim=2, start=dst_h_offset, end=dst_h_offset + shard_H2)
+                    nisa.dma_copy(
+                        dst=dst_view.get_view(),
+                        src=src_view.get_view(),
+                        dge_mode=_DGE_MODE_NONE,
+                    )
+                    src_h_offset += H0 * shard_H2
+                    dst_h_offset += shard_H2
     return input_sb
 
 
@@ -386,13 +470,32 @@ def load_gamma_to_sbuf(
         # (1, H) -> (H)
         gamma_hbm = gamma_hbm.flatten_dims(start_dim=0, end_dim=1)
         # Standard layout: (H) -> (num_H_shards, H0, H2) -> (H0, num_H_shards, H2)
-        gamma_hbm_view = gamma_hbm.reshape_dim(dim=0, shape=[num_H_shards, H0, H2]).permute(dims=[1, 0, 2])
-        gamma_sb_view_reshaped = gamma_sb.reshape_dim(dim=1, shape=[num_H_shards, H2])
-        nisa.dma_copy(
-            dst=gamma_sb_view_reshaped.get_view(),
-            src=gamma_hbm_view.get_view(),
-            dge_mode=_DGE_MODE_NONE,
-        )
+        if H1 % num_H_shards == 0:
+            gamma_hbm_view = gamma_hbm.reshape_dim(dim=0, shape=[num_H_shards, H0, H2]).permute(dims=[1, 0, 2])
+            gamma_sb_view_reshaped = gamma_sb.reshape_dim(dim=1, shape=[num_H_shards, H2])
+            nisa.dma_copy(
+                dst=gamma_sb_view_reshaped.get_view(),
+                src=gamma_hbm_view.get_view(),
+                dge_mode=_DGE_MODE_NONE,
+            )
+        else:
+            # Unbalanced sharding: load each shard separately
+            src_h_offset = 0
+            dst_h_offset = 0
+            for shard_idx in range(num_H_shards):
+                shard_H2 = H2 if shard_idx < num_H_shards - 1 else H1 - H2 * (num_H_shards - 1)
+                # [shard_H2 * H0] -> [H0, shard_H2] -> [H0, shard_H2]
+                src_view = gamma_hbm.slice(dim=0, start=src_h_offset, end=src_h_offset + H0 * shard_H2).reshape_dim(
+                    dim=0, shape=[H0, shard_H2]
+                )
+                dst_view = gamma_sb.slice(dim=1, start=dst_h_offset, end=dst_h_offset + shard_H2)
+                nisa.dma_copy(
+                    dst=dst_view.get_view(),
+                    src=src_view.get_view(),
+                    dge_mode=_DGE_MODE_NONE,
+                )
+                src_h_offset += H0 * shard_H2
+                dst_h_offset += shard_H2
     return gamma_sb
 
 
@@ -424,60 +527,179 @@ def get_token_tile_size(num_tokens: int) -> int:
     return num_tokens
 
 
-def validate_shapes_quantize_mx(
-    input_shape: tuple,
-    gamma_shape: tuple,
-    output_shape: tuple,
-    output_quant_shape: tuple,
-    output_scale_shape: tuple,
-    output_dtype,
-    hidden_dim_tp: bool,
-    is_residual_add: bool,
-    residual_shape: tuple = None,
-    output_residual_shape: tuple = None,
-) -> tuple:
-    """
-    Validate tensor shapes for RMSNorm + MX quantization operations.
+@dataclass
+class RmsNormMXQuantizeDims(nl.NKIObject):
+    """Dimension and hardware parameters derived from input shapes."""
 
-    Args:
-        input_shape: Input tensor shape [B, S, H]
-        gamma_shape: Gamma tensor shape [1, H]
-        output_shape: Output tensor shape [H0, B*S, H1]
-        output_quant_shape: Quantized output shape [H0, H/512, B*S]
-        output_scale_shape: Scale output shape [H0, H/512, B*S]
-        output_dtype: Output tensor dtype
-        hidden_dim_tp: Whether H dimension is transposed
-        is_residual_add: Whether residual add is enabled
-        residual_shape: Residual tensor shape (if is_residual_add)
-        output_residual_shape: Output residual shape (if is_residual_add)
+    input_shape: tuple
+    hidden_actual: int = None
+
+    # Computed fields
+    B: int = None
+    S: int = None
+    H: int = None
+    H0: int = None
+    H1: int = None
+    BxS: int = None
+    num_H512_tiles: int = None
+    pmax: int = None
+    psum_fmax: int = None
+    inter_dtype: object = None
+
+    def __post_init__(self):
+        self.pmax = nl.tile_size.pmax
+        self.H0 = self.pmax
+        self.psum_fmax = nl.tile_size.gemm_moving_fmax
+        self.inter_dtype = nl.float32
+
+        # NOTE: NKI does not support unpacking complex var into multiple class var assignments
+        B, S, H = self.input_shape
+        self.B = B
+        self.S = S
+        self.H = H
+        self.H1 = self.H // self.H0
+        self.BxS = self.B * self.S
+        self.num_H512_tiles = self.H // self.psum_fmax
+        if self.hidden_actual == None:
+            self.hidden_actual = self.H
+
+
+@dataclass
+class RmsNormMXQuantizeConfig(nl.NKIObject):
+    """Hyperparameter configuration for RMSNorm + MX quantization TKG kernel."""
+
+    eps: float
+    is_residual_add: bool
+    is_static_mx: bool
+    is_output_quant_in_sbuf: bool
+    is_output_quant_packed: bool
+    qmx_output_dtype: object
+    output_quant_dtype: object
+    do_shard: bool
+    shard_id: int
+    shard_size: int
+    BxS_offset: int
+    BxS_tile_size: int
+    num_BxS_tiles: int
+
+
+def validate_rmsnorm_mx_quantize_tkg(
+    input_shape,
+    gamma_shape,
+    output_shape,
+    output_quant_dtype,
+    output_quant_shape,
+    output_quant_buffer,
+    output_scale_shape,
+    output_scale_buffer,
+    output_dtype,
+    eps=1e-6,
+    hidden_actual=None,
+    hidden_dim_tp=True,
+    has_residual=False,
+    residual_shape=None,
+    has_output_residual=False,
+    output_residual_shape=None,
+    has_gate_up_in_scale=False,
+    has_output_input_dequant_scale=False,
+):
+    """
+    Validate inputs and build RmsNormMXQuantizeDims and RmsNormMXQuantizeConfig.
 
     Returns:
-        Tuple of (B, S, H, H0, H1, BxS, n_H512_tiles)
+        Tuple[RmsNormMXQuantizeDims, RmsNormMXQuantizeConfig]: (dims, cfg)
     """
-    H0 = nl.tile_size.pmax
-    F_MAX = nl.tile_size.psum_fmax
-    B, S, H = input_shape
-    H1 = H // H0
-    BxS = B * S
-    n_H512_tiles = H // F_MAX
+    dims = RmsNormMXQuantizeDims(input_shape=input_shape, hidden_actual=hidden_actual)
+    H0, H1, BxS, H = dims.H0, dims.H1, dims.BxS, dims.H
 
-    kernel_assert(H % F_MAX == 0, f"Expected H divisible by {F_MAX}, got H={H}")
+    # HW validation
+    kernel_assert(
+        nisa.get_nc_version() >= nisa.nc_version.gen4,
+        f"rmsnorm_mx_quantize_tkg only supports gen4+ (Trn3+) but got {nisa.get_nc_version()=}",
+    )
+
+    # Shape validation
+    kernel_assert(H % dims.psum_fmax == 0, f"Expected H divisible by {dims.psum_fmax}, got H={H}")
     kernel_assert(H % H0 == 0, f"H must be divisible by {H0}")
     kernel_assert(gamma_shape == (1, H), f"Malformed shape of gamma {gamma_shape}")
     kernel_assert(hidden_dim_tp, "Only hidden_dim_tp=True is supported")
     kernel_assert(output_shape == (H0, BxS, H1), f"Expected output.shape = {(H0, BxS, H1)}")
+    kernel_assert(output_dtype in [nl.float16, nl.bfloat16], "output.dtype must be float16 or bfloat16")
 
-    SUPPORTED_QMX_INPUT_DTYPES = [nl.float16, nl.bfloat16]
-    kernel_assert(output_dtype in SUPPORTED_QMX_INPUT_DTYPES, "output.dtype must be float16 or bfloat16")
+    # Output quantization config
+    is_output_quant_in_sbuf = output_quant_buffer == nl.sbuf
+    is_output_quant_packed = output_quant_shape == (BxS, H + H // 4)
 
+    qmx_output_dtype = None
+    if output_scale_shape != None:
+        kernel_assert(
+            output_quant_shape == output_scale_shape,
+            f"Expected same shape for output_quant and output_scale, but got {output_quant_shape=}, {output_scale_shape=}",
+        )
+        kernel_assert(
+            output_quant_buffer == output_scale_buffer,
+            f"Expected output_quant and output_scale both in HBM or SBUF, but got {output_quant_buffer=}, {output_scale_buffer=}",
+        )
+        kernel_assert(
+            output_quant_dtype in _SUPPORTED_QMX_OUTPUT_DTYPES,
+            f"Expected output_quant.dtype in {_SUPPORTED_QMX_OUTPUT_DTYPES}, but got {output_quant_dtype=}",
+        )
+        qmx_output_dtype = output_quant_dtype
+    else:
+        kernel_assert(
+            is_output_quant_packed,
+            f"Expected packed output_quant with shape (B*S, H+H/4), but got {output_quant_shape=}",
+        )
+        kernel_assert(
+            output_quant_dtype in _QMX_UNPACKED_OUTPUT_DTYPES,
+            f"Expected output_quant.dtype in {_QMX_UNPACKED_OUTPUT_DTYPES}, but got {output_quant_dtype=}",
+        )
+        qmx_output_dtype = _MX_UNPACKED_PACKED_MAP[output_quant_dtype]
+
+    # Residual validation
+    is_residual_add = has_residual
     if is_residual_add:
         kernel_assert(input_shape == residual_shape, "input and residual shapes must match")
-        kernel_assert(output_residual_shape is not None, "output_residual required when residual provided")
+        kernel_assert(has_output_residual, "output_residual required when residual provided")
         kernel_assert(output_residual_shape == (BxS, H), f"expected output_residual shape (B*S, H)={(BxS, H)}")
         kernel_assert(H1 % 8 == 0, f"Expected H1 divisible by 8 with fused residual add")
-        # Residual transpose requires shard_size >= 128 (with LNC=2, BxS >= 256)
         kernel_assert(BxS >= 256, f"Residual add requires BxS >= 256 (got {BxS})")
     else:
         kernel_assert(H1 % 4 == 0, f"Expected H1 divisible by 4")
 
-    return B, S, H, H0, H1, BxS, n_H512_tiles
+    # LNC sharding strategy
+    _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_mx_quantize_tkg", (0, 1))
+    kernel_assert(lnc == 2, "rmsnorm_mx_quantize_tkg kernel only supports LNC=2")
+    do_shard = BxS % lnc == 0 and BxS >= _RMSNORM_QMX_SHARDING_THRESHOLD
+    shard_size = BxS // lnc if do_shard else BxS
+    BxS_offset = shard_id * shard_size if do_shard else 0
+
+    # Tiling strategy
+    BxS_tile_size = get_token_tile_size(shard_size)
+    num_BxS_tiles = shard_size // BxS_tile_size
+    kernel_assert(shard_size % BxS_tile_size == 0, "shard_size must be divisible by BxS_tile_size")
+
+    # STATIC_MX validation
+    is_static_mx = has_gate_up_in_scale
+    if is_static_mx:
+        kernel_assert(has_output_input_dequant_scale, "output_input_dequant_scale required for STATIC_MX")
+        kernel_assert(is_output_quant_in_sbuf, "STATIC_MX mode requires SBUF output")
+
+    # Build cfg
+    cfg = RmsNormMXQuantizeConfig(
+        eps=eps,
+        is_residual_add=is_residual_add,
+        is_static_mx=is_static_mx,
+        is_output_quant_in_sbuf=is_output_quant_in_sbuf,
+        is_output_quant_packed=is_output_quant_packed,
+        qmx_output_dtype=qmx_output_dtype,
+        output_quant_dtype=output_quant_dtype,
+        do_shard=do_shard,
+        shard_id=shard_id,
+        shard_size=shard_size,
+        BxS_offset=BxS_offset,
+        BxS_tile_size=BxS_tile_size,
+        num_BxS_tiles=num_BxS_tiles,
+    )
+
+    return dims, cfg

@@ -14,17 +14,17 @@
 
 """Integration tests for cumsum kernel."""
 
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.coverage_parametrized_tests import FilterResult
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-
 import ml_dtypes
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.cumsum import cumsum
 from nkilib_src.nkilib.core.cumsum.cumsum_torch import cumsum_torch_ref
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.coverage_parametrized_tests import FilterResult
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def filter_invalid_combinations(batch, hidden, ndim, seq_len, dtype=None):
@@ -60,16 +60,16 @@ FAST_TEST_PARAMS = [
 # fmt: on
 
 
-@pytest_test_metadata(
-    name="Cumsum",
-    pytest_marks=["cumsum"],
-)
+@pytest_test_metadata(name="Cumsum")
+@pytest_marks(["cumsum"])
 class TestCumsumKernel:
     """Test class for cumsum kernel."""
 
     @pytest.mark.fast
     @pytest.mark.parametrize(FAST_PARAM_NAMES, FAST_TEST_PARAMS)
-    def test_cumsum_fast(self, test_manager: Orchestrator, batch, hidden, ndim, seq_len, dtype):
+    def test_cumsum_fast(
+        self, test_manager: Orchestrator, platform_target: Platforms, batch, hidden, ndim, seq_len, dtype
+    ):
         """Fast compile-only tests with minimal coverage."""
         is_bf16 = dtype == ml_dtypes.bfloat16
 
@@ -85,7 +85,7 @@ class TestCumsumKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(),
+            compiler_args=CompilerArgs(platform_target=platform_target),
             atol=1e-2 if hidden > 5000 else 1e-3,
             rtol=1e-2 if is_bf16 else 1e-3,
         )
@@ -100,7 +100,17 @@ class TestCumsumKernel:
         coverage="pairs",
         enable_automatic_boundary_tests=False,
     )
-    def test_cumsum_sweep(self, test_manager: Orchestrator, batch, hidden, ndim, seq_len, dtype, is_negative_test_case):
+    def test_cumsum_sweep(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        hidden,
+        ndim,
+        seq_len,
+        dtype,
+        is_negative_test_case,
+    ):
         """Full sweep tests with pairwise coverage."""
         is_bf16 = dtype == ml_dtypes.bfloat16
 
@@ -116,7 +126,7 @@ class TestCumsumKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(),
+            compiler_args=CompilerArgs(platform_target=platform_target),
             atol=1e-2 if hidden > 5000 else 1e-3,
             rtol=1e-2 if is_bf16 else 1e-3,
             is_negative_test=is_negative_test_case,

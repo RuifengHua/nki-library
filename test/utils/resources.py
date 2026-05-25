@@ -19,6 +19,7 @@ import subprocess
 from abc import ABC
 
 import fabric2
+import paramiko
 
 from .exceptions import (
     LocalExecutionException,
@@ -129,6 +130,70 @@ class RemoteDirectory(ABC):
             )
         return self.download_sftp(destination_dir_path, collector, list_of_files, force_clean_destination)
 
+    _STREAM_BUFFER_SIZE = 65536
+
+    def _open_exec_channel(self, command: str) -> paramiko.Channel:
+        """Open a paramiko exec channel on the existing connection's transport.
+
+        Returns a channel ready for binary I/O over the existing SSH connection.
+        """
+        transport = self.connection.transport
+        if transport is None or not transport.is_active():
+            self.connection.open()
+            transport = self.connection.transport
+        try:
+            channel = transport.open_session()
+            channel.exec_command(command)
+        except paramiko.SSHException as e:
+            raise RemoteFileTransferException(f"Failed to open remote channel: {command}", e)
+        return channel
+
+    def _recv_compressed(self, remote_path: str, local_path: str, files: list[str] | None = None):
+        """Stream a compressed tar from remote_path into local_path over the existing connection."""
+        files_arg = " ".join(files) if files else "."
+        remote_cmd = f"tar --ignore-failed-read -czf - -C {remote_path} {files_arg}"
+        channel = self._open_exec_channel(remote_cmd)
+        try:
+            local_tar = subprocess.Popen(["tar", "-xzf", "-", "-C", local_path], stdin=subprocess.PIPE)
+            while True:
+                data = channel.recv(self._STREAM_BUFFER_SIZE)
+                if not data:
+                    break
+                local_tar.stdin.write(data)
+            local_tar.stdin.close()
+            local_tar.wait()
+        finally:
+            exit_status = channel.recv_exit_status()
+            channel.close()
+        if exit_status != 0:
+            raise RemoteFileTransferException(
+                f"Remote command failed with exit code {exit_status}", Exception(f"exit code {exit_status}")
+            )
+        if local_tar.returncode != 0:
+            raise LocalExecutionException("Local tar extract failed", local_tar)
+
+    def _send_compressed(self, local_path: str, remote_path: str):
+        """Stream a compressed tar of local_path to remote_path over the existing connection."""
+        remote_cmd = f"mkdir -p -m 777 {remote_path} && tar -xzf - -C {remote_path}"
+        channel = self._open_exec_channel(remote_cmd)
+        try:
+            local_tar = subprocess.Popen(["tar", "-czf", "-", "-C", local_path, "."], stdout=subprocess.PIPE)
+            while True:
+                data = local_tar.stdout.read(self._STREAM_BUFFER_SIZE)
+                if not data:
+                    break
+                channel.sendall(data)
+            channel.shutdown_write()
+            local_tar.stdout.close()
+            local_tar.wait()
+        finally:
+            exit_status = channel.recv_exit_status()
+            channel.close()
+        if exit_status != 0:
+            raise RemoteFileTransferException(
+                f"Remote command failed with exit code {exit_status}", Exception(f"exit code {exit_status}")
+            )
+
     def download_sftp(
         self,
         destination_dir_path: str,
@@ -136,70 +201,25 @@ class RemoteDirectory(ABC):
         list_of_files: list[str] | None = None,
         force_clean_destination: bool = False,
     ):
-        """Download files from remote device via SFTP."""
+        """Download files from remote device via tar pipe over existing paramiko connection."""
         if not force_clean_destination:
-            assert not os.path.exists(
-                destination_dir_path
-            ), f"{destination_dir_path} already exists locally. Can't download artifacts into it for the fear of overwriting content"
+            assert not os.path.exists(destination_dir_path), (
+                f"{destination_dir_path} already exists locally. Can't download artifacts into it for the fear of overwriting content"
+            )
         else:
             shutil.rmtree(os.path.join(destination_dir_path, "*"), ignore_errors=True)
 
-        remote_archive_location = to_archive_name_in_parent(self.remote_path)
-
-        # Time remote compression
-        with collector.timer(MetricName.FILE_TRANSFER_COMPRESSION_TIME):
-            result: fabric2.Result = self.connection.run(
-                create_archive_command(self.remote_path, remote_archive_location, list_of_files)
-            )
-            if result.failed:
-                raise RemoteExecutionException(
-                    f"Unable to create tarball in {remote_archive_location} on remote",
-                    result,
-                )
-
-        # download the archive
-        local_archive_location = os.path.join(destination_dir_path, os.path.basename(remote_archive_location))
-        download_exception = None
+        os.makedirs(destination_dir_path, exist_ok=True)
 
         with collector.timer(MetricName.SFTP_DOWNLOAD_TIME):
-            _ = self.connection.get(remote=remote_archive_location, local=local_archive_location)
+            self._recv_compressed(self.remote_path, destination_dir_path, list_of_files)
 
-        # Record compressed bytes
-        try:
-            compressed_bytes = os.path.getsize(local_archive_location)
-            collector.record_metric(MetricName.FILE_TRANSFER_BYTES_COMPRESSED, compressed_bytes, "Bytes")
-        except Exception as e:
-            download_exception = RemoteFileTransferException(
-                f"Unable to download {remote_archive_location} from remote", e
-            )
-        finally:
-            __cleanup_remote_paths__(
-                self.connection,
-                remote_archive_location,
-                base_exception=download_exception,
-            )
-
-        # Time local decompression
-        with collector.timer(MetricName.FILE_TRANSFER_COMPRESSION_TIME):
-            deflate_exception = None
-            command_result = subprocess.run(
-                defalate_archive_command(local_archive_location, destination_dir_path).split(" ")
-            )
-            if command_result.returncode != 0:
-                deflate_exception = LocalExecutionException(
-                    f"Unable to unarchive {local_archive_location}", command_result
-                )
-        __cleanup_local_paths__(local_archive_location, base_exception=deflate_exception)
-
-        # Record uncompressed bytes
-        uncompressed_bytes = 0
-        for root, dirs, files in os.walk(destination_dir_path):
-            for file in files:
-                file_path = os.path.join(root, file)
-                uncompressed_bytes += os.path.getsize(file_path)
+        # Record bytes
+        uncompressed_bytes = sum(
+            os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(destination_dir_path) for f in files
+        )
         collector.record_metric(MetricName.FILE_TRANSFER_BYTES_UNCOMPRESSED, uncompressed_bytes, "Bytes")
 
-        # return where archive was unpacked
         return destination_dir_path
 
     def download_s3(
@@ -212,9 +232,9 @@ class RemoteDirectory(ABC):
     ):
         """Download files from remote device via S3 intermediary."""
         if not force_clean_destination:
-            assert not os.path.exists(
-                destination_dir_path
-            ), f"{destination_dir_path} already exists locally. Can't download artifacts into it for the fear of overwriting content"
+            assert not os.path.exists(destination_dir_path), (
+                f"{destination_dir_path} already exists locally. Can't download artifacts into it for the fear of overwriting content"
+            )
         else:
             shutil.rmtree(os.path.join(destination_dir_path, "*"), ignore_errors=True)
 
@@ -290,6 +310,7 @@ class RemoteDirectory(ABC):
         return self.upload_sftp(local_path, collector, force_local_cleanup=force_local_cleanup)
 
     def upload_sftp(self, local_path: str, collector: IMetricsCollector, force_local_cleanup: bool = False):
+        """Upload files to remote device via tar pipe over existing paramiko connection."""
         # Record uncompressed upload bytes
         uncompressed_bytes = sum(
             os.path.getsize(os.path.join(root, f)) for root, _, files in os.walk(local_path) for f in files
@@ -297,66 +318,13 @@ class RemoteDirectory(ABC):
         collector.record_metric(MetricName.FILE_TRANSFER_BYTES_UNCOMPRESSED, uncompressed_bytes, "Bytes")
 
         assert os.path.exists(local_path)
-        original_source_path = local_path  # Save for cleanup
 
-        # Time local compression
-        with collector.timer(MetricName.FILE_TRANSFER_COMPRESSION_TIME):
-            if not is_archive(local_path):
-                # create a tarball if it's not already one
-                local_archive_location = to_archive_name_in_parent(local_path)
-                command_result = subprocess.run(create_archive_command(local_path, local_archive_location).split(" "))
-                if command_result.returncode != 0:
-                    raise LocalExecutionException(f"Unable to create tarball of {local_path}", command_result)
-                local_path = local_archive_location
-
-                # Delete .bin files immediately after tarball creation to free disk space
-                if force_local_cleanup:
-                    for bin_file in pathlib.Path(original_source_path).glob("*.bin"):
-                        bin_file.unlink(missing_ok=True)
-
-        remote_archive_location = os.path.join(self.remote_path, os.path.basename(local_path))
-        upload_exception = None
-
-        # Time network transfer only
         with collector.timer(MetricName.SFTP_UPLOAD_TIME):
-            # Create with global permissions so any user can use the shared test directory
-            _ = self.connection.run(f"mkdir -p -m 777 {self.remote_path}")
-            _ = self.connection.put(remote=remote_archive_location, local=local_path)
+            self._send_compressed(local_path, self.remote_path)
 
-        # Record bytes (after timer exits)
-        try:
-            compressed_bytes = os.path.getsize(local_path)
-            collector.record_metric(MetricName.FILE_TRANSFER_BYTES_COMPRESSED, compressed_bytes, "Bytes")
-        except Exception as e:
-            upload_exception = RemoteFileTransferException(
-                f"Unable to upload {local_path} to {remote_archive_location} to remote",
-                e,
-            )
-            # only attempt clean up remote path in case we failed to upload because we need it
-            # later on
-            __cleanup_remote_paths__(self.connection, remote_archive_location, ignore_exceptions=True)
-        finally:
-            __cleanup_local_paths__(local_path, base_exception=upload_exception)
-
-        # unpack uploaded tarball
-        deflate_exception = None
-        try:
-            with collector.timer(MetricName.FILE_TRANSFER_COMPRESSION_TIME):
-                result: fabric2.Result = self.connection.run(
-                    defalate_archive_command(remote_archive_location, self.remote_path)
-                )
-            if result.failed:
-                deflate_exception = RemoteExecutionException(
-                    f"Unable to create tarball in {self.remote_path} on remote",
-                    result,
-                )
-        finally:
-            __cleanup_local_paths__(local_path, ignore_exceptions=True)
-            __cleanup_remote_paths__(
-                self.connection,
-                remote_archive_location,
-                base_exception=deflate_exception,
-            )
+        if force_local_cleanup:
+            for bin_file in pathlib.Path(local_path).glob("*.bin"):
+                bin_file.unlink(missing_ok=True)
 
     def upload_s3(
         self,

@@ -22,10 +22,10 @@ from unittest.mock import Mock
 from ..utils.param_extractor import (
     _unwrap_kernel_func,
     extract_pytest_params,
+    normalize_param_names,
     normalize_param_value,
     normalize_params_with_type_hints,
 )
-from ..utils.ranged_test_harness import RangeTestCase
 
 
 class SampleEnum(Enum):
@@ -86,17 +86,21 @@ class TestNormalizeParamValue:
         obj = CustomObj()
         assert normalize_param_value(obj) == "CustomObj(123)"
 
-    def test_list_stringified(self):
-        """Lists are JSON-stringified to avoid dynamic mapping conflicts."""
-        assert normalize_param_value([1, 2, 3]) == "[1, 2, 3]"
+    def test_homogeneous_list_kept_native(self):
+        """Homogeneous lists are kept as native arrays for correct OpenSearch mapping."""
+        assert normalize_param_value([1, 2, 3]) == [1, 2, 3]
 
-    def test_tuple_stringified(self):
-        """Tuples are JSON-stringified to avoid dynamic mapping conflicts."""
+    def test_mixed_type_tuple_stringified(self):
+        """Mixed-type tuples are JSON-stringified to avoid dynamic mapping conflicts."""
         assert normalize_param_value((8000, 512, 4, 4, False)) == "[8000, 512, 4, 4, false]"
 
-    def test_empty_list_stringified(self):
-        """Empty lists are JSON-stringified."""
-        assert normalize_param_value([]) == "[]"
+    def test_homogeneous_tuple_kept_native(self):
+        """Homogeneous tuples are kept as native arrays."""
+        assert normalize_param_value((1, 2)) == [1, 2]
+
+    def test_empty_list_kept_native(self):
+        """Empty lists are kept as native arrays."""
+        assert normalize_param_value([]) == []
 
 
 class TestUnwrapKernelFunc:
@@ -280,25 +284,6 @@ class TestExtractPytestParams:
         result = extract_pytest_params(params)
         assert result == {"mode": "VALUE_A"}
 
-    def test_range_test_case_extracted(self):
-        """RangeTestCase objects have their tensors and params extracted."""
-        # Create a mock for test_config_ref since it's required
-        mock_config = Mock()
-
-        test_case = RangeTestCase(
-            tensors={"input": {"batch": 4, "seq_len": 128}},
-            test_type="unit",
-            additional_params={"use_bias": True},
-            test_config_ref=mock_config,
-        )
-        params = {"case": test_case}
-        result = extract_pytest_params(params)
-
-        assert result["batch"] == 4
-        assert result["seq_len"] == 128
-        assert result["test_type"] == "unit"
-        assert result["use_bias"] is True
-
     def test_mixed_params(self):
         """Mixed parameter types are handled correctly."""
         params = {
@@ -315,3 +300,51 @@ class TestExtractPytestParams:
         assert result["mode"] == "VALUE_B"
         assert result["flag"] is True
         assert "empty" not in result  # Empty string filtered
+
+
+class TestNormalizeParamNames:
+    """Tests for normalize_param_names function."""
+
+    def test_empty_dict(self):
+        assert normalize_param_names({}) == {}
+
+    def test_no_mapping_passes_through(self):
+        params = {"batch": 32, "seqlen": 1024, "custom_param": 7}
+        assert normalize_param_names(params) == params
+
+    def test_batch_size_normalized(self):
+        assert normalize_param_names({"batch_size": 32}) == {"batch": 32}
+
+    def test_seq_len_normalized(self):
+        assert normalize_param_names({"seq_len": 1024}) == {"seqlen": 1024}
+
+    def test_sequence_length_normalized(self):
+        assert normalize_param_names({"sequence_length": 512}) == {"seqlen": 512}
+
+    def test_hidden_size_normalized(self):
+        assert normalize_param_names({"hidden_size": 4096}) == {"hidden": 4096}
+
+    def test_hidden_dim_normalized(self):
+        assert normalize_param_names({"hidden_dim": 8192}) == {"hidden": 8192}
+
+    def test_head_names_normalized_to_n_prefix(self):
+        """num_* head names normalize to n_* for OpenSearch consistency."""
+        assert normalize_param_names({"num_q_heads": 8}) == {"n_q_heads": 8}
+        assert normalize_param_names({"num_kv_heads": 4}) == {"n_kv_heads": 4}
+        assert normalize_param_names({"num_heads": 64}) == {"n_heads": 64}
+
+    def test_n_prefix_head_names_unchanged(self):
+        """n_* head names are already canonical — pass through."""
+        assert normalize_param_names({"n_q_heads": 16}) == {"n_q_heads": 16}
+        assert normalize_param_names({"n_kv_heads": 8}) == {"n_kv_heads": 8}
+        assert normalize_param_names({"n_heads": 4}) == {"n_heads": 4}
+
+    def test_mixed_params(self):
+        params = {"batch_size": 16, "seq_len": 2048, "hidden": 4096, "custom": "abc"}
+        expected = {"batch": 16, "seqlen": 2048, "hidden": 4096, "custom": "abc"}
+        assert normalize_param_names(params) == expected
+
+    def test_kernel_specific_params_not_normalized(self):
+        """S_tkg, S_ctx, BxS should NOT be normalized — they have distinct semantics."""
+        params = {"S_tkg": 1, "S_ctx": 9216, "BxS": 64}
+        assert normalize_param_names(params) == params

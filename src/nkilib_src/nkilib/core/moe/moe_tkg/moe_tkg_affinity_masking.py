@@ -187,7 +187,7 @@ def _slice_affinities_hbm(expert_affinities, expert_offset_sbuf, E_L, T, io_dtyp
     nisa.dma_copy(
         src=expert_affinities.ap(
             pattern=[[E, T_shard], [1, E_L]],
-            offset=T_offset,
+            offset=T_offset * E,
             scalar_offset=expert_offset_sbuf,
             indirect_dim=1,
         ),

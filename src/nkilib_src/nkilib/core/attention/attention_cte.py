@@ -116,21 +116,23 @@ bfloat16 for other operations.
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import reduce_cmd
+from nki.isa import engine, reduce_cmd
+from nki.language.opcode import maximum as _maximum
 
 from ..utils.allocator import align_to
 from ..utils.kernel_assert import assert_shape, kernel_assert
-from ..utils.kernel_helpers import PSUM_BANK_SIZE, div_ceil, get_verified_program_sharding_info
+from ..utils.kernel_helpers import PSUM_BANK_SIZE, div_ceil, get_verified_program_sharding_info, is_sbuf_tensor
 from ..utils.logging import get_logger
 from ..utils.modular_allocator import ModularAllocator
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
 logger = get_logger("attention_cte")
+
 
 _FLOAT32_MIN = -3.4028235e38  # used for initialization and masking
 
@@ -188,6 +190,8 @@ def attention_cte(
     cp_strided_q_slicing: bool = False,
     bound_min: Optional[nl.ndarray] = None,
     bound_max: Optional[nl.ndarray] = None,
+    cp_striped_input: bool = False,
+    skip_output_normalization: bool = False,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
 
@@ -223,15 +227,32 @@ def attention_cte(
       global_cp_deg (int, optional): Global context parallel degree
       cp_strided_q_slicing (bool, optional): Whether Q is strided for load balancing (default False)
       bound_min (nt.tensor, optional): (Sequence packing) Per-query lower bound (inclusive) of the KV range
-                     to attend to, with shape (seqlen_q, 1). Query position i attends only to KV positions j
-                     where bound_min[i] <= j < bound_max[i]. Must be provided together with bound_max.
-                     Not compatible with prefix caching or context parallelism.
+                     to attend to, with shape (batch, seqlen_q, 1). Query position i attends only to KV
+                     positions j where bound_min[..., i, :] <= j < bound_max[..., i, :]. Must be provided
+                     together with bound_max. Not compatible with prefix caching or context parallelism.
       bound_max (nt.tensor, optional): (Sequence packing) Per-query upper bound (exclusive) of the KV range
-                     to attend to, with shape (seqlen_q, 1). Must be provided together with bound_min.
+                     to attend to, with shape (batch, seqlen_q, 1). Must be provided together with bound_min.
+      cp_striped_input (bool, optional): Whether the input sequence was distributed across CP ranks
+                     in round-robin (striped) order rather than contiguous chunks. When True, the
+                     caller must set cp_offset to 0 (include diagonal, q_rank >= kv_rank) or -1
+                     (exclude diagonal, q_rank < kv_rank). Requires causal_mask=True. Not compatible
+                     with sliding window or prefix caching. Default False.
+      skip_output_normalization (bool): When True, skips the final 1/S normalization of the output
+                     and returns the raw softmax denominator (exp_running_sum) instead of its
+                     reciprocal (exp_sum_reciprocal). This avoids wasted work when the caller
+                     (e.g., ring attention) needs unnormalized outputs for cross-step reduction
+                     and will normalize once at the very end.
+                     IMPORTANT: Must be used together with cache_softmax=True. When enabled:
+                       - Output is unnormalized: out = exp(scores - max) @ V (not divided by S)
+                       - Third return value is raw sum S (not 1/S)
+                       - Caller is responsible for final normalization: final_out = out / S
+                     Default False.
 
     Returns:
       Output tensor with attention results. Shape depends on tp_out parameter.
       If cache_softmax is True, returns tuple of (output, out_neg_max, out_sum_recip).
+      If skip_output_normalization is also True, the output is unnormalized and the
+      third element is the raw softmax denominator S (not 1/S).
 
     IO Shapes:
       - q:
@@ -316,26 +337,188 @@ def attention_cte(
       ```
 
     """
+    return _attention_cte(
+        q=q,
+        k=k,
+        v=v,
+        scale=scale,
+        causal_mask=causal_mask,
+        k_prior=k_prior,
+        v_prior=v_prior,
+        prior_used_len=prior_used_len,
+        sink=sink,
+        sliding_window=sliding_window,
+        tp_q=tp_q,
+        tp_k=tp_k,
+        tp_out=tp_out,
+        cache_softmax=cache_softmax,
+        softmax_dtype=softmax_dtype,
+        mm_out_dtype=mm_out_dtype,
+        cp_offset=cp_offset,
+        global_cp_deg=global_cp_deg,
+        cp_strided_q_slicing=cp_strided_q_slicing,
+        bound_min=bound_min,
+        bound_max=bound_max,
+        cp_striped_input=cp_striped_input,
+        skip_output_normalization=skip_output_normalization,
+    )
+
+
+def _attention_cte(
+    q: nl.ndarray,
+    k: Optional[nl.ndarray] = None,
+    v: Optional[nl.ndarray] = None,
+    scale: float = 1.0,
+    causal_mask: bool = True,
+    k_prior: Optional[nl.ndarray] = None,
+    v_prior: Optional[nl.ndarray] = None,
+    prior_used_len: Optional[nl.ndarray] = None,
+    sink: Optional[nl.ndarray] = None,
+    sliding_window: Optional[int] = None,
+    tp_q: bool = True,
+    tp_k: bool = False,
+    tp_out: bool = False,
+    cache_softmax: bool = False,
+    softmax_dtype=nl.float32,
+    mm_out_dtype=nl.float32,
+    cp_offset: Optional[nl.ndarray] = None,
+    global_cp_deg: int = None,
+    cp_strided_q_slicing: bool = False,
+    bound_min: Optional[nl.ndarray] = None,
+    bound_max: Optional[nl.ndarray] = None,
+    cp_striped_input: bool = False,
+    skip_output_normalization: bool = False,
+    k_cache_sbuf: Optional[List[nl.ndarray]] = None,
+    v_cache_sbuf: Optional[List[nl.ndarray]] = None,
+    k_prior_sbuf: Optional[List[nl.ndarray]] = None,
+    v_prior_sbuf: Optional[List[nl.ndarray]] = None,
+    out_o_hbm=None,
+    out_neg_max_hbm=None,
+    out_sum_hbm=None,
+    init_sbuf_addr: int = 0,
+    k_scale_sb=None,
+    kv_used_len: Optional[nl.ndarray] = None,
+):
+    """Internal attention implementation with full parameter set including SBUF I/O.
+
+    Contains the core attention logic including validation, batch loop, and LNC sharding.
+    Called by attention_cte() (public API) and directly by internal callers
+    (segmented attention, ring attention) that need SBUF parameters.
+
+    See attention_cte() for documentation of shared parameters.
+
+    Additional internal parameters:
+      k_cache_sbuf: List[nl.ndarray]: List of k cache tiles, shape (batch_size_kv, d, k_tile_sz), k_tile_sz = 512
+      v_cache_sbuf: List[nl.ndarray]: List of v cache tiles, shape (batch_size_kv, v_tile_sz, d), v_tile_sz = 128
+      k_prior_sbuf: List[nl.ndarray]: (Segmented attention) List of k prior tiles in SBUF, shape (d, 512) per tile
+      v_prior_sbuf: List[nl.ndarray]: (Segmented attention) List of v prior tiles in SBUF, shape (128, d) per tile
+      init_sbuf_addr: the address where the sbuf allocation should start
+      k_scale_sb: Optional SBUF tensor (pmax, 1) for delayed fp8 K dequantization. When provided,
+                  Q is scaled by k_scale_sb in SBUF instead of scaling all K tiles, avoiding redundant
+                  per-tile scaling. Applied as Q = Q * k_scale_sb before QK^T matmul.
+      kv_used_len: Optional SBUF tensor (shape (1,) or (1, 1), int32). Lets the
+                  kernel perform non-causal attention with the KV cache length
+                  as a runtime value. This is needed so a single memory copy of
+                  the k_cache_sbuf / v_cache_sbuf tensor can be reused for both
+                  the active segment and the prior segment, enabling support
+                  for large prior_seg_size in the segmented kernel.
+    """
     if sliding_window is None:
         sliding_window = 0
 
-    if k_prior is not None:
+    # Check if prefix caching is enabled via HBM tensors or SBUF tiles
+    use_sbuf_prior = (k_prior_sbuf is not None and len(k_prior_sbuf) > 0) or (
+        v_prior_sbuf is not None and len(v_prior_sbuf) > 0
+    )
+
+    if k_prior is not None or use_sbuf_prior:
         is_prefix_caching = True
-        kernel_assert(v_prior is not None, "k_prior is not None but v_prior is None for prefix caching")
-        kernel_assert(
-            prior_used_len is not None,
-            "k_prior is not None but prior_used_len is None for prefix caching",
-        )
+        if use_sbuf_prior:
+            # Using SBUF tiles for prior (from segmented attention)
+            kernel_assert(
+                k_prior_sbuf is not None and len(k_prior_sbuf) > 0,
+                "k_prior_sbuf must be provided when using SBUF prior",
+            )
+            kernel_assert(
+                v_prior_sbuf is not None and len(v_prior_sbuf) > 0,
+                "v_prior_sbuf must be provided when using SBUF prior",
+            )
+            kernel_assert(
+                prior_used_len is not None and is_sbuf_tensor(prior_used_len),
+                "prior_used_len must be an SBUF tensor when using SBUF prior",
+            )
+            kernel_assert(
+                k_prior is None and v_prior is None,
+                "Cannot use both HBM (k_prior/v_prior) and SBUF (k_prior_sbuf/v_prior_sbuf) prior",
+            )
+        else:
+            # Using HBM tensors for prior (original behavior)
+            kernel_assert(v_prior is not None, "k_prior is not None but v_prior is None for prefix caching")
+            kernel_assert(
+                prior_used_len is not None,
+                "k_prior is not None but prior_used_len is None for prefix caching",
+            )
     else:
         is_prefix_caching = False
         kernel_assert(v_prior is None, "k_prior is None but v_prior is not None.")
         kernel_assert(prior_used_len is None, "k_prior is None but prior_used_len is not None.")
+        kernel_assert(
+            k_prior_sbuf is None or len(k_prior_sbuf) == 0,
+            "k_prior_sbuf provided but prefix caching not enabled",
+        )
+        kernel_assert(
+            v_prior_sbuf is None or len(v_prior_sbuf) == 0,
+            "v_prior_sbuf provided but prefix caching not enabled",
+        )
 
     kernel_assert(
         (bound_min is None) == (bound_max is None), "bound_min and bound_max must both be set or both be None"
     )
     # Sequence packing is active when per-query KV bounds are provided
     is_sequence_packed = bound_min is not None
+
+    # Validate kv_used_len: dynamic active-KV upper bound. Restricted to the
+    # non-APC, non-SWA, non-CP, non-sequence-packed, non-causal path. Shape
+    # must be (1,) for HBM or (1, 1) for SBUF (same convention as prior_used_len).
+    has_kv_used_len = kv_used_len is not None
+    if has_kv_used_len:
+        kernel_assert(not causal_mask, "kv_used_len requires causal_mask=False")
+        kernel_assert(not is_prefix_caching, "kv_used_len is not compatible with prefix caching")
+        kernel_assert(not is_sequence_packed, "kv_used_len is not compatible with sequence packing")
+        kernel_assert(global_cp_deg is None, "kv_used_len is not compatible with context parallelism")
+        kernel_assert(
+            sliding_window is None or sliding_window == 0,
+            "kv_used_len is not compatible with sliding_window",
+        )
+        expected_shape = (1, 1) if is_sbuf_tensor(kv_used_len) else (1,)
+        kernel_assert(
+            kv_used_len.shape == expected_shape,
+            f"kv_used_len shape must be {expected_shape}, got {kv_used_len.shape}",
+        )
+    # Validate k/v parameters
+    use_sbuf_kv = (k_cache_sbuf is not None and len(k_cache_sbuf) > 0) or (
+        v_cache_sbuf is not None and len(v_cache_sbuf) > 0
+    )
+
+    # When using sbuf_kv, k and v can be None; otherwise they are required
+    if use_sbuf_kv:
+        kernel_assert(
+            k_cache_sbuf is not None and len(k_cache_sbuf) > 0, "k_cache_sbuf must be provided when using sbuf kv"
+        )
+        kernel_assert(
+            v_cache_sbuf is not None and len(v_cache_sbuf) > 0, "v_cache_sbuf must be provided when using sbuf kv"
+        )
+    else:
+        kernel_assert(k is not None, "k must be provided when not using k_cache_sbuf")
+        kernel_assert(v is not None, "v must be provided when not using v_cache_sbuf")
+
+    # Prefix caching WITH sbuf kv is supported when using SBUF prior (from segmented attention)
+    # Only disallow when using HBM prior with SBUF active
+    if use_sbuf_kv and is_prefix_caching:
+        kernel_assert(
+            use_sbuf_prior,
+            "When using k_cache_sbuf/v_cache_sbuf with prefix caching, must use k_prior_sbuf/v_prior_sbuf (not HBM k_prior/v_prior)",
+        )
 
     seqlen_q, seqlen_k_active, seqlen_k_prior, d, out_shape, softmax_shape = _check_input_and_return_shape(
         q,
@@ -349,30 +532,54 @@ def attention_cte(
         tp_k,
         tp_out,
         cache_softmax,
+        k_cache_sbuf,
+        v_cache_sbuf,
+        k_prior_sbuf,
+        v_prior_sbuf,
     )
     if is_sequence_packed:
+        batch_size = out_shape[0]
         kernel_assert(
-            bound_min.shape == (seqlen_q, 1),
-            f"bound_min shape must be (seqlen_q, 1)=({seqlen_q}, 1), got {bound_min.shape}",
+            bound_min.shape == (batch_size, seqlen_q, 1),
+            f"bound_min shape must be (batch, seqlen_q, 1)=({batch_size}, {seqlen_q}, 1), got {bound_min.shape}",
         )
         kernel_assert(
-            bound_max.shape == (seqlen_q, 1),
-            f"bound_max shape must be (seqlen_q, 1)=({seqlen_q}, 1), got {bound_max.shape}",
+            bound_max.shape == (batch_size, seqlen_q, 1),
+            f"bound_max shape must be (batch, seqlen_q, 1)=({batch_size}, {seqlen_q}, 1), got {bound_max.shape}",
         )
         kernel_assert(not is_prefix_caching, "is_sequence_packed is not supported with prefix caching")
         kernel_assert(
             global_cp_deg is None or global_cp_deg <= 1, "is_sequence_packed is not supported with context parallelism"
         )
 
-    result = nl.ndarray(shape=out_shape, dtype=q.dtype, buffer=nl.shared_hbm)
+    # Use out_o_hbm if provided, otherwise allocate result in HBM
+    if out_o_hbm is not None:
+        result = out_o_hbm
+    else:
+        result = nl.ndarray(shape=out_shape, dtype=q.dtype, buffer=nl.shared_hbm)
 
     out_sum_recip, out_neg_max = None, None
     if cache_softmax:
-        out_neg_max = nl.ndarray(shape=softmax_shape, dtype=softmax_dtype, buffer=nl.shared_hbm)
-        out_sum_recip = nl.ndarray(shape=softmax_shape, dtype=softmax_dtype, buffer=nl.shared_hbm)
+        if out_neg_max_hbm is not None:
+            out_neg_max = out_neg_max_hbm
+        else:
+            out_neg_max = nl.ndarray(shape=softmax_shape, dtype=softmax_dtype, buffer=nl.shared_hbm)
+
+        if out_sum_hbm is not None:
+            out_sum_recip = out_sum_hbm
+        else:
+            out_sum_recip = nl.ndarray(shape=softmax_shape, dtype=softmax_dtype, buffer=nl.shared_hbm)
 
     bs = q.shape[0]
-    bs_kv = k.shape[0]
+    # When using sbuf_kv, batch_size_kv was already computed in shape checking
+    use_sbuf_kv = (k_cache_sbuf is not None and len(k_cache_sbuf) > 0) or (
+        v_cache_sbuf is not None and len(v_cache_sbuf) > 0
+    )
+    if use_sbuf_kv:
+        # batch_size_kv was returned from _check_input_and_return_shape as 1
+        bs_kv = 1
+    else:
+        bs_kv = k.shape[0]
 
     # Batch size checks
     kernel_assert(bs > 0, f"Batch size must be positive, got {bs}")
@@ -397,7 +604,7 @@ def attention_cte(
         f"attention_cte kernel is not tested for seqlen above {_MAX_SEQLEN}, got {seqlen_k_total=}.",
     )
     bs_seqlen_qk_product = float(bs * seqlen_q) * seqlen_k_total  # use float to avoid overflow
-    if bs_seqlen_qk_product <= _MAX_BS_TIMES_SEQLEN_QK:
+    if bs_seqlen_qk_product > _MAX_BS_TIMES_SEQLEN_QK:
         logger.warn(
             f"attention_cte kernel is not tested for batch size x seqlen_q x seqlen_k above {_MAX_BS_TIMES_SEQLEN_QK}, got {bs_seqlen_qk_product=}.",
         )
@@ -430,6 +637,17 @@ def attention_cte(
             f"got {global_cp_deg=}.",
         )
 
+    # Detect if using SBUF for KV input
+    has_k_sbuf = k_cache_sbuf is not None and len(k_cache_sbuf) > 0
+    has_v_sbuf = v_cache_sbuf is not None and len(v_cache_sbuf) > 0
+
+    # K and V SBUF must be provided together
+    kernel_assert(
+        has_k_sbuf == has_v_sbuf,
+        f"k_cache_sbuf and v_cache_sbuf must be provided together. "
+        f"Got: k_cache_sbuf={has_k_sbuf}, v_cache_sbuf={has_v_sbuf}",
+    )
+
     # Create AttnConfig with high-level configuration
     ac = AttnConfig(
         seqlen_q=seqlen_q,
@@ -446,21 +664,46 @@ def attention_cte(
         use_cp=global_cp_deg is not None,
         global_cp_deg=global_cp_deg,
         cp_strided_q_slicing=cp_strided_q_slicing,
+        cp_striped_input=cp_striped_input,
         scale=scale,
         cache_softmax=cache_softmax,
+        skip_output_normalization=skip_output_normalization,
         dtype=q.dtype,
         softmax_dtype=softmax_dtype,
         mm_out_dtype=mm_out_dtype,
         is_sequence_packed=is_sequence_packed,
+        has_kv_used_len=has_kv_used_len,
+    )
+
+    # skip_output_normalization requires cache_softmax so the caller gets the raw sum
+    # for normalization. Without cache_softmax, the sum is not returned and the caller
+    # cannot normalize.
+    kernel_assert(
+        not skip_output_normalization or cache_softmax,
+        "skip_output_normalization=True requires cache_softmax=True",
     )
 
     grid_ndim, num_shard, shard_id = get_verified_program_sharding_info("attention_cte", max_sharding=2)
+
+    # When using SBUF KV, disable internal sharding (caller already sharded)
+    use_sbuf_kv = has_k_sbuf and has_v_sbuf
+    if use_sbuf_kv:
+        num_shard = 1
+        shard_id = 0
+
     # Shard on batch size while it is divisible (if not sharded, num_shard = 1, shard_id = 0)
     num_bs_per_shard = bs // num_shard
     bs_offset = shard_id * num_bs_per_shard
 
     for batch_idx in range(num_bs_per_shard):
-        kv_batch_id = _q_to_kv_batch_id(batch_idx + bs_offset, bs, bs_kv)
+        # When using SBUF KV (from segmented_cte):
+        #   - bs = LOCAL batch size (typically 1)
+        #   - b is LOCAL index (0, 1, 2, ...) matching SBUF/HBM indexing
+        # When using HBM I/O:
+        #   - bs = GLOBAL batch size
+        #   - batch_id = b + bs_offset (global index)
+        batch_id = batch_idx if use_sbuf_kv else (batch_idx + bs_offset)
+        kv_batch_id = _q_to_kv_batch_id(batch_id, bs, bs_kv)
         _attention_cte_impl(
             q,
             k,
@@ -469,7 +712,7 @@ def attention_cte(
             v_prior,
             prior_used_len,
             result,
-            batch_idx + bs_offset,
+            batch_id,
             kv_batch_id,
             ac,
             sink=sink,
@@ -478,6 +721,13 @@ def attention_cte(
             cp_offset=cp_offset,
             bound_min=bound_min,
             bound_max=bound_max,
+            k_cache_sbuf=k_cache_sbuf,
+            v_cache_sbuf=v_cache_sbuf,
+            k_prior_sbuf=k_prior_sbuf,
+            v_prior_sbuf=v_prior_sbuf,
+            init_sbuf_addr=init_sbuf_addr,
+            k_scale_sb=k_scale_sb,
+            kv_used_len=kv_used_len,
         )
 
     has_remainder = (bs % num_shard) != 0
@@ -527,6 +777,9 @@ def attention_cte(
                 cp_offset=cp_offset,
                 bound_min=bound_min,
                 bound_max=bound_max,
+                k_prior_sbuf=k_prior_sbuf,
+                v_prior_sbuf=v_prior_sbuf,
+                kv_used_len=kv_used_len,
             )
         else:
             # Have core 0 do all the work
@@ -548,6 +801,9 @@ def attention_cte(
                     cp_offset=cp_offset,
                     bound_min=bound_min,
                     bound_max=bound_max,
+                    k_prior_sbuf=k_prior_sbuf,
+                    v_prior_sbuf=v_prior_sbuf,
+                    kv_used_len=kv_used_len,
                 )
 
     if cache_softmax:
@@ -586,16 +842,24 @@ class AttnConfig(nl.NKIObject):
     use_cp: bool = None
     global_cp_deg: int = None
     cp_strided_q_slicing: bool = None
+    cp_striped_input: bool = None  # Input was distributed across CP ranks in round-robin (striped) order.
+    # When True, cp_offset encodes diagonal inclusion (0) or exclusion (-1) instead of a position offset.
 
     # Other
     scale: float = None
     cache_softmax: bool = None
+    skip_output_normalization: bool = None  # Skip 1/S normalization; return unnormalized output + raw sum
     dtype: Any = None
     softmax_dtype: Any = None
     mm_out_dtype: Any = None
 
     # sequence packing
     is_sequence_packed: bool = None
+
+    # Dynamic active-KV masking: when True, query positions attend only to
+    # active-K positions [0, kv_used_len). Restricted to causal_mask=False
+    # and incompatible with SWA/CP/sequence packing/prefix caching.
+    has_kv_used_len: bool = None
 
 
 def _attention_cte_impl(
@@ -617,6 +881,13 @@ def _attention_cte_impl(
     cp_offset: Any = None,
     bound_min: Any = None,
     bound_max: Any = None,
+    k_cache_sbuf: Optional[List[nl.ndarray]] = None,
+    v_cache_sbuf: Optional[List[nl.ndarray]] = None,
+    k_prior_sbuf: Optional[List[nl.ndarray]] = None,
+    v_prior_sbuf: Optional[List[nl.ndarray]] = None,
+    init_sbuf_addr: int = 0,
+    k_scale_sb=None,
+    kv_used_len: Optional[nl.ndarray] = None,
 ):
     """
     Internal implementation function for attention computation.
@@ -634,6 +905,10 @@ def _attention_cte_impl(
       out_neg_max, out_sum_recip: Optional softmax cache outputs
       shard_seqlen_q_start, shard_seqlen_q_length: Seqlen sharding parameters
       cp_offset: Context parallel offset tensor
+      k_cache_sbuf: List of K cache tiles in SBUF
+      v_cache_sbuf: List of V cache tiles in SBUF
+      init_sbuf_addr: Initial SBUF address for allocation
+      k_scale_sb: Optional SBUF tensor (pmax, 1) for delayed fp8 K dequantization
 
     High-level logic:
     For large enough K/V length, we divide the K/V into sections of 8k.
@@ -670,8 +945,11 @@ def _attention_cte_impl(
         shard_seqlen_q_length = atp.num_grps
 
     # Initialize allocator and buffer container
-    allocator = ModularAllocator(initial_address=0)
+    allocator = ModularAllocator(initial_address=init_sbuf_addr)
     bufs = AttnInternalBuffers()
+    bufs.k_scale_sb = k_scale_sb
+
+    # Write softmax intermediates
 
     # Allocate shared utilities (zero bias, sink)
     bufs.zero_bias_tensor = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, 1), dtype=nl.float32)
@@ -683,8 +961,19 @@ def _attention_cte_impl(
         nisa.dma_copy(dst=bufs.sink_sb[0, 0], src=sink[batch_id, 0])
         stream_shuffle_broadcast(src=bufs.sink_sb, dst=bufs.sink_sb)
 
-    # Setup range select bounds for dynamic masking (used in CP/SWA/Prefix caching)
-    _setup_range_select_bounds(ac, atp, bufs, allocator, cp_offset, prior_used_len, bound_min, bound_max)
+    # Setup range select bounds for dynamic masking (used in CP/SWA/Prefix caching/kv_used_len)
+    _setup_range_select_bounds(
+        ac,
+        atp,
+        bufs,
+        allocator,
+        cp_offset,
+        prior_used_len,
+        bound_min,
+        bound_max,
+        batch_id=batch_id,
+        kv_used_len=kv_used_len,
+    )
 
     # Allocate running statistics (persistent across sections)
     bufs.mm1_running_max = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
@@ -716,39 +1005,46 @@ def _attention_cte_impl(
 
         # Allocate the internal buffers
         allocator.set_current_address(sbuf_addr_outer)
-        _allocate_attention_buffers(allocator, ac, atp, bufs, sink)
+        _allocate_attention_buffers(allocator, ac, atp, bufs, sink, k_cache_sbuf, v_cache_sbuf)
         sbuf_addr = allocator.get_current_address()
 
-        # Load K and V for the section
-        sbuf_addr = _load_k_tile(
-            k_active,
-            k_prior,
-            bufs.k_sb,
-            batch_id_kv,
-            sp,
-            nl.bfloat16,
-            ac.tp_k,
-            atp.num_k_tiles_per_section,
-            sbuf_addr,
-            load_offset_active=bufs.k_offset_sb_u32,
-        )
-        sbuf_addr = _load_v_tile(
-            v_active,
-            v_prior,
-            bufs.v_sb,
-            batch_id_kv,
-            sp,
-            nl.bfloat16,
-            atp.num_v_tiles_per_section,
-            sbuf_addr,
-            load_offset_active=bufs.k_offset_sb_u32,
-        )
+        # Store prior SBUF tiles if provided (for SBUF-based prefix caching)
+        if k_prior_sbuf is not None and len(k_prior_sbuf) > 0:
+            bufs.k_sb_prior = k_prior_sbuf
+        if v_prior_sbuf is not None and len(v_prior_sbuf) > 0:
+            bufs.v_sb_prior = v_prior_sbuf
+
+        if not (k_cache_sbuf is not None and len(k_cache_sbuf) > 0):
+            # Load K and V for the section from HBM
+            sbuf_addr = _load_k_tile(
+                k_active,
+                k_prior,
+                bufs.k_sb,
+                batch_id_kv,
+                sp,
+                nl.bfloat16,
+                ac.tp_k,
+                atp.num_k_tiles_per_section,
+                sbuf_addr,
+                load_offset_active=bufs.k_offset_sb_u32,
+            )
+            sbuf_addr = _load_v_tile(
+                v_active,
+                v_prior,
+                bufs.v_sb,
+                batch_id_kv,
+                sp,
+                nl.bfloat16,
+                atp.num_v_tiles_per_section,
+                sbuf_addr,
+                load_offset_active=bufs.k_offset_sb_u32,
+            )
 
         # Start with Q load and actual compute
         if shard_seqlen_q_length <= 1:
             # no pipelining when there's only 1 group
             _load_q_impl(shard_seqlen_q_start, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
-            _qk_and_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs)
+            _qk_and_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs, batch_id)
             _update_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs, sink)
             _exp_impl(shard_seqlen_q_start, ac, atp, sp, bufs, sink)
             _pv_impl(shard_seqlen_q_start, ac, atp, sp, bufs)
@@ -758,12 +1054,12 @@ def _attention_cte_impl(
             # Do software pipelining. We have a group loop and some initial/final calls
             # outside the loop.
             _load_q_impl(shard_seqlen_q_start, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
-            _qk_and_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs)
+            _qk_and_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs, batch_id)
             _update_max_impl(shard_seqlen_q_start, ac, atp, sp, bufs, sink)
             _exp_impl(shard_seqlen_q_start, ac, atp, sp, bufs, sink)
 
             _load_q_impl(shard_seqlen_q_start + 1, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
-            _qk_and_max_impl(shard_seqlen_q_start + 1, ac, atp, sp, bufs)
+            _qk_and_max_impl(shard_seqlen_q_start + 1, ac, atp, sp, bufs, batch_id)
             _update_max_impl(shard_seqlen_q_start + 1, ac, atp, sp, bufs, sink)
             shard_seqlen_q_end = shard_seqlen_q_start + shard_seqlen_q_length
 
@@ -777,7 +1073,7 @@ def _attention_cte_impl(
                 # grp_i+2 :  Load Q, QK+Max
                 _load_q_impl(grp_i + 2, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
                 _exp_impl(grp_i + 1, ac, atp, sp, bufs, sink)
-                _fused_qkmax_and_pv_impl(grp_i, ac, atp, sp, bufs)
+                _fused_qkmax_and_pv_impl(grp_i, ac, atp, sp, bufs, batch_id)
                 _write_back_impl(grp_i, ac, atp, sp, bufs, o, batch_id)
                 _update_max_impl(grp_i + 2, ac, atp, sp, bufs, sink)
 
@@ -802,10 +1098,17 @@ def _attention_cte_impl(
             src=bufs.mm1_running_max.ap(pattern=src_ap, offset=src_offset),
         )
     if out_sum_recip is not None:
-        nisa.dma_copy(
-            out_sum_recip.ap(pattern=dst_ap, offset=dst_offset),
-            src=bufs.exp_sum_reciprocal.ap(pattern=src_ap, offset=src_offset),
-        )
+        if ac.skip_output_normalization:
+            # Return raw sum S instead of 1/S
+            nisa.dma_copy(
+                out_sum_recip.ap(pattern=dst_ap, offset=dst_offset),
+                src=bufs.exp_running_sum.ap(pattern=src_ap, offset=src_offset),
+            )
+        else:
+            nisa.dma_copy(
+                out_sum_recip.ap(pattern=dst_ap, offset=dst_offset),
+                src=bufs.exp_sum_reciprocal.ap(pattern=src_ap, offset=src_offset),
+            )
 
 
 @dataclass
@@ -816,6 +1119,11 @@ class AttnInternalBuffers(nl.NKIObject):
     q_sb = None
     k_sb = None
     v_sb = None
+    k_sb_prior = None  # Prior K tiles (for SBUF-based prefix caching)
+    v_sb_prior = None  # Prior V tiles (for SBUF-based prefix caching)
+
+    # Scale factor for delayed fp8 K dequant (applied to Q instead of K), SBUF tensor
+    k_scale_sb = None
 
     # SBUF/PSUM tensors for computation
 
@@ -867,12 +1175,13 @@ class AttnInternalBuffers(nl.NKIObject):
 
 @dataclass
 class SectionParams(nl.NKIObject):
-    section_idx = None  # Index of section
+    section_idx = None  # Index of section (controls flash attention accumulation)
     section_offset = None  # Offset of section
     section_offset_active = None  # Offset of active K (adjusted by subtracting prior)
     next_section_offset_active = None  # Offset of active K for next section
     section_contains_prefix = None  # Whether current section contains prefix
     next_section_contains_prefix = None  # Whether next section contains prefix
+    kv_section_idx = None  # K/V tile indexing section idx (defaults to section_idx if None)
 
 
 @dataclass
@@ -941,11 +1250,11 @@ def _compute_tile_parameters(
     atp = AttnTileParams()
 
     # Validate scale parameter for special modes
-    if ac.use_swa or ac.is_prefix_caching or ac.use_cp:
+    if ac.use_swa or ac.is_prefix_caching or ac.use_cp or ac.has_kv_used_len:
         # Only scale = 1.0 supported in these cases due to use of range select instead of TSCR
         kernel_assert(
             ac.scale == 1.0,
-            f"SWA/Prefix Caching/CP only support scale=1.0, but got {ac.scale=}",
+            f"SWA/Prefix Caching/CP/kv_used_len only support scale=1.0, but got {ac.scale=}",
         )
 
     # When we use CP, tiles are dynamically masked (mask unknown at compile time), so we turn off causal
@@ -956,10 +1265,27 @@ def _compute_tile_parameters(
     kernel_assert(ac.causal_mask or not ac.use_swa, "SWA currently only supports causal attn")
     atp.dynamic_sel_mask = False
     if ac.use_cp:
-        if not ac.cp_strided_q_slicing:
+        if not ac.cp_strided_q_slicing and not ac.cp_striped_input:
             atp.is_causal = False
         atp.dynamic_sel_mask = True
     if ac.is_sequence_packed:
+        atp.dynamic_sel_mask = True
+    if ac.has_kv_used_len:
+        # kv_used_len produces a dynamic upper bound on the active-K segment.
+        # Enforce the restricted compatibility set: causal_mask=False, no SWA,
+        # no CP, no sequence packing, no prefix caching.
+        kernel_assert(not ac.causal_mask, "kv_used_len requires causal_mask=False")
+        kernel_assert(not ac.use_swa, "kv_used_len is not compatible with sliding_window")
+        kernel_assert(not ac.use_cp, "kv_used_len is not compatible with context parallelism")
+        kernel_assert(not ac.is_sequence_packed, "kv_used_len is not compatible with sequence packing")
+        kernel_assert(not ac.is_prefix_caching, "kv_used_len is not compatible with prefix caching")
+        atp.dynamic_sel_mask = True
+    if ac.cp_striped_input:
+        kernel_assert(ac.use_cp, "cp_striped_input requires CP mode (global_cp_deg must be set)")
+        kernel_assert(ac.causal_mask, "Striped CP requires causal_mask=True")
+        kernel_assert(not ac.use_swa, "Striped CP does not yet support SWA")
+        kernel_assert(not ac.is_prefix_caching, "Striped CP does not yet support prefix caching")
+        atp.is_causal = True
         atp.dynamic_sel_mask = True
     atp.seqlen_k_active_updated = ac.seqlen_k_active
     atp.use_swa_optimized_allocation = (
@@ -1078,9 +1404,17 @@ def _setup_range_select_bounds(
     prior_used_len: Any,
     bound_min: Any,
     bound_max: Any,
+    batch_id: int = 0,
+    kv_used_len: Any = None,
 ) -> tuple:
     """
     Set up range select bounds for dynamic masking (CP/SWA/prefix caching).
+
+    For striped CP, the caller pre-computes cp_offset as:
+      - 0 when q_rank >= kv_rank (include diagonal)
+      - -1 when q_rank < kv_rank (exclude diagonal)
+    This allows the standard CP path (iota + cp_offset) to handle striped masking
+    without needing a separate kv_rank_id parameter.
     """
     # Populate range select lower and/or upper bounds. NOTE: both bounds are inclusive
     if atp.dynamic_sel_mask:
@@ -1137,12 +1471,15 @@ def _setup_range_select_bounds(
             tmp_buffer = local_allocator.alloc_sbuf_tensor(
                 shape=bufs.range_sel_ubs.shape, dtype=bufs.range_sel_ubs.dtype
             )
-            bound_min_reshaped = bound_min.reshape((atp.sb_p, atp.num_grps))
-            bound_max_reshaped = bound_max.reshape((atp.sb_p, atp.num_grps))
+            bound_offset = batch_id * atp.sb_p * atp.num_grps
             nisa.dma_copy(
-                dst=bufs.range_sel_lbs[...], src=bound_min_reshaped.ap([[1, atp.sb_p], [atp.sb_p, atp.num_grps]])
+                dst=bufs.range_sel_lbs[...],
+                src=bound_min.ap(pattern=[[1, atp.sb_p], [atp.sb_p, atp.num_grps]], offset=bound_offset),
             )
-            nisa.dma_copy(dst=tmp_buffer[...], src=bound_max_reshaped.ap([[1, atp.sb_p], [atp.sb_p, atp.num_grps]]))
+            nisa.dma_copy(
+                dst=tmp_buffer[...],
+                src=bound_max.ap(pattern=[[1, atp.sb_p], [atp.sb_p, atp.num_grps]], offset=bound_offset),
+            )
             nisa.tensor_tensor(dst=bufs.range_sel_ubs, data1=bufs.range_sel_ubs, data2=tmp_buffer, op=nl.minimum)
 
         # Create range select lower bounds for sliding window
@@ -1175,10 +1512,15 @@ def _setup_range_select_bounds(
         #   where the cp offset (if any) is already included.
         # Note that we do not need the k_offset subtraction because the prior KV is loaded fully
         prior_used_len_sb = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, 1), dtype=nl.float32)
-        nisa.dma_copy(
-            dst=prior_used_len_sb[0, 0],
-            src=prior_used_len.ap(pattern=[[1, 1], [1, 1]], offset=0),
-        )
+        if is_sbuf_tensor(prior_used_len):
+            # tensor_copy here does the cast from int32 -> fp32
+            nisa.tensor_copy(dst=prior_used_len_sb[0, 0], src=prior_used_len)
+        else:
+            # HBM tensor - allocate SBUF and dma_copy
+            nisa.dma_copy(
+                dst=prior_used_len_sb[0, 0],
+                src=prior_used_len.ap(pattern=[[1, 1], [1, 1]], offset=0),
+            )
 
         stream_shuffle_broadcast(src=prior_used_len_sb, dst=prior_used_len_sb)
         bufs.range_sel_ubs_prior = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
@@ -1222,6 +1564,39 @@ def _setup_range_select_bounds(
                     operand1=-(ac.sliding_window - 1.0),
                 )
 
+    # Setup kv_used_len bounds: dynamic upper bound on the active-K segment.
+    # Restricted mode — no CP/SWA/sequence packing/prefix caching — so this
+    # branch owns range_sel_ubs entirely. Loads the scalar into SBUF,
+    # broadcasts across partitions, then fills range_sel_ubs uniformly.
+    # MM1's range_select path (line ~3070) reads range_sel_ubs[:num_p, qkmax_grp]
+    # and applies `k < kv_used_len` via comp_op1=nl.less_equal (k <= ubs-1) or
+    # nl.less (k < ubs) — we use the existing non-prior/non-seq-packed branch
+    # with comp_op1=nl.less_equal, so we emit kv_used_len - 1 as the stored
+    # upper bound (range_select treats bound as inclusive for <=).
+    # Actually: with causal_mask=False and no CP, the current code uses
+    # comp_op1=nl.less_equal, so we store `kv_used_len - 1` as the bound to
+    # get `k <= kv_used_len - 1` equivalent to `k < kv_used_len`.
+    if ac.has_kv_used_len:
+        kv_used_len_sb = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, 1), dtype=nl.float32)
+        if is_sbuf_tensor(kv_used_len):
+            nisa.tensor_copy(dst=kv_used_len_sb[0, 0], src=kv_used_len)
+        else:
+            nisa.dma_copy(
+                dst=kv_used_len_sb[0, 0],
+                src=kv_used_len.ap(pattern=[[1, 1], [1, 1]], offset=0),
+            )
+        stream_shuffle_broadcast(src=kv_used_len_sb, dst=kv_used_len_sb)
+        # Fill range_sel_ubs[:, :] = kv_used_len - 1 (inclusive upper bound).
+        bufs.range_sel_ubs = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
+        nisa.tensor_scalar(
+            bufs.range_sel_ubs[...],
+            bufs.zero_bias_tensor.ap(pattern=[[1, atp.sb_p], [0, atp.num_grps]], offset=0),
+            op0=nl.add,
+            operand0=kv_used_len_sb,
+            op1=nl.add,
+            operand1=-1.0,
+        )
+
     # If using SWA and CP, compute K load offset = max(0, cp_offset - sliding_window + 1)
     # Also adjust range select bounds because K seqlen now does not start from 0
     if ac.use_swa and ac.use_cp and not ac.cp_strided_q_slicing:
@@ -1259,6 +1634,8 @@ def _allocate_attention_buffers(
     atp: AttnTileParams,
     bufs: AttnInternalBuffers,
     sink: Any,
+    k_cache_sbuf: Optional[List[nl.ndarray]] = None,
+    v_cache_sbuf: Optional[List[nl.ndarray]] = None,
 ):
     """
     Allocate all SBUF and PSUM buffers needed for attention computation.
@@ -1274,22 +1651,31 @@ def _allocate_attention_buffers(
     mm1_p, mm1_n = atp.sb_p, nl.tile_size.psum_fmax
     mm2_p, mm2_n = atp.sb_p, ac.d
 
-    p_k, n_k = ac.d, _K_TILE_SZ  # d is reduction dim for MM1
-    bufs.k_sb = allocator.alloc_sbuf_tensor(
-        shape=(p_k, n_k),
-        dtype=nl.bfloat16,
-        block_dim=[atp.num_k_tiles_per_section],
-        num_free_tiles=[atp.num_k_tiles_per_section],
-        align_to=32,  # align for dma transpose
-    )
+    # Use provided K/V cache sbuf if available, otherwise allocate
+    # Note: For prefix caching with SBUF, k_cache_sbuf contains ACTIVE tiles
+    # and k_prior_sbuf contains PRIOR tiles (passed separately to bufs)
+    if k_cache_sbuf is not None and len(k_cache_sbuf) > 0:
+        bufs.k_sb = k_cache_sbuf
+    else:
+        p_k, n_k = ac.d, _K_TILE_SZ  # d is reduction dim for MM1
+        bufs.k_sb = allocator.alloc_sbuf_tensor(
+            shape=(p_k, n_k),
+            dtype=nl.bfloat16,
+            block_dim=[atp.num_k_tiles_per_section],
+            num_free_tiles=[atp.num_k_tiles_per_section],
+            align_to=32,  # align for dma transpose
+        )
 
-    p_v, n_v = atp.sb_p, ac.d  # d is free dim for MM2
-    bufs.v_sb = allocator.alloc_sbuf_tensor(
-        shape=(p_v, n_v),
-        dtype=nl.bfloat16,
-        block_dim=[atp.num_v_tiles_per_section],
-        num_free_tiles=[atp.num_v_tiles_per_section],
-    )
+    if v_cache_sbuf is not None and len(v_cache_sbuf) > 0:
+        bufs.v_sb = v_cache_sbuf
+    else:
+        p_v, n_v = atp.sb_p, ac.d  # d is free dim for MM2
+        bufs.v_sb = allocator.alloc_sbuf_tensor(
+            shape=(p_v, n_v),
+            dtype=nl.bfloat16,
+            block_dim=[atp.num_v_tiles_per_section],
+            num_free_tiles=[atp.num_v_tiles_per_section],
+        )
 
     bufs.q_sb = allocator.alloc_sbuf_tensor(
         shape=(ac.d, atp.sb_p * atp.num_q_grps_per_load),
@@ -1563,27 +1949,28 @@ def _check_input_and_return_shape(
     tp_k,
     tp_out,
     cache_softmax,
+    k_cache_sbuf=None,
+    v_cache_sbuf=None,
+    k_prior_sbuf=None,
+    v_prior_sbuf=None,
 ) -> tuple:
     """Validate input tensor shapes and compute output shapes.
 
     Check the shape of inputs base on kernel_name, and return the tuple,
     (seqlen_q, seqlen_k, seqlen_k_prior, d, out_shape, cache_softmax_shape)
+
+    When k_cache_sbuf/v_cache_sbuf are provided, derives shape info from them.
     """
-    if is_prefix_caching:
+    use_sbuf_kv = (k_cache_sbuf is not None and len(k_cache_sbuf) > 0) or (
+        v_cache_sbuf is not None and len(v_cache_sbuf) > 0
+    )
+    if is_prefix_caching and prior_used_len is not None:
+        expected_shape = (1, 1) if is_sbuf_tensor(prior_used_len) else (1,)
         kernel_assert(
-            prior_used_len.shape == (1,),
+            prior_used_len.shape == expected_shape,
             "Received unexpected shape for prior_used_len. "
-            f"Expected (1,), received {prior_used_len.shape}. "
+            f"Expected {expected_shape}, received {prior_used_len.shape}. "
             "User note: prefix caching expects a single "
-            "prior_used_len meaning it cannot be used "
-            "if multiple requests (batch) are used with different "
-            "prior_used_len values.",
-        )
-        assert_shape(
-            prior_used_len,
-            (1,),
-            "prior_used_len",
-            error_text="User note: prefix caching expects a single "
             "prior_used_len meaning it cannot be used "
             "if multiple requests (batch) are used with different "
             "prior_used_len values.",
@@ -1593,23 +1980,50 @@ def _check_input_and_return_shape(
         batch_size, seqlen_q, d = q.shape
     else:
         batch_size, d, seqlen_q = q.shape
-    seqlen_k_dim = 1 if tp_k else 2
-    seqlen_k = k.shape[seqlen_k_dim]
-    batch_size_kv = k.shape[0]
-    if tp_k:
-        assert_shape(k, (batch_size_kv, seqlen_k, d), "k")
-    else:
-        assert_shape(k, (batch_size_kv, d, seqlen_k), "k")
-    assert_shape(v, (batch_size_kv, seqlen_k, d), "v")
-    if is_prefix_caching:
-        seqlen_k_prior = k_prior.shape[seqlen_k_dim]
-        if tp_k:
-            assert_shape(k_prior, (batch_size_kv, seqlen_k_prior, d), "k_prior")
+
+    # When using sbuf for K/V, derive shape from sbuf instead of k/v tensors
+    if use_sbuf_kv:
+        # k_cache_sbuf tiles have shape (d, 512), compute total seqlen from number of tiles
+        kernel_assert(
+            k_cache_sbuf is not None and len(k_cache_sbuf) > 0, "k_cache_sbuf must be provided when using sbuf kv"
+        )
+        kernel_assert(
+            v_cache_sbuf is not None and len(v_cache_sbuf) > 0, "v_cache_sbuf must be provided when using sbuf kv"
+        )
+
+        # Extract d from k_cache_sbuf tile shape (d, 512)
+        d_from_k = k_cache_sbuf[0].shape[0]
+        kernel_assert(d == d_from_k, f"Head dimension mismatch: q has d={d}, but k_cache_sbuf has d={d_from_k}")
+
+        # Compute seqlen_k from number of tiles (each tile is _K_TILE_SZ elements)
+        seqlen_k = len(k_cache_sbuf) * _K_TILE_SZ
+
+        # batch_size_kv is 1 when using sbuf (tiles are per-batch)
+        batch_size_kv = 1
+
+        # Derive seqlen_k_prior from k_prior_sbuf if provided
+        if is_prefix_caching and k_prior_sbuf is not None and len(k_prior_sbuf) > 0:
+            seqlen_k_prior = len(k_prior_sbuf) * _K_TILE_SZ
         else:
-            assert_shape(k_prior, (batch_size_kv, d, seqlen_k_prior), "k_prior")
-        assert_shape(v_prior, (batch_size_kv, seqlen_k_prior, d), "v_prior")
+            seqlen_k_prior = None
     else:
-        seqlen_k_prior = None
+        seqlen_k_dim = 1 if tp_k else 2
+        seqlen_k = k.shape[seqlen_k_dim]
+        batch_size_kv = k.shape[0]
+        if tp_k:
+            assert_shape(k, (batch_size_kv, seqlen_k, d), "k")
+        else:
+            assert_shape(k, (batch_size_kv, d, seqlen_k), "k")
+        assert_shape(v, (batch_size_kv, seqlen_k, d), "v")
+        if is_prefix_caching:
+            seqlen_k_prior = k_prior.shape[seqlen_k_dim]
+            if tp_k:
+                assert_shape(k_prior, (batch_size_kv, seqlen_k_prior, d), "k_prior")
+            else:
+                assert_shape(k_prior, (batch_size_kv, d, seqlen_k_prior), "k_prior")
+            assert_shape(v_prior, (batch_size_kv, seqlen_k_prior, d), "v_prior")
+        else:
+            seqlen_k_prior = None
 
     out_seqlen = seqlen_q
 
@@ -2086,6 +2500,17 @@ def _load_q_impl(
                 sbuf_addr,
                 grps_per_load=atp.num_q_grps_per_load,
             )
+            # Delayed fp8 K dequant: scale Q in SBUF instead of scaling all K tiles.
+            # q_sb has shape (d, 128*grps_per_load) with partition dim = d (head_dim).
+            # k_scale_sb is (pmax, 1) SBUF tensor applied along partition dim.
+            if bufs.k_scale_sb is not None:
+                num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ * atp.num_q_grps_per_load)
+                nisa.tensor_scalar(
+                    dst=bufs.q_sb[grp_i // atp.num_q_grps_per_load][: ac.d, :num_f],
+                    data=bufs.q_sb[grp_i // atp.num_q_grps_per_load][: ac.d, :num_f],
+                    op0=nl.multiply,
+                    operand0=bufs.k_scale_sb[: ac.d, :],
+                )
 
 
 def _qk_and_max_impl(
@@ -2094,6 +2519,7 @@ def _qk_and_max_impl(
     atp: AttnTileParams,
     sp: SectionParams,
     bufs: AttnInternalBuffers,
+    batch_id: int = 0,
 ):
     """Compute QK^T matmul (MM1) and find row-wise maximum for this Q group.
     Also apply masking if relevant.
@@ -2107,7 +2533,7 @@ def _qk_and_max_impl(
         nisa.memset(bufs.mm1_partial_max[grp_i], value=_FLOAT32_MIN)
 
         for large_tile_idx in range(atp.num_large_tiles_per_section):
-            _qk_and_max_large_tile_impl(grp_i, large_tile_idx, ac, atp, sp, bufs)
+            _qk_and_max_large_tile_impl(grp_i, large_tile_idx, ac, atp, sp, bufs, batch_id)
 
 
 def _update_max_impl(
@@ -2335,6 +2761,7 @@ def _fused_qkmax_and_pv_impl(
     atp: AttnTileParams,
     sp: SectionParams,
     bufs: AttnInternalBuffers,
+    batch_id: int = 0,
 ):
     """Fused implementation computing QK+max for group i+2 while computing PV for group i (software pipelining)."""
     qkmax_grp = grp_i + 2
@@ -2357,7 +2784,7 @@ def _fused_qkmax_and_pv_impl(
             _pv_large_tile_impl(grp_i, large_tile_idx, ac, atp, sp, bufs)
 
         if has_any_compute_pred_qkmax:
-            _qk_and_max_large_tile_impl(qkmax_grp, large_tile_idx, ac, atp, sp, bufs)
+            _qk_and_max_large_tile_impl(qkmax_grp, large_tile_idx, ac, atp, sp, bufs, batch_id)
 
 
 def _write_back_impl(
@@ -2407,13 +2834,18 @@ def _write_back_impl(
                 op1=nl.add,
                 operand1=bufs.exp_section_sum[grp_i],
             )
-        if (sp.section_idx == atp.num_sections - 1) or is_last_section_with_compute:
-            nisa.reciprocal(
-                bufs.exp_sum_reciprocal[:, grp_i],
-                bufs.exp_running_sum[:, grp_i],
-            )
+        if not ac.skip_output_normalization:
+            if (sp.section_idx == atp.num_sections - 1) or is_last_section_with_compute:
+                nisa.reciprocal(
+                    bufs.exp_sum_reciprocal[:, grp_i],
+                    bufs.exp_running_sum[:, grp_i],
+                )
     else:
-        nisa.reciprocal(bufs.exp_sum_reciprocal[:, grp_i], bufs.exp_section_sum[grp_i])
+        if ac.skip_output_normalization:
+            # Single section: exp_running_sum was never set, copy from exp_section_sum
+            nisa.tensor_copy(bufs.exp_running_sum[:, grp_i], bufs.exp_section_sum[grp_i])
+        else:
+            nisa.reciprocal(bufs.exp_sum_reciprocal[:, grp_i], bufs.exp_section_sum[grp_i])
 
     num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
     num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
@@ -2434,10 +2866,16 @@ def _write_back_impl(
     if atp.num_sections != 1:
         if sp.section_idx == 0:
             if is_last_section_with_compute:
-                # Last section, so scale by reciprocal and write current output to HBM
-                _scale_reciprocal_write_back_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f)
+                if ac.skip_output_normalization:
+                    # Skip normalization: write unnormalized output directly
+                    _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
+                else:
+                    # Last section, so scale by reciprocal and write current output
+                    _scale_reciprocal_write_back_impl(
+                        bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f
+                    )
             else:
-                # Not last section, so just write current output to HBM
+                # Not last section, so just write current output
                 _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
 
         if sp.section_idx > 0:
@@ -2494,33 +2932,24 @@ def _write_back_impl(
                     operand1=bufs.mm2_sb[grp_i][:num_p, : ac.d],
                 )
             if sp.section_idx == atp.num_sections - 1 or is_last_section_with_compute:
-                # Last section, so scale by reciprocal and write accumulated output to HBM
-                _scale_reciprocal_write_back_impl(
-                    bufs.mm2_accum_flash_attn[grp_i],
-                    grp_i,
-                    ac,
-                    atp,
-                    bufs,
-                    o,
-                    batch_id,
-                    num_p,
-                    num_f,
-                )
+                if ac.skip_output_normalization:
+                    # Skip normalization: write unnormalized accumulated output directly
+                    _write_back_o_impl(bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
+                else:
+                    # Last section, so scale by reciprocal and write accumulated output
+                    _scale_reciprocal_write_back_impl(
+                        bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f
+                    )
             else:
-                # Not last section, just write accumulated output to HBM
-                _write_back_o_impl(
-                    bufs.mm2_accum_flash_attn[grp_i],
-                    grp_i,
-                    ac,
-                    atp,
-                    o,
-                    batch_id,
-                    num_p,
-                    num_f,
-                )
+                # Not last section, just write accumulated output
+                _write_back_o_impl(bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
     else:
-        # Only one section, so scale by reciprocal and write current output to HBM
-        _scale_reciprocal_write_back_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f)
+        if ac.skip_output_normalization:
+            # Skip normalization: write unnormalized output directly
+            _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
+        else:
+            # Only one section, so scale by reciprocal and write current output
+            _scale_reciprocal_write_back_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f)
 
 
 def _scale_reciprocal_write_back_impl(
@@ -2538,7 +2967,6 @@ def _scale_reciprocal_write_back_impl(
     Write back o for the final section after multiplication by reciprocal. Transposes reciprocal if tp_out.
     """
     if ac.tp_out:
-        # Original: tp_exp_sum_reciprocal_psum[grp_i] = nisa.nc_transpose(exp_sum_reciprocal[ip_broadcast, grp_i])
         nisa.nc_transpose(
             bufs.tp_exp_sum_reciprocal_psum[grp_i].ap(pattern=[[atp.sb_p, ac.d], [1, atp.sb_p]], offset=0),
             bufs.exp_sum_reciprocal.ap(pattern=[[atp.num_grps, atp.sb_p], [0, ac.d]], offset=grp_i),
@@ -2554,30 +2982,31 @@ def _scale_reciprocal_write_back_impl(
             nl.multiply,
         )
     else:
-        nisa.activation(
+        nisa.tensor_scalar(
             bufs.mm2_final[grp_i][:num_p, : ac.d],
-            nl.copy,
             src_buf[:num_p, : ac.d],
-            scale=bufs.exp_sum_reciprocal[:num_p, grp_i],
-            bias=bufs.zero_bias_tensor[:num_p],
+            nl.multiply,
+            bufs.exp_sum_reciprocal[:num_p, grp_i],
+            engine=engine.vector,
         )
 
     _write_back_o_impl(bufs.mm2_final[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
 
 
 def _write_back_o_impl(src_buf, grp_i, ac: AttnConfig, atp: AttnTileParams, o, batch_id, num_p, num_f):
-    """Helper function to write a source buffer to HBM output (o) with proper transpose handling.
+    """Helper function to write a source buffer to output (o) with proper transpose handling.
 
     Args:
       src_buf: Source buffer in SBUF to copy from
       grp_i: Q group index
       ac: Attention configuration
       atp: Tile parameters
-      o: Output HBM tensor
+      o: Output tensor (HBM) or list of SBUF tiles
       batch_id: Batch index
       num_p: Number of partition elements
       num_f: Number of free elements
     """
+
     if ac.tp_out:
         # o shape: (batch_size, d, seqlen), accessing o[batch_id, 0:d, grp_i*sb_p:grp_i*sb_p+num_f]
         # Offset: batch_id*d*seqlen_q + grp_i*sb_p
@@ -2604,6 +3033,7 @@ def _qk_and_max_large_tile_impl(
     atp: AttnTileParams,
     sp: SectionParams,
     bufs: AttnInternalBuffers,
+    batch_id: int = 0,
 ):
     """Compute QK^T matmul (MM1) and find row-wise maximum for this Q group and large (2048) K tile.
     Also apply masking if relevant.
@@ -2623,7 +3053,8 @@ def _qk_and_max_large_tile_impl(
         mm1_partial_max_tile = bufs.mm1_partial_max[qkmax_grp]
 
         k_tile_idx_in_section = large_tile_idx * num_k_tiles_in_large_tile + k_tile_idx
-        k_tile_idx_global = atp.num_k_tiles_per_section * sp.section_idx + k_tile_idx_in_section
+        _kv_sec_idx = sp.kv_section_idx if sp.kv_section_idx is not None else sp.section_idx
+        k_tile_idx_global = atp.num_k_tiles_per_section * _kv_sec_idx + k_tile_idx_in_section
         is_prior_tile, seqlen_k, k_start_pos, _ = _get_kv_tile_apc(
             ac.is_prefix_caching,
             False,
@@ -2652,13 +3083,25 @@ def _qk_and_max_large_tile_impl(
             num_q_free = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
 
             # Step 1: MM1 matmul
+            # For SBUF-based prefix caching, select correct SBUF list based on is_prior_tile
+            # k_start_pos from _get_kv_tile_apc is already relative to prior/active
+            if is_prior_tile and bufs.k_sb_prior is not None:
+                # Prior tile: use k_sb_prior, k_start_pos is relative to prior
+                k_tile_to_use = bufs.k_sb_prior[k_start_pos // _K_TILE_SZ]
+            elif bufs.k_sb_prior is not None:
+                # Active tile in SBUF prefix caching: use k_sb, k_start_pos is relative to active
+                k_tile_to_use = bufs.k_sb[k_start_pos // _K_TILE_SZ]
+            else:
+                # Non-APC or HBM-based APC: use k_tile_idx_in_section
+                k_tile_to_use = bufs.k_sb[k_tile_idx_in_section]
+
             nisa.nc_matmul(
                 mm1_psum_tile[:num_q_free, :num_f],
                 bufs.q_sb[qkmax_grp // atp.num_q_grps_per_load][
                     : ac.d,
                     nl.ds((qkmax_grp % atp.num_q_grps_per_load) * _Q_GRP_SZ, num_q_free),
                 ],
-                bufs.k_sb[k_tile_idx_in_section][:, :num_f],
+                k_tile_to_use[:, :num_f],
             )
 
             # Step 2: Masking
@@ -2743,7 +3186,7 @@ def _qk_and_max_large_tile_impl(
                     comp_op1=comp_op1,
                     bound0=bound0[:num_p, :1],
                     bound1=bound1[:num_p, :1],
-                    reduce_op=nl.maximum,
+                    reduce_op=_maximum,
                     reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
                     reduce_cmd=reduce_cmd.reset_reduce,
                     range_start=k_start_pos,
@@ -2811,19 +3254,31 @@ def _pv_large_tile_impl(
 
             if mm2_sel_mask and v_tile_idx < atp.num_v_tiles_per_section and num_p > 0 and num_f > 0:
                 mm2_psum_set = True
+
+                # For SBUF-based prefix caching, select correct V SBUF list based on is_prior_tile
+                if is_prior_tile and bufs.v_sb_prior is not None:
+                    # Prior tile: k_start_pos_512_tile is relative to prior
+                    v_tile_to_use = bufs.v_sb_prior[k_start_pos_512_tile // _V_TILE_SZ + mm2_i]
+                elif bufs.v_sb_prior is not None:
+                    # Active tile in SBUF prefix caching: k_start_pos_512_tile is relative to active
+                    v_tile_to_use = bufs.v_sb[k_start_pos_512_tile // _V_TILE_SZ + mm2_i]
+                else:
+                    # Non-APC or HBM-based APC: use v_tile_idx
+                    v_tile_to_use = bufs.v_sb[v_tile_idx]
+
                 # src partition mask: (k_start_pos+nl.arange(128)[:, None]<seqlen_k)
                 # exp_tp_sb free mask: if_l_mm2 + q_seqlen_offset < seqlen_q
                 if ac.tp_out:
                     nisa.nc_matmul(
                         mm2_psum_tile[: ac.d, :num_f],
-                        bufs.v_sb[v_tile_idx][:num_p, : ac.d],
+                        v_tile_to_use[:num_p, : ac.d],
                         exp_tp_sb_tile[:num_p, nl.ds(mm2_i * _V_TILE_SZ, num_f)],
                     )
                 else:
                     nisa.nc_matmul(
                         mm2_psum_tile[:num_f, : ac.d],
                         exp_tp_sb_tile[:num_p, nl.ds(mm2_i * _V_TILE_SZ, num_f)],
-                        bufs.v_sb[v_tile_idx][:num_p, : ac.d],
+                        v_tile_to_use[:num_p, : ac.d],
                     )
 
     # Step 2: accumulate the MM2 groups (reduction dim 512) into the large tile reduction dim 2048

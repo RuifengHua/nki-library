@@ -24,10 +24,11 @@ import os
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from test.utils.s3_utils import S3ArtifactUploadConfig, get_s3_client_and_session
 from urllib.parse import quote
 
 from botocore.exceptions import BotoCoreError, ClientError
+
+from .s3_utils import S3ArtifactUploadConfig, get_s3_client_and_session
 
 
 class UploadOutcome(str, Enum):

@@ -196,13 +196,14 @@ def store_half_hidden_tensor_tile(
     # Note: hidden_tile_sbuf is now a Python list (migrated from nl.par_dim block dimensions)
     for bxs_subtile_idx in range(bxs_dim_tile.subtile_dim_info.tile_count):
         p_bxs_size = bxs_dim_tile.get_subtile_bound(indices.bxs_tile_idx, bxs_subtile_idx)
-        bxs_offset = bxs_dim_tile.get_subtile_start(indices.bxs_tile_idx, bxs_subtile_idx)
-        output_offset = indices.batch_idx * H * output_tensor_hbm_view.shape[1] + bxs_offset * H + hidden_offset
-        nisa.dma_copy(
-            # This can't be replaced with slicing because of batch dimension (no nested slicing support)
-            dst=output_tensor_hbm_view.ap([[H, p_bxs_size], [1, half_hidden_size]], offset=output_offset),
-            src=hidden_tile_sbuf[bxs_subtile_idx][0:p_bxs_size, hidden_offset : hidden_offset + half_hidden_size],
-        )
+        if p_bxs_size > 0:
+            bxs_offset = bxs_dim_tile.get_subtile_start(indices.bxs_tile_idx, bxs_subtile_idx)
+            output_offset = indices.batch_idx * H * output_tensor_hbm_view.shape[1] + bxs_offset * H + hidden_offset
+            nisa.dma_copy(
+                # This can't be replaced with slicing because of batch dimension (no nested slicing support)
+                dst=output_tensor_hbm_view.ap([[H, p_bxs_size], [1, half_hidden_size]], offset=output_offset),
+                src=hidden_tile_sbuf[bxs_subtile_idx][0:p_bxs_size, hidden_offset : hidden_offset + half_hidden_size],
+            )
 
 
 def load_and_transpose_mx_quant_hidden_tile(

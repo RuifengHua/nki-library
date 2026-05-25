@@ -14,6 +14,10 @@
 """Unit tests for core_lock_manager module."""
 
 import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+
 from test.utils.core_lock_client import (
     DEFAULT_LOCKING_PROTOCOL_VERSION,
 )
@@ -24,9 +28,6 @@ from test.utils.core_lock_manager import (
 )
 from test.utils.metrics_collector import NoopMetricsCollector
 from test.utils.scripts.remote_lock_scripts import LockResult, LockStatus
-from unittest.mock import MagicMock
-
-import pytest
 
 
 class TestLockVersionError:
@@ -180,85 +181,63 @@ class TestPhysicalToLogicalCores:
 class TestDrain:
     """Tests for CoreLockManager.drain method."""
 
-    def _make_manager(self, run_side_effects: list) -> CoreLockManager:
-        """Create a CoreLockManager with mocked connection and noop collector."""
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
-        mock_conn.run.side_effect = run_side_effects
-        mgr = CoreLockManager(mock_conn, total_physical_cores=8, collector=NoopMetricsCollector())
-        mgr._initialized = True  # Skip initialize
-        mgr._host_locking_version = 2
+    def _make_manager(self) -> CoreLockManager:
+        mock_executor = MagicMock()
+        mgr = CoreLockManager(
+            "test-host",
+            total_physical_cores=8,
+            collector=NoopMetricsCollector(),
+            executor=mock_executor,
+            host_locking_version=2,
+        )
         return mgr
 
-    def test_drain_returns_max_lock_expiry(self):
+    @patch("test.utils.core_lock_client.drain")
+    def test_drain_returns_max_lock_expiry(self, mock_drain):
         """drain() returns max_lock_expiry from result file."""
-        result_json = LockResult(status=LockStatus.DRAINED, max_lock_expiry=1234567890).to_json()
-        # flock_execute result (exit code 13 = DRAINED)
-        flock_result = MagicMock()
-        flock_result.return_code = LockStatus.DRAINED.exit_code
-        # cat result file
-        cat_result = MagicMock()
-        cat_result.failed = False
-        cat_result.stdout = result_json
+        mock_drain.return_value = LockResult(status=LockStatus.DRAINED, max_lock_expiry=1234567890)
+        mgr = self._make_manager()
+        assert mgr.drain(timeout_seconds=1800) == 1234567890
 
-        mgr = self._make_manager([flock_result, cat_result])
-        max_expiry = mgr.drain(timeout_seconds=1800)
-        assert max_expiry == 1234567890
-
-    def test_drain_returns_zero_when_no_active_locks(self):
+    @patch("test.utils.core_lock_client.drain")
+    def test_drain_returns_zero_when_no_active_locks(self, mock_drain):
         """drain() returns 0 when no active locks."""
-        result_json = LockResult(status=LockStatus.DRAINED, max_lock_expiry=0).to_json()
-        flock_result = MagicMock()
-        flock_result.return_code = LockStatus.DRAINED.exit_code
-        cat_result = MagicMock()
-        cat_result.failed = False
-        cat_result.stdout = result_json
+        mock_drain.return_value = LockResult(status=LockStatus.DRAINED, max_lock_expiry=0)
+        mgr = self._make_manager()
+        assert mgr.drain(timeout_seconds=1800) == 0
 
-        mgr = self._make_manager([flock_result, cat_result])
-        max_expiry = mgr.drain(timeout_seconds=1800)
-        assert max_expiry == 0
-
-    def test_drain_returns_zero_on_failure(self):
+    @patch("test.utils.core_lock_client.drain")
+    def test_drain_returns_zero_on_failure(self, mock_drain):
         """drain() returns 0 when helper reports error."""
-        flock_result = MagicMock()
-        flock_result.return_code = LockStatus.ERROR.exit_code
-        # rm -f cleanup
-        rm_result = MagicMock()
-        rm_result.failed = False
-
-        mgr = self._make_manager([flock_result, rm_result])
-        max_expiry = mgr.drain(timeout_seconds=1800)
-        assert max_expiry == 0
+        mock_drain.return_value = LockResult(status=LockStatus.ERROR, message="test error")
+        mgr = self._make_manager()
+        assert mgr.drain(timeout_seconds=1800) == 0
 
 
 class TestDisableDrain:
     """Tests for CoreLockManager.disable_drain method."""
 
-    def _make_manager(self, run_side_effects: list) -> CoreLockManager:
-        mock_conn = MagicMock()
-        mock_conn.host = "test-host"
-        mock_conn.run.side_effect = run_side_effects
-        mgr = CoreLockManager(mock_conn, total_physical_cores=8, collector=NoopMetricsCollector())
-        mgr._initialized = True
-        mgr._host_locking_version = 2
+    def _make_manager(self) -> CoreLockManager:
+        mock_executor = MagicMock()
+        mgr = CoreLockManager(
+            "test-host",
+            total_physical_cores=8,
+            collector=NoopMetricsCollector(),
+            executor=mock_executor,
+            host_locking_version=2,
+        )
         return mgr
 
-    def test_disable_drain_succeeds(self):
+    @patch("test.utils.core_lock_client.undrain")
+    def test_disable_drain_succeeds(self, mock_undrain):
         """disable_drain() calls undrain helper."""
-        flock_result = MagicMock()
-        flock_result.return_code = LockStatus.UNDRAINED.exit_code
-        rm_result = MagicMock()
-        rm_result.failed = False
-
-        mgr = self._make_manager([flock_result, rm_result])
+        mock_undrain.return_value = LockResult(status=LockStatus.UNDRAINED)
+        mgr = self._make_manager()
         mgr.disable_drain()  # Should not raise
 
-    def test_disable_drain_warns_on_failure(self):
+    @patch("test.utils.core_lock_client.undrain")
+    def test_disable_drain_warns_on_failure(self, mock_undrain):
         """disable_drain() logs warning on failure."""
-        flock_result = MagicMock()
-        flock_result.return_code = LockStatus.ERROR.exit_code
-        rm_result = MagicMock()
-        rm_result.failed = False
-
-        mgr = self._make_manager([flock_result, rm_result])
+        mock_undrain.return_value = LockResult(status=LockStatus.ERROR, message="test error")
+        mgr = self._make_manager()
         mgr.disable_drain()  # Should not raise, just warn

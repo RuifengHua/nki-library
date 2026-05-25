@@ -18,24 +18,6 @@ import os
 
 os.environ["NKI_FRONTEND"] = "beta2"
 
-from test.utils.common_dataclasses import (
-    CompilerArgs,
-    InferenceArgs,
-    KernelArgs,
-    LazyGoldenGenerator,
-    ValidationArgs,
-)
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.ranged_test_harness import (
-    DimensionRangeConfig,
-    RangeManualGeneratorStrategy,
-    RangeTestCase,
-    RangeTestConfig,
-    TensorConfig,
-    TensorRangeConfig,
-    range_test_config,
-)
-from test.utils.test_orchestrator import Orchestrator
 from typing import List, Optional, final
 
 import ml_dtypes
@@ -45,20 +27,16 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
+from nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
+
 from nkilib_src.nkilib.experimental.transformer.transformer_tkg import transformer_tkg
 from nkilib_src.nkilib.experimental.transformer.transformer_tkg_torch import llama3_transformer_fwd_tkg_torch
-
-# Dimension names
-TP_DIM = "tp"
-BATCH_DIM = "batch"
-S_TKG_DIM = "S_tkg"
-S_CTX_DIM = "S_ctx"
-Q_HEADS_DIM = "q_heads"
-D_HEAD_DIM = "d_head"
-H_DIM = "H"
-I_DIM = "I"
-LNC_DIM = "lnc"
-REL_TOL_DIM = "rel_tol"
+from test.integration.nkilib.core.attention.test_attention_tkg_utils import generate_cache_lens
+from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def generate_llama3_transformer_tkg_combinations(
@@ -102,21 +80,10 @@ def generate_llama3_transformer_tkg_combinations(
                         rel_diff_tolerance,
                     ]
 
-                    # FIXME: This combination fails accuracy check, need fix NKILIB-797
-                    if combination == [32, 64, 1, 1024, 64, 128, 8192, 28672, 2, 2.5]:
-                        continue
-                    if combination == [16, 32, 1, 1024, 64, 128, 8192, 28672, 2, 2.5]:
-                        continue
-                    if combination == [32, 32, 1, 1024, 64, 128, 8192, 28672, 2, 2.5]:
-                        continue
-
                     combinations.append(combination)
 
     return combinations
 
-
-# Tensor names
-DIMS_TENSOR = "dims"
 
 # ── Variance-preserving tensor generators ──────────────────────────────────
 # bf16 has ~0.4% worst-case quantization error. With N(0,1) weights, QKV
@@ -187,8 +154,7 @@ def transformer_tkg_tp4_4layer_wrapper(
     V_cache_3: nl.ndarray,
     RoPE_cos: nl.ndarray,
     RoPE_sin: nl.ndarray,
-    mask_cache: nl.ndarray,
-    mask_active: nl.ndarray,
+    attention_mask: nl.ndarray,
     position_ids: Optional[nl.ndarray],
     eps: float,
     sbuf_residual_and_cc: bool,
@@ -220,8 +186,7 @@ def transformer_tkg_tp4_4layer_wrapper(
         V_caches=[V_cache_0, V_cache_1, V_cache_2, V_cache_3],
         RoPE_cos=RoPE_cos,
         RoPE_sin=RoPE_sin,
-        mask_cache=mask_cache,
-        mask_active=None,
+        attention_mask=attention_mask,
         position_ids=position_ids,
         num_layers=4,
         eps=eps,
@@ -233,40 +198,167 @@ def transformer_tkg_tp4_4layer_wrapper(
     )
 
 
-@pytest_test_metadata(
-    name="Transformer TKG",
-    pytest_marks=["transformer_tkg", "transformer"],
-)
+def transformer_tkg_tp4_4layer_torch_ref(
+    X,
+    W_qkv_0,
+    W_qkv_1,
+    W_qkv_2,
+    W_qkv_3,
+    W_out_0,
+    W_out_1,
+    W_out_2,
+    W_out_3,
+    W_gate_0,
+    W_gate_1,
+    W_gate_2,
+    W_gate_3,
+    W_up_0,
+    W_up_1,
+    W_up_2,
+    W_up_3,
+    W_down_0,
+    W_down_1,
+    W_down_2,
+    W_down_3,
+    W_gamma_qkv_0,
+    W_gamma_qkv_1,
+    W_gamma_qkv_2,
+    W_gamma_qkv_3,
+    W_gamma_mlp_0,
+    W_gamma_mlp_1,
+    W_gamma_mlp_2,
+    W_gamma_mlp_3,
+    K_cache_0,
+    K_cache_1,
+    K_cache_2,
+    K_cache_3,
+    V_cache_0,
+    V_cache_1,
+    V_cache_2,
+    V_cache_3,
+    RoPE_cos,
+    RoPE_sin,
+    attention_mask,
+    position_ids,
+    eps,
+    sbuf_residual_and_cc,
+    W_gate_scale_0,
+    W_gate_scale_1,
+    W_gate_scale_2,
+    W_gate_scale_3,
+    W_up_scale_0,
+    W_up_scale_1,
+    W_up_scale_2,
+    W_up_scale_3,
+    W_down_scale_0,
+    W_down_scale_1,
+    W_down_scale_2,
+    W_down_scale_3,
+    replica_groups,
+):
+    """Torch reference matching transformer_tkg_tp4_4layer_wrapper signature."""
+    result = llama3_transformer_fwd_tkg_torch(
+        X=X,
+        W_qkvs=[W_qkv_0, W_qkv_1, W_qkv_2, W_qkv_3],
+        W_outs=[W_out_0, W_out_1, W_out_2, W_out_3],
+        W_gates=[W_gate_0, W_gate_1, W_gate_2, W_gate_3],
+        W_gate_scales=[W_gate_scale_0, W_gate_scale_1, W_gate_scale_2, W_gate_scale_3],
+        W_ups=[W_up_0, W_up_1, W_up_2, W_up_3],
+        W_up_scales=[W_up_scale_0, W_up_scale_1, W_up_scale_2, W_up_scale_3],
+        W_downs=[W_down_0, W_down_1, W_down_2, W_down_3],
+        W_down_scales=[W_down_scale_0, W_down_scale_1, W_down_scale_2, W_down_scale_3],
+        W_gamma_qkvs=[W_gamma_qkv_0, W_gamma_qkv_1, W_gamma_qkv_2, W_gamma_qkv_3],
+        W_gamma_mlps=[W_gamma_mlp_0, W_gamma_mlp_1, W_gamma_mlp_2, W_gamma_mlp_3],
+        RoPE_cos=RoPE_cos,
+        RoPE_sin=RoPE_sin,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        K_caches=[K_cache_0, K_cache_1, K_cache_2, K_cache_3],
+        V_caches=[V_cache_0, V_cache_1, V_cache_2, V_cache_3],
+        num_layers=4,
+        replica_groups=replica_groups,
+        eps=eps,
+        mlp_down_proj_layout_enabled=False,
+    )
+    return {"layer_output": result}
+
+
+# Test vectors generated using generate_llama3_transformer_tkg_combinations()
+# Uses Llama 70B model dimensions (H=8192, I=28672, q_heads=64)
+# Format: [tp, batch, S_tkg, S_ctx, q_heads, d_head, H, I, lnc, rel_tol]
+PARAM_NAMES = "tp, batch, S_tkg, S_ctx, q_heads, d_head, H, I, lnc, rel_tol"
+TEST_PARAMS = generate_llama3_transformer_tkg_combinations()
+_ABBREVS = {"batch": "B", "S_tkg": "St", "S_ctx": "Sc", "q_heads": "qh", "d_head": "dh", "rel_tol": "rt"}
+
+# (tp, batch, S_tkg, S_ctx) keys for full-only tests (excluded from fast suite)
+_FULL_ONLY_KEYS = {
+    (8, 8, 1, 1024),
+    (8, 8, 1, 10240),
+    (16, 2, 1, 1024),
+    (16, 2, 1, 10240),
+    (16, 2, 1, 36864),
+    (16, 4, 1, 1024),
+    (16, 4, 1, 10240),
+    (16, 4, 1, 36864),
+    (16, 8, 1, 1024),
+    (16, 8, 1, 10240),
+    (16, 16, 1, 1024),
+    (16, 32, 1, 1024),
+    (32, 4, 1, 1024),
+    (32, 4, 1, 10240),
+    (32, 4, 1, 36864),
+    (32, 8, 1, 1024),
+    (32, 8, 1, 10240),
+    (32, 16, 1, 1024),
+    (32, 16, 1, 10240),
+    (32, 32, 1, 1024),
+    (32, 64, 1, 1024),
+    (32, 64, 1, 36864),
+    (16, 32, 1, 36864),
+    (32, 32, 1, 36864),
+    (8, 16, 1, 36864),
+    (16, 16, 1, 36864),
+    (32, 16, 1, 36864),
+    (32, 64, 1, 10240),
+    (8, 8, 1, 36864),
+    (8, 16, 1, 10240),
+    (8, 4, 1, 36864),
+    (16, 32, 1, 10240),
+    (16, 8, 1, 36864),
+    (8, 2, 1, 36864),
+    (32, 8, 1, 36864),
+    (32, 32, 1, 10240),
+    (8, 2, 1, 10240),
+    (8, 1, 1, 36864),
+    (8, 4, 1, 10240),
+    (16, 16, 1, 10240),
+    (8, 16, 1, 1024),
+}
+
+ALL_PARAMS = [
+    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:4]) not in _FULL_ONLY_KEYS else c for c in TEST_PARAMS
+]
+
+
+@pytest_test_metadata(name="Transformer TKG")
+@pytest_marks(["transformer_tkg", "transformer"])
 @final
+@pytest.mark.high_rank
 class TestTransformerTKG:
     """Integration tests for transformer_tkg kernel."""
 
-    def prepare_test_parametrized(
-        self,
-        test_manager: Orchestrator,
-        test_options: RangeTestCase,
-    ):
-        """Prepare and execute a parametrized test case for transformer_tkg kernel."""
-        dims = test_options.tensors[DIMS_TENSOR]
-        tp = dims[TP_DIM]
-        B = dims[BATCH_DIM]
-        S_tkg = dims[S_TKG_DIM]
-        S_ctx = dims[S_CTX_DIM]
-        num_q_heads = dims[Q_HEADS_DIM]
-        d_head = dims[D_HEAD_DIM]
-        H = dims[H_DIM]
-        I = dims[I_DIM]
-        lnc = dims[LNC_DIM]
-        rel_tol = dims[REL_TOL_DIM]
-
+    @staticmethod
+    def generate_inputs(tp, batch, S_tkg, S_ctx, q_heads, d_head, H, I, lnc):
+        """Generate all input tensors for the transformer_tkg kernel."""
+        np.random.seed(42)
+        B = batch
         num_kv_heads = 1
         num_layers = 4
         eps = 1e-6
-        abs_tol = 1e-2
         dtype = nl.bfloat16
 
         # Compute per-core dimensions (sharded across TP)
-        q_heads_per_core = num_q_heads // tp
+        q_heads_per_core = q_heads // tp
         fd_per_core = I // tp
         # Round up to the nearest 128 - MLP only supports I that are multiples of 128
         fd_per_core = math.ceil(fd_per_core / 128) * 128
@@ -274,38 +366,37 @@ class TestTransformerTKG:
         qkv_dim = d_head * (q_heads_per_core + 2 * num_kv_heads)
 
         # Generate per-layer tensors with variance-preserving distributions
-        W_qkvs = [_fan_in_projection((H, qkv_dim), dtype, fan_in=H) for i in range(num_layers)]
-        W_outs = [_gaussian((q_heads_per_core * d_head, H), dtype, std=0.5) for i in range(num_layers)]
-        W_gates = [_fan_in_projection((H, fd_per_core), dtype, fan_in=H) for i in range(num_layers)]
-        W_ups = [_fan_in_projection((H, fd_per_core), dtype, fan_in=H) for i in range(num_layers)]
-        W_downs = [_fan_in_projection((fd_per_core, H), dtype, fan_in=fd_per_core) for i in range(num_layers)]
-        W_gamma_qkvs = [_near_unity((1, H), dtype) for i in range(num_layers)]
-        W_gamma_mlps = [_near_unity((1, H), dtype) for i in range(num_layers)]
-        K_caches = [_uniform_activation((B, num_kv_heads, d_head, S_ctx), dtype) for i in range(num_layers)]
-        V_caches = [_uniform_activation((B, num_kv_heads, S_ctx, d_head), dtype) for i in range(num_layers)]
+        W_qkvs = [_fan_in_projection((H, qkv_dim), dtype, fan_in=H) for _ in range(num_layers)]
+        W_outs = [_gaussian((q_heads_per_core * d_head, H), dtype, std=0.5) for _ in range(num_layers)]
+        W_gates = [_fan_in_projection((H, fd_per_core), dtype, fan_in=H) for _ in range(num_layers)]
+        W_ups = [_fan_in_projection((H, fd_per_core), dtype, fan_in=H) for _ in range(num_layers)]
+        W_downs = [_fan_in_projection((fd_per_core, H), dtype, fan_in=fd_per_core) for _ in range(num_layers)]
+        W_gamma_qkvs = [_near_unity((1, H), dtype) for _ in range(num_layers)]
+        W_gamma_mlps = [_near_unity((1, H), dtype) for _ in range(num_layers)]
+        K_caches = [_uniform_activation((B, num_kv_heads, d_head, S_ctx), dtype) for _ in range(num_layers)]
+        V_caches = [_uniform_activation((B, num_kv_heads, S_ctx, d_head), dtype) for _ in range(num_layers)]
 
-        # Generate cache lengths: each batch has its own assumed context length
-        assumed_actual_ctx_lens = np.arange(B) * 3 + (S_ctx // 4 * 3)
-        assert assumed_actual_ctx_lens.max() < S_ctx  # Make sure not to go out of bound
+        # Generate attention mask and position_ids
+        cache_len = generate_cache_lens(B, S_ctx, S_tkg, mode="normal")
+        assert cache_len.max() <= (S_ctx - S_tkg)
 
-        # Generate cascaded attention mask using the ported function
-        # NOTE: while the kernel can take the single mask_cache where unify_for_cascaded is True,
-        # the golden expect explicit mask_cache and mask_active
+        cache_lens_torch = torch.from_numpy(cache_len.flatten()).to(torch.float32)
+        attention_mask = build_full_attention_mask(
+            cache_lens=cache_lens_torch,
+            batch=B,
+            num_heads=q_heads_per_core,
+            s_active=S_tkg,
+            s_ctx=S_ctx,
+            lnc=lnc,
+            block_len=0,
+            include_active_mask=True,
+            transposed=True,
+        ).numpy()  # (S_ctx, B, q_heads_per_core, S_tkg)
+        attention_mask = dt.static_cast(np.ascontiguousarray(attention_mask), dtype=np.uint8)
 
-        mask_cache_shape = (S_ctx, B, q_heads_per_core, S_tkg)
-
-        arr = np.ones(mask_cache_shape, dtype=np.bool_)
-        mask_cache = arr.reshape(B, q_heads_per_core, S_tkg, S_ctx)
-        mask_active = np.tril(np.ones((B, q_heads_per_core, S_tkg, S_tkg), dtype=np.bool_), k=0)
-        mask_cache[:, :, :, S_ctx - S_tkg :] = mask_active
-        mask_cache = mask_cache.transpose((3, 0, 1, 2))
-
-        position_ids = assumed_actual_ctx_lens[:, np.newaxis] + np.arange(S_tkg)
-
-        # Generate position_ids based on cache lengths
+        position_ids = cache_len + np.arange(S_tkg)  # (B, S_tkg)
 
         # Generate MLP scales: first and last layers are non-quantized (no scales)
-        # Use fixed seed RNG matching old frontend strategy: fill with single random scalar
         nonquantized_layers = {0, num_layers - 1}
         scale_rng = np.random.default_rng(0)
         W_gate_scales = []
@@ -343,146 +434,55 @@ class TestTransformerTKG:
             kernel_input[f"V_cache_{i}"] = V_caches[i]
         kernel_input["RoPE_cos"] = _uniform_activation((d_head // 2, B, S_tkg), dtype)
         kernel_input["RoPE_sin"] = _uniform_activation((d_head // 2, B, S_tkg), dtype)
-
-        kernel_input["mask_cache"] = mask_cache
-        kernel_input["mask_active"] = mask_active
-
+        kernel_input["attention_mask"] = attention_mask
         kernel_input["position_ids"] = position_ids.astype(np.uint32)
         kernel_input["eps"] = eps
         kernel_input["sbuf_residual_and_cc"] = False
-
-        collective_ranks = tp
-        # Shared-fleet instances (trn2.3xlarge) have 4 NeuronCores; demote to compile-only
-        # when the test needs more ranks than available.
-        # Set TEST_TRANSFORMER_TKG_FORCE_INFER=1 to override and run on hardware anyway.
-        _MAX_SHARED_FLEET_RANKS = 4
-        if not os.environ.get("TEST_TRANSFORMER_TKG_FORCE_INFER") and tp > _MAX_SHARED_FLEET_RANKS:
-            import warnings
-
-            warnings.warn(
-                f"Demoting to use replica group of size 4: tp={tp} exceeds shared-fleet limit "
-                f"of {_MAX_SHARED_FLEET_RANKS} NeuronCores. "
-                f"Set TEST_TRANSFORMER_TKG_FORCE_INFER=1 to override.",
-                stacklevel=2,
-            )
-
-            collective_ranks = 4
-        kernel_input["replica_groups"] = (tuple(range(collective_ranks)),)
-
         for i in range(num_layers):
             kernel_input[f"W_gate_scale_{i}"] = W_gate_scales[i]
             kernel_input[f"W_up_scale_{i}"] = W_up_scales[i]
             kernel_input[f"W_down_scale_{i}"] = W_down_scales[i]
 
-        def to_torch(arr):
-            if arr is None:
-                return None
-            if hasattr(arr, 'dtype') and arr.dtype == ml_dtypes.bfloat16:
-                return torch.tensor(arr.astype(np.float32)).to(torch.bfloat16)
-            return torch.from_numpy(arr)
+        return kernel_input
 
-        def create_lazy_golden():
-            golden_output = llama3_transformer_fwd_tkg_torch(
-                X=to_torch(kernel_input["X"]),
-                W_qkvs=[to_torch(w) for w in W_qkvs],
-                W_outs=[to_torch(w) for w in W_outs],
-                W_gates=[to_torch(w) for w in W_gates],
-                W_gate_scales=[to_torch(s) for s in W_gate_scales],
-                W_ups=[to_torch(w) for w in W_ups],
-                W_up_scales=[to_torch(s) for s in W_up_scales],
-                W_downs=[to_torch(w) for w in W_downs],
-                W_down_scales=[to_torch(s) for s in W_down_scales],
-                W_gamma_qkvs=[to_torch(w) for w in W_gamma_qkvs],
-                W_gamma_mlps=[to_torch(w) for w in W_gamma_mlps],
-                RoPE_cos=to_torch(kernel_input["RoPE_cos"]),
-                RoPE_sin=to_torch(kernel_input["RoPE_sin"]),
-                mask_cache=to_torch(mask_cache),
-                mask_active=to_torch(mask_active),
-                position_ids=to_torch(position_ids),
-                K_caches=[to_torch(k) for k in K_caches],
-                V_caches=[to_torch(v) for v in V_caches],
-                num_layers=num_layers,
-                replica_groups=kernel_input["replica_groups"],
-                eps=eps,
-                mlp_down_proj_layout_enabled=False,
-            )
-            golden_np = golden_output.to(torch.float32).numpy().astype(ml_dtypes.bfloat16)
-            return {"layer_output": golden_np}
-
-        output_tensors = {"layer_output": np.zeros((B, S_tkg, H), dtype=ml_dtypes.bfloat16)}
-
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=nki.jit(transformer_tkg_tp4_4layer_wrapper),
-                compiler_input=CompilerArgs(logical_nc_config=lnc),
-                inference_args=InferenceArgs(collective_ranks=collective_ranks),
-                kernel_input=kernel_input,
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(
-                        lazy_golden_generator=create_lazy_golden,
-                        output_ndarray=output_tensors,
-                    ),
-                    relative_accuracy=rel_tol / 100.0,
-                    absolute_accuracy=abs_tol,
-                ),
-            )
-        )
-
-    @staticmethod
-    def manual_test_config(test_grid) -> RangeTestConfig:
-        """Generate manual test configuration from test grid."""
-        test_cases = []
-        for test_case in test_grid:
-            test_cases.append(
-                {
-                    DIMS_TENSOR: {
-                        TP_DIM: test_case[0],
-                        BATCH_DIM: test_case[1],
-                        S_TKG_DIM: test_case[2],
-                        S_CTX_DIM: test_case[3],
-                        Q_HEADS_DIM: test_case[4],
-                        D_HEAD_DIM: test_case[5],
-                        H_DIM: test_case[6],
-                        I_DIM: test_case[7],
-                        LNC_DIM: test_case[8],
-                        REL_TOL_DIM: test_case[9],
-                    },
-                }
-            )
-        return RangeTestConfig(
-            additional_params={},
-            global_tensor_configs=TensorRangeConfig(
-                tensor_configs={
-                    DIMS_TENSOR: TensorConfig(
-                        [
-                            DimensionRangeConfig(name=TP_DIM),
-                            DimensionRangeConfig(name=BATCH_DIM),
-                            DimensionRangeConfig(name=S_TKG_DIM),
-                            DimensionRangeConfig(name=S_CTX_DIM),
-                            DimensionRangeConfig(name=Q_HEADS_DIM),
-                            DimensionRangeConfig(name=D_HEAD_DIM),
-                            DimensionRangeConfig(name=H_DIM),
-                            DimensionRangeConfig(name=I_DIM),
-                            DimensionRangeConfig(name=LNC_DIM),
-                            DimensionRangeConfig(name=REL_TOL_DIM),
-                        ]
-                    ),
-                },
-                monotonic_step_size=1,
-                custom_generators=[RangeManualGeneratorStrategy(test_cases=test_cases)],
-            ),
-        )
-
-    # Test vectors generated using generate_llama3_transformer_tkg_combinations()
-    # Uses Llama 70B model dimensions (H=8192, I=28672, q_heads=64)
-    # Format: [tp, batch, S_tkg, S_ctx, q_heads, d_head, H, I, lnc, rel_tol]
-    TEST_GRID = generate_llama3_transformer_tkg_combinations()
-
-    @pytest.mark.fast
-    @range_test_config(manual_test_config(TEST_GRID))
-    def test_transformer_tkg(self, test_manager: Orchestrator, range_test_options: RangeTestCase):
+    @pytest_parametrize(PARAM_NAMES, ALL_PARAMS, abbrevs=_ABBREVS)
+    def test_transformer_tkg(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        tp: int,
+        batch: int,
+        S_tkg: int,
+        S_ctx: int,
+        q_heads: int,
+        d_head: int,
+        H: int,
+        I: int,
+        lnc: int,
+        rel_tol: float,
+    ):
         """Test transformer_tkg with various configurations."""
-        self.prepare_test_parametrized(
+        B = batch
+
+        def input_generator(test_config):
+            kernel_input = self.generate_inputs(tp, batch, S_tkg, S_ctx, q_heads, d_head, H, I, lnc)
+            kernel_input["replica_groups"] = (tuple(range(tp)),)
+            return kernel_input
+
+        def output_tensors(kernel_input):
+            return {"layer_output": np.zeros((B, S_tkg, H), dtype=ml_dtypes.bfloat16)}
+
+        framework = UnitTestFramework(
             test_manager=test_manager,
-            test_options=range_test_options,
+            kernel_entry=nki.jit(transformer_tkg_tp4_4layer_wrapper),
+            torch_ref=torch_ref_wrapper(transformer_tkg_tp4_4layer_torch_ref, preserve_lower_precision=True),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            inference_args=InferenceArgs(collective_ranks=tp),
+            rtol=rel_tol / 100.0,
+            atol=1e-2,
         )

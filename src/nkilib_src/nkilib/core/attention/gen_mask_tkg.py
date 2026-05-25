@@ -28,6 +28,7 @@ Design spec: gen_mask_tkg_design_spec.md
 
 from typing import Optional
 
+import nki
 import nki.isa as nisa
 import nki.language as nl
 from nki.isa import dge_mode
@@ -449,10 +450,18 @@ def _create_batch_masks_swa(
     q_head. Uses the raw iota tensor directly since each query is processed
     one at a time.
 
+    The prior mask end boundary is always pos_ids[b, 0] (the base position =
+    cache_lens[b]) for every query in a batch, NOT pos_ids[b, i].  Positions
+    cache_lens[b] .. cache_lens[b]+i-1 are active tokens that live in the
+    active KV buffer, not the prior cache.  Using pos_ids[b, i] would
+    incorrectly mark stale prior-cache slots as attended.
+
     Args:
         iota: Raw index tensor. Shape [P_MAX, n_sprior_tile].
         mask_out: Output mask buffer. Shape [P_MAX, n_sprior_tile, bs, q_head, s_active].
         pos_ids: End position IDs (exclusive). Shape [P_MAX, bs * s_active].
+            pos_ids[:, b*s_active + i] = cache_lens[b] + i.  Only the first
+            element per batch (i=0) is used as the prior mask end.
         start_pos: Start position IDs (inclusive). Shape [P_MAX, bs * s_active].
         bs: Batch size.
         q_head: Number of query heads.
@@ -487,6 +496,10 @@ def _create_batch_masks_swa(
             name=f"swa_scratch_{batch_idx}_{s_prior_offset}",
         )
 
+        # Prior mask end = pos_ids[b, 0] = cache_lens[b] for all queries in this batch.
+        # Positions >= cache_lens[b] are active tokens (not in the prior cache).
+        base_col_idx = batch_idx * s_active
+
         for sa_idx in range(s_active):
             col_idx = batch_idx * s_active + sa_idx
 
@@ -498,12 +511,12 @@ def _create_batch_masks_swa(
                 operand0=start_pos[:, nl.ds(col_idx, 1)],
             )
 
-            # Step 2: lt = (iota < end)
+            # Step 2: lt = (iota < end), end = pos_ids[b, 0] (base position)
             nisa.tensor_scalar(
                 dst=buf_lt[...],
                 data=iota[...],
                 op0=nl.less,
-                operand0=pos_ids[:, nl.ds(col_idx, 1)],
+                operand0=pos_ids[:, nl.ds(base_col_idx, 1)],
             )
 
             # Step 3: normal = ge AND lt (multiply for binary)
@@ -515,11 +528,11 @@ def _create_batch_masks_swa(
             # Step 5: diff = wrap - normal
             nisa.tensor_tensor(buf_ge[...], buf_ge[...], buf_scratch[...], op=nl.subtract)
 
-            # Step 6: is_wrap = (start > end)
+            # Step 6: is_wrap = (start > end), end = pos_ids[b, 0]
             nisa.tensor_tensor(
                 buf_lt[:, nl.ds(0, 1)],
                 start_pos[:, nl.ds(col_idx, 1)],
-                pos_ids[:, nl.ds(col_idx, 1)],
+                pos_ids[:, nl.ds(base_col_idx, 1)],
                 op=nl.greater,
             )
 
@@ -857,6 +870,7 @@ def _load_active_mask_hbm(
         )
 
 
+@nki.jit
 def gen_mask_tkg_hbm(
     pos_ids_hbm: nl.ndarray,
     bs: int,

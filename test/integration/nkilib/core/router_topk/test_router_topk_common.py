@@ -19,6 +19,7 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 import torch
+
 from nkilib_src.nkilib.core.router_topk.router_topk import (
     XHBMLayout_T_H__1,
     router_topk,

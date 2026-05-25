@@ -20,12 +20,16 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import numpy.typing as npt
+import pytest
 import torch
 
 from ..utils.common_dataclasses import (
+    CompilerArgs,
     CustomValidator,
     CustomValidatorWithOutputTensorData,
     KernelArgs,
+    LazyGoldenGenerator,
+    Platforms,
     ValidationArgs,
 )
 from ..utils.output_validator import OutputValidator
@@ -150,14 +154,12 @@ class PassingCustomValidator(CustomValidator):
 class TestOutputValidatorCustomValidator:
     """Tests for OutputValidator with custom validators."""
 
-    def _create_mock_emitter(self):
-        """Create a mock emitter with metrics collector."""
+    def _create_mock_collector(self):
+        """Create a mock metrics collector."""
         collector = MagicMock()
         collector.timer.return_value.__enter__ = MagicMock()
         collector.timer.return_value.__exit__ = MagicMock()
-        emitter = MagicMock()
-        emitter.get_collector.return_value = collector
-        return emitter
+        return collector
 
     def test_custom_validator_failure_does_not_raise_name_error(self, tmp_path):
         """
@@ -175,7 +177,8 @@ class TestOutputValidatorCustomValidator:
         # Create kernel args with a failing custom validator
         kernel_args = KernelArgs(
             kernel_func=lambda: None,
-            emitter=self._create_mock_emitter(),
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
+            collector=self._create_mock_collector(),
             validation_args=ValidationArgs(
                 golden_output={
                     "test_output": CustomValidatorWithOutputTensorData(
@@ -219,7 +222,8 @@ class TestOutputValidatorCustomValidator:
         # Create kernel args with a passing custom validator
         kernel_args = KernelArgs(
             kernel_func=lambda: None,
-            emitter=self._create_mock_emitter(),
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
+            collector=self._create_mock_collector(),
             validation_args=ValidationArgs(
                 golden_output={
                     "test_output": CustomValidatorWithOutputTensorData(
@@ -237,3 +241,73 @@ class TestOutputValidatorCustomValidator:
 
         # Should complete without error
         validator.validate()
+
+
+class TestOutputValidatorEqualNanInf:
+    """Test that equal_nan_inf is plumbed through to maxAllClose."""
+
+    def _create_mock_collector(self):
+        collector = MagicMock()
+        collector.timer.return_value.__enter__ = MagicMock()
+        collector.timer.return_value.__exit__ = MagicMock()
+        return collector
+
+    def test_equal_nan_inf_passes_with_matching_nans(self, tmp_path):
+        """With equal_nan_inf=True, matching NaN values should pass validation."""
+        # Create output with a NaN value
+        output_data = np.array([1.0, 2.0, float('nan'), 4.0], dtype=np.float32)
+        output_file = tmp_path / "test_output.bin"
+        output_data.tofile(output_file)
+
+        # Golden has the same NaN
+        golden_data = {"test_output": np.array([1.0, 2.0, float('nan'), 4.0], dtype=np.float32)}
+        output_ndarray = {"test_output": np.zeros(4, dtype=np.float32)}
+
+        kernel_args = KernelArgs(
+            kernel_func=lambda: None,
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
+            collector=self._create_mock_collector(),
+            validation_args=ValidationArgs(
+                golden_output=LazyGoldenGenerator(
+                    lazy_golden_generator=lambda: golden_data,
+                    output_ndarray=output_ndarray,
+                ),
+                equal_nan_inf=True,
+            ),
+        )
+
+        validator = OutputValidator(
+            kernels_args=kernel_args,
+            output_file_list=[str(output_file)],
+        )
+        # Should pass — NaN == NaN with equal_nan_inf=True
+        validator.validate()
+
+    def test_equal_nan_inf_false_fails_with_matching_nans(self, tmp_path):
+        """With equal_nan_inf=False (default), matching NaN values should fail validation."""
+        output_data = np.array([1.0, 2.0, float('nan'), 4.0], dtype=np.float32)
+        output_file = tmp_path / "test_output.bin"
+        output_data.tofile(output_file)
+
+        golden_data = {"test_output": np.array([1.0, 2.0, float('nan'), 4.0], dtype=np.float32)}
+        output_ndarray = {"test_output": np.zeros(4, dtype=np.float32)}
+
+        kernel_args = KernelArgs(
+            kernel_func=lambda: None,
+            compiler_input=CompilerArgs(platform_target=Platforms.TRN2),
+            collector=self._create_mock_collector(),
+            validation_args=ValidationArgs(
+                golden_output=LazyGoldenGenerator(
+                    lazy_golden_generator=lambda: golden_data,
+                    output_ndarray=output_ndarray,
+                ),
+                equal_nan_inf=False,
+            ),
+        )
+
+        validator = OutputValidator(
+            kernels_args=kernel_args,
+            output_file_list=[str(output_file)],
+        )
+        with pytest.raises(AssertionError, match="Validation failed"):
+            validator.validate()

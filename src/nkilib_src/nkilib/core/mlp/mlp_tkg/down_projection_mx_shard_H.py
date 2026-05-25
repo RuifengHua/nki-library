@@ -27,9 +27,11 @@ from typing import Optional
 import nki.isa as nisa
 import nki.language as nl
 
+from ...quantization.fp8_quantize import pre_combine_dequant_scales
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil
+from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, _psum_alloc, _sbm_alloc, div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+from ...utils.tensor_view import TensorView
 from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
@@ -41,7 +43,12 @@ from .projection_mx_constants import (
 
 
 def _down_proj_prep_inter_and_weights(
-    inter_sb: nl.ndarray, weight: nl.ndarray, weight_scale: nl.ndarray, cfg: ProjConfig
+    inter_sb: nl.ndarray,
+    weight: nl.ndarray,
+    weight_scale: nl.ndarray,
+    cfg: ProjConfig,
+    sbm=None,
+    name_prefix: str = None,
 ) -> tuple[nl.ndarray, nl.ndarray, nl.ndarray, nl.ndarray]:
     """
     Prep intermediate and weights for down projection:
@@ -49,8 +56,11 @@ def _down_proj_prep_inter_and_weights(
         - for weight, load from HBM into SBUF.
 
     :param inter_sb: bf16[_pmax, n_I512_tile, BxS, 4] @ SB. Dim I is shuffled on 128.
-    :param weight: mxfp_x4[_pmax, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
-    :param weight_scale: mxfp_x4[_pmax // _q_height, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
+    :param weight: mxfp_x4[128_I, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
+        I-contiguous x4 packing: element [p, tile, h] packs W[512*tile + 4p + q, h]
+        for q=0..3 (4 consecutive I values at the same H column). This layout is
+        shared with the CTE MX down projection path.
+    :param weight_scale: uint8[128_I // _q_height, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
     :return:
         1. (inter_qtz)        mxfp8_x4[_pmax, cfg.n_total_I512_tile, BxS]
         2. (inter_qtz_scale)  uint8[_pmax, cfg.n_total_I512_tile, BxS]
@@ -71,8 +81,20 @@ def _down_proj_prep_inter_and_weights(
     However, we memset the last tile of weight_qtz and weight_qtz_scale so the garbage does not matter.
     """
     inter_sb = inter_sb.reshape((_pmax, cfg.n_total_I512_tile * BxS * _q_width))
-    inter_qtz = nl.ndarray((_pmax, cfg.n_total_I512_tile * BxS), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-    inter_qtz_scale = nl.ndarray(inter_qtz.shape, dtype=nl.uint8, buffer=nl.sbuf)
+    inter_qtz = _sbm_alloc(
+        sbm,
+        (_pmax, cfg.n_total_I512_tile * BxS),
+        dtype=nl.float8_e4m3fn_x4,
+        name=f"{name_prefix}_inter_qtz" if name_prefix else None,
+        align=SBUF_QUADRANT_SIZE,
+    )
+    inter_qtz_scale = _sbm_alloc(
+        sbm,
+        inter_qtz.shape,
+        dtype=nl.uint8,
+        name=f"{name_prefix}_inter_qtz_scale" if name_prefix else None,
+        align=SBUF_QUADRANT_SIZE,
+    )
     nisa.quantize_mx(dst=inter_qtz, src=inter_sb, dst_scale=inter_qtz_scale)
     inter_qtz = inter_qtz.reshape((_pmax, cfg.n_total_I512_tile, BxS))
     inter_qtz_scale = inter_qtz_scale.reshape(inter_qtz.shape)
@@ -85,8 +107,12 @@ def _down_proj_prep_inter_and_weights(
         weight_qtz = weight
     else:
         # Load weight into [I0, ceil(I/512), H_sharded] NOTE: this is pre-quantized and each elt is mxfp_x4 (packed I)
-        weight_qtz = nl.ndarray(
-            (_pmax, cfg.n_total_I512_tile, H_sharded), dtype=weight.dtype, buffer=nl.sbuf, name='down_w_qtz_sb'
+        weight_qtz = _sbm_alloc(
+            sbm,
+            (_pmax, cfg.n_total_I512_tile, H_sharded),
+            dtype=weight.dtype,
+            name=f'{cfg.name_prefix}down_w_qtz_sb',
+            align=SBUF_QUADRANT_SIZE,
         )
         # Memset weight if input weight HBM does not pad on par dim
         if p_I != _pmax:
@@ -109,7 +135,13 @@ def _down_proj_prep_inter_and_weights(
         weight_qtz_scale = weight_scale
     else:
         # Load weight scale into [I0, ceil(I/512), H_sharded] NOTE: we have 1 scale per 8(p)x4(f) tile, but still span across full pdim with gaps
-        weight_qtz_scale = nl.ndarray(weight_qtz.shape, dtype=nl.uint8, buffer=nl.sbuf, name="down_w_scale_sb")
+        weight_qtz_scale = _sbm_alloc(
+            sbm,
+            weight_qtz.shape,
+            dtype=nl.uint8,
+            name=f"{cfg.name_prefix}down_w_scale_sb",
+            align=SBUF_QUADRANT_SIZE,
+        )
         # Memset weight scale if input weight scale HBM does not pad on par dim
         if p_I != _pmax:
             nisa.memset(dst=weight_qtz_scale[:, cfg.n_total_I512_tile - 1, :], value=0)
@@ -141,6 +173,11 @@ def down_projection_mx_tp_shard_H(
     bias_sb: Optional[nl.ndarray],
     cfg: ProjConfig,
     partial_output: bool = False,
+    pre_quantized: bool = False,
+    pre_quantized_scale: Optional[nl.ndarray] = None,
+    w_dequant_scale=None,
+    input_dequant_scale=None,
+    name_prefix: str = None,
 ) -> nl.ndarray:
     """
     Performs the Down projection with H-dimension sharding. Math (Neuron matmul):
@@ -150,21 +187,64 @@ def down_projection_mx_tp_shard_H(
     a contiguous slice of 128 elts from the full H. Instead, those are 128 elts with a stride of H//128 (H1).
     This means the final output of shape [_pmax (H0), H//_pmax (H1), BxS] would have a contiguous H1 and strided H0.
 
-    :param inter_sb: bf16[_pmax, n_I512_tile, BxS, 4] @ SB. Dim I is shuffled on 128.
-    :param weight: mxfp_x4[_pmax, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
-    :param weight_scale: mxfp_x4[_pmax // _q_height, ceil(I/512), H] @ HBM. NOTE: expect zero-padding.
+    Weight x4 packing convention (I-contiguous, shared with CTE MX down projection):
+        Element [p, tile, h] packs W[512*tile + 4p + q, h] for q=0..3
+        (4 consecutive I values at the same H column).
+        nc_matmul_mx contracts over partition × x4 = I dimension.
+
+    :param inter_sb: bf16[_pmax, n_I512_tile, BxS, 4] @ SB (MX path), or fp8_x4[_pmax, n_I512_tile, BxS] @ SB (pre_quantized).
+    :param weight: mxfp_x4[128_I, ceil(I/512), H] @ HBM. I-contiguous x4 packing. NOTE: expect zero-padding.
+    :param weight_scale: uint8[128_I // _q_height, ceil(I/512), H] @ HBM (MX), or uint8[_pmax, n_I512_tile, H_sharded] @ SB (pre_quantized).
     :param bias_sb [OPTIONAL]: bf16[_pmax, H_sharded//_pmax] @ SB.
     :param partial_output: If True, skips LNC synchronization and returns only local shard.
+    :param pre_quantized: If True, inter_sb is already fp8_x4 quantized with dummy scales (STATIC_MX path).
+    :param pre_quantized_scale: uint8 dummy scale for pre-quantized intermediate, required when pre_quantized=True.
+    :param w_dequant_scale [OPTIONAL]: Weight dequant scale in SBUF.
+        [_pmax, 1] for STATIC_MX, [_pmax, H//128] for ROW_MX, None for MX.
+    :param input_dequant_scale [OPTIONAL]: Input dequant scale in SBUF.
+        [_pmax, 1] for STATIC_MX, [_pmax, T_padded, 1] for ROW_MX, None for MX.
     :return: bf16[_pmax, H1_sharded, BxS] @ SB if partial_output=True, else bf16[_pmax, H1, BxS] @ SB.
     """
     n_prgs, prg_id = cfg.n_prgs, cfg.prg_id
     kernel_assert(cfg.H_sharded % _pmax == 0, "down projection with [H, T] output layout requires H divisible by 128")
     kernel_assert(cfg.BxS <= 128, f"MX4 down proj with HT output layout only supports TKG but got {cfg.BxS=}")
 
-    # Prep inputs
-    inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale = _down_proj_prep_inter_and_weights(
-        inter_sb, weight, weight_scale, cfg
-    )
+    if pre_quantized:
+        # ── STATIC_MX/ROW_MX path: intermediate already quantized, use dummy scales ──
+        kernel_assert(pre_quantized_scale is not None, "pre_quantized_scale required when pre_quantized=True")
+        inter_qtz_tv = inter_sb if isinstance(inter_sb, TensorView) else TensorView(inter_sb)
+        inter_qtz_scale = pre_quantized_scale  # Dummy uint8[_pmax, n_I512_tile, BxS] all-127
+
+        weight_base = TensorView(weight).base_tensor if isinstance(weight, TensorView) else weight
+        if weight_base.buffer == nl.sbuf:
+            # Weight already in SBUF
+            weight_qtz = weight_base
+            weight_qtz_scale = weight_scale
+        else:
+            # Load weight from HBM
+            p_I = _pmax if cfg.I > _psum_fmax else cfg.I // _q_width
+            weight_qtz = nl.ndarray(
+                (_pmax, cfg.n_total_I512_tile, cfg.H_sharded),
+                dtype=weight.dtype,
+                buffer=nl.sbuf,
+                name=f'{cfg.name_prefix}down_w_qtz_sb',
+            )
+            if p_I != _pmax:
+                nisa.memset(dst=weight_qtz[:, cfg.n_total_I512_tile - 1, :], value=0.0)
+            kernel_assert(weight.shape == (p_I, cfg.n_total_I512_tile, cfg.H), "Incorrect weight shape")
+            nisa.dma_copy(
+                src=weight[:, :, prg_id * cfg.H_sharded : (prg_id + 1) * cfg.H_sharded],
+                dst=weight_qtz[:p_I, :, :],
+                dge_mode=nisa.dge_mode.hwdge,
+            )
+            weight_qtz_scale = weight_scale
+    else:
+        # ── MX path: quantize intermediate and load weights ──
+        inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale = _down_proj_prep_inter_and_weights(
+            inter_sb, weight, weight_scale, cfg, name_prefix=name_prefix
+        )
+        # Wrap in TensorView for consistent access in the matmul loop (inter_qtz_tv.slice)
+        inter_qtz_tv = TensorView(inter_qtz)
     if cfg.dbg_weight:
         return weight_qtz, weight_qtz_scale
 
@@ -182,17 +262,20 @@ def down_projection_mx_tp_shard_H(
             nisa.nc_matmul_mx(
                 dst=h128_psum,
                 stationary=weight_qtz[:, i_I512_tile, i_H1 * _pmax : (i_H1 + 1) * _pmax],
-                moving=inter_qtz[:, i_I512_tile, :],  # [_pmax (I), BxS]
+                moving=inter_qtz_tv.slice(1, i_I512_tile, i_I512_tile + 1).get_view(),
                 stationary_scale=weight_qtz_scale[:, i_I512_tile, i_H1 * _pmax : (i_H1 + 1) * _pmax],
                 moving_scale=inter_qtz_scale[:, i_I512_tile, :],
             )
 
         # Copy out the current H128 tile to SB, use ACT because DVE is usually bottlenecked
-        act_bias_arg = None
-        if bias_sb is not None:
-            act_bias_arg = bias_sb[:, i_H1]
         idx = i_H1 if partial_output else cfg.H1_sharded * prg_id + i_H1
-        nisa.activation(dst=out_sb[:, idx, :], op=nl.copy, data=h128_psum, bias=act_bias_arg)
+        if w_dequant_scale is not None:
+            # ── Software quant path: copy psum to sbuf first, dequant applied after sendrecv ──
+            nisa.activation(dst=out_sb[:, idx, :], op=nl.copy, data=h128_psum)
+        else:
+            # ── MX path or no dequant: fuse bias into the copy ──
+            act_bias_arg = bias_sb[:, i_H1] if bias_sb is not None else None
+            nisa.activation(dst=out_sb[:, idx, :], op=nl.copy, data=h128_psum, bias=act_bias_arg)
 
     # Receive projection output from the other NC when LNC > 1
     # Skip sendrecv if partial_output=True (caller handles synchronization or only needs local shard)
@@ -206,11 +289,72 @@ def down_projection_mx_tp_shard_H(
             pipe_id=0,
         )
 
+    # ── Post-matmul dequant (STATIC_MX / ROW_MX): apply w_dequant_scale, input_dequant_scale, bias ──
+    # Applied AFTER LNC reduce so bias is added once and scale is applied to the full sum.
+    if w_dequant_scale is not None:
+        H1_out = out_sb.shape[1]
+        # When partial_output=True, out_sb only has H1_sharded columns corresponding to
+        # the local shard, so we need H1_offset to index into the full weight scale.
+        # When partial_output=False, out_sb has the full H1 range and indices are global.
+        H1_offset = cfg.H1_sharded * prg_id if partial_output else 0
+        if w_dequant_scale.shape[1] == 1:
+            # ── STATIC_MX: both scales are [_pmax, 1], pre-combine and broadcast ──
+            combined = pre_combine_dequant_scales(input_dequant_scale, w_dequant_scale)
+            nisa.activation(
+                dst=out_sb,
+                op=nl.copy,
+                data=out_sb,
+                scale=combined,
+            )
+        else:
+            # ── ROW_MX: fuse per-row weight scale × per-token input scale ──
+            for i_H1 in nl.affine_range(H1_out):
+                h_col = H1_offset + i_H1
+                if input_dequant_scale is not None:
+                    # Fuse both dequant scales into one instruction
+                    nisa.scalar_tensor_tensor(
+                        dst=out_sb[:, i_H1, :],
+                        data=out_sb[:, i_H1, :],
+                        op0=nl.multiply,
+                        operand0=w_dequant_scale[:, h_col : h_col + 1],
+                        op1=nl.multiply,
+                        operand1=input_dequant_scale[:, : cfg.BxS, 0],
+                    )
+                else:
+                    # Weight dequant only (caller handles input dequant externally)
+                    nisa.activation(
+                        dst=out_sb[:, i_H1, :],
+                        op=nl.copy,
+                        data=out_sb[:, i_H1, :],
+                        scale=w_dequant_scale[:, h_col : h_col + 1],
+                    )
+
+        # Add bias if present (after dequant for both STATIC_MX and ROW_MX)
+        # Bias is [H0, H1_shard] — only covers the local shard's H1 range.
+        # Apply to the correct slice of out_sb based on partial_output layout.
+        if bias_sb is not None:
+            for i_H1 in nl.affine_range(cfg.H1_sharded):
+                out_idx = i_H1 if partial_output else cfg.H1_sharded * prg_id + i_H1
+                nisa.activation(
+                    dst=out_sb[:, out_idx, :],
+                    op=nl.copy,
+                    data=out_sb[:, out_idx, :],
+                    bias=bias_sb[:, i_H1],
+                )
+
     return out_sb
 
 
 def down_projection_mx_shard_H(
-    inter_sb: nl.ndarray, weight: nl.ndarray, weight_scale: nl.ndarray, bias_sb: nl.ndarray, cfg: ProjConfig
+    inter_sb: nl.ndarray,
+    weight: nl.ndarray,
+    weight_scale: nl.ndarray,
+    bias_sb: nl.ndarray,
+    cfg: ProjConfig,
+    sbm=None,
+    psum_bank_offset: int = 0,
+    name_prefix: str = None,
+    out_sb=None,
 ) -> nl.ndarray:
     """
     Perform down projection with MXFP quantization.
@@ -251,7 +395,7 @@ def down_projection_mx_shard_H(
 
     # Prep inputs
     inter_qtz, inter_qtz_scale, weight_qtz, weight_qtz_scale = _down_proj_prep_inter_and_weights(
-        inter_sb, weight, weight_scale, cfg
+        inter_sb, weight, weight_scale, cfg, sbm=sbm, name_prefix=name_prefix
     )
 
     if cfg.dbg_weight:
@@ -268,45 +412,71 @@ def down_projection_mx_shard_H(
     - False: Use PE broadcast via matmul with ones
     """
     bias_broadcasted = None
-    if bias_sb is not None:
-        if bias_sb.shape[0] == 1:
-            bias_broadcasted = nl.ndarray((BxS_tile_sz, H_sharded), dtype=bias_sb.dtype, buffer=nl.sbuf)
+    if bias_sb and bias_sb.shape[0] == 1:
+        bias_broadcasted = _sbm_alloc(
+            sbm,
+            (BxS_tile_sz, H_sharded),
+            dtype=bias_sb.dtype,
+            name=f"{name_prefix}_bias_bcast" if name_prefix else None,
+            align=SBUF_QUADRANT_SIZE,
+        )
 
-            if cfg.use_stream_shuffle_broadcast:
-                # Stream shuffle broadcast: broadcast from partition 0 to all partitions
-                stream_shuffle_broadcast(src=bias_sb, dst=bias_broadcasted)
-            else:
-                # PE broadcast via matmul with ones tiled by 512 chunks
-                ones_sb = nl.ndarray((1, _pmax), dtype=nl.bfloat16, buffer=nl.sbuf)
-                nisa.memset(dst=ones_sb, value=1.0)
-
-                n_bias_tiles = div_ceil(H_sharded, _psum_fmax)
-                for i_bias_tile in nl.affine_range(n_bias_tiles):
-                    bias_h_offset = i_bias_tile * _psum_fmax
-                    bias_h_size = min(_psum_fmax, H_sharded - bias_h_offset)
-                    bias_h_slice = nl.ds(bias_h_offset, bias_h_size)
-                    bias_psum = nl.ndarray((BxS_tile_sz, bias_h_size), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_matmul(
-                        dst=bias_psum,
-                        stationary=ones_sb[:, :BxS_tile_sz],
-                        moving=bias_sb[:, bias_h_slice],
-                        is_stationary_onezero=True,
-                    )
-                    nisa.tensor_copy(
-                        dst=bias_broadcasted[:, bias_h_slice],
-                        src=bias_psum,
-                    )
+        if cfg.use_stream_shuffle_broadcast:
+            # Stream shuffle broadcast: broadcast from partition 0 to all partitions
+            stream_shuffle_broadcast(src=bias_sb, dst=bias_broadcasted)
         else:
-            # Path 2: Bias already broadcasted to (128, H)
-            bias_broadcasted = bias_sb
+            # PE broadcast via matmul with ones tiled by 512 chunks
+            ones_sb = _sbm_alloc(
+                sbm,
+                (1, _pmax),
+                dtype=nl.bfloat16,
+                name=f"{name_prefix}_ones_sb" if name_prefix else None,
+                align=SBUF_QUADRANT_SIZE,
+            )
+            nisa.memset(dst=ones_sb, value=1.0)
+
+            n_bias_tiles = div_ceil(H_sharded, _psum_fmax)
+            for i_bias_tile in nl.affine_range(n_bias_tiles):
+                bias_h_offset = i_bias_tile * _psum_fmax
+                bias_h_size = min(_psum_fmax, H_sharded - bias_h_offset)
+                bias_h_slice = nl.ds(bias_h_offset, bias_h_size)
+                bias_psum = _psum_alloc((BxS_tile_sz, bias_h_size), nl.float32, sbm, psum_bank_offset * PSUM_BANK_SIZE)
+                nisa.nc_matmul(
+                    dst=bias_psum,
+                    stationary=ones_sb[:, :BxS_tile_sz],
+                    moving=bias_sb[:, bias_h_slice],
+                    is_stationary_onezero=True,
+                )
+                nisa.tensor_copy(
+                    dst=bias_broadcasted[:, bias_h_slice],
+                    src=bias_psum,
+                )
+    else:
+        # Path 2: Bias already broadcasted to (128, H)
+        bias_broadcasted = bias_sb
 
     # Allocate output buffer
-    if cfg.out_p_offset != 0:
-        out_sb = nl.ndarray((_pmax, n_BxS_tile, H), dtype=nl.bfloat16, buffer=nl.sbuf)
+    if out_sb != None:
+        out_sb_p_start = 0
+        out_sb_p_end = BxS_tile_sz
+    elif cfg.out_p_offset != 0:
+        out_sb = _sbm_alloc(
+            sbm,
+            (_pmax, n_BxS_tile, H),
+            dtype=nl.bfloat16,
+            name=f"{name_prefix}_out_sb" if name_prefix else None,
+            align=SBUF_QUADRANT_SIZE,
+        )
         out_sb_p_start = cfg.out_p_offset
         out_sb_p_end = cfg.out_p_offset + BxS
     else:
-        out_sb = nl.ndarray((BxS_tile_sz, n_BxS_tile, H), dtype=nl.bfloat16, buffer=nl.sbuf)
+        out_sb = _sbm_alloc(
+            sbm,
+            (BxS_tile_sz, n_BxS_tile, H),
+            dtype=nl.bfloat16,
+            name=f"{name_prefix}_out_sb" if name_prefix else None,
+            align=SBUF_QUADRANT_SIZE,
+        )
         out_sb_p_start = 0
         out_sb_p_end = BxS_tile_sz
 
@@ -319,7 +489,8 @@ def down_projection_mx_shard_H(
             curr_BxS = min(BxS_tile_sz, BxS - BxS_offset)
             curr_BxS_slice = nl.ds(BxS_offset, curr_BxS)
 
-            psum_bank = nl.ndarray((curr_BxS, cfg.H_tile_size), dtype=nl.bfloat16, buffer=nl.psum)
+            bank_id = (i_H_tile * n_BxS_tile + i_BxS_tile) % NUM_HW_PSUM_BANKS
+            psum_bank = _psum_alloc((curr_BxS, cfg.H_tile_size), nl.bfloat16, sbm, bank_id * PSUM_BANK_SIZE)
 
             for i_I512_tile in nl.affine_range(cfg.n_total_I512_tile):
                 nisa.nc_matmul_mx(

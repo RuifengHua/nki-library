@@ -28,6 +28,20 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def default_metadata_dir() -> Path:
+    """Locate configuration/test_vector_metadata from either source or installed layout.
+
+    Walk up from this file's directory to handle both the source-tree path
+    (test/utils/) and the installed nkilib_testing package path
+    (site-packages/nkilib_testing/).
+    """
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "configuration" / "test_vector_metadata"
+        if candidate.is_dir():
+            return candidate
+    return Path(__file__).parent.parent.parent / "configuration" / "test_vector_metadata"
+
+
 def compute_config_version_id(config: dict) -> str:
     """Compute stable version ID from config content (SHA256 hash)."""
     content = json.dumps(config, sort_keys=True)
@@ -59,7 +73,7 @@ def load_model_configs(test_key: str) -> list[dict[str, Any]]:
         #   ...
         # ]
     """
-    metadata_dir = Path(__file__).parent.parent.parent / "configuration" / "test_vector_metadata"
+    metadata_dir = default_metadata_dir()
 
     # Use glob to find all matching files (e.g., test_moe_tkg_*.json)
     pattern = f"{test_key}_*.json"

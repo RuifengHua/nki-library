@@ -27,10 +27,10 @@ import nki.language as nl
 from .allocator import num_elts, sizeinbytes
 from .kernel_assert import kernel_assert
 from .kernel_helpers import is_hbm_buffer
-from .logging import Logger
+from .logging import get_logger
 
 # Create logger instance
-logger = Logger("TensorView")
+logger = get_logger("TensorView")
 
 
 class TensorView(nl.NKIObject):

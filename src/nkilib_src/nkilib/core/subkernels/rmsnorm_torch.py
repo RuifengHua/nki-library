@@ -64,6 +64,7 @@ def rmsnorm_tkg_torch_ref_lnc1(
     shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[object] = None,
+    inp_layout=None,
 ) -> dict[str, torch.Tensor]:
     """Torch reference for rmsnorm_tkg kernel (LNC1 output layout).
 
@@ -81,6 +82,7 @@ def rmsnorm_tkg_torch_ref_lnc1(
         shard_on_h (bool): Unused, present for interface compatibility.
         use_heap_memory (bool): Unused, present for interface compatibility.
         sbm: Unused, present for interface compatibility.
+        inp_layout: Unused, present for interface compatibility.
 
     Returns:
         dict: {"out": torch.Tensor} with shape [128, B*S, H//128].
@@ -116,6 +118,7 @@ def rmsnorm_tkg_torch_ref(
     shard_on_h: bool = False,
     use_heap_memory: bool = False,
     sbm: Optional[object] = None,
+    inp_layout=None,
 ) -> dict[str, torch.Tensor]:
     """Torch reference for rmsnorm_tkg kernel (LNC2 output layout).
 
@@ -134,6 +137,7 @@ def rmsnorm_tkg_torch_ref(
         shard_on_h (bool): Unused, present for interface compatibility.
         use_heap_memory (bool): Unused, present for interface compatibility.
         sbm: Unused, present for interface compatibility.
+        inp_layout: Unused, present for interface compatibility.
 
     Returns:
         dict: {"out": torch.Tensor} with shape [128, B*S, H//128].

@@ -14,19 +14,21 @@
 """Unit tests for kernel_tracer to verify trace-only mode catches kernel errors."""
 
 import tempfile
+
+import nki
+import numpy as np
+import pytest
+
 from test.utils.common_dataclasses import (
     CompilerArgs,
     KernelArgs,
     LazyGoldenGenerator,
+    NKICompilationMode,
     Platforms,
     TraceMode,
     ValidationArgs,
 )
 from test.utils.kernel_tracer import trace_kernel
-
-import nki
-import numpy as np
-import pytest
 
 
 @nki.jit
@@ -52,4 +54,9 @@ class TestKernelTracerFailsOnAssert:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(Exception, match="This kernel should fail"):
-                trace_kernel(kernel_args, mode=TraceMode.CompileOnly, output_directory=tmpdir)
+                trace_kernel(
+                    kernel_args,
+                    mode=TraceMode.CompileOnly,
+                    output_directory=tmpdir,
+                    frontendMode=NKICompilationMode.parser,
+                )

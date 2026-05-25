@@ -64,12 +64,25 @@ def moe_block_tkg_torch_ref(
     is_all_expert: bool = False,
     rank_id=None,
     residual=None,
+    expert_gate_up_input_scale=None,
+    expert_down_input_scale=None,
+    is_all_expert_dynamic=False,
+    block_size=None,
+    inp_layout=None,
+    outp_layout=None,
 ) -> dict:
     """Composite torch ref for moe_block_tkg kernel.
 
     Signature matches the moe_block_tkg kernel exactly.
     Composes: RMSNorm -> RouterTopK -> MoE TKG.
     """
+    from ..utils.common_types import MoEBlockIOLayout
+
+    _T_LAYOUT = MoEBlockIOLayout._128_Nprgs_Hfree_T
+
+    if inp_layout == _T_LAYOUT and len(inp.shape) == 4:
+        H0, n_prgs, H1_shard, BxS = inp.shape
+        inp = inp.permute(3, 1, 0, 2).reshape(BxS, n_prgs * H0 * H1_shard).unsqueeze(0)
     B, S, H = inp.shape
     T = B * S
     dtype = inp.dtype
@@ -123,6 +136,8 @@ def moe_block_tkg_torch_ref(
         expert_down_bias=expert_down_bias,
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
+        expert_gate_up_input_scale=expert_gate_up_input_scale,
+        expert_down_input_scale=expert_down_input_scale,
         mask_unselected_experts=router_pre_norm,
         expert_affinities_scaling_mode=expert_affinities_scaling_mode,
         activation_fn=hidden_act_fn,
@@ -133,6 +148,15 @@ def moe_block_tkg_torch_ref(
     )
 
     result = {"out": moe_outputs["out"]}
+    if outp_layout == _T_LAYOUT:
+        out_np = result["out"]
+        if isinstance(out_np, torch.Tensor):
+            out_np = out_np.float().numpy()
+        H0 = 128
+        n_prgs_out = 2  # LNC=2
+        H1_shard_out = H // (H0 * n_prgs_out)
+        # [T, H] -> [T, n_prgs, H0, H1_shard] -> [H0, n_prgs, H1_shard, T]
+        result["out"] = out_np.reshape(T, n_prgs_out, H0, H1_shard_out).transpose(2, 1, 3, 0)
     if not skip_router_logits:
         result["router_logits"] = router_outputs["router_logits"]
 

@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import enum
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, dataclass, fields
 from typing import Any, Optional, Union
 
 import nki.language as nl
+
 from nkilib_src.nkilib.core.utils.common_types import QuantizationType
+from nkilib_src.nkilib.experimental.transformer.attention_block_tkg_sharding import KVDPCollectiveMode
+from test.utils.common_dataclasses import Platforms
 
 
 class KVScaleTest(enum.Enum):
@@ -28,6 +31,10 @@ class KVScaleTest(enum.Enum):
     """
 
     DEFAULT = "default"
+
+
+# Fields excluded from test_id output.
+_TEST_ID_EXCLUDED_FIELDS = {"supported_platforms"}
 
 
 @dataclass
@@ -57,6 +64,7 @@ class AttnBlkTestConfig:
     quantization_type: QuantizationType = QuantizationType.NONE
     lnc: int = 2
     skip_output_projection: bool = False
+    transposed_in: bool = False
     transposed_out: bool = False
     test_bias: bool = False
     input_in_sb: bool = False
@@ -64,23 +72,51 @@ class AttnBlkTestConfig:
     softmax_scale: Optional[float] = None
     enable_fa_s_prior_tiling: bool = True
     kv_quant: bool = False
+    kv_quant_dtype: str = nl.float8_e4m3
     kv_scale: Optional[Union[KVScaleTest, float]] = None
     KVDP: int = 1
     DCP: int = 1
+    KVDP_collective_mode: KVDPCollectiveMode = KVDPCollectiveMode.ALL_TO_ALL
     skip_attention: bool = False
+    use_pos_id: bool = False
+    sliding_window: int = 0
+    cache_lens_mean: Optional[float] = None
+    cache_lens_stddev: Optional[float] = None
+
+    # Platform restrictions for this test config. Set to a set of Platforms values
+    # to restrict which hardware this config runs on. None means all platforms.
+    # Must match the PlatformAware protocol defined in test.utils.common_dataclasses.
+    supported_platforms: set[Platforms] | None = None
+
+    # Maximum NeuronCores available on standard shared-fleet instances (trn2.3xlarge).
+    # Configs exceeding this threshold require high-rank (48xl) hosts.
+    _HIGH_RANK_THRESHOLD = 4
+
+    def is_high_rank(self) -> bool:
+        """Whether this config requires more NeuronCores than a standard shared-fleet instance."""
+        return max(self.KVDP, self.DCP) > self._HIGH_RANK_THRESHOLD
 
     def __post_init__(self):
         if self.kv_quant and self.kv_scale is None:
             self.kv_scale = KVScaleTest.DEFAULT
 
     def test_id(self, prefix: str = "") -> str:
-        """Generate a unique test ID string from all field values."""
+        """Generate a readable test ID with named parameters.
+
+        Includes all required fields (no default) and any optional field whose
+        value differs from its default. Use ``-k "field_name-value"`` with pytest
+        to filter by any parameter.
+        """
         parts = []
-        for val in asdict(self).values():
-            if hasattr(val, "value"):
-                parts.append(str(val.value))
-            else:
-                parts.append(str(val))
+        for f in fields(self):
+            if f.name in _TEST_ID_EXCLUDED_FIELDS:
+                continue
+            val = getattr(self, f.name)
+            has_default = f.default is not MISSING or f.default_factory is not MISSING
+            if has_default and val == f.default:
+                continue
+            display = val.value if hasattr(val, "value") else val
+            parts.append(f"{f.name}-{display}")
         if prefix:
             prefix = f"{prefix}_"
 

@@ -30,6 +30,9 @@ import nki.language as nl
 from .allocator import align_to as align_to_fn
 from .allocator import sizeinbytes
 from .kernel_assert import kernel_assert
+from .logging import get_logger
+
+logger = get_logger("modular_allocator")
 
 
 class ModularAllocator(nl.NKIObject):
@@ -189,7 +192,9 @@ class ModularAllocator(nl.NKIObject):
                 buffer=nl.sbuf,
                 address=(base_partition, self._current_address),
             )
-            self._current_address += tile_size_bytes
+            end_addr = self._current_address + tile_size_bytes
+            logger.debug(f"Single tensor allocated: [{self._current_address}, {end_addr})")
+            self._current_address = end_addr
             return tensor
 
         # Calculate total physical tiles needed
@@ -198,6 +203,7 @@ class ModularAllocator(nl.NKIObject):
             total_physical_tiles *= num_free_tiles[i]
 
         # Allocate using current address
+        alloc_start = self._current_address
         nested_list = _allocate_recursive(
             [],
             0,
@@ -211,7 +217,11 @@ class ModularAllocator(nl.NKIObject):
         )
 
         # Update current address after allocation
-        self._current_address += total_physical_tiles * tile_size_bytes
+        total_size = total_physical_tiles * tile_size_bytes
+        self._current_address += total_size
+        logger.debug(
+            f"Nested allocation: [{alloc_start}, {self._current_address}), total_size={total_size} bytes, physical_tiles={total_physical_tiles}"
+        )
 
         return nested_list
 

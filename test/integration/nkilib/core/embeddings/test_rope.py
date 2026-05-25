@@ -12,20 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
 import nki.language as nl
-import nkilib_src.nkilib.core.embeddings.rope as rope
 import numpy as np
 import pytest
+
+import nkilib_src.nkilib.core.embeddings.rope as rope
 from nkilib_src.nkilib.core.embeddings.rope_torch import rope_torch_ref
+from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 _BF16_EPS = 2**-7
 _RTOL = _BF16_EPS
@@ -66,10 +67,8 @@ def generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in
     }
 
 
-@pytest_test_metadata(
-    name="RoPE",
-    pytest_marks=["embeddings", "rope"],
-)
+@pytest_test_metadata(name="RoPE")
+@pytest_marks(["embeddings", "rope"])
 @final
 class TestRopeKernel:
     """Test class for RoPE kernel."""
@@ -80,7 +79,16 @@ class TestRopeKernel:
         return {"x_out": np.zeros(x_in.shape, dtype=x_in.dtype)}
 
     def _run_rope_test(
-        self, test_manager, d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf, is_negative_test=False
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        d_head,
+        B,
+        n_heads,
+        S,
+        contiguous_layout,
+        relayout_in_sbuf,
+        is_negative_test=False,
     ):
         def input_generator(test_config):
             return generate_kernel_inputs(d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)
@@ -94,7 +102,7 @@ class TestRopeKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(),
+            compiler_args=CompilerArgs(platform_target=platform_target),
             rtol=_RTOL,
             atol=_ATOL,
             is_negative_test=is_negative_test,
@@ -116,6 +124,7 @@ class TestRopeKernel:
     def test_rope_fast(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         d_head,
         B,
         n_heads,
@@ -127,6 +136,7 @@ class TestRopeKernel:
         """Fast tests with minimal coverage for quick validation."""
         self._run_rope_test(
             test_manager,
+            platform_target,
             d_head,
             B,
             n_heads,
@@ -150,6 +160,7 @@ class TestRopeKernel:
     def test_rope_sweep(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         d_head,
         B,
         n_heads,
@@ -161,6 +172,7 @@ class TestRopeKernel:
         """Full sweep tests with pairwise coverage."""
         self._run_rope_test(
             test_manager,
+            platform_target,
             d_head,
             B,
             n_heads,
@@ -197,6 +209,16 @@ class TestRopeKernel:
         ],
         abbrevs=_ROPE_ABBREVS,
     )
-    def test_rope_manual(self, test_manager: Orchestrator, d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf):
+    def test_rope_manual(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        d_head,
+        B,
+        n_heads,
+        S,
+        contiguous_layout,
+        relayout_in_sbuf,
+    ):
         """Manual test cases for QoR tracking and deterministic pipeline runs."""
-        self._run_rope_test(test_manager, d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)
+        self._run_rope_test(test_manager, platform_target, d_head, B, n_heads, S, contiguous_layout, relayout_in_sbuf)

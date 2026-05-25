@@ -48,16 +48,22 @@ F_MAX = nl.tile_size.psum_fmax
 
 
 class OutputTensors(NKIObject):
+    """Container for kernel output tensors."""
+
     output: Any
     gate_up_activations_T: Any
     down_activations: Any
 
 
 class DebugTensors(NKIObject):
+    """Container for debug tensors."""
+
     hidden_states: Any
 
 
 class DimensionSizes(NKIObject):
+    """Container for tensor dimension sizes and derived tiling parameters."""
+
     B: int
     H: int
     T: int
@@ -83,7 +89,7 @@ class DimensionSizes(NKIObject):
         self.GUP_N_TILES = div_ceil(self.I_TP_sharded, TILE_SIZE)
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def blockwise_mm_baseline_shard_intermediate(
     hidden_states,
     expert_affinities_masked,
@@ -323,7 +329,7 @@ def blockwise_mm_baseline_shard_intermediate(
         return output
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def blockwise_mm_baseline_shard_intermediate_hybrid(
     conditions,
     hidden_states,
@@ -579,10 +585,24 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
 
 
 def check_blockwise_mm_shard_I_kernel_compatibility(dims: DimensionSizes, configs: Configs):
+    """
+    Validate kernel input dimensions and configuration compatibility.
+
+    Args:
+        dims: DimensionSizes object with tensor dimensions.
+        configs: Configs object with kernel configuration.
+
+    Raises:
+        AssertionError: If any compatibility check fails.
+    """
     kernel_assert(dims.B % 256 == 0, f"Blocksize must be a multiple of 256")
     kernel_assert(512 <= dims.H <= 8192, f"Hidden dims must be between 512 and 8192, found {dims.H}")
-    kernel_assert(dims.H % PSUM_SIZE == 0, f"Hidden dim size must be multiples of {PSUM_SIZE}, found {dims.H} ")
+    kernel_assert(dims.H % TILE_SIZE == 0, f"Hidden dim size must be multiples of {TILE_SIZE}, found {dims.H} ")
     kernel_assert(dims.I_TP % 16 == 0, f"down_proj_weight I must be divisible by 16, found {dims.I_TP} . Please pad it")
+    kernel_assert(
+        dims.I_TP % dims.NUM_SHARDS == 0,
+        f"I_TP ({dims.I_TP}) must be divisible by NUM_SHARDS ({dims.NUM_SHARDS}) for intermediate sharding",
+    )
     kernel_assert(
         configs.skip_dma.skip_weight == False, "DMA weight skipping is not yet supported by the BWMM shard on I kernel"
     )
@@ -791,6 +811,20 @@ def transpose_hidden_states_allocated(block_hidden_states, H, B, compute_dtype):
 
 
 def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs: OutputTensors, cfg: Configs, shard_id):
+    """
+    Compute MoE forward pass for a single block.
+
+    Processes one block of tokens through gate/up projections, activation,
+    down projection, and accumulates results to output.
+
+    Args:
+        block_idx: Current block index.
+        dims: DimensionSizes object with tensor dimensions.
+        inps: InputTensors object with input tensors.
+        outs: OutputTensors object with output tensors.
+        cfg: Configs object with kernel configuration.
+        shard_id: Current shard ID for intermediate dimension sharding.
+    """
     if cfg.use_dynamic_while:
         token_indices = load_token_indices_dynamic_block(
             inps.token_position_to_id, block_idx, dims, skip_dma=cfg.skip_dma
@@ -863,17 +897,21 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
     )
 
     expert_affinity = None
-    if cfg.scaling_mode == ExpertAffinityScaleMode.POST_SCALE:
-        if not cfg.expert_affinity_multiply_on_I:
-            expert_affinity = calculate_expert_affinities(
-                inps.expert_affinities_masked,
-                token_indices,
-                block_expert,
-                dims.E,
-                dims.NUM_B_TILES,
-                cfg.compute_dtype,
-                cfg.skip_dma,
-            )
+    need_affinity_for_post_scale = (
+        cfg.scaling_mode == ExpertAffinityScaleMode.POST_SCALE and not cfg.expert_affinity_multiply_on_I
+    )
+    need_affinity_for_bias = cfg.expert_affinity_multiply_on_I and cfg.linear_bias
+    if need_affinity_for_post_scale or need_affinity_for_bias:
+        expert_affinity = calculate_expert_affinities(
+            inps.expert_affinities_masked,
+            token_indices,
+            block_expert,
+            dims.E,
+            dims.NUM_B_TILES,
+            cfg.compute_dtype,
+            cfg.skip_dma,
+            cast_to_f32=False if cfg.is_tensor_update_accumulating else True,
+        )
 
     if cfg.is_tensor_update_accumulating:
         block_old = load_old_block(outs.output, token_indices, dims.NUM_B_TILES, cfg.compute_dtype, cfg.skip_dma)
@@ -935,6 +973,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
 
     free_size = block_hidden_states_T[0][0].shape[-1]
     h_outer_tripcount = div_ceil(dims.H, PSUM_SIZE)
+    linearized_h_tripcount = div_ceil(dims.H, TILE_SIZE)
 
     gate_and_up_proj_res_sbuf_lst = []
     for gate_or_up in range(2):
@@ -972,9 +1011,10 @@ def compute_gate_and_up_projections_shard_on_intermediate(
 
         tmp_psum = nl.ndarray((TILE_SIZE, 2 * GUP_N_TILES), dtype=gate_up_bias.dtype, buffer=nl.psum)
         for i_i in range(GUP_N_TILES):
+            actual_f_size = min(TILE_SIZE, dims.I_TP_sharded - i_i * TILE_SIZE)
             nisa.nc_transpose(
-                data=gate_up_bias[0:2, i_i * TILE_SIZE : (i_i + 1) * TILE_SIZE],
-                dst=tmp_psum[0:TILE_SIZE, i_i * 2 : (i_i + 1) * 2],
+                data=gate_up_bias[0:2, i_i * TILE_SIZE : i_i * TILE_SIZE + actual_f_size],
+                dst=tmp_psum[0:actual_f_size, i_i * 2 : (i_i + 1) * 2],
             )
 
         nisa.tensor_copy(
@@ -1005,6 +1045,8 @@ def compute_gate_and_up_projections_shard_on_intermediate(
 
             for h_outer_idx in range(h_outer_tripcount):
                 for h_inner_idx in range(h_inner_tripcount):
+                    if h_outer_idx * h_inner_tripcount + h_inner_idx >= linearized_h_tripcount:
+                        continue
                     for b_psum_idx in range(N_PSUM_TILE):
                         gup_weight_tensor = gup_weights[h_outer_idx][h_inner_idx]
                         N_WEIGHTS = gup_weight_tensor.shape[1]
@@ -1027,7 +1069,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                                     ],
                                 )
                                 nisa.nc_matmul(
-                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                                     stationary=gup_weights_upcasted,
                                     moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
                                         0:TILE_SIZE, b_psum_idx, 0:free_size
@@ -1035,7 +1077,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                                 )
                             else:
                                 nisa.nc_matmul(
-                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                                     stationary=gup_weights[h_outer_idx][h_inner_idx][
                                         0:TILE_SIZE,
                                         gate_or_up,
@@ -1057,7 +1099,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                                     ],
                                 )
                                 nisa.nc_matmul(
-                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                                     stationary=gup_weights_upcasted,
                                     moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
                                         0:TILE_SIZE, b_psum_idx, 0:free_size
@@ -1066,7 +1108,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
 
                             else:
                                 nisa.nc_matmul(
-                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                                     stationary=gup_weights[h_outer_idx][h_inner_idx][
                                         0:TILE_SIZE,
                                         0,
@@ -1079,49 +1121,49 @@ def compute_gate_and_up_projections_shard_on_intermediate(
 
         for psum_tile_idx in range(N_PSUM_TILE):
             for i_tile_idx in range(GUP_N_TILES):
+                num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
                 if cfg.linear_bias:
                     if gup_scale != None:
                         nisa.scalar_tensor_tensor(
-                            data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                             op0=nl.multiply,
-                            operand0=gup_scale[i_tile_idx][gate_or_up],
+                            operand0=gup_scale[i_tile_idx][gate_or_up][0:num_i_tile, :],
                             op1=nl.add,
                             operand1=gate_up_bias_T.ap(
-                                pattern=[[gate_up_bias_T.shape[1], TILE_SIZE], [0, free_size]],
+                                pattern=[[gate_up_bias_T.shape[1], num_i_tile], [0, free_size]],
                                 offset=i_tile_idx * 2 + gate_or_up,
                             ),
                             dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                                0:TILE_SIZE, 0:free_size
+                                0:num_i_tile, 0:free_size
                             ],
                         )
                     else:
                         nisa.tensor_tensor(
-                            data1=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            data1=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                             data2=gate_up_bias_T.ap(
                                 pattern=[
-                                    [2 * GUP_N_TILES, TILE_SIZE],
+                                    [2 * GUP_N_TILES, num_i_tile],
                                     [0, free_size],
                                 ],
                                 offset=i_tile_idx * 2 + gate_or_up,
                             ),
                             op=nl.add,
                             dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                                0:TILE_SIZE, 0:free_size
+                                0:num_i_tile, 0:free_size
                             ],
                         )
 
                 else:
                     if gup_scale != None:
                         nisa.tensor_scalar(
-                            data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                             op0=nl.multiply,
-                            operand0=gup_scale[i_tile_idx][gate_or_up],
+                            operand0=gup_scale[i_tile_idx][gate_or_up][0:num_i_tile, :],
                             dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                                0:TILE_SIZE, 0:free_size
+                                0:num_i_tile, 0:free_size
                             ],
                         )
                     else:
-                        num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
                         nisa.tensor_copy(
                             dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
                                 0:num_i_tile, 0:free_size
@@ -1138,54 +1180,55 @@ def compute_gate_and_up_projections_shard_on_intermediate(
     ):
         for psum_tile_idx in range(N_PSUM_TILE):
             for i_tile_idx in range(GUP_N_TILES):
+                num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
                 if cfg.gate_clamp_lower_limit != None and cfg.gate_clamp_upper_limit != None:
                     nisa.tensor_scalar(
-                        data=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                        data=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                         op0=nl.minimum,
                         operand0=cfg.gate_clamp_upper_limit,
                         op1=nl.maximum,
                         operand1=cfg.gate_clamp_lower_limit,
-                        dst=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                        dst=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                     )
                 else:
                     if cfg.gate_clamp_upper_limit != None:
                         nisa.tensor_scalar(
-                            data=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            data=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                             op0=nl.minimum,
                             operand0=cfg.gate_clamp_upper_limit,
-                            dst=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            dst=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                         )
                     if cfg.gate_clamp_lower_limit != None:
                         nisa.tensor_scalar(
-                            data=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            data=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                             op0=nl.maximum,
                             operand0=cfg.gate_clamp_lower_limit,
-                            dst=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            dst=gate_and_up_proj_res_sbuf_lst[0][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                         )
 
                 if cfg.up_clamp_upper_limit != None and cfg.up_clamp_lower_limit != None:
                     nisa.tensor_scalar(
-                        data=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                        data=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                         op0=nl.minimum,
                         operand0=cfg.up_clamp_upper_limit,
                         op1=nl.maximum,
                         operand1=cfg.up_clamp_lower_limit,
-                        dst=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                        dst=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                     )
                 else:
                     if cfg.up_clamp_upper_limit != None:
                         nisa.tensor_scalar(
-                            data=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            data=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                             op0=nl.minimum,
                             operand0=cfg.up_clamp_upper_limit,
-                            dst=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            dst=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                         )
                     if cfg.up_clamp_lower_limit != None:
                         nisa.tensor_scalar(
-                            data=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            data=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                             op0=nl.maximum,
                             operand0=cfg.up_clamp_lower_limit,
-                            dst=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                            dst=gate_and_up_proj_res_sbuf_lst[1][psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
                         )
 
     if gate_up_activations_T != None:
@@ -1281,7 +1324,13 @@ def load_gate_up_proj_weights_shard_intermediate(
     for h_i in range(h_outer_tripcount):
         for h_j in range(h_inner_tripcount):
             load_p_offset = PSUM_SIZE * h_i + TILE_SIZE * h_j
+            if load_p_offset >= H:
+                nisa.memset(dst=load_dst[h_i][h_j], value=0.0)
+                continue
             num_p_elems = min(TILE_SIZE, H - load_p_offset)
+
+            if num_p_elems < TILE_SIZE:
+                nisa.memset(dst=load_dst[h_i][h_j], value=0.0)
 
             # gate_up_proj_weight shape: (E, H, 2_or_1, I_TP)
             # Access: [block_expert[0, 0], load_p + load_p_offset, load_fgu, load_fi + I_TP_offset]
@@ -1722,6 +1771,23 @@ def compute_down_proj_shard_on_intermediate(
 
     if cfg.expert_affinity_multiply_on_I:
         for b_shard_tile_idx in range(dims.NUM_B_TILES_SHARDED):
+            if cfg.linear_bias and expert_affinity != None:
+                # bias must be scaled by affinity: b_down * affinity + block_new
+                nisa.scalar_tensor_tensor(
+                    data=down_bias_broadcasted[0:TILE_SIZE, 0 : dims.H],
+                    op0=nl.multiply,
+                    operand0=expert_affinity[b_shard_tile_idx + N_B_TILES_OFFSET][0:TILE_SIZE, 0],
+                    op1=nl.add,
+                    operand1=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
+                    dst=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
+                )
+            elif cfg.linear_bias:
+                nisa.tensor_tensor(
+                    data1=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
+                    data2=down_bias_broadcasted[0:TILE_SIZE, 0 : dims.H],
+                    op=nl.add,
+                    dst=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
+                )
             if block_old != None:
                 nisa.tensor_tensor(
                     data1=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
@@ -2010,7 +2076,7 @@ def compute_one_block_dropping(
     dims.NUM_B_TILES_SHARDED = ORIGINAL_NUM_B_TILES_SHARDED
 
 
-@nki.jit(mode="trace")
+@nki.jit
 def blockwise_mm_shard_intermediate_dropping(
     hidden_states,
     expert_affinities_masked,

@@ -27,24 +27,22 @@ Test Coverage:
 - Edge Cases: Single batch/sequence scenarios and larger vocabulary sizes up to 16K
 """
 
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-
 import nki.language as nl
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.core.max.cascaded_max import cascaded_max
 from nkilib_src.nkilib.core.max.cascaded_max_torch import cascaded_max_torch_ref
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
-@pytest_test_metadata(
-    name="Cascaded Max",
-    pytest_marks=["max", "cascaded"],
-)
+@pytest_test_metadata(name="Cascaded Max")
+@pytest_marks(["max", "cascaded"])
 class TestCascadedMaxKernel:
     @staticmethod
     def generate_inputs(batch: int, seqlen: int, vocab_size: int, dtype):
@@ -116,6 +114,7 @@ class TestCascadedMaxKernel:
     def test_cascaded_max_unit(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         batch: int,
         seqlen: int,
@@ -134,7 +133,7 @@ class TestCascadedMaxKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=lnc_degree),
+            compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target),
             rtol=1e-5,
             atol=1e-5,
         )
@@ -154,10 +153,10 @@ class TestCascadedMaxKernel:
         filter=filter_combinations,
         coverage="pairs",
     )
-    @pytest.mark.paramterize
     def test_cascaded_max_sweep(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         batch: int,
         seqlen: int,
@@ -181,7 +180,7 @@ class TestCascadedMaxKernel:
             )
             framework.run_test(
                 test_config=None,
-                compiler_args=CompilerArgs(logical_nc_config=lnc_degree),
+                compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target),
                 rtol=1e-5,
                 atol=1e-5,
             )

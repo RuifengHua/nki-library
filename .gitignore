@@ -27,7 +27,7 @@ src/nkilib_src/nkilib/version/__init__.py
 /stubs
 /wheelhouse/
 log-neuron-cc.txt
-neuron_test_output
+neuron_test_output*
 compilation_artifacts
 neuronx_cc*
 .mise.toml
@@ -40,3 +40,5 @@ pyrightconfig.json
 .env
 *unison*
 .idea
+oncall_data/
+test/utils/bin/neuron_explorer_profile_upload

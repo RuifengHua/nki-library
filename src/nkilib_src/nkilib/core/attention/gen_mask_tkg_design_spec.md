@@ -35,87 +35,134 @@ caller-provided bounds.
 
 ### 2A. Standard Attention (start_pos=None)
 
-All prior positions where `iota < pos_ids[b, i]` are valid. Active region uses causal triangle.
-Positions beyond the actual cached range (cols 14–15) are masked even though the buffer
-holds 16 prior slots — those slots contain no valid KV data.
+All prior positions where `iota < pos_ids[b, 0]` are valid (the kernel reads
+only the first element per batch from `pos_ids`). The active mask (causal
+triangle) is placed at the last `s_active` positions of the prior buffer,
+overwriting whatever the prior mask produced there.
 
 ```
-pos_id=16, s_prior=14, s_active=4.  # = attend, · = masked
+cache_lens[b]=10, s_prior=16, s_active=4.  # = attend, · = masked
+pos_ids=[10,11,12,13] (prior mask uses pos_ids[b,0]=10 for all queries)
 
-              k/v_prior (cols 0–15)                      │ k/v_active
-         0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 │ 16 17 18 19
-        ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┼──┬──┬──┬──┐
-   q0   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ ·│ ·│ ·│
-   q1   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ ·│ ·│
-   q2   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ #│ ·│
-   q3   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ #│ #│
-        └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+         k/v_prior buffer (total size = s_prior = 16)
+         0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+        ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+   q0   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ ·│ ·│ ·│
+   q1   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ ·│ ·│
+   q2   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ #│ ·│
+   q3   │ #│ #│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ #│ #│
+        └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+         ◄──── cached (iota<10) ────►       ◄─ active ─►
+                                      ^^^^^^
+                                      stale/empty (masked by prior mask)
 ```
+
+Cols 0–9: valid cached tokens (prior mask: iota < 10).
+Cols 10–11: stale/empty slots (prior mask: iota >= 10, masked).
+Cols 12–15: last `s_active` positions, overwritten by active mask (causal triangle).
 
 ### 2B. SWA Per-Query Banded Mask
 
-Each query has its own window `[start_pos[b,i], end_pos[b,i])`, producing a
-BANDED/DIAGONAL pattern (not a uniform rectangle).
+Each query has its own window start that shifts per active token, but the
+prior mask end is always clamped to `pos_ids[b, 0]` (= `cache_lens[b]`).
+Positions `cache_lens[b]` through `cache_lens[b] + s_active - 1` are active
+tokens in the active KV buffer, not the prior cache — the active mask handles
+those.
 
 ```
-Per-query positions: rope_pos_ids[b,i] = pos_id[b] + i
-  start_pos[b,i] = rope_pos_ids[b,i] - W + 1  (mod cache_len for flat KV)
-  end_pos[b,i]   = rope_pos_ids[b,i]           (exclusive via < comparison)
+Input contract:
+  pos_ids[b, i]   = cache_lens[b] + i   (but only pos_ids[b, 0] used for prior end)
+  start_pos[b, i] = (pos_ids[b, i] - W + 1) mod s_prior   (flat KV)
+                   = max(0, pos_ids[b, i] - W + 1)         (block KV)
+
+Prior mask per query:
+  end   = pos_ids[b, 0]                 (clamped — same for all queries)
+  start = start_pos[b, i]               (shifts right per query)
 ```
 
-#### Small window (W=8, s_prior=14, s_active=4, pos_id=16)
+#### Small window (W=8, s_prior=16, s_active=4, cache_lens[b]=10)
+
+The prior mask end is 10 for all queries. Start shifts: 3, 4, 5, 6.
+The prior portion shrinks per query; the active mask fills the gap.
 
 ```
-              k/v_prior (cols 0–15)                      │ k/v_active
-         0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 │ 16 17 18 19
-        ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┼──┬──┬──┬──┐
-   q0   │ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ ·│
-   q1   │ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│
-   q2   │ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ #│ #│ #│ ·│
-   q3   │ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ #│ #│ #│
-        └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+         k/v_prior buffer (total size = s_prior = 16)
+         0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+        ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+   q0   │ ·│ ·│ ·│ #│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ ·│ ·│ ·│  7 prior + 1 active = 8
+   q1   │ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ ·│ ·│  6 prior + 2 active = 8
+   q2   │ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ ·│ ·│ #│ #│ #│ ·│  5 prior + 3 active = 8
+   q3   │ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ ·│ ·│ #│ #│ #│ #│  4 prior + 4 active = 8
+        └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+         ◄── prior mask (start..9) ──►       ◄─ active ─►
+                                      ^^^^^^
+                                    stale/empty (masked by prior mask)
 ```
 
-#### Wrap-around (W=8, s_prior=14, s_active=4, pos_id=3 — early positions, window wraps)
+Cols 10–11 are stale slots masked by the prior mask (iota >= 10).
+Cols 12–15 are overwritten by the active mask (causal triangle).
+
+#### Wrap-around (flat KV circular buffer)
+
+Flat KV SWA uses a circular buffer of `s_prior - s_active` usable slots
+(the last `s_active` slots are reserved for active tokens). The caller is
+responsible for computing `pos_ids[b, 0]` and `start_pos[b, i]` as slot
+indices with the appropriate modular arithmetic before passing them to the
+kernel. The kernel only sees the resulting slot indices.
+
+When the sliding window spans the buffer boundary, `start_pos > pos_ids[b, 0]`,
+triggering OR logic: `[start, s_prior) ∪ [0, end)`.
+
+Example: W=5, s_prior=16, s_active=4.
+The caller passes pos_ids=[2, 3, 4, 5] and start_pos=[10, 11, 0, 1].
 
 ```
-  q0: sp=12, pos_ids=3 → sp>pos_ids → wrap (OR) → [12,16)∪[0,3) → {0,1,2,12,13,14,15}
-  q1: sp=13, pos_ids=4 → sp>pos_ids → wrap (OR) → [13,16)∪[0,4) → {0,1,2,3,13,14,15}
-  q2: sp=14, pos_ids=5 → sp>pos_ids → wrap (OR) → [14,16)∪[0,5) → {0,1,2,3,4,14,15}
-  q3: sp=15, pos_ids=6 → sp>pos_ids → wrap (OR) → [15,16)∪[0,6) → {0,1,2,3,4,5,15}
+  pos_ids[b, 0] = 2 (prior mask end, same for all queries)
 
-              k/v_prior (cols 0–15)                      │ k/v_active
-         0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 │ 16 17 18 19
-        ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┼──┬──┬──┬──┐
-   q0   │ #│ #│ #│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ ·│ ·│ ·│
-   q1   │ #│ #│ #│ #│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ ·│ ·│
-   q2   │ #│ #│ #│ #│ #│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│ ·│
-   q3   │ #│ #│ #│ #│ #│ #│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│ #│
-        └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+  start_pos  end  wrap?
+    q0: 10    2   start(10)>end(2) → OR
+    q1: 11    2   start(11)>end(2) → OR
+    q2:  0    2   start(0)<=end(2) → AND
+    q3:  1    2   start(1)<=end(2) → AND
+
+         k/v_prior buffer (total size = s_prior = 16)
+         0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+        ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+   q0   │ #│ #│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ ·│ ·│ ·│  OR:  [10,16)∪[0,2)
+   q1   │ #│ #│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ ·│ ·│  OR:  [11,16)∪[0,2)
+   q2   │ #│ #│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ ·│  AND: [0,2)
+   q3   │ ·│ #│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ ·│ #│ #│ #│ #│  AND: [1,2)
+        └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+         ◄──►                                ◄─ active ─►
+         valid cached                        (causal triangle)
 ```
 
-Column labels 0–15 are cache slot indices (iota values); 16–19 are the active
-region columns in the QK matrix. `start_pos` is modded
-(`(pos - W + 1) % cache_len`), while `pos_ids` is raw. Wrap-around triggers
-when `start_pos > pos_ids` (i.e., early positions where `pos < W - 1`).
+Slots 12–15 are the reserved active region, overwritten by the active mask
+(causal triangle). The OR logic for q0/q1 marks some of these slots, but
+the active mask overwrites them. q2/q3 have `start <= end` so normal AND
+logic applies. Note q3 has `start=1, end=2` so only slot 1 is in the prior
+window — slot 0 is excluded.
 
 #### Block KV (no wrap-around)
 
-`start_pos[b,i] = max(0, rope_pos_ids[b,i] - W + 1)`. Invariant: `end >= start` always.
+`start_pos[b,i] = max(0, pos_ids[b,i] - W + 1)`. End = `pos_ids[b, 0]`.
+Invariant: `end >= start` always (no wrap-around in block KV).
 
 ---
 
 ## 3. SWA Branchless Wrap-Around Selection
 
 NKI has no runtime branching. Both normal and wrap-around cases are handled
-in a single code path:
+in a single code path. The prior mask end is always `pos_ids[b, 0]`
+(= `cache_lens[b]`), clamped to the base position for all queries in a batch:
 
 ```python
-ge = (iota >= start_pos[b, i])          # 1 where pos >= start
-lt = (iota <  pos_ids[b, i])            # 1 where pos <  end
-normal  = ge × lt                       # AND (no wrap)
-wrap    = max(ge, lt)                   # OR  (wrap)
-is_wrap = (start_pos[b,i] > pos_ids[b,i])
+end = pos_ids[b, 0]                            # base position (same for all queries)
+ge = (iota >= start_pos[b, i])                  # 1 where pos >= start
+lt = (iota <  end)                              # 1 where pos <  end
+normal  = ge × lt                               # AND (no wrap)
+wrap    = max(ge, lt)                           # OR  (wrap)
+is_wrap = (start_pos[b,i] > end)
 final   = normal + is_wrap × (wrap − normal)
 ```
 
@@ -218,8 +265,8 @@ Each NC processes different s_prior portion, all batches. No cross-NC communicat
 
 | Aspect | Standard | SWA |
 |--------|----------|-----|
-| Valid range | `[0, end_pos)` | `[start_pos[b,i], end_pos[b,i])` per query |
-| Mask pattern | Uniform rectangle | Banded/diagonal |
+| Valid range | `[0, end_pos)` | `[start_pos[b,i], pos_ids[b,0])` per query |
+| Mask pattern | Uniform rectangle | Prior mask is shrinking rectangle (start shifts, end fixed) |
 | Wrap-around | N/A | Per-query OR logic |
 | Input tensors | `pos_ids` only | `start_pos` + `pos_ids` |
 | Code path | `_create_batch_masks()` | `_create_batch_masks_swa()` |

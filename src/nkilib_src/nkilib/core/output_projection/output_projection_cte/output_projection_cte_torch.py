@@ -180,11 +180,19 @@ def output_projection_cte_torch_ref(
         out = out + bias if bias else out
         return out
     """
-    batch_size, num_heads, head_dim, seq_len = attention.shape
-
     # Convert to float32 for computation
     attention = attention.float()
     weight = weight.float()
+
+    if quantization_type == QuantizationType.ROW:
+        # ROW: attention is [B, S, N, D]
+        batch_size, seq_len, num_heads, head_dim = attention.shape
+        attn_reshaped = attention.reshape(batch_size, seq_len, num_heads * head_dim)
+    else:
+        # All other paths: attention is [B, N, D, S]
+        batch_size, num_heads, head_dim, seq_len = attention.shape
+        # Reshape attention from [B, N, D, S] to [B, S, N*D]
+        attn_reshaped = attention.permute(0, 3, 1, 2).reshape(batch_size, seq_len, num_heads * head_dim)
 
     # STATIC_MX weight is pre-shuffled for kernel; reverse to logical layout
     if quantization_type == QuantizationType.STATIC_MX:
@@ -192,9 +200,6 @@ def output_projection_cte_torch_ref(
         if nd % 4 == 0:
             w = weight.reshape(nd // 4, weight.shape[1], 4)
             weight = w.permute(0, 2, 1).reshape(nd, weight.shape[1])
-
-    # Reshape attention from [B, N, D, S] to [B, S, N*D]
-    attn_reshaped = attention.permute(0, 3, 1, 2).reshape(batch_size, seq_len, num_heads * head_dim)
 
     if quantization_type == QuantizationType.STATIC:
         min_val, max_val = _get_min_max_for_dtype(weight.dtype)
@@ -204,6 +209,33 @@ def output_projection_cte_torch_ref(
         min_val, max_val = _get_min_max_for_dtype(torch.float8_e4m3fn)
         quantized_input = _perform_static_quant(attn_reshaped, input_scales, min_val, max_val)
         out = _perform_projection(quantized_input, weight, weight_scales, input_scales)
+    elif quantization_type == QuantizationType.ROW_MX:
+        # ROW_MX: MXFP4 quantize input on-device, plain matmul with FP8 weight, apply per-row weight dequant
+        nd = num_heads * head_dim
+        w_mx = weight.reshape(nd // 4, weight.shape[1] * 4)
+        w_dummy_scale = torch.full((nd // 32, weight.shape[1]), 127, dtype=torch.float32)
+        results = []
+        for batch_idx in range(batch_size):
+            attn_b = attention[batch_idx].numpy()
+            attn_b = attn_b.reshape(nd // 4, 4, seq_len)
+            attn_b = np.transpose(attn_b, (0, 2, 1)).reshape(-1, seq_len * 4)
+            inp_packed, inp_scale_np = quantize_to_mx(attn_b, nl.float8_e4m3fn_x4)
+            inp_unpacked = unpack_float8_e4m3fn_x4(inp_packed)
+            inp_scale = torch.from_numpy(inp_scale_np).float()
+            results.append(mx_matmul(inp_unpacked, w_mx, inp_scale, w_dummy_scale))
+        out = torch.stack(results, dim=0)
+        out = _scale_with_broadcast(out, weight_scales)
+    elif quantization_type == QuantizationType.ROW:
+        # ROW: dynamic per-token FP8 quantization, matmul, two-step dequant
+        # ROW uses float8_e4m3 (max=240), not float8_e4m3fn (max=448)
+        min_val, max_val = (-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        # Per-token row quantize: absmax over N*D, scale, clamp
+        absmax = attn_reshaped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        dequant_scale = absmax / max_val
+        quant_scale = 1.0 / dequant_scale
+        quantized_input = torch.clamp(attn_reshaped * quant_scale, min_val, max_val)
+        out = _scale_with_broadcast(quantized_input @ weight, weight_scales)
+        out = out * dequant_scale
     else:
         out = attn_reshaped @ weight
 

@@ -15,11 +15,11 @@
 """
 Down projection sub-kernels with LNC sharding support.
 
-Supports multiple LNC sharding strategies (mutually exclusive):
-- no sharding: Both shard_on_I and shard_on_T are False. Used when running without LNC.
-- shard_on_I: Shard on I (intermediate) dimension. Default for most workloads.
-- shard_on_T: Shard on T (token) dimension. Useful when T is large.
-- TODO: shard_on_E: Shard on E (expert) dimension. When E_L is divisible by 2 and T is large,
+Supports multiple LNC sharding strategies (see SUPPORTED_MOE_SHARDING_STRATEGIES in all_expert_mx_utils.py):
+- NO_SHARD: No sharding, each NC computes full result independently. Used when LNC=1.
+- SHARD_I: Shard on I (intermediate) dimension. Default for most workloads.
+- SHARD_T: Shard on T (token) dimension. Useful when T is large.
+- TODO: SHARD_E: Shard on E (expert) dimension. When E_L is divisible by 2 and T is large,
   better to shard on E than I because we can support higher TP and get better DMA throughput
   by loading larger packets.
 
@@ -42,11 +42,13 @@ from ...mlp.mlp_tkg.projection_mx_constants import (
 )
 
 # Common utils
-from ...utils.common_types import ExpertAffinityScaleMode
+from ...utils.common_types import ExpertAffinityScaleMode, MoELNCShardingStrategy
+from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ...utils.tensor_view import TensorView
+from .all_expert_mx_utils import BF16_PER_INT32, SUPPORTED_MOE_SHARDING_STRATEGIES
 
 
 @nki.jit
@@ -62,7 +64,8 @@ def load_broadcast_down_weight_scale_bias(
     tile_T: int,
     activation_compute_dtype=nl.bfloat16,
     use_PE_bias_broadcast: bool = True,
-    shard_on_T: bool = False,
+    sharding_strategy: MoELNCShardingStrategy = MoELNCShardingStrategy.SHARD_I,
+    skip_scale_load: bool = False,
 ) -> tuple[nl.ndarray, nl.ndarray, Optional[nl.ndarray]]:
     """
     Load down projection weight, scale, and bias (optional) for one expert using static DMA.
@@ -83,6 +86,7 @@ def load_broadcast_down_weight_scale_bias(
         activation_compute_dtype: Data type for bias buffer (default: nl.bfloat16).
         use_PE_bias_broadcast (bool): If True, use PE (matmul with ones) for bias broadcast; else use DVE
             stream_shuffle_broadcast.
+        sharding_strategy (MoELNCShardingStrategy): LNC sharding strategy. Determines bias H-sharding behavior.
 
     Returns:
         weight_sb (nl.ndarray): [128_I, n_I512_tiles, H], Weight in SBUF (4_I packed in x4 dtype).
@@ -102,9 +106,10 @@ def load_broadcast_down_weight_scale_bias(
     bias_sb_shape = (tile_T, H)
 
     # Allocate buffers
-    base_weight = weight.base_tensor
+    base_weight = TensorView(weight).base_tensor
     weight_sb = nl.ndarray(weight_sb_shape, dtype=base_weight.dtype, buffer=nl.sbuf)
-    scale_sb = nl.ndarray(weight_sb_shape, dtype=scale.dtype, buffer=nl.sbuf)
+    scale_dtype = nl.uint8 if skip_scale_load else scale.dtype
+    scale_sb = nl.ndarray(weight_sb_shape, dtype=scale_dtype, buffer=nl.sbuf)
     bias_sb: Optional[nl.ndarray] = None
 
     actual_prg_offset = tile_offset
@@ -119,14 +124,14 @@ def load_broadcast_down_weight_scale_bias(
             .select(dim=0, index=expert_idx)
             .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
         )
-        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[:I_p_in_hbm, :, :])
+        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[:I_p_in_hbm, :, :], dge_mode=nisa.dge_mode.none)
     else:
         weight_view = (
             TensorView(base_weight)
             .select(dim=0, index=expert_idx)
             .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
         )
-        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[...])
+        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
     weight_sb = weight_sb.view(weight.dtype)
 
     """
@@ -135,48 +140,54 @@ def load_broadcast_down_weight_scale_bias(
     Note: scales have I_p//8 (not 128), need to map to first 4 partitions of each quadrant.
     Scale layout: 16 partitions map to partitions [0-3, 32-35, 64-67, 96-99] in 128-partition buffer.
     """
-    I_p_scale_in_hbm = scale.shape[1]
-    n_quadrants_needed = div_ceil(I_p_scale_in_hbm, SCALE_P_ELEM_PER_QUADRANT)
+    if skip_scale_load:
+        # STATIC_MX: fill with dummy 127 scales (scale factor 1.0)
+        nisa.memset(dst=scale_sb[...], value=127)
+    else:
+        I_p_scale_in_hbm = scale.shape[1]
+        n_quadrants_needed = div_ceil(I_p_scale_in_hbm, SCALE_P_ELEM_PER_QUADRANT)
 
-    if I_p_scale_in_hbm < tile_I // 8:
-        for quadrant_idx in nl.affine_range(NUM_QUADRANTS_IN_SBUF):
-            nisa.memset(
-                dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, SCALE_P_ELEM_PER_QUADRANT), :, :], value=0.0
-            )
-
-    for quadrant_idx in nl.affine_range(n_quadrants_needed):
-        actual_scale_p = min(SCALE_P_ELEM_PER_QUADRANT, I_p_scale_in_hbm - SCALE_P_ELEM_PER_QUADRANT * quadrant_idx)
-        if actual_scale_p > 1:
-            scale_view = (
-                TensorView(scale)
-                .select(dim=0, index=expert_idx)
-                .slice(
-                    dim=0,
-                    start=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx,
-                    end=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx + actual_scale_p,
+        if I_p_scale_in_hbm < tile_I // 8:
+            for quadrant_idx in nl.affine_range(NUM_QUADRANTS_IN_SBUF):
+                nisa.memset(
+                    dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, SCALE_P_ELEM_PER_QUADRANT), :, :], value=0.0
                 )
-                .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
-            )
-            nisa.dma_copy(
-                src=scale_view.get_view(),
-                dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, actual_scale_p), :, :],
-            )
-        else:
-            hbm_p_idx = SCALE_P_ELEM_PER_QUADRANT * quadrant_idx
-            sb_p_idx = SBUF_QUADRANT_SIZE * quadrant_idx
-            scale_f_per_partition = n_I512_tiles * H
-            expert_stride = I_p_scale_in_hbm * scale_f_per_partition
-            hbm_offset = expert_idx * expert_stride + hbm_p_idx * scale_f_per_partition + actual_prg_offset * H
-            nisa.dma_copy(
-                src=scale.ap(
-                    pattern=[[scale_f_per_partition, 1], [1, scale_f_per_partition]],
-                    offset=hbm_offset,
-                ),
-                dst=scale_sb.ap(
-                    pattern=[[scale_f_per_partition, 1], [1, scale_f_per_partition]],
-                    offset=sb_p_idx * scale_f_per_partition,
-                ),
-            )
+
+        for quadrant_idx in nl.affine_range(n_quadrants_needed):
+            actual_scale_p = min(SCALE_P_ELEM_PER_QUADRANT, I_p_scale_in_hbm - SCALE_P_ELEM_PER_QUADRANT * quadrant_idx)
+            if actual_scale_p > 1:
+                scale_view = (
+                    TensorView(scale)
+                    .select(dim=0, index=expert_idx)
+                    .slice(
+                        dim=0,
+                        start=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx,
+                        end=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx + actual_scale_p,
+                    )
+                    .slice(dim=1, start=actual_prg_offset, end=actual_prg_offset + n_I512_tiles)
+                )
+                nisa.dma_copy(
+                    src=scale_view.get_view(),
+                    dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, actual_scale_p), :, :],
+                    dge_mode=nisa.dge_mode.none,
+                )
+            else:
+                hbm_p_idx = SCALE_P_ELEM_PER_QUADRANT * quadrant_idx
+                sb_p_idx = SBUF_QUADRANT_SIZE * quadrant_idx
+                scale_f_per_partition = n_I512_tiles * H
+                expert_stride = I_p_scale_in_hbm * scale_f_per_partition
+                hbm_offset = expert_idx * expert_stride + hbm_p_idx * scale_f_per_partition + actual_prg_offset * H
+                nisa.dma_copy(
+                    src=scale.ap(
+                        pattern=[[scale_f_per_partition, 1], [1, scale_f_per_partition]],
+                        offset=hbm_offset,
+                    ),
+                    dst=scale_sb.ap(
+                        pattern=[[scale_f_per_partition, 1], [1, scale_f_per_partition]],
+                        offset=sb_p_idx * scale_f_per_partition,
+                    ),
+                    dge_mode=nisa.dge_mode.none,
+                )
 
     """
     Load + broadcast bias, sharding on H dim when LNC=2.
@@ -186,26 +197,34 @@ def load_broadcast_down_weight_scale_bias(
     """
     if bias != None:
         bias_sb = nl.ndarray(bias_sb_shape, dtype=activation_compute_dtype, buffer=nl.sbuf)
-        nisa.memset(dst=bias_sb[...], value=0.0, engine=nisa.gpsimd_engine)
-        H_size_local = H if shard_on_T else (H // 2 if n_prgs > 1 else H)
-        H_offset = 0 if shard_on_T else (H_size_local * prg_id)
+        H_size_local = H if (sharding_strategy == MoELNCShardingStrategy.SHARD_T) else (H // 2 if n_prgs > 1 else H)
+        H_offset = 0 if (sharding_strategy == MoELNCShardingStrategy.SHARD_T) else (H_size_local * prg_id)
+        if H_size_local < H:
+            other_H_offset = H_size_local * (1 - prg_id)
+            nisa.memset(dst=bias_sb[:, nl.ds(other_H_offset, H_size_local)], value=0.0, engine=nisa.gpsimd_engine)
+        else:
+            nisa.memset(dst=bias_sb[...], value=0.0, engine=nisa.gpsimd_engine)
         H_slice_local = nl.ds(H_offset, H_size_local)
         bias_view = (
             TensorView(bias)
             .slice(dim=0, start=expert_idx, end=expert_idx + 1)
             .slice(dim=1, start=H_offset, end=H_offset + H_size_local)
         )
-        nisa.dma_copy(src=bias_view.get_view(), dst=bias_sb[0:1, H_slice_local])
+        nisa.dma_copy(src=bias_view.get_view(), dst=bias_sb[0:1, H_slice_local], dge_mode=nisa.dge_mode.none)
 
         # Broadcast bias using PE
         if use_PE_bias_broadcast:
-            H_tile_size_local = min(H_size_local, nl.tile_size.gemm_moving_fmax)
+            is_bias_16bit = activation_compute_dtype in (nl.bfloat16, nl.float16)
+            psum_fmax = nl.tile_size.psum_fmax * 2 if is_bias_16bit else nl.tile_size.psum_fmax
+            psum_dtype = activation_compute_dtype if is_bias_16bit else nl.float32
+            H_tile_size_local = min(H_size_local, psum_fmax)
             ones_mask = nl.ndarray((1, tile_T), dtype=bias_sb.dtype, buffer=nl.sbuf)
             nisa.memset(dst=ones_mask[...], value=1.0, engine=nisa.gpsimd_engine)
-            n_H512_tiles = div_ceil(H_size_local, nl.tile_size.gemm_moving_fmax)
-            for h512_tile_idx in nl.affine_range(n_H512_tiles):
-                bias_bc_psum = nl.ndarray((tile_T, H_tile_size_local), dtype=nl.float32, buffer=nl.psum)
-                H_tile_slice = nl.ds(H_offset + h512_tile_idx * H_tile_size_local, H_tile_size_local)
+            n_H_tiles_local = div_ceil(H_size_local, H_tile_size_local)
+            for h_tile_idx in nl.affine_range(n_H_tiles_local):
+                h_tile_actual = min(H_tile_size_local, H_size_local - h_tile_idx * H_tile_size_local)
+                bias_bc_psum = nl.ndarray((tile_T, h_tile_actual), dtype=psum_dtype, buffer=nl.psum)
+                H_tile_slice = nl.ds(H_offset + h_tile_idx * H_tile_size_local, h_tile_actual)
                 nisa.nc_matmul(
                     dst=bias_bc_psum,
                     stationary=ones_mask[...],
@@ -241,13 +260,15 @@ def down_projection_mx(
     activation_compute_dtype=nl.bfloat16,
     is_first_expert: bool = False,
     is_last_expert: bool = False,
-    shard_on_I: bool = True,
-    shard_on_T: bool = False,
+    sharding_strategy: MoELNCShardingStrategy = MoELNCShardingStrategy.SHARD_I,
     T_offset: int = 0,
+    down_dequant_scale: Optional[nl.ndarray] = None,
+    down_input_dequant_scale: Optional[nl.ndarray] = None,
+    global_token_indices: Optional[nl.ndarray] = None,
 ) -> nl.ndarray:
     """
     Computes down projection, expert affinity scaling, expert add, LNC reduction, and SB->HBM spill.
-    Supports multiple LNC sharding strategies (no sharding, shard_on_I, shard_on_T) - at most one may be active.
+    Supports multiple LNC sharding strategies (see SUPPORTED_MOE_SHARDING_STRATEGIES in all_expert_mx_utils.py).
 
     Usage:
         Tuned for: mx all-expert MoE algorithm
@@ -272,19 +293,27 @@ def down_projection_mx(
         activation_compute_dtype: Compute dtype for activations (default: bfloat16).
         is_first_expert (bool): Whether the current expert is the first expert.
         is_last_expert (bool): Whether the current expert is the last expert.
-        shard_on_I (bool): Whether I dimension is sharded across NCs. When False, both NCs compute
-            redundantly and LNC reduction is skipped.
-        shard_on_T (bool): Whether T dimension is sharded across NCs.
+        sharding_strategy (MoELNCShardingStrategy): LNC sharding strategy.
+            Supported: see SUPPORTED_MOE_SHARDING_STRATEGIES in all_expert_mx_utils.py.
         T_offset (int): Offset for T dimension in HBM output (used with direct DMA).
+        down_dequant_scale (Optional[nl.ndarray]): Dequant scale for down projection.
+            STATIC_MX: [tile_T, 1] combined (input * weight) scale. ROW_MX: [tile_T, H//_pmax] per-row weight scale.
+        down_input_dequant_scale (Optional[nl.ndarray]): [_pmax, T, 1], ROW_MX per-token intermediate dequant scale.
+        global_token_indices (Optional[nl.ndarray]): [_pmax, 1], Optional token indices to store in final columns of output.
 
     Returns:
         out_sb (nl.ndarray): [min(T, 128), ⌈T/128⌉, H], Output tensor in SBUF with accumulated results.
     """
 
-    # Validate sharding strategy (mutually exclusive)
+    # Validate sharding strategy is supported (use explicit equality checks for NKI tracing compatibility)
+    _is_supported_strategy = (
+        (sharding_strategy == MoELNCShardingStrategy.NO_SHARD)
+        or (sharding_strategy == MoELNCShardingStrategy.SHARD_I)
+        or (sharding_strategy == MoELNCShardingStrategy.SHARD_T)
+    )
     kernel_assert(
-        not (shard_on_I and shard_on_T),
-        f"Only one LNC sharding strategy allowed, got {shard_on_I=}, {shard_on_T=}",
+        _is_supported_strategy,
+        f"Unsupported sharding strategy: {sharding_strategy}. Supported: {SUPPORTED_MOE_SHARDING_STRATEGIES}",
     )
 
     # Extract / validate shapes
@@ -312,7 +341,7 @@ def down_projection_mx(
     _, n_prgs, prg_id = get_verified_program_sharding_info("down_projection_mx", (0, 1))
 
     # When not sharding on I, treat as single-program for LNC reduction purposes
-    effective_n_prgs = n_prgs if shard_on_I else 1
+    effective_n_prgs = n_prgs if (sharding_strategy == MoELNCShardingStrategy.SHARD_I) else 1
 
     # Algorithm + tiling strategy
     pmax = nl.tile_size.pmax
@@ -320,9 +349,12 @@ def down_projection_mx(
     TILE_H = min(H, nl.tile_size.psum_fmax * 2)  # use 2 * fmax with bf16 PSUM
     n_T128_tiles = div_ceil(T, pmax)
     n_H1024_tiles = H // TILE_H
+    is_static_mx = down_dequant_scale != None
     is_blockwise = token_position_to_id_T != None
+    is_a2av = global_token_indices != None
 
     # Cast expert affinities to fp32 for tensor_scalar on scalar engine
+    # FIXME[perf]: skip TensorCopy and use strided AP in below TensorScalar when affinities are already fp32
     is_3D_affinities = len(expert_affinities_masked_sb.shape) == 3
     expert_affinities_masked_fp32_sb = nl.ndarray((TILE_T, n_T128_tiles), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(
@@ -354,8 +386,8 @@ def down_projection_mx(
                     moving_scale=weight_scale_sb[:, tile_i, weight_H_slice],
                 )
 
-            # Accumulate bias during PSUM eviction
-            if bias_sb != None:
+            # Accumulate bias during PSUM eviction (skip for software dequant paths)
+            if bias_sb != None and down_dequant_scale == None:
                 nisa.tensor_tensor(
                     dst=expert_out_tile_sb[:tile_T_actual, :],
                     data1=out_psum[:tile_T_actual, :],
@@ -367,6 +399,51 @@ def down_projection_mx(
                     dst=expert_out_tile_sb[:tile_T_actual, :],
                     src=out_psum[:tile_T_actual, :],
                 )
+
+            # Software dequant: STATIC_MX [_pmax, 1] or ROW_MX [tile_T, H//_pmax], then bias
+            if is_static_mx:
+                if down_dequant_scale.shape[1] == 1:
+                    # STATIC_MX: combined scale broadcasts over TILE_H
+                    nisa.activation(
+                        dst=expert_out_tile_sb[:tile_T_actual, :],
+                        op=nl.copy,
+                        data=expert_out_tile_sb[:tile_T_actual, :],
+                        scale=down_dequant_scale[:tile_T_actual, :],
+                    )
+                else:
+                    # ROW_MX: per-column weight dequant, then per-token input dequant
+                    n_H128_in_tile = TILE_H // pmax
+                    for i_h128 in nl.affine_range(n_H128_in_tile):
+                        h_col = tile_H_offset // pmax + i_h128
+                        h_slice = nl.ds(i_h128 * pmax, pmax)
+                        interleave_copy(
+                            dst=expert_out_tile_sb[:tile_T_actual, h_slice],
+                            src=expert_out_tile_sb[:tile_T_actual, h_slice],
+                            scale=TensorView(down_dequant_scale[:tile_T_actual, h_col : h_col + 1]),
+                            index=i_h128,
+                        )
+                    if down_input_dequant_scale != None:
+                        token_scale_sb = nl.ndarray((TILE_T, 1), dtype=nl.float32, buffer=nl.sbuf)
+                        token_scale_psum = nl.ndarray((TILE_T, 1), dtype=nl.float32, buffer=nl.psum)
+                        token_scale_1d = down_input_dequant_scale[0:1, tile_T_offset : tile_T_offset + tile_T_actual, 0]
+                        nisa.nc_transpose(
+                            data=token_scale_1d,
+                            dst=token_scale_psum[:tile_T_actual, 0],
+                        )
+                        nisa.tensor_copy(dst=token_scale_sb[:tile_T_actual, :], src=token_scale_psum[:tile_T_actual, :])
+                        nisa.activation(
+                            dst=expert_out_tile_sb[:tile_T_actual, :],
+                            op=nl.copy,
+                            data=expert_out_tile_sb[:tile_T_actual, :],
+                            scale=token_scale_sb[:tile_T_actual, :],
+                        )
+                if bias_sb != None:
+                    nisa.tensor_tensor(
+                        dst=expert_out_tile_sb[:tile_T_actual, :],
+                        data1=expert_out_tile_sb[:tile_T_actual, :],
+                        op=nl.add,
+                        data2=bias_sb[:tile_T_actual, tile_H_offset : tile_H_offset + TILE_H],
+                    )
 
             # Expert affinity scaling, expert add
             if is_first_expert or is_blockwise:
@@ -408,26 +485,11 @@ def down_projection_mx(
                 PIPE_ID_OUTPUT = 0
 
                 # NC0 recieves 1st half of output from NC1 and reduces locally on DVE; NC1 does the inverse
-                # Create temporary buffers to hold the data for sendrecv
-                out_sb_send = nl.ndarray((tile_T_actual, H_local), out_sb.dtype, buffer=nl.sbuf)
-                out_sb_local = nl.ndarray((tile_T_actual, H_local), out_sb.dtype, buffer=nl.sbuf)
-
-                # FIXME: remove extra TensorCopy instructions when compiler supports direct sendrecv
-                # Copy data to temporary buffers
-                nisa.tensor_copy(
-                    dst=out_sb_send,
-                    src=out_sb[:tile_T_actual, tile_t, H_send_slice],
-                )
-                nisa.tensor_copy(
-                    dst=out_sb_local,
-                    src=out_sb[:tile_T_actual, tile_t, H_local_slice],
-                )
-
-                # Perform sendrecv
+                # Perform sendrecv directly on sliced views
                 nisa.sendrecv(
                     send_to_rank=send_to_rank,
                     recv_from_rank=recv_from_rank,
-                    src=out_sb_send,
+                    src=out_sb[:tile_T_actual, tile_t, H_send_slice],
                     dst=out_sb_reduced[:tile_T_actual, :],
                     pipe_id=PIPE_ID_OUTPUT,
                 )
@@ -435,7 +497,7 @@ def down_projection_mx(
                 # Reduce
                 nisa.tensor_tensor(
                     dst=out_sb_reduced[:tile_T_actual, :],
-                    data1=out_sb_local,
+                    data1=out_sb[:tile_T_actual, tile_t, H_local_slice],
                     op=nl.add,
                     data2=out_sb_reduced[:tile_T_actual, :],
                 )
@@ -457,20 +519,46 @@ def down_projection_mx(
                         # When a token is not routed to a given expert, vector_offset[token] = -1 and we skip DMA
                         oob_mode=oob_mode.skip,
                     )
+
+                    if is_a2av:
+                        # Reinterpret global token indices to out_hbm dtype, scatter into final 2 columns of out_hbm [T, H + 2]
+                        # TODO[perf]: Combine this with block spill on NC1 to avoid duplicate indirect DMAs
+                        nisa.dma_copy(
+                            src=global_token_indices.ap(
+                                pattern=[[n_T128_tiles * BF16_PER_INT32, tile_T_actual], [1, BF16_PER_INT32]],
+                                offset=BF16_PER_INT32 * tile_t,
+                                dtype=out_hbm.dtype,
+                            ),
+                            dst=out_hbm.ap(
+                                pattern=[[H + BF16_PER_INT32, tile_T_actual], [1, BF16_PER_INT32]],
+                                offset=H,
+                                vector_offset=token_position_to_id_T.ap(
+                                    pattern=[[n_T128_tiles, tile_T_actual], [1, 1]],
+                                    offset=tile_t,
+                                ),
+                                indirect_dim=0,
+                            ),
+                            # When a token is not routed to a given expert, vector_offset[token] = -1 and we skip DMA
+                            oob_mode=oob_mode.skip,
+                        )
                 else:
                     # Direct DMA
                     nisa.dma_copy(
                         src=out_sb_reduced[:tile_T_actual, :],
                         dst=out_hbm[nl.ds(T_offset + TILE_T * tile_t, tile_T_actual), H_local_slice],
+                        dge_mode=nisa.dge_mode.none,
                     )
 
-            # LNC1, shard_on_T, or redundant compute fallback: each NC spills its H portion
+            # LNC1, SHARD_T, or redundant compute fallback: each NC spills its H portion
             else:
-                H_local = H if (n_prgs == 1 or shard_on_T) else H // n_prgs
-                H_offset_local = 0 if (n_prgs == 1 or shard_on_T) else H_local * prg_id
+                H_local = H if (n_prgs == 1 or sharding_strategy == MoELNCShardingStrategy.SHARD_T) else H // n_prgs
+                H_offset_local = (
+                    0 if (n_prgs == 1 or sharding_strategy == MoELNCShardingStrategy.SHARD_T) else H_local * prg_id
+                )
                 nisa.dma_copy(
                     src=out_sb[:tile_T_actual, tile_t : tile_t + 1, nl.ds(H_offset_local, H_local)],
                     dst=out_hbm[nl.ds(T_offset + TILE_T * tile_t, tile_T_actual), nl.ds(H_offset_local, H_local)],
+                    dge_mode=nisa.dge_mode.none,
                 )
 
     return out_sb

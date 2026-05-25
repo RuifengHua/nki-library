@@ -11,12 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from unittest.mock import MagicMock
+
 from test.utils.feature_flag_helper import (
     NEURON_NEV_PREFIX,
     derive_pytest_test_id,
     get_feature_flag,
 )
-from unittest.mock import MagicMock
 
 
 class TestGetFeatureFlag:

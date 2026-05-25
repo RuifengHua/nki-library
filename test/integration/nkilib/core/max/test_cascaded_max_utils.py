@@ -17,11 +17,6 @@ Test suite for predicated_folded_load and unfolded_store utilities using UnitTes
 """
 
 import math
-from test.utils.common_dataclasses import CompilerArgs
-from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 import nki
 import nki.isa as nisa
@@ -29,8 +24,14 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
+
 from nkilib_src.nkilib.core.max.cascaded_max_utils import predicated_folded_load, unfolded_store
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_program_sharding_info
+from test.utils.common_dataclasses import CompilerArgs, Platforms
+from test.utils.pytest_parametrize import pytest_parametrize
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 FILL_VALUE = -9948.0
 
@@ -200,7 +201,8 @@ def folded_load_oversized_sb_torch_ref(
     return {"output_tensor": output}
 
 
-@pytest_test_metadata(name="Cascaded Max Utils", pytest_marks=["max", "utils"])
+@pytest_test_metadata(name="Cascaded Max Utils")
+@pytest_marks(["max", "utils"])
 class TestCascadedMaxUtils:
     # fmt: off
     full_batch_params = "lnc_degree, b, n, fold_factor"
@@ -234,7 +236,13 @@ class TestCascadedMaxUtils:
     @pytest.mark.fast
     @pytest_parametrize(full_batch_params, full_batch_perms, abbrevs=_full_batch_abbrevs)
     def test_folded_load_store_full_batch(
-        self, test_manager: Orchestrator, lnc_degree: int, b: int, n: int, fold_factor: int
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        lnc_degree: int,
+        b: int,
+        n: int,
+        fold_factor: int,
     ):
         def input_generator(test_config, input_tensor_def=None):
             return self.generate_full_batch_inputs(b, n, fold_factor, 0, b)
@@ -246,7 +254,9 @@ class TestCascadedMaxUtils:
             kernel_input_generator=input_generator,
             output_tensor_descriptor=self.output_full_batch,
         )
-        framework.run_test(test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree))
+        framework.run_test(
+            test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
+        )
 
     # fmt: off
     partial_batch_params = "lnc_degree, b, n, fold_factor, batch_start, batch_end"
@@ -266,6 +276,7 @@ class TestCascadedMaxUtils:
     def test_folded_load_store_partial_batch(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         b: int,
         n: int,
@@ -283,7 +294,9 @@ class TestCascadedMaxUtils:
             kernel_input_generator=input_generator,
             output_tensor_descriptor=self.output_full_batch,
         )
-        framework.run_test(test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree))
+        framework.run_test(
+            test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
+        )
 
     # fmt: off
     dst_batch_params = "lnc_degree, b, n, fold_factor, src_start, src_end, dst_start, dst_end"
@@ -318,6 +331,7 @@ class TestCascadedMaxUtils:
     def test_folded_load_store_dst_batch(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         b: int,
         n: int,
@@ -337,7 +351,9 @@ class TestCascadedMaxUtils:
             kernel_input_generator=input_generator,
             output_tensor_descriptor=self.output_dst_batch,
         )
-        framework.run_test(test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree))
+        framework.run_test(
+            test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
+        )
 
     # fmt: off
     oversized_sb_params = "lnc_degree, b, n, fold_factor, batch_start, batch_end, sb_extra_cols"
@@ -379,6 +395,7 @@ class TestCascadedMaxUtils:
     def test_folded_load_oversized_sb(
         self,
         test_manager: Orchestrator,
+        platform_target: Platforms,
         lnc_degree: int,
         b: int,
         n: int,
@@ -397,4 +414,6 @@ class TestCascadedMaxUtils:
             kernel_input_generator=input_generator,
             output_tensor_descriptor=self.output_oversized,
         )
-        framework.run_test(test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree))
+        framework.run_test(
+            test_config=None, compiler_args=CompilerArgs(logical_nc_config=lnc_degree, platform_target=platform_target)
+        )

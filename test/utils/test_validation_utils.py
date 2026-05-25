@@ -28,6 +28,7 @@ Usage:
 """
 
 import ast
+import functools
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -111,6 +112,22 @@ def get_decorator_kwargs(decorator: ast.expr) -> Dict[str, Any]:
             if value is not None:
                 result[keyword.arg] = value
     return result
+
+
+def get_decorator_args(decorator: ast.expr) -> List[Any]:
+    """
+    Extract positional arguments from a decorator call.
+
+    Args:
+        decorator: AST decorator node (must be ast.Call)
+
+    Returns:
+        List of extracted argument values
+    """
+    if not isinstance(decorator, ast.Call):
+        return []
+
+    return [v for arg in decorator.args if (v := extract_ast_value(arg)) is not None]
 
 
 # =============================================================================
@@ -233,13 +250,23 @@ class IntegrationFileCollector:
         )
 
     @staticmethod
+    @functools.cache
     def get_repo_root() -> Path:
         """
-        Get the repository root from the current file location.
+        Get the repository root.
 
-        Assumes this file is at test/utils/test_validation_utils.py
+        Searches upward from this file's location for a directory containing
+        both ``setup.cfg`` and a ``test/`` subdirectory.  Falls back to
+        searching from the current working directory when the module is loaded
+        from an installed package (site-packages) rather than the source tree.
         """
-        return Path(__file__).parent.parent.parent
+        for start in (Path(__file__).resolve().parent, Path.cwd()):
+            candidate = start
+            while candidate != candidate.parent:
+                if (candidate / "setup.cfg").is_file() and (candidate / "test").is_dir():
+                    return candidate
+                candidate = candidate.parent
+        raise RuntimeError("Could not find repository root (looked for setup.cfg + test/)")
 
     @staticmethod
     def get_integration_core_dir() -> Path:

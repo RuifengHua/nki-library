@@ -78,7 +78,7 @@ class MLPCTEConstants(NKIObject):
     required_src_proj_psum_bank_count: int
     required_down_proj_psum_bank_count: int
     # Constants for weights buffering to facilitate overlapped loads
-    src_proj_weights_buffer_count: int
+    src_proj_weights_max_buffer_count: int
     down_proj_weights_buffer_count: int
     down_proj_weights_scales_buffer_count: int
     # True if PE transpose should be used
@@ -180,7 +180,7 @@ def build_mlp_cte_constants(
     """
 
     # Empirical number of weights buffering to facilitate overlapped DMA loads with following matmul
-    src_proj_weights_buffer_count = 4
+    src_proj_weights_max_buffer_count = 4
     down_proj_weights_buffer_count = 8
     down_proj_weights_scales_buffer_count = 4
 
@@ -277,7 +277,7 @@ def build_mlp_cte_constants(
         required_int_xpose_psum_bank_count=required_int_xpose_psum_bank_count,
         required_src_proj_psum_bank_count=required_src_proj_psum_bank_count,
         required_down_proj_psum_bank_count=required_down_proj_psum_bank_count,
-        src_proj_weights_buffer_count=src_proj_weights_buffer_count,
+        src_proj_weights_max_buffer_count=src_proj_weights_max_buffer_count,
         down_proj_weights_buffer_count=down_proj_weights_buffer_count,
         down_proj_weights_scales_buffer_count=down_proj_weights_scales_buffer_count,
         use_pe_xpose_flag=use_pe_xpose_flag,

@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Common type definitions (enums) shared across NKI Library kernels."""
 
+from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
+
+import nki.language as nl
 
 
 class QKVOutputLayout(Enum):
@@ -34,6 +39,7 @@ class ActFnType(Enum):
     GELU = 1
     GELU_Tanh_Approx = 2
     Swish = 3
+    ReLU = 4
 
 
 class RouterActFnType(Enum):
@@ -54,12 +60,25 @@ class ExpertAffinityScaleMode(Enum):
 
 
 class QuantizationType(Enum):
-    NONE = 0
-    STATIC = 1
-    ROW = 2
-    MX = 3
-    STATIC_MX = 4
-    ROW_MX = 5
+    NONE = 0  # No quantization; data remains in native precision (BF16/FP16)
+    STATIC = 1  # Per-tensor quantization to FP8 using a single scalar scale (TRN2)
+    ROW = 2  # Per-channel quantization to FP8 (TRN2): for a [T, H] tensor, each row is independently
+    # scaled along the H dimension by absmax / max_representable_fp8_value
+    MX = 3  # Microscaling (MX) quantization (TRN3): along the H dimension, every 32 elements share a micro-scale factor
+    STATIC_MX = 4  # Per-tensor quantization in MXFP format (TRN3): FP8/FP4 with a single scalar scale
+    # and identity micro-scale factors (127) to satisfy the hardware tensor engine
+    ROW_MX = 5  # Per-channel quantization in MXFP format (TRN3): FP8/FP4 with per-row scaling
+    # and identity micro-scale factors (127) to satisfy the hardware tensor engine
+
+    def is_mx(self) -> bool:
+        """Whether this quantization type uses the MXFP hardware format (TRN3)."""
+        return self in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX)
+
+
+class ComputationMode(Enum):
+    AUTO = 0
+    PREFILL = 1
+    DECODE = 2
 
 
 class QKVWeightLayout(Enum):
@@ -94,3 +113,128 @@ class QKVWeightLayout(Enum):
 class GateUpDim(Enum):
     GATE = 0
     UP = 1
+
+
+class HiddenLayout(Enum):
+    """Layout of hidden activations in SBUF for TKG kernels."""
+
+    H0_T_H1 = 0  # [H0, T, H1]
+    H0_H1_T = 1  # [H0, H1, T]
+
+    def get_t_dim(self):
+        return 1 if self == HiddenLayout.H0_T_H1 else 2
+
+    def get_h1_dim(self):
+        return 2 if self == HiddenLayout.H0_T_H1 else 1
+
+
+class MoELNCShardingStrategy(Enum):
+    """LNC (Logical NeuronCore) sharding strategies for MoE kernels.
+
+    Defines how computation is distributed across NeuronCores when LNC=2.
+    Not all strategies are supported by all MoE kernels - check kernel documentation
+    or the SUPPORTED_MOE_SHARDING_STRATEGIES list for kernel-specific support.
+    """
+
+    NO_SHARD = 0  # No sharding: each NC computes full result independently
+    SHARD_I = 1  # Shard on I (intermediate) dimension - default for most workloads
+    SHARD_T = 2  # Shard on T (token) dimension - useful when T is large
+    # SHARD_E = 3  # Future: Shard on E (expert) dimension
+
+
+class MoEAllToAllVStrategy(Enum):
+    """MoE all_to_all_v (A2A-v) strategy for MoE kernels.
+
+    Defines how the MoE kernel processes hidden input and MoE output.
+    Not all strategies are supported by all MoE kernels.
+    """
+
+    DISABLED = 0  # A2A-v not used
+    PERMUTED_OUTPUT = 1  # A2A-v used; input is permuted, output retains permuted row ordering from input
+    # TODO[perf]: implement fused unpermute
+    # UNPERMUTED_OUTPUT = 2  # A2A-v used; input is permuted, kernel unpermutes output to global token order
+
+
+class MoEBlockIOLayout(Enum):
+    """I/O tensor layout for MoE Block TKG kernel.
+
+    B_S_H: Standard [B, S, H] layout (input) / [T, H] layout (output).
+    _128_Nprgs_Hfree_T: [128, n_prgs, H//128//n_prgs, T] layout in HBM.
+        Avoids intermediate layout conversions between transformer layers.
+    """
+
+    B_S_H = 0
+    _128_Nprgs_Hfree_T = 1
+
+
+@dataclass
+class QKNormConfig(nl.NKIObject):
+    """Configuration for per-head QK-norm on Q and K projections.
+
+    Each head group independently specifies which norm to apply (or None to skip).
+
+    Args:
+        q_norm: Normalization type for Q heads, or None to skip Q norm.
+            Only RMS_NORM is registered by default.
+        k_norm: Normalization type for K heads, or None to skip K norm.
+            Only RMS_NORM is registered by default.
+        eps: Epsilon for numerical stability. Default matches norm_eps used throughout
+            the QKV CTE codebase.
+        q_gamma_norm_weights: [1, d_head] gamma weights for Q heads, or None for
+            pure RMSNorm without affine scale.
+        k_gamma_norm_weights: [1, d_head] gamma weights for K heads, or None for
+            pure RMSNorm without affine scale.
+        q_beta_norm_weights: [1, d_head] beta weights for Q heads (LayerNorm only).
+            Not yet implemented.
+        k_beta_norm_weights: [1, d_head] beta weights for K heads (LayerNorm only).
+            Not yet implemented.
+        gamma_fused_in_rope_caches: When True, gamma weights have been pre-multiplied
+            into the cos/sin RoPE caches by the caller. The kernel fuses the rsqrt
+            into the RoPE multiply instructions, eliminating the per-head gamma multiply.
+            Requires fused_rope=True, q/k_gamma_norm_weights=None, and only valid on
+            qk_norm_pre_rope (not qk_norm_post_rope). The sin cache must be [B, S, d_head]
+            with sin_lo_fused in [:,:,0:d_half] and sin_hi_fused in [:,:,d_half:d_head].
+    """
+
+    q_norm: Optional[NormType] = NormType.RMS_NORM
+    k_norm: Optional[NormType] = NormType.RMS_NORM
+    eps: float = 1e-6
+    q_gamma_norm_weights: Optional[nl.ndarray] = None
+    k_gamma_norm_weights: Optional[nl.ndarray] = None
+    q_beta_norm_weights: Optional[nl.ndarray] = None
+    k_beta_norm_weights: Optional[nl.ndarray] = None
+    gamma_fused_in_rope_caches: bool = False
+
+
+@dataclass(frozen=True)
+class StridedInputConfig(nl.NKIObject):
+    """Gather uniformly-spaced blocks from the input sequence dimension.
+
+    The kernel reads num_local_tokens // block_len blocks from the input,
+    starting at token offset block_offset, with block_stride tokens between
+    the start of consecutive blocks. Output is written contiguously with
+    S = num_local_tokens.
+
+    Requires caller-provided output_hbm (output S != input S).
+
+    block_len must either divide pmax (128) or be a multiple of pmax. Accepted:
+    {1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, ...}. The kernel also requires
+    this shard's S window (S_shard_offset, S_shard) to be block-aligned.
+
+    Visual example (block_len=16, block_stride=64, block_offset=16, num_local_tokens=32):
+
+        Input HBM [S_full=128 tokens]:
+        Block:    0       1       2       3       4       5       6       7
+        Tokens: [0-15] [16-31] [32-47] [48-63] [64-79] [80-95] [96-111] [112-127]
+                         ^^^^^                           ^^^^^
+                         OURS                            OURS
+                 offset=16 -------- stride=64 ---------->
+
+        Output HBM [num_local_tokens=32]:
+        [16-31] [80-95]   <- gathered blocks, written contiguously
+    """
+
+    block_len: int  # Contiguous tokens per block
+    block_stride: int  # Tokens between start of consecutive owned blocks
+    block_offset: int  # Token offset of first owned block
+    num_local_tokens: int  # Total tokens to process (= output S dimension)

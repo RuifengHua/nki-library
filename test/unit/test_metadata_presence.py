@@ -19,14 +19,14 @@ suite have the required @pytest_test_metadata decorator for proper test discover
 tracking.
 """
 
+import pytest
+
 from test.utils.pytest_test_metadata import extract_pytest_test_metadata_from_file
 from test.utils.test_validation_utils import (
     IntegrationFileCollector,
     ValidationErrorReporter,
     ValidationViolation,
 )
-
-import pytest
 
 # Fix instructions for @pytest_test_metadata decorator
 METADATA_FIX_INSTRUCTIONS = [
@@ -39,8 +39,8 @@ METADATA_FIX_INSTRUCTIONS = [
     "",
     "   @pytest_test_metadata(",
     "       name=\"Descriptive Test Name\",",
-    "       pytest_marks=[\"category\", \"subcategory\"],",
     "   )",
+    "   @pytest_marks([\"category\", \"subcategory\"])",
     "   class TestYourKernel:",
     "       ...",
     "",
@@ -53,8 +53,8 @@ METADATA_FIX_INSTRUCTIONS = [
     "",
     "   @pytest_test_metadata(",
     "       name=\"Attention CTE\",",
-    "       pytest_marks=[\"attention\", \"cte\"],",
     "   )",
+    "   @pytest_marks([\"attention\", \"cte\"])",
     "   @final",
     "   class TestRangedAttentionCTEKernels:",
     "       ...",
@@ -78,7 +78,6 @@ def test_all_integration_test_classes_have_metadata():
 
         @pytest_test_metadata(
             name="Your Test Name",
-            pytest_marks=["relevant", "marks"],
         )
         class TestYourKernel:
             pass
@@ -108,18 +107,16 @@ def test_all_integration_test_classes_have_metadata():
     for file_info in test_files:
         # Extract test class metadata from the file
         test_classes = extract_pytest_test_metadata_from_file(file_info.file_path)
+        has_metadata = any(tc.metadata is not None for tc in test_classes)
 
-        # Check each test class for @pytest_test_metadata decorator
-        for test_class_info in test_classes:
-            if test_class_info.metadata is None:
-                reporter.add_violation(
-                    ValidationViolation(
-                        file_path=test_class_info.file_path,
-                        message="",
-                        line_number=test_class_info.line_number,
-                        class_name=test_class_info.class_name,
-                    )
+        # Each file with test classes must have at least one @pytest_test_metadata
+        if test_classes and not has_metadata:
+            reporter.add_violation(
+                ValidationViolation(
+                    file_path=file_info.file_path,
+                    message=f"No @pytest_test_metadata found ({len(test_classes)} test class(es))",
                 )
+            )
 
     # If there are violations, fail with detailed message
     if reporter.has_violations():
@@ -128,3 +125,56 @@ def test_all_integration_test_classes_have_metadata():
     # Report success
     total_classes = sum(len(extract_pytest_test_metadata_from_file(f.file_path)) for f in test_files)
     print(f"\n✓ All {total_classes} test classes in {len(test_files)} files have @pytest_test_metadata decorators")
+
+
+def test_one_metadata_per_file():
+    """
+    Enforce that each test file has at most one @pytest_test_metadata annotation.
+
+    The CDK creates one pipeline approval step per @pytest_test_metadata annotation.
+    Multiple annotations in the same file cause duplicate approval steps running the
+    same tests. Use @pytest_marks for additional test classes instead.
+    """
+    integration_core_dir = IntegrationFileCollector.get_integration_core_dir()
+    collector = IntegrationFileCollector(integration_core_dir)
+    test_files = collector.collect()
+
+    reporter = ValidationErrorReporter(
+        error_title="Found test files with multiple @pytest_test_metadata annotations",
+    )
+    reporter.add_fix_instructions(
+        [
+            "Each test file must have exactly ONE @pytest_test_metadata decorator.",
+            "",
+            "Only the first test class should have @pytest_test_metadata.",
+            "Other test classes should only use @pytest_marks for marking:",
+            "",
+            "   @pytest_test_metadata(",
+            '       name="My Kernel",',
+            "   )",
+            '   @pytest_marks(["kernel", "core"])',
+            "   class TestMyKernelBasic:",
+            "       ...",
+            "",
+            '   @pytest_marks(["kernel", "core", "advanced"])',
+            "   class TestMyKernelAdvanced:",
+            "       ...",
+        ]
+    )
+
+    for file_info in test_files:
+        test_classes = extract_pytest_test_metadata_from_file(file_info.file_path)
+        annotated = [tc for tc in test_classes if tc.metadata is not None]
+
+        if len(annotated) > 1:
+            reporter.add_violation(
+                ValidationViolation(
+                    file_path=file_info.file_path,
+                    message=f"Found {len(annotated)} @pytest_test_metadata annotations",
+                )
+            )
+
+    if reporter.has_violations():
+        pytest.fail(reporter.build())
+
+    print(f"\n✓ All {len(test_files)} test files have at most one @pytest_test_metadata annotation")

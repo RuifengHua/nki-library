@@ -87,6 +87,18 @@ class LockAcquisitionError(Exception):
         super().__init__(message)
 
 
+class InsufficientCoreCountError(LockAcquisitionError):
+    """
+    Raised when a host does not have enough physical cores to satisfy the request.
+
+    This is a non-retryable error on the same host - the core count is a fixed property.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.retryable = False
+
+
 def check_lock_version(conn: fabric2.Connection) -> None:
     """
     Check if the host's locking protocol version is compatible with this client.
@@ -117,81 +129,38 @@ class CoreLockManager:
 
     def __init__(
         self,
-        connection: fabric2.Connection,
+        host: str,
         total_physical_cores: int,
         collector: IMetricsCollector,
+        executor=None,
+        host_locking_version: int | None = None,
     ):
         """
         Initialize the core lock manager.
 
         Args:
-            connection: Fabric SSH connection to the remote host
+            host: Remote host identifier (for logging)
             total_physical_cores: Total number of physical neuron cores on the host
-            collector: Metrics collector for recording timing metrics
+            collector: Metrics collector for the current test
+            executor: Optional RemoteExecutor for low-latency remote calls
+            host_locking_version: Pre-resolved locking version (skips remote query)
         """
-        self.connection = connection
         self.total_physical_cores = total_physical_cores
-        self.host = connection.host
+        self.host = host
         self._collector = collector
-        self._initialized = False
-        self._version_checked = False
-        self._host_locking_version: int | None = None
-        # Contention tracking
+        self._executor = executor
+        self._caller_id = getattr(collector, "test_name", None) or None
+        self._host_locking_version = host_locking_version
         self._no_cores_count = 0
         self._contention_wait_time = 0.0
-
-    def initialize(self) -> None:
-        """
-        Initialize the remote lock directory and files.
-
-        This is called automatically before any lock operations, but can be
-        called explicitly for pre-flight setup. It:
-        - Creates the lock directory on the remote host
-        - Deploys the lock helper script to the remote host
-        """
-        if self._initialized:
-            return
-
-        with self._collector.timer(MetricName.CORE_LOCK_INIT_TIME):
-            logging.info(f"[{self.host}] Initializing core lock manager")
-            lock_client.initialize(self.connection)
-
-            with self._collector.timer(MetricName.CORE_LOCK_DEPLOY_TIME):
-                lock_client.deploy_lock_helpers(self.connection)
-
-            self._initialized = True
+        self._current_expiry: int | None = None
 
     @property
     def host_locking_version(self) -> int:
         """Get the locking protocol version for this host."""
         if self._host_locking_version is None:
-            with self._collector.timer(MetricName.CORE_LOCK_VERSION_CHECK_TIME):
-                self._host_locking_version = lock_client.get_host_locking_version(self.connection)
+            raise LockAcquisitionError(f"[{self.host}] Lock manager not initialized — host_locking_version not set")
         return self._host_locking_version
-
-    def _check_lock_version(self) -> None:
-        """
-        Check lock version compatibility.
-
-        Raises:
-            LockVersionError: If the host requires a newer locking protocol
-        """
-        if self._version_checked:
-            return
-
-        required_version = self.host_locking_version
-
-        if required_version > lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION:
-            raise LockVersionError(
-                required_version=required_version,
-                current_version=lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION,
-            )
-
-        logging.info(
-            f"[{self.host}] Using locking protocol v{required_version} "
-            f"(client supports up to v{lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION})"
-        )
-        self._version_checked = True
 
     @staticmethod
     def _physical_to_logical_cores(physical_core_ids: list[int], lnc_config: int) -> list[int]:
@@ -221,9 +190,9 @@ class CoreLockManager:
         num_logical = len(physical_core_ids) // lnc_config
         # Verify physical cores are contiguous and aligned
         expected = list(range(first_logical * lnc_config, (first_logical + num_logical) * lnc_config))
-        assert (
-            physical_core_ids == expected
-        ), f"Physical cores must be contiguous and aligned (lnc_config={lnc_config}): expected {expected}, got {physical_core_ids}"
+        assert physical_core_ids == expected, (
+            f"Physical cores must be contiguous and aligned (lnc_config={lnc_config}): expected {expected}, got {physical_core_ids}"
+        )
         return list(range(first_logical, first_logical + num_logical))
 
     def acquire(
@@ -260,28 +229,30 @@ class CoreLockManager:
             result = manager.acquire(num_logical_cores=2, lnc_config=2, timeout_seconds=60)
             # Returns e.g. ([0, 1], [0, 1, 2, 3]) or ([2, 3], [4, 5, 6, 7])
         """
-        self.initialize()
-
-        # Check lock version before attempting to acquire
-        self._check_lock_version()
-
         num_physical_cores = num_logical_cores * lnc_config
-        assert (
-            num_physical_cores % lnc_config == 0
-        ), f"num_physical_cores ({num_physical_cores}) must be a multiple of lnc_config ({lnc_config})"
+        assert num_physical_cores % lnc_config == 0, (
+            f"num_physical_cores ({num_physical_cores}) must be a multiple of lnc_config ({lnc_config})"
+        )
+
+        if num_physical_cores > self.total_physical_cores:
+            raise InsufficientCoreCountError(
+                f"[{self.host}] Requested {num_logical_cores} logical cores (lnc{lnc_config} = "
+                f"{num_physical_cores} physical) but host only has {self.total_physical_cores} physical cores"
+            )
 
         attempt_start = time.time()
 
         try:
             with self._collector.timer(MetricName.CORE_LOCK_ACQUIRE_TIME):
                 lock_result = lock_client.acquire(
-                    self.connection,
+                    self._executor,
                     self.total_physical_cores,
                     num_physical_cores,
                     timeout_seconds,
                     self.host_locking_version,
+                    caller_id=self._caller_id,
                 )
-        except RuntimeError as e:
+        except Exception as e:
             raise LockAcquisitionError(str(e))
 
         if lock_result.status == LockStatus.DRAINING:
@@ -299,6 +270,7 @@ class CoreLockManager:
             if lock_result.cores is None:
                 raise LockAcquisitionError(f"[{self.host}] ALLOCATED status but no cores returned")
             allocated_physical_cores = lock_result.cores
+            self._current_expiry = lock_result.expiry
             logical_cores = self._physical_to_logical_cores(allocated_physical_cores, lnc_config)
             logging.info(
                 f"[{self.host}] Acquired logical cores {logical_cores} "
@@ -322,14 +294,19 @@ class CoreLockManager:
         if not core_ids:
             return
 
-        self.initialize()
-
         logging.info(f"[{self.host}] Releasing cores {core_ids}")
 
-        lock_result = lock_client.release(self.connection, core_ids, self.host_locking_version)
+        lock_result = lock_client.release(
+            self._executor,
+            core_ids,
+            self.host_locking_version,
+            caller_id=self._caller_id,
+            expected_expiry=self._current_expiry,
+        )
 
         if lock_result.status == LockStatus.RELEASED:
             logging.info(f"[{self.host}] Released cores {core_ids}")
+            self._current_expiry = None
         else:
             logging.warning(f"[{self.host}] Release may have failed: {lock_result.status}, {lock_result.message}")
 
@@ -346,11 +323,9 @@ class CoreLockManager:
         Returns:
             Max lock expiry epoch seconds (0 if no active locks)
         """
-        self.initialize()
-
         logging.info(f"[{self.host}] Enabling drain mode for {timeout_seconds}s")
 
-        lock_result = lock_client.drain(self.connection, timeout_seconds, self.host_locking_version)
+        lock_result = lock_client.drain(self._executor, timeout_seconds, self.host_locking_version)
 
         if lock_result.status == LockStatus.DRAINED:
             max_lock_expiry = lock_result.max_lock_expiry or 0
@@ -362,11 +337,9 @@ class CoreLockManager:
 
     def disable_drain(self) -> None:
         """Disable drain mode to allow new test acquisitions."""
-        self.initialize()
-
         logging.info(f"[{self.host}] Disabling drain mode")
 
-        lock_result = lock_client.undrain(self.connection, self.host_locking_version)
+        lock_result = lock_client.undrain(self._executor, self.host_locking_version)
 
         if lock_result.status == LockStatus.UNDRAINED:
             logging.info(f"[{self.host}] Drain disabled")

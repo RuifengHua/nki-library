@@ -15,20 +15,22 @@ import contextlib
 import os
 from dataclasses import asdict
 from functools import lru_cache
+
+import nki
+
 from test.integration.nkilib.core.attention.test_attention_tkg_utils import (
     AttnTKGTestParams,
     build_active_attention_mask,
     build_swa_positions,
     cfg_repr,
     gen_deterministic_active_block_table,
+    generate_cache_lens,
     generate_pow_range,
     get_bqs_tile_parameters,
     get_debug_tensor_shapes,
     print_test_config,
 )
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-
-import nki
 
 try:
     from test.integration.nkilib.core.attention.test_attention_tkg_model_config import (
@@ -37,22 +39,6 @@ try:
 except ImportError:
     attention_tkg_model_configs = []
 
-from test.integration.nkilib.utils.comparators import maxAllClose
-from test.integration.nkilib.utils.tensor_generators import np_random_sample, np_random_sample_fp8
-from test.utils.common_dataclasses import (
-    MODEL_TEST_TYPE,
-    TKG_INFERENCE_ARGS,
-    CompilerArgs,
-    CustomValidator,
-    CustomValidatorWithOutputTensorData,
-    Platforms,
-)
-from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
-from test.utils.metadata_loader import load_model_configs
-from test.utils.metrics_collector import IMetricsCollector
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.tensor_histogram import TensorHistogram
-from test.utils.test_orchestrator import Orchestrator
 from typing import Any, final
 
 import neuron_dtypes as dt
@@ -62,6 +48,8 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 import torch
+from typing_extensions import override
+
 from nkilib_src.nkilib.core.attention.attention_tkg import (
     AttnTKGConfig,
     TileConstants,
@@ -79,7 +67,22 @@ from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
 from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
 from nkilib_src.nkilib.core.utils.allocator import SbufManager
 from nkilib_src.nkilib.core.utils.logging import Logger
-from typing_extensions import override
+from test.integration.nkilib.utils.tensor_generators import np_random_sample, np_random_sample_fp8
+from test.utils.common_dataclasses import (
+    MODEL_TEST_TYPE,
+    TKG_INFERENCE_ARGS,
+    CompilerArgs,
+    CustomValidator,
+    CustomValidatorWithOutputTensorData,
+    Platforms,
+)
+from test.utils.comparators import maxAllClose
+from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
+from test.utils.metadata_loader import load_model_configs
+from test.utils.metrics_collector import IMetricsCollector
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.tensor_histogram import TensorHistogram
+from test.utils.test_orchestrator import Orchestrator
 
 P_MAX = 128
 FP8_TEST_DTYPE = nl.float8_e4m3
@@ -271,7 +274,7 @@ def run_attention_tkg_test(
     k_out_shape = (cfg.d_head, cfg.bs * cfg.s_active) if cfg.k_out_in_sb else (cfg.bs, 1, cfg.d_head, cfg.s_active)
 
     # Generate pos_id outside of tensor_gen so it stays the same for all inputs
-    pos_id = ((np.arange(cfg.bs) * 3 + (cfg.curr_sprior // 4 * 3)) % (cfg.curr_sprior - cfg.s_active))[:, np.newaxis]
+    pos_id = generate_cache_lens(cfg.bs, cfg.curr_sprior, cfg.s_active, mode="normal")
 
     def input_generator(test_config):
         random_gen = np_random_sample()
@@ -330,11 +333,14 @@ def run_attention_tkg_test(
                     block_len=cfg.block_len,
                 )
             else:
-                rope_pos_ids = np.broadcast_to(pos_id, (cfg.bs, cfg.s_active)).astype(np.float32)
+                rope_pos_ids = (
+                    np.broadcast_to(pos_id, (cfg.bs, cfg.s_active)).astype(np.float32)
+                    + np.arange(cfg.s_active, dtype=np.float32)[np.newaxis, :]
+                )
         active_blocks_table = (
             gen_deterministic_active_block_table(
                 cfg.bs, cfg.curr_sprior, cfg.s_active, pos_id, cfg.block_len, cfg.bs * cfg.curr_sprior // cfg.block_len
-            ).astype(np.uint32)
+            ).astype(np.int32)
             if is_block_kv
             else None
         )
@@ -824,7 +830,7 @@ attention_tkg_fast_configs = [
     [AttnTKGConfig(4, 1, 5, 1024, 10240, 128, 0, tp_k_prior=True, strided_mm1=False, use_pos_id=True, fuse_rope=True), AttnTKGTestParams()],
     [AttnTKGConfig(4, 1, 5, 1536, 10240, 128, 0, tp_k_prior=True, strided_mm1=False, use_pos_id=True, fuse_rope=True), AttnTKGTestParams()],
     [AttnTKGConfig(4, 10, 5, 5376, 5376, 64, 0, strided_mm1=False, qk_in_sb=True), AttnTKGTestParams()],
-    
+
     #################### Test sprior_sharding when s_active_bqh > 128####################
     [AttnTKGConfig(5, 7, 7, 24576, 24576, 64, 0, use_pos_id=True, qk_in_sb=True), AttnTKGTestParams(test_sink=True)],
 
@@ -930,10 +936,23 @@ def _get_attention_tkg_metadata():
     return load_model_configs("test_attention_tkg")
 
 
-@pytest_test_metadata(
-    name="Attention TKG",
-    pytest_marks=["attention", "tkg"],
-)
+_ABBREVS = {
+    "batch_size": "bs",
+    "s_prior_full_multiple": "s_pfm",
+    "block_len": "blen",
+    "tp_k_prior": "tp_kp",
+    "strided_mm1": "smm1",
+    "use_pos_id": "posid",
+    "fuse_rope": "frope",
+    "out_in_sb": "osb",
+    "k_out_in_sb": "kosb",
+    "qk_in_sb": "qksb",
+    "sliding_window": "swin",
+}
+
+
+@pytest_test_metadata(name="Attention TKG")
+@pytest_marks(["attention", "tkg"])
 @final
 class TestAttentionTkgKernel:
     @pytest.mark.fast
@@ -1023,6 +1042,7 @@ class TestAttentionTkgKernel:
         filter=filter_invalid_tests,
         enable_automatic_boundary_tests=True,
         enable_invalid_combination_tests=True,
+        abbrev=_ABBREVS,
     )
     def test_attn_tkg_sweep(
         self,

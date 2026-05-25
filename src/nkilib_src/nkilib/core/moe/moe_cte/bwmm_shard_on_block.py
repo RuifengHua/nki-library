@@ -68,7 +68,7 @@ class DimensionSizes(NKIObject):
         self.n_psum_tile_count = div_ceil(self.B, PSUM_SIZE)
 
 
-@nki.jit(mode='trace')
+@nki.jit
 def bwmm_shard_on_block(
     hidden_states: nl.ndarray,
     expert_affinities_masked: nl.ndarray,

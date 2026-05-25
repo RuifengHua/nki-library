@@ -135,23 +135,28 @@ def mx_matmul(stationary, moving, stationary_scale, moving_scale):
     """Hardware-accurate MX block-scaled matmul. All inputs are torch tensors.
 
     Reshapes to [P, F//4, 4], applies block scale per 8x1x4 block,
-    then einsum("kiq,kjq->ij").
+    then contracts over partition and q dims via BLAS matmul.
     """
     moving = moving.reshape(moving.shape[0], moving.shape[1] // 4, 4)
     MP, MF0, _ = moving.shape
+    MSP = moving_scale.shape[0]
 
     stationary = stationary.reshape(stationary.shape[0], stationary.shape[1] // 4, 4)
     SP, SF0, _ = stationary.shape
+    SSP = stationary_scale.shape[0]
 
-    ms = torch.pow(2.0, moving_scale[:, :MF0] - 127.0)
-    ms = ms.unsqueeze(2).repeat(1, 1, 4).unsqueeze(1).repeat(1, 8, 1, 1).reshape(-1, MF0, 4)[:MP]
-    moving = moving * ms
+    # Apply moving scale: each scale applies to an 8x1x4 block
+    ms = torch.pow(2.0, moving_scale[:, :MF0] - 127.0)  # [MSP, MF0]
+    moving = moving.reshape(MSP, 8, MF0, 4) * ms[:, None, :, None]
+    moving = moving.reshape(MP, MF0, 4)
 
-    ss = torch.pow(2.0, stationary_scale[:, :SF0] - 127.0)
-    ss = ss.unsqueeze(2).repeat(1, 1, 4).unsqueeze(1).repeat(1, 8, 1, 1).reshape(-1, SF0, 4)[:SP]
-    stationary = stationary * ss
+    # Apply stationary scale
+    ss = torch.pow(2.0, stationary_scale[:, :SF0] - 127.0)  # [SSP, SF0]
+    stationary = stationary.reshape(SSP, 8, SF0, 4) * ss[:, None, :, None]
+    stationary = stationary.reshape(SP, SF0, 4)
 
-    return torch.einsum("kiq,kjq->ij", stationary, moving)
+    # Contract over k (partition) and q (4-wide): [SF0, SP*4] @ [MF0, MP*4].T
+    return stationary.permute(1, 0, 2).reshape(SF0, -1) @ moving.permute(1, 0, 2).reshape(MF0, -1).T
 
 
 def quantize_to_mx(data, out_x4_dtype):
@@ -218,7 +223,7 @@ def quantize_to_mx(data, out_x4_dtype):
         data_f32.astype(np.float64) / np.where(scale_expanded == 0, 1.0, scale_expanded), -max_val, max_val
     )
 
-    return dt.static_cast(clipped.astype(np.float32), out_x4_dtype), scale_uint8
+    return dt.static_cast(np.ascontiguousarray(clipped.astype(np.float32)), out_x4_dtype), scale_uint8
 
 
 def quantize_mx_golden(src_hbm, out_data_hbm, out_scale_hbm):

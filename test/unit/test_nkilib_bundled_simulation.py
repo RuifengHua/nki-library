@@ -1226,7 +1226,7 @@ class TestCircularImportsE2E:
                 print("PASS: Circular import during swap was handled correctly")
             """)
             result = sim.run_python(code, root)
-            assert (
-                result.returncode == 0
-            ), f"Failed (possible infinite recursion): {result.stderr}\\nstdout: {result.stdout}"
+            assert result.returncode == 0, (
+                f"Failed (possible infinite recursion): {result.stderr}\\nstdout: {result.stdout}"
+            )
             assert "PASS" in result.stdout

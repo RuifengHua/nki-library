@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from test.utils.common_dataclasses import Platforms
-
 import pytest
+
+from test.utils.common_dataclasses import Platforms
 
 
 class TestPlatformsIsTrn3:
@@ -46,6 +46,7 @@ class TestPlatformsGetCompileTarget:
 
 from test.utils.common_dataclasses import (
     ModelTestType,
+    Platforms,
     _iter_model_configs,
     is_model_test_type,
     prepare_model_parametrize,
@@ -54,19 +55,20 @@ from test.utils.common_dataclasses import (
 
 class TestModelTestType:
     def test_test_id_prefix(self):
-        assert ModelTestType.BROAD.test_id_prefix == "MODEL_WIP_BROAD"
-        assert ModelTestType.GENERALITY.test_id_prefix == "MODEL_WIP_GENERALITY"
-        assert ModelTestType.OPTIMAL.test_id_prefix == "MODEL_WIP_OPTIMAL"
+        assert ModelTestType.BROAD.test_id_prefix == "BROAD"
+        assert ModelTestType.GENERALITY.test_id_prefix == "GENERALITY"
+        assert ModelTestType.OPTIMAL.test_id_prefix == "OPTIMAL"
 
 
 class TestIsModelTestType:
     @pytest.mark.parametrize(
         "test_type,expected",
         [
-            ("MODEL_WIP", True),
-            ("MODEL_WIP_BROAD", True),
-            ("MODEL_WIP_GENERALITY", True),
-            ("MODEL_WIP_OPTIMAL", True),
+            ("BROAD", True),
+            ("BROAD_some_test", True),
+            ("GENERALITY_test", True),
+            ("OPTIMAL_config", True),
+            ("TIER0_ln-2", True),
             ("manual", False),
             ("random", False),
         ],
@@ -83,17 +85,31 @@ class TestIterModelConfigs:
         }
         result = list(_iter_model_configs(configs))
         assert result == [
-            (ModelTestType.BROAD, [1, 2]),
-            (ModelTestType.BROAD, [3, 4]),
-            (ModelTestType.OPTIMAL, [5, 6]),
+            (ModelTestType.BROAD, [1, 2], None),
+            (ModelTestType.BROAD, [3, 4], None),
+            (ModelTestType.OPTIMAL, [5, 6], None),
         ]
 
     def test_flat_list_format(self):
         configs = [[1, 2], [3, 4]]
         result = list(_iter_model_configs(configs))
         assert result == [
-            (ModelTestType.BROAD, [1, 2]),
-            (ModelTestType.BROAD, [3, 4]),
+            (ModelTestType.BROAD, [1, 2], None),
+            (ModelTestType.BROAD, [3, 4], None),
+        ]
+
+    def test_platform_restricted_entry(self):
+        platforms = {Platforms.TRN3, Platforms.TRN3_A0}
+        configs = {
+            ModelTestType.TIER0: [
+                ([1, 2], platforms),
+                [3, 4],
+            ],
+        }
+        result = list(_iter_model_configs(configs))
+        assert result == [
+            (ModelTestType.TIER0, [1, 2], platforms),
+            (ModelTestType.TIER0, [3, 4], None),
         ]
 
 
@@ -105,18 +121,18 @@ class TestPrepareModelParametrize:
         }
         params, ids = prepare_model_parametrize(configs)
         assert params == [[1, 2], [3, 4]]
-        assert ids == ["MODEL_WIP_BROAD_1-2", "MODEL_WIP_GENERALITY_3-4"]
+        assert ids == ["BROAD_1-2", "GENERALITY_3-4"]
 
     def test_flat_list_format(self):
         configs = [[1, 2], [3, 4]]
         params, ids = prepare_model_parametrize(configs)
         assert params == [[1, 2], [3, 4]]
-        assert ids == ["MODEL_WIP_BROAD_1-2", "MODEL_WIP_BROAD_3-4"]
+        assert ids == ["BROAD_1-2", "BROAD_3-4"]
 
     def test_custom_id_formatter(self):
         configs = {ModelTestType.OPTIMAL: [[10, 20]]}
         params, ids = prepare_model_parametrize(configs, id_formatter=lambda p: f"x{p[0]}")
-        assert ids == ["MODEL_WIP_OPTIMAL_x10"]
+        assert ids == ["OPTIMAL_x10"]
 
     def test_empty_dict(self):
         params, ids = prepare_model_parametrize({})
@@ -137,3 +153,18 @@ class TestUnpackModelConfig:
         mt, params = unpack_model_config([1, 2, 3])
         assert mt == ModelTestType.BROAD
         assert params == [1, 2, 3]
+
+
+from test.utils.common_dataclasses import LazyGoldenGenerator, ValidationArgs
+
+
+class TestValidationArgsEqualNanInf:
+    def test_default_equal_nan_inf_is_false(self):
+        golden = LazyGoldenGenerator(lazy_golden_generator=lambda: {}, output_ndarray={})
+        args = ValidationArgs(golden_output=golden)
+        assert args.equal_nan_inf is False
+
+    def test_equal_nan_inf_can_be_set_true(self):
+        golden = LazyGoldenGenerator(lazy_golden_generator=lambda: {}, output_ndarray={})
+        args = ValidationArgs(golden_output=golden, equal_nan_inf=True)
+        assert args.equal_nan_inf is True

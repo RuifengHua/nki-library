@@ -21,9 +21,10 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...core.mlp.mlp import mlp
-from ...core.utils.allocator import BufferManager, Logger
+from ...core.utils.allocator import BufferManager
 from ...core.utils.common_types import ActFnType, NormType, QuantizationType
 from ...core.utils.kernel_helpers import get_verified_program_sharding_info
+from ...core.utils.logging import get_logger
 from ...core.utils.tensor_view import TensorView
 from .attention_block_tkg import attention_block_tkg
 
@@ -101,8 +102,7 @@ def transformer_tkg(
     V_caches: List[nl.ndarray],
     RoPE_cos: nl.ndarray,
     RoPE_sin: nl.ndarray,
-    mask_cache: nl.ndarray,
-    mask_active: nl.ndarray,
+    attention_mask: nl.ndarray,
     position_ids: Optional[nl.ndarray],
     # Config parameters (replacing dataclass)
     num_layers: int,
@@ -143,9 +143,8 @@ def transformer_tkg(
         V_caches (List[nl.ndarray]): Per-layer V caches on HBM
         RoPE_cos (nl.ndarray): [d_head//2, B, S_tkg], RoPE cosine embeddings
         RoPE_sin (nl.ndarray): [d_head//2, B, S_tkg], RoPE sine embeddings
-        mask_cache (nl.ndarray): Attention mask for cached KV context
-        mask_active (nl.ndarray): Attention mask for active tokens
-        position_ids (Optional[nl.ndarray]): [B, 1], KV cache write positions (None = skip cache update)
+        attention_mask (nl.ndarray): Attention mask (includes cache and active portions)
+        position_ids (Optional[nl.ndarray]): [B, S_tkg], Per-token KV cache write positions (None = skip cache update)
         num_layers (int): Number of transformer layers to execute
         eps (float): RMSNorm epsilon (default 1e-6)
         replica_groups (Optional[List[List[int]]]): Replica groups for collective communication
@@ -195,7 +194,7 @@ def transformer_tkg(
     # Determine quantization type
     rg = nccl.ReplicaGroup(replica_groups) if replica_groups != None else None
 
-    sbm = BufferManager(0, _SBM_SIZE_BYTES, Logger("transformer_tkg"))
+    sbm = BufferManager(0, _SBM_SIZE_BYTES, get_logger("transformer_tkg"))
     sbm.set_auto_alloc(False)
 
     # ==================== Main Loop ====================
@@ -254,7 +253,7 @@ def transformer_tkg(
                 active_blocks_table=None,
                 K_cache=K_cache,
                 V_cache=V_cache,
-                attention_mask=mask,
+                attention_mask=attention_mask,
                 sink=None,
                 update_cache=position_ids != None,
                 kv_cache_update_idx=position_ids,
@@ -352,7 +351,7 @@ def transformer_tkg(
                 active_blocks_table=None,
                 K_cache=K_cache,
                 V_cache=V_cache,
-                attention_mask=mask_cache,
+                attention_mask=attention_mask,
                 sink=None,
                 update_cache=position_ids != None,
                 kv_cache_update_idx=position_ids,

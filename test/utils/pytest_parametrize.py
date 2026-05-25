@@ -16,26 +16,10 @@
 
 import pytest
 
-
-def _fmt_val(v):
-    """Format a parameter value for test ID: bools→int, enums→.value, else str.
-
-    Lists/tuples are joined with 'x' to avoid spaces and commas in test IDs
-    (IDs may be used as folder names).
-    """
-    if isinstance(v, bool):
-        return int(v)
-    if hasattr(v, "value"):
-        return v.value
-    # numpy dtype types (e.g., np.float16) → short name like "float16"
-    if isinstance(v, type) and hasattr(v, "__name__") and hasattr(v, "dtype"):
-        return v.__name__
-    if isinstance(v, (list, tuple)):
-        return "x".join(str(_fmt_val(x)) for x in v)
-    return v
+from .coverage_parametrized_tests import MAX_PATH_COMPONENT_LENGTH, format_param_value
 
 
-def pytest_parametrize(param_names, param_values, abbrevs=None, prefix=None):
+def pytest_parametrize(param_names, param_values, abbrevs=None, prefix=None, test_func_name=None):
     """Drop-in replacement for @pytest.mark.parametrize that auto-generates keyword-prefixed test IDs.
 
     Args:
@@ -44,6 +28,9 @@ def pytest_parametrize(param_names, param_values, abbrevs=None, prefix=None):
         abbrevs: Optional dict mapping full param names to short aliases.
             Example: {"tokens": "t", "hidden": "h"} → "t-4_h-3072" instead of "tokens-4_hidden-3072".
         prefix: Optional string prefix for test IDs (e.g., "manual" → "_manual_cfg__vnc-2_...").
+        test_func_name: Optional test function name for full path component length
+            validation. When provided, validates ``len(test_func_name) + 2 +
+            len(test_id) <= 255``. When ``None``, only the test ID is checked.
 
     Returns:
         pytest.mark.parametrize decorator with auto-generated ids.
@@ -55,15 +42,37 @@ def pytest_parametrize(param_names, param_values, abbrevs=None, prefix=None):
         # Test ID: test_foo[vnc-2_t-4_h-3072]
     """
     names = [n.strip() for n in param_names.split(",")]
+    overhead = len(test_func_name) + 2 if test_func_name else 0
 
     def make_id(params):
         values = params.values if hasattr(params, "values") and not isinstance(params, dict) else params
         parts = []
         for name, val in zip(names, values):
             short = abbrevs.get(name, name) if abbrevs else name
-            parts.append(f"{short}-{_fmt_val(val)}")
+            parts.append(f"{short}-{format_param_value(val)}")
         id_str = "_".join(parts)
-        return f"_{prefix}_{id_str}" if prefix else id_str
+        test_id = f"_{prefix}_{id_str}" if prefix else id_str
+        full_len = overhead + len(test_id)
+        assert full_len <= MAX_PATH_COMPONENT_LENGTH, (
+            f"Test ID length {full_len} exceeds {MAX_PATH_COMPONENT_LENGTH}. "
+            f"Use abbrevs to shorten parameter names. ID: {test_id}"
+        )
+        return test_id
 
     ids = [make_id(p) for p in param_values]
     return pytest.mark.parametrize(param_names, param_values, ids=ids)
+
+
+def tag_params(tag, params):
+    """Prepend a tag value to each param tuple, preserving pytest.param marks.
+
+    Useful for adding a model/group identifier to parametrized test vectors.
+
+    Example::
+
+        SWITCH = [(4, 4096), (1, 1)]
+        DEEP = [pytest.param(2, 4096, marks=pytest.mark.fast)]
+        ALL = tag_params("switch", SWITCH) + tag_params("deep", DEEP)
+        # → [("switch", 4, 4096), ("switch", 1, 1), pytest.param("deep", 2, 4096, marks=fast)]
+    """
+    return [pytest.param(tag, *p.values, marks=p.marks) if hasattr(p, "values") else (tag,) + p for p in params]

@@ -51,6 +51,15 @@ _MAX_D_HEAD = 128
 _MAX_S_PRIOR_ACCURATE_ROPE = 2**17
 
 _MIN_FLOAT32 = float(np.finfo(np.float32).min)
+_MAX_FLOAT32 = float(np.finfo(np.float32).max)
+
+# Sentinel value for inactive block slots in active_blocks_table.
+# A batch only needs ceil((prior_tokens + active_tokens) / block_len) blocks;
+# remaining ABT slots use this value. Indirect DMA loads of the KV cache use
+# oob_mode.skip to skip these entries (since -1 is out of bounds), avoiding
+# wasted memory bandwidth. The attention mask ensures they don't contribute
+# to the output.
+INACTIVE_BLOCK_IDX = np.int32(-1)
 
 
 def attention_tkg(
@@ -312,7 +321,9 @@ def attention_tkg(
     if DBG_TENSORS:
         _setup_debug_tensors(DBG_TENSORS, atp, TC, bufs)
 
-    bufs.one_vec = sbm.alloc_stack((TC.p_max, 1), dtype=atp.io_type, buffer=nl.sbuf, align=2)
+    bufs.one_vec = sbm.alloc_stack(
+        (TC.p_max, 1), dtype=atp.io_type, buffer=nl.sbuf, align=4
+    )  # align to 4 bytes to prevent race condition (TODO: fix properly in NKILIB-876)
     nisa.memset(bufs.one_vec, value=1.0)
 
     # Load position IDs (needed for RoPE and mask generation)
@@ -818,7 +829,9 @@ def _compute_tile_params(
 
     # Get shapes and dtypes
     atp.k_prior_load_type = nl.bfloat16 if atp.is_fp8_kv else k_prior.dtype
-    atp.use_dma_transpose = (cfg.d_head == 128) and (sizeinbytes(atp.k_prior_load_type) == 2) and not atp.is_fp8_kv
+    atp.use_dma_transpose = (
+        (sizeinbytes(atp.k_prior_load_type) == 2) and not atp.is_fp8_kv
+    )  # use_dma_transpose may be further disabled in _setup_block_kv_cache for small block_len configs
     atp.io_type = q.dtype
     atp.inter_type = nl.float32
     atp.bs_full = cfg.bs
@@ -884,11 +897,14 @@ def _setup_block_kv_cache(
     is less than 128, resizes block_len to make blocks per batch a multiple of 128 for optimal performance.
     Loads and reshapes the active blocks table to track which cache blocks are active per batch.
     """
-    # Active blocks table must be uint32 to enable indirect dma_transpose with vector offset
-    kernel_assert(
-        active_blocks_table.dtype == nl.uint32,
-        f"active_blocks_table must have dtype uint32 for block KV cache. Got {active_blocks_table.dtype}.",
-    )
+    # Active blocks table is int32 with INACTIVE_BLOCK_IDX (-1) for invalid/padding blocks.
+    # When use_dma_transpose is enabled, we convert to uint32
+    # When use_dma_transpose is disabled, int32 indices with -1 enable oob_mode.skip in dma_copy.
+    if active_blocks_table.dtype != nl.int32:
+        print(
+            f"WARNING: active_blocks_table dtype is {active_blocks_table.dtype}, not int32. "
+            f"Use int32 with -1 for OOB indices to take advantage of DMA skipping."
+        )
     # Check shapes
     kernel_assert(not cfg.strided_mm1, f"Block KV requires MM1 to not be strided.")
     kernel_assert(cfg.tp_k_prior, f"Block KV requires k_prior to not be transposed.")
@@ -939,8 +955,10 @@ def _setup_block_kv_cache(
         enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
     )
 
-    # dma_transpose overhead outweighs benefits for small block lengths
-    if block_len < 8:
+    # Disable dma_transpose when block_len is very small, or block_len, d_head, and batches per core are all small on LNC2.
+    # For these configs the DMA transpose overhead outweighs the benefits because there are too few batches to pipeline DMA bursts
+    # and small block_len leads to too many folds per batch.
+    if (block_len < 8) or (block_len <= 16 and cfg.d_head <= 16 and atp.bs < 4 and atp.n_prgs == 2):
         atp.use_dma_transpose = False
 
     # assign to atp (can't do directly because function return value cannot be assigned to object)
@@ -1637,7 +1655,12 @@ def _compute_qk_matmul(
                 )
 
                 if atp.use_dma_transpose:
-                    # DMA transpose path: single indirect DMA transpose per fold
+                    # DMA transpose path: single indirect DMA transpose per fold.
+                    # dma_transpose requires uint32 indices, but active_blocks_sb is kept
+                    # as int32 so V's dma_copy can use oob_mode.skip with -1 sentinels.
+                    # Cast per-fold: int32(-1) → float32(-1.0) → uint32(0).
+                    cur_blks_u32 = nl.ndarray((TC.p_max, 1), dtype=nl.uint32, buffer=nl.sbuf)
+                    nisa.tensor_copy(cur_blks_u32, cur_blks, engine=nisa.vector_engine)
                     # Note that indirect dma_transpose requires src to be a 4-d tile (in addition to other constraints for src and the indices)
                     nisa.dma_transpose(
                         dst=(
@@ -1656,7 +1679,7 @@ def _compute_qk_matmul(
                                 [1, cfg.d_head],
                             ],
                             offset=0,
-                            vector_offset=cur_blks,
+                            vector_offset=cur_blks_u32,
                             indirect_dim=0,
                         ),
                         axes=(3, 1, 2, 0),
@@ -1669,8 +1692,12 @@ def _compute_qk_matmul(
                         dtype=atp.k_prior_load_type,
                         buffer=nl.sbuf,
                     )
-
-                    # No memset needed: OOB blocks copy dummy values that are later masked out
+                    # Memset K to 0 for easier accuracy debug: not strictly necessary since runtime does not
+                    # throw NaN errors by default, and the QK result for skipped blocks is masked
+                    # to -inf by the attention mask (so NaN from stale K data doesn't propagate).
+                    # Can be removed for max perf since the NaN result is not copied back, and
+                    # the SBUF value stays as -inf after softmax masking.
+                    nisa.memset(k_loaded, value=0)
                     nisa.dma_copy(
                         dst=k_loaded,
                         # TODO: Port to TensorView once dynamic vector_offset is supported
@@ -1683,7 +1710,7 @@ def _compute_qk_matmul(
                             vector_offset=cur_blks,
                             indirect_dim=0,
                         ),
-                        oob_mode=oob_mode.error,
+                        oob_mode=oob_mode.skip,
                         name=f"k_prior_block_load_indirect_fa{fa_ctx.fa_tile_idx}_b{i_b}_f{i_fold}_bt{btc.batch_tile_idx}",
                     )
 
@@ -2147,6 +2174,7 @@ def _cascaded_max_reduce(
     #             Negate if we are doing the reduction to save one op for sink exponential.
     # Do this only if syncing softmax per tile (not deferring to FA finalization)
     atp.max_negated = False
+    tile_max = bufs.qk_max_buf[: atp.s_active_bqh_tile, : atp.n_bsq_tiles]
     if atp.softmax_final_reduction_length > 1 and atp.sync_softmax_per_fa_tile:
         atp.max_negated = True
         for i_bsq_tile in range(atp.n_bsq_tiles):
@@ -2157,7 +2185,7 @@ def _cascaded_max_reduce(
                 .select(2, i_bsq_tile)
             )
             nisa.tensor_reduce(
-                bufs.qk_max_buf[: atp.s_active_bqh_tile, i_bsq_tile],
+                tile_max[:, i_bsq_tile],
                 data=qk_max_buf_view.get_view(),
                 op=nl.maximum,
                 axis=1,
@@ -2166,7 +2194,9 @@ def _cascaded_max_reduce(
     elif sink is not None and atp.use_fa and atp.sprior_n_prgs == 1:
         # need to negate in tile > 0 for consistency with 0th tile even though no sink
         atp.max_negated = True
-        nisa.tensor_scalar(bufs.qk_max_buf, bufs.qk_max_buf, op0=nl.multiply, operand0=-1)
+        nisa.tensor_scalar(tile_max, tile_max, op0=nl.multiply, operand0=-1)
+
+    _clamp_max_to_finite(dst=tile_max, src=tile_max, max_negated=atp.max_negated)
 
     # Step 2.3.4 Update FA running max (if FA enabled)
     if atp.use_fa:
@@ -2292,7 +2322,6 @@ def _transpose_broadcast_max(
 ):
     """Step 2.4. Tranpose and broadcast along pdim -> [128, bs * s_active_qh]"""
     sbm.open_scope()
-    qk_max_buf_copy = sbm.alloc_stack((tile_size, 1), dtype=bufs.qk_max_buf.dtype)
     qk_max_copy = sbm.alloc_stack((TC.p_max, tile_size), dtype=bufs.qk_max.dtype)
 
     # For FA, use running max instead of tile max for exp computation
@@ -2301,12 +2330,9 @@ def _transpose_broadcast_max(
     else:
         max_src_tensor = bufs.qk_max_buf[:tile_size, nl.ds(index, 1)]
 
-    # Clamp -inf to min float (if all values are -inf, qk - qk_max => -inf - (-inf) = nan, PROBLEM!)
-    nisa.tensor_scalar(qk_max_buf_copy, max_src_tensor, op0=nl.maximum, operand0=_MIN_FLOAT32)
-
     # FIXME: a hack was put into the tp_broadcast
     tp_broadcast(
-        src=qk_max_buf_copy, dst=qk_max_copy, src_offset=0, psum_address=None if sbm.is_auto_alloc() else (0, 0)
+        src=max_src_tensor, dst=qk_max_copy, src_offset=0, psum_address=None if sbm.is_auto_alloc() else (0, 0)
     )
     nisa.tensor_copy(
         bufs.qk_max[:, nl.ds(index * atp.s_active_bqh_tile, tile_size)],
@@ -2709,6 +2735,9 @@ def _compute_pv_matmul_and_store(
             fold_end = div_ceil(fa_tile_offset + fa_tile_s_prior, fold_s_prior)
             num_folds_this_tile = fold_end - fold_start
 
+            # This memset is required for oob skip to prevent uninitialized NaNs from corrupting results
+            nisa.memset(v_sb, value=0)
+
             sbm.open_scope()
             for i_fold_rel in range(num_folds_this_tile):
                 i_fold = fold_start + i_fold_rel
@@ -2742,7 +2771,7 @@ def _compute_pv_matmul_and_store(
                         vector_offset=cur_blks,
                         indirect_dim=0,
                     ),
-                    oob_mode=oob_mode.error,
+                    oob_mode=oob_mode.skip,
                     name=f"v_prior_block_load_indirect_fa{fa_ctx.fa_tile_idx}_b{i_b}_f{i_fold}_bt{btc.batch_tile_idx}",
                 )
             sbm.close_scope()
@@ -3604,3 +3633,17 @@ def _get_safe_batch_interleave_degree(space_needed_per_batch: int, max_batch_int
 def pad_partitions_for_ext_inst(partitions):
     PARTITIONS_PER_GPSIMD_CORE = 16
     return (partitions + PARTITIONS_PER_GPSIMD_CORE - 1) // PARTITIONS_PER_GPSIMD_CORE * PARTITIONS_PER_GPSIMD_CORE
+
+
+def _clamp_max_to_finite(dst: nl.ndarray, src: nl.ndarray, max_negated: bool = False):
+    """Clamp infinite max values to finite bounds to prevent NaN in exp(a - b).
+
+    Fully masked tiles produce -Inf (or +Inf when negated) as the softmax max.
+    When computing exp(prev_max - curr_max), -Inf - (-Inf) = NaN per IEEE 754.
+    Clamping to a finite bound ensures exp produces 0 instead.
+
+    When max_negated=False: -Inf -> _MIN_FLOAT32 (clamp up via maximum)
+    When max_negated=True:  +Inf -> _MAX_FLOAT32 (clamp down via minimum)
+    """
+    op, bound = (nl.minimum, _MAX_FLOAT32) if max_negated else (nl.maximum, _MIN_FLOAT32)
+    nisa.tensor_scalar(dst, src, op0=op, operand0=bound)

@@ -17,10 +17,11 @@ import neuron_dtypes as dt
 import nki.language as nl
 import numpy as np
 import torch
+from scipy.special import erf, expit
+
 from nkilib_src.nkilib.core.subkernels.layernorm_torch import layer_norm_torch_ref
 from nkilib_src.nkilib.core.subkernels.rmsnorm_torch import rms_norm_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import ActFnType, NormType
-from scipy.special import erf, expit
 
 
 def rms_norm(hidden, gamma, eps=1e-6, hidden_actual=None, **_):

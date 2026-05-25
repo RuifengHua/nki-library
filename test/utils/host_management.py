@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import functools
 import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import time
@@ -28,14 +30,14 @@ from filelock import FileLock
 from paramiko import SSHException
 from typing_extensions import override
 
+from . import core_lock_client as lock_client
 from .common_dataclasses import INF_ARTIFACT_DIR_NAME, NeuronDeviceInfo, Platforms, TargetHost
-from .core_lock_client import get_host_locking_version
+from .core_lock_client import REMOTE_LOCKS_JSON
 from .core_lock_manager import (
     CoreAllocation,
     CoreLockManager,
     LockAcquisitionError,
     LockVersionError,
-    check_lock_version,
 )
 from .exceptions import (
     InferenceException,
@@ -46,8 +48,10 @@ from .exceptions import (
     UnimplementedException,
 )
 from .metrics_collector import IMetricsCollector, MetricName
+from .remote_executor import RemoteExecutor
 from .resources import RemoteDirectory
 from .s3_utils import S3ArtifactUploadConfig
+from .scripts.remote_lock_scripts import LockState, find_contiguous_cores
 
 
 @contextlib.contextmanager
@@ -61,8 +65,59 @@ def temporary_random_seed(seed: int) -> Generator[None, None, None]:
         random.setstate(state)
 
 
+@functools.lru_cache(maxsize=1)
+def _run_neuron_ls(neuron_installation_path: str) -> list[dict] | None:
+    """Run neuron-ls --json-output and return parsed JSON, or None on failure."""
+    try:
+        neuron_ls_path = os.path.join(neuron_installation_path, "neuron-ls")
+        if not os.path.isfile(neuron_ls_path):
+            return None
+        result = subprocess.run(
+            [neuron_ls_path, "--json-output"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            if data:
+                return data
+        return None
+    except Exception:
+        return None
+
+
+def detect_local_neuron_devices(neuron_installation_path: str) -> bool:
+    """Check if local Neuron devices are available via neuron-ls.
+
+    Returns False gracefully if neuron-ls is not installed, times out, or finds no devices.
+    """
+    return _run_neuron_ls(neuron_installation_path) is not None
+
+
+def detect_local_platform(neuron_installation_path: str) -> Platforms | None:
+    """Detect the local Neuron platform type from neuron-ls instance_type.
+
+    Returns the Platforms enum value, or None if detection fails.
+    """
+    data = _run_neuron_ls(neuron_installation_path)
+    if not data:
+        return None
+
+    instance_type = data[0].get("instance_type", "")
+    # instance_type is e.g. "trn2.48xlarge" or "trn3pds.48xlarge" — extract "trn" + digits
+    match = re.match(r"(trn\d+)", instance_type)
+    if not match:
+        logging.warning(f"Unknown platform from instance_type '{instance_type}', cannot auto-detect")
+        return None
+    try:
+        return Platforms(match.group(1))
+    except ValueError:
+        logging.warning(f"Unknown platform from instance_type '{instance_type}', cannot auto-detect")
+        return None
+
+
 class Host(ABC):
-    @abstractmethod
     def execute_command(
         self,
         command: str,
@@ -72,7 +127,57 @@ class Host(ABC):
         lnc_config: int,
         do_copy_artifacts: bool = False,
         get_list_of_files_to_copy: Callable[[str], list[str]] | None = None,
+        post_lock_command: str | None = None,
     ) -> str | None:
+        with self.get_core_allocation(
+            collective_ranks=collective_ranks, lnc_config=lnc_config, collector=collector
+        ) as core_allocation:
+            with collector.timer(MetricName.CORE_LOCK_HOLD_TIME):
+                unique_port = self._get_unique_collectives_port(core_allocation.logical_core_ids[0])
+                neuron_env = self._build_neuron_env(
+                    core_allocation,
+                    lnc_config,
+                    unique_port,
+                    self._get_debug_output_dir(target_directory),
+                )
+
+                stdout = self._run_command(command, target_directory, neuron_env, collector)
+
+        if post_lock_command:
+            if self._should_run_post_lock():
+                post_lock_stdout = self._run_post_lock_command(post_lock_command, target_directory, collector)
+                stdout = stdout + "\n" + post_lock_stdout
+            else:
+                logging.error("Skipping post-lock commands: host is draining")
+
+        if do_copy_artifacts:
+            return self._collect_artifacts(target_directory, stdout, get_list_of_files_to_copy, collector)
+        return None
+
+    @abstractmethod
+    def _get_debug_output_dir(self, target_directory: str) -> str:
+        raise UnimplementedException()
+
+    @abstractmethod
+    def _run_command(
+        self,
+        command: str,
+        target_directory: str,
+        neuron_env: dict[str, str],
+        collector: IMetricsCollector,
+    ) -> str:
+        """Run the command on the host and return stdout."""
+        raise UnimplementedException()
+
+    @abstractmethod
+    def _collect_artifacts(
+        self,
+        target_directory: str,
+        stdout: str,
+        get_list_of_files_to_copy: Callable[[str], list[str]] | None,
+        collector: IMetricsCollector,
+    ) -> str:
+        """Download/copy artifacts and return the local artifact directory path."""
         raise UnimplementedException()
 
     @abstractmethod
@@ -112,6 +217,20 @@ class Host(ABC):
         raise UnimplementedException()
 
     @abstractmethod
+    def _run_post_lock_command(
+        self,
+        command: str,
+        target_directory: str,
+        collector: IMetricsCollector,
+    ) -> str:
+        """Run a command that does NOT require Neuron hardware, after core lock release."""
+        raise UnimplementedException()
+
+    def _should_run_post_lock(self) -> bool:
+        """Check if post-lock commands should run. Override to check drain state."""
+        return True
+
+    @abstractmethod
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
         raise UnimplementedException()
 
@@ -119,33 +238,150 @@ class Host(ABC):
     def get_host_id(self) -> str:
         raise UnimplementedException()
 
+    @staticmethod
+    def _get_unique_collectives_port(core_id: int) -> int:
+        """Generate unique port for collectives coordination based on first allocated core.
+
+        This ensures parallel tests don't conflict on the same port.
+        E.g., test on cores [8, 9] gets port 61242, test on cores [16, 17] gets port 61250.
+        """
+        return 61234 + core_id
+
+    @staticmethod
+    def _build_neuron_env(
+        core_allocation: CoreAllocation,
+        lnc_config: int,
+        unique_port: int,
+        debug_output_dir: str,
+    ) -> dict[str, str]:
+        """Build the common Neuron runtime environment variables for execution."""
+        return {
+            "NEURON_RT_ENABLE_OCP": "1",
+            "NEURON_RT_ENABLE_OCP_SATURATION": "1",
+            "NEURON_RT_VISIBLE_CORES": core_allocation.get_core_list_str(),
+            "NEURON_LOGICAL_NC_CONFIG": str(lnc_config),
+            "NEURON_RT_ROOT_COMM_ID": f"localhost:{unique_port}",
+            "NEURON_RT_DEBUG_OUTPUT_DIR": debug_output_dir,
+        }
+
     def __lock__(self, lock_file_path: str, timeout_seconds: int):
         return FileLock(f"{lock_file_path}.lock", timeout=timeout_seconds * 1000)
 
 
 @final
 class LocalHost(Host):
-    def __init__(self, local_neuron_installation_path: str, host_id: str):
+    def __init__(self, local_neuron_installation_path: str, host_id: str, core_allocation_dir: str):
         super().__init__()
         self.neuron_ls_path: str = os.path.join(local_neuron_installation_path, "neuron-ls")
         self.host_id: str = host_id
+        self.core_allocation_dir: str = core_allocation_dir
+        self._core_state_path: str = os.path.join(core_allocation_dir, "local_core_locks.json")
 
     @override
     def get_host_id(self) -> str:
         return self.host_id
 
+    @staticmethod
+    def _check_no_remote_locks() -> None:
+        """Raise if this machine has active remote SSH-based core locks (locks.json)."""
+        if not os.path.isfile(REMOTE_LOCKS_JSON):
+            return
+        try:
+            with open(REMOTE_LOCKS_JSON, "r") as f:
+                data = json.load(f)
+            state = LockState.from_dict(data, default_version=2)
+            active = state.get_locked_cores(int(time.time()))
+            if active:
+                raise RuntimeError(
+                    f"Active remote core locks found in {REMOTE_LOCKS_JSON} (cores: {active}). "
+                    "This machine appears to be in use as a shared fleet host via SSH. "
+                    "Local testing is not supported on shared fleet instances to avoid core allocation conflicts."
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
     @override
-    def execute_command(
+    def _get_debug_output_dir(self, target_directory: str) -> str:
+        return os.path.join(target_directory, "debug_output")
+
+    @override
+    def _run_command(
+        self,
+        command: str,
+        target_directory: str,
+        neuron_env: dict[str, str],
+        collector: IMetricsCollector,
+    ) -> str:
+        env = os.environ.copy()
+        env.update(neuron_env)
+
+        full_command = f"set -o pipefail; cd {target_directory} && {command}"
+        logging.info(
+            f"Executing local command: {full_command} "
+            f"with NEURON_RT_VISIBLE_CORES={env.get('NEURON_RT_VISIBLE_CORES')} "
+            f"NEURON_LOGICAL_NC_CONFIG={env.get('NEURON_LOGICAL_NC_CONFIG')}"
+        )
+
+        with collector.timer(MetricName.INFERENCE_TIME):
+            result = subprocess.run(
+                ["bash", "-c", full_command],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+        if result.returncode != 0:
+            raise LocalExecutionException(
+                f"Unable to execute {command} in {target_directory}",
+                result,
+            )
+        return result.stdout
+
+    @override
+    def _run_post_lock_command(
         self,
         command: str,
         target_directory: str,
         collector: IMetricsCollector,
-        collective_ranks: int,
-        lnc_config: int,
-        do_copy_artifacts: bool = False,
-        get_list_of_files_to_copy: Callable[[str], list[str]] | None = None,
-    ) -> str | None:
-        pass
+    ) -> str:
+        full_command = f"set -o pipefail; cd {target_directory} && {command}"
+        logging.info(f"Executing local post-lock command: {full_command}")
+
+        result = subprocess.run(
+            ["bash", "-c", full_command],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise LocalExecutionException(
+                f"Post-lock command failed in {target_directory}",
+                result,
+            )
+        return result.stdout
+
+    @override
+    def _collect_artifacts(
+        self,
+        target_directory: str,
+        stdout: str,
+        get_list_of_files_to_copy: Callable[[str], list[str]] | None,
+        collector: IMetricsCollector,
+    ) -> str:
+        local_download_location = os.path.join(target_directory, INF_ARTIFACT_DIR_NAME)
+        os.makedirs(local_download_location, exist_ok=True)
+
+        if get_list_of_files_to_copy:
+            files_to_copy = get_list_of_files_to_copy(stdout)
+            for f in files_to_copy:
+                src = os.path.join(target_directory, f)
+                dst = os.path.join(local_download_location, f)
+                if os.path.exists(src) and os.path.abspath(src) != os.path.abspath(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.move(src, dst)
+
+        return local_download_location
 
     @override
     @contextlib.contextmanager
@@ -168,10 +404,102 @@ class LocalHost(Host):
         timeout_seconds: int = 9000,
         poll_period_seconds: int = 5,
     ) -> Generator[CoreAllocation, None, None]:
-        # TODO: this needs to be fixed
-        yield CoreAllocation(
-            host_id=self.host_id, logical_core_ids=list(range(collective_ranks)), lnc_config=lnc_config
-        )
+        # Guard against running LocalHost on a machine also used as a remote SshHost target.
+        # SshHost uses locks.json for core locking — if it has active (non-expired) locks,
+        # another user is running tests via SSH and our local locks won't coordinate with theirs.
+        self._check_no_remote_locks()
+
+        with collector.timer(MetricName.CORE_ALLOCATION_TIME):
+            devices = self.get_neuron_device_info()
+            # neuron-ls returns logical core IDs; multiply by lnc_config to get physical count
+            device_lnc = devices[0].logical_neuroncore_config if devices else lnc_config
+            total_physical_cores = sum(len(d.neuroncore_ids) * device_lnc for d in devices)
+
+            # We lock at the physical core level to prevent conflicts between
+            # LNC1 and LNC2 tests (same approach as SshHost/CoreLockManager).
+            num_physical_needed = collective_ranks * lnc_config
+
+            if num_physical_needed > total_physical_cores:
+                raise NoNeuronDevicesException(
+                    f"Requested {collective_ranks} logical cores (lnc{lnc_config} = {num_physical_needed} physical) "
+                    f"but only {total_physical_cores} physical cores available on {self.host_id}"
+                )
+
+            os.makedirs(self.core_allocation_dir, exist_ok=True)
+            lock = self.__lock__(self._core_state_path, timeout_seconds)
+            allocated_physical: list[int] = []
+            pid = os.getpid()
+
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                with lock.acquire():
+                    state = self._read_core_state(total_physical_cores)
+                    self._purge_stale_owners(state)
+                    all_physical = list(range(total_physical_cores))
+                    available = [c for c in all_physical if c not in state["in_use"]]
+
+                    # Find a contiguous, aligned block of physical cores
+                    result = find_contiguous_cores(available, num_physical_needed, total_physical_cores)
+                    if result:
+                        allocated_physical = result
+                        state["in_use"].extend(allocated_physical)
+                        state.setdefault("owners", {})[str(pid)] = allocated_physical
+                        self._write_core_state(state)
+                        break
+
+                logging.info(
+                    f"Waiting for {num_physical_needed} physical cores (lnc{lnc_config}), "
+                    f"{len(available)} available. Retrying in {poll_period_seconds}s..."
+                )
+                time.sleep(poll_period_seconds)
+            else:
+                raise TimeoutException(
+                    f"Timed out waiting for {num_physical_needed} physical cores on {self.host_id} "
+                    f"after {timeout_seconds}s"
+                )
+
+        # Convert physical core IDs to logical core IDs (same logic as CoreLockManager)
+        logical_cores = CoreLockManager._physical_to_logical_cores(allocated_physical, lnc_config)
+
+        try:
+            yield CoreAllocation(host_id=self.host_id, logical_core_ids=logical_cores, lnc_config=lnc_config)
+        finally:
+            with lock.acquire():
+                state = self._read_core_state(total_physical_cores)
+                for core in allocated_physical:
+                    if core in state["in_use"]:
+                        state["in_use"].remove(core)
+                state.get("owners", {}).pop(str(pid), None)
+                self._write_core_state(state)
+
+    @staticmethod
+    def _purge_stale_owners(state: dict) -> None:
+        """Remove core reservations from PIDs that no longer exist."""
+        owners = state.get("owners", {})
+        stale_pids = []
+        for pid_str, cores in owners.items():
+            try:
+                os.kill(int(pid_str), 0)
+            except OSError:
+                stale_pids.append(pid_str)
+        for pid_str in stale_pids:
+            stale_cores = owners.pop(pid_str)
+            for core in stale_cores:
+                if core in state["in_use"]:
+                    state["in_use"].remove(core)
+            logging.warning(f"Purged stale core locks from dead PID {pid_str}: cores {stale_cores}")
+
+    def _read_core_state(self, total_physical_cores: int) -> dict:
+        """Read or initialize the local core allocation state file."""
+        if os.path.exists(self._core_state_path):
+            with open(self._core_state_path, "r") as f:
+                return json.load(f)
+        return {"total_physical_cores": total_physical_cores, "in_use": []}
+
+    def _write_core_state(self, state: dict) -> None:
+        """Write the local core allocation state file."""
+        with open(self._core_state_path, "w") as f:
+            json.dump(state, f)
 
     @override
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
@@ -184,8 +512,7 @@ class LocalHost(Host):
 
 @final
 class SshHost(Host):
-    # Default timeout for core locks (in minutes)
-    DEFAULT_CORE_LOCK_TIMEOUT_MINUTES = 1
+    SSH_CONNECT_TIMEOUT_SECONDS = 10
 
     def __init__(
         self,
@@ -206,6 +533,7 @@ class SshHost(Host):
 
         self.connection: fabric2.Connection = fabric2.Connection(
             host=ssh_alias,
+            connect_timeout=SshHost.SSH_CONNECT_TIMEOUT_SECONDS,
             config=fabric2.Config(
                 runtime_ssh_path=ssh_config_path,
                 overrides=config_overrides,
@@ -215,86 +543,108 @@ class SshHost(Host):
         self.remote_full_path: str | None = None
 
         self.lock_file_path: str = os.path.join(test_base_path, self.ssh_alias)
-        self.core_allocation_file: str = os.path.join(test_base_path, f"{self.ssh_alias}_core_allocation.json")
-        self.remote_lock_dir: str = "/tmp/neuronx-cc/core_locks"
-        self._lock_system_initialized: bool = False
-        # New locking system (v2+)
-        self._core_lock_manager: CoreLockManager | None = None
         self._total_physical_cores: int | None = None
-
+        self._remote_executor = None
+        self._host_locking_version: int | None = None
         self.neuron_ls_path: str = os.path.join(remote_neuron_install_dir, "neuron-ls")
+        # Cached for the lifetime of this SshHost — device topology is assumed stable during a test run.
+        self._cached_device_info: list[NeuronDeviceInfo] | None = None
 
     @override
     def get_host_id(self) -> str:
         return self.ssh_alias
 
-    @staticmethod
-    def __get_unique_collectives_port__(core_id: int) -> int:
-        """Generate unique port for collectives coordination based on first allocated core.
+    @override
+    def _get_debug_output_dir(self, target_directory: str) -> str:
+        return "$(pwd)/debug_output"
 
-        This ensures parallel tests don't conflict on the same port.
-        E.g., test on cores [8, 9] gets port 61242, test on cores [16, 17] gets port 61250.
-        """
-        return 61234 + core_id
+    def _get_remote_executor(self) -> RemoteExecutor:
+        """Lazily create a RemoteExecutor for this host's connection."""
+        if self._remote_executor is None:
+            self._remote_executor = RemoteExecutor(self.connection)
+        return self._remote_executor
+
+    def _reconnect(self):
+        """Reconnect SSH and rebuild the remote executor."""
+        self.connection.close()
+        self.connection.open()
+        self._remote_executor = RemoteExecutor(self.connection)
 
     @override
-    def execute_command(
+    def _run_command(
+        self,
+        command: str,
+        target_directory: str,
+        neuron_env: dict[str, str],
+        collector: IMetricsCollector,
+    ) -> str:
+        assert self.remote_full_path is not None, "You have to prepare host first!"
+
+        env_var = " && ".join(f'export {k}="{v}"' for k, v in neuron_env.items())
+        full_command = self.inside_venv(f"set -o pipefail; cd {self.remote_full_path} && {env_var} && {command}")
+        logging.info(f"Executing remote command: {full_command}")
+
+        result: fabric2.Result = self.connection.run(full_command)
+
+        if result.failed:
+            # Log PATH on remote host to help debug missing tools issues
+            path_result = self.connection.run("echo DIAGNOSTIC: PATH=$PATH", warn=True)
+            logging.warning(
+                f"Remote PATH on {self.ssh_alias}: {path_result.stdout.strip() if path_result.ok else 'FAILED TO GET PATH'}"
+            )
+            raise RemoteExecutionException(f"Unable to execute {command} in {self.remote_full_path}", result)
+
+        return result.stdout
+
+    @override
+    def _run_post_lock_command(
         self,
         command: str,
         target_directory: str,
         collector: IMetricsCollector,
-        collective_ranks: int,
-        lnc_config: int,
-        do_copy_artifacts: bool = False,
-        get_list_of_files_to_copy: Callable[[str], list[str]] | None = None,
-    ) -> str | None:
+    ) -> str:
         assert self.remote_full_path is not None, "You have to prepare host first!"
 
-        logging.info(f"Attempting to run {command=} on {self.ssh_alias=}")
+        full_command = self.inside_venv(f"set -o pipefail; cd {self.remote_full_path} && {command}")
+        logging.info(f"Executing remote post-lock command: {full_command}")
 
-        # Common env var for every run
-        common_env_var = "export NEURON_RT_ENABLE_OCP=1 && export NEURON_RT_ENABLE_OCP_SATURATION=1 && export NEURON_RT_DEBUG_OUTPUT_DIR=\"$(pwd)/debug_output\""
+        result: fabric2.Result = self.connection.run(full_command)
 
-        with self.get_core_allocation(
-            collective_ranks=collective_ranks, lnc_config=lnc_config, collector=collector
-        ) as core_allocation:
-            unique_port = self.__get_unique_collectives_port__(core_allocation.logical_core_ids[0])
+        if result.failed:
+            raise RemoteExecutionException(f"Post-lock command failed in {self.remote_full_path}", result)
 
-            # This env var sets which core will be used for this command
-            env_var = (
-                f"{common_env_var}"
-                f" && export NEURON_RT_VISIBLE_CORES={core_allocation.get_core_list_str()}"
-                f" && export NEURON_LOGICAL_NC_CONFIG={lnc_config}"
-                # NEURON_RT_ROOT_COMM_ID is needed for collectives coordination (when collective_ranks > 1)
-                f" && export NEURON_RT_ROOT_COMM_ID=localhost:{unique_port}"
-            )
-            full_command = self.inside_venv(f"set -o pipefail; cd {self.remote_full_path} && {env_var} && {command}")
-            logging.info(f"Executing remote command: {full_command}")
+        return result.stdout
 
-            result: fabric2.Result = self.connection.run(full_command)
+    @override
+    def _should_run_post_lock(self) -> bool:
+        if self._host_locking_version is None:
+            return True
+        try:
+            return not lock_client.is_draining(self._get_remote_executor(), self._host_locking_version)
+        except Exception as e:
+            logging.warning(f"[{self.ssh_alias}] Failed to check drain state: {e}")
+            return True
 
-            if result.failed:
-                # Log PATH on remote host to help debug missing tools issues
-                path_result = self.connection.run("echo DIAGNOSTIC: PATH=$PATH", warn=True)
-                logging.warning(
-                    f"Remote PATH on {self.ssh_alias}: {path_result.stdout.strip() if path_result.ok else 'FAILED TO GET PATH'}"
-                )
+    @override
+    def _collect_artifacts(
+        self,
+        target_directory: str,
+        stdout: str,
+        get_list_of_files_to_copy: Callable[[str], list[str]] | None,
+        collector: IMetricsCollector,
+    ) -> str:
+        assert self.remote_full_path is not None, "You have to prepare host first!"
 
-                raise RemoteExecutionException(f"Unable to execute {command} in {self.remote_full_path}", result)
+        local_download_location = os.path.join(target_directory, INF_ARTIFACT_DIR_NAME)
+        # Clean up any existing infer_result directory from previous failed/retry attempts
+        shutil.rmtree(local_download_location, ignore_errors=True)
 
-        if do_copy_artifacts:
-            local_download_location = os.path.join(target_directory, INF_ARTIFACT_DIR_NAME)
-            # Clean up any existing infer_result directory from previous failed/retry attempts
-            shutil.rmtree(local_download_location, ignore_errors=True)
-
-            return self.__download_artifacts__(
-                remote_path=self.remote_full_path,
-                local_path=local_download_location,
-                list_of_files_to_copy=(get_list_of_files_to_copy(result.stdout) if get_list_of_files_to_copy else None),
-                collector=collector,
-            )
-        else:
-            return None
+        return self.__download_artifacts__(
+            remote_path=self.remote_full_path,
+            local_path=local_download_location,
+            list_of_files_to_copy=(get_list_of_files_to_copy(stdout) if get_list_of_files_to_copy else None),
+            collector=collector,
+        )
 
     def __download_artifacts__(
         self,
@@ -374,7 +724,9 @@ class SshHost(Host):
         assert self.remote_full_path
         return f"source {self.remote_full_path}/.venv/bin/activate && {command}"
 
-    def __run_with_retry__(self, command: str, max_retries: int = 5, base_delay: float = 1.0) -> fabric2.Result:
+    def __run_with_retry__(
+        self, command: str, max_retries: int = 5, base_delay: float = 1.0, hide: bool = False
+    ) -> fabric2.Result:
         """
         Execute SSH command with exponential backoff retry logic to avoid SSH rate limiting.
         """
@@ -383,385 +735,24 @@ class SshHost(Host):
         for attempt in range(max_retries):
             try:
                 logging.info(f"Executing remote command (attempt {attempt + 1}): {command}")
-                result = self.connection.run(command)
+                result = self.connection.run(command, hide=hide)
                 return result
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise
+                if isinstance(e, (SSHException, OSError)):
+                    logging.warning(f"SSH connection error (attempt {attempt + 1}): {e}. Reconnecting...")
+                    try:
+                        self._reconnect()
+                    except Exception:
+                        pass
+                else:
+                    logging.warning(f"Non-SSH error (attempt {attempt + 1}): {e}. Retrying...")
                 # Exponential backoff with jitter
                 delay = base_delay * (2**attempt) + random.uniform(0, 1)
                 time.sleep(delay)
 
         raise Exception("Retry logic failed unexpectedly")
-
-    def __initialize_remote_lock_dir__(self):
-        """
-        Initialize remote core lock directory on remote host.
-        Should only be called once per SshHost instance.
-        """
-        logging.info(f"Initializing remote lock directory {self.remote_lock_dir} on {self.ssh_alias}")
-        # Create with global permissions so any user can use the shared lock directory
-        # Also create atomic_lock file for flock-based coordination
-        result = self.connection.run(
-            f"mkdir -p -m 777 {self.remote_lock_dir} && touch {self.remote_lock_dir}/atomic_lock && chmod 666 {self.remote_lock_dir}/atomic_lock 2>/dev/null || true",
-            warn=True,
-        )
-        if result.failed:
-            raise RemoteExecutionException(f"Failed to create remote lock directory {self.remote_lock_dir}", result)
-
-        # Check infrastructure version compatibility before any locking operations
-        check_lock_version(self.connection)
-
-        self.__cleanup_stale_remote_locks__()
-
-    def __cleanup_stale_remote_locks__(self):
-        """
-        Clean up stale remote locks based on per-lock timeout.
-        """
-        logging.info(f"Cleaning up stale locks on {self.ssh_alias}")
-        # Loops through all lock directories, extracts timeout from name, deletes if stale
-        cleanup_script = f"""
-        for lock_dir in {self.remote_lock_dir}/core_*_timeout_*m {self.remote_lock_dir}/physical_lock_*_timeout_*m {self.remote_lock_dir}/legacy_lock_all_timeout_*m; do
-            [ -d "$lock_dir" ] || continue
-            timeout=$(echo "$lock_dir" | sed 's/.*_timeout_\\([0-9]*\\)m/\\1/')
-            if [ -n "$timeout" ]; then
-                find "$lock_dir" -maxdepth 0 -mmin +$timeout -delete 2>/dev/null || true
-            fi
-        done
-        """
-        self.connection.run(cleanup_script, warn=True)
-
-    # ==================== BEGIN TEMPORARY LEGACY BLOCKING CODE ====================
-    # Problem: Old code uses core_{logical_core_id}_timeout_1m locks instead of
-    # core_{physical_core_id}_timeout_1m. New code needs to coexist and block old
-    # code from running at the same time to prevent "Logical Neuron Core(s) not
-    # available" errors.
-    #
-    # Solution: Two-phase locking with flock(atomic_lock) for atomicity
-    #
-    #   Acquire:
-    #     1. flock -> create all core_* locks + legacy_lock_all marker
-    #     2. If partial creation (legacy holds some), cleanup and retry
-    #     3. flock -> create physical_lock_{id} for requested cores
-    #
-    #   Release:
-    #     flock -> rmdir physical_lock_{id} -> if no physical_lock_* remain ->
-    #     rmdir legacy_lock_all + all core_*
-    #
-    # Lock files in /tmp/neuronx-cc/core_locks/:
-    #   - core_{0..N}_timeout_1m: blocks legacy code
-    #   - physical_lock_{id}_timeout_1m: actual physical core locks
-    #   - legacy_lock_all_timeout_1m: marker that legacy is fully blocked
-    #   - atomic_lock: flock file for atomicity
-    #
-    # To remove after migration:
-    #   1. Delete the section between BEGIN/END TEMPORARY markers
-    #   2. In __try_allocate_physical_cores__: remove the __temp_ensure_legacy_locks__ call
-    #   3. In __release_cores__: change __temp_release_cores_and_maybe_legacy__ to __unlock_remote_physical_cores__
-    # ==============================================================================
-
-    def __temp_flock_run__(self, script: str) -> str:
-        """TEMPORARY: Run script inside flock, return stdout. Logs warning on flock timeout or script error."""
-        result = self.connection.run(
-            f"flock -w 30 {self.remote_lock_dir}/atomic_lock -c '{script}; echo FLOCK_OK' || echo FLOCK_TIMEOUT",
-            warn=True,
-        )
-        if "FLOCK_TIMEOUT" in result.stdout and "FLOCK_OK" not in result.stdout:
-            logging.warning(f"flock timed out on {self.ssh_alias}")
-        if result.stderr:
-            logging.warning(f"flock script error on {self.ssh_alias}: {result.stderr.strip()}")
-        return result.stdout
-
-    # --- BEGIN TEMPORARY: Legacy blocking for migration ---
-    # Old code uses core_{logical_id} locks. New code uses physical_lock_{id}.
-    # To prevent conflicts, we create all core_* locks to block old code.
-    # Remove this section after migration is complete.
-
-    def __temp_ensure_legacy_locks__(self, total_physical_cores: int) -> bool:
-        """
-        TEMPORARY: Ensure all core_* locks exist to block legacy code.
-        Returns True if legacy locks are in place, False if blocked by legacy code.
-        """
-        script = f"""
-            if [ -d "{self.remote_lock_dir}/legacy_lock_all_timeout_1m" ]; then
-                echo LEGACY_EXISTS
-            else
-                {
-            " && ".join(
-                f"mkdir -m 777 {self.remote_lock_dir}/core_{i}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m && echo C{i}"
-                for i in range(total_physical_cores)
-            )
-        } && mkdir -m 777 {self.remote_lock_dir}/legacy_lock_all_timeout_1m && echo LEGACY_CREATED
-            fi
-        """
-        stdout = self.__temp_flock_run__(script)
-
-        if "LEGACY_EXISTS" in stdout or "LEGACY_CREATED" in stdout:
-            if "LEGACY_CREATED" in stdout:
-                logging.info(f"Created all {total_physical_cores} legacy locks on {self.ssh_alias}")
-            else:
-                logging.info(f"Legacy locks already in place on {self.ssh_alias}")
-            return True
-
-        # Partial or blocked - clean up what we created
-        created_cores = [int(x[1:]) for x in stdout.split('\n') if x.startswith('C') and x[1:].isdigit()]
-        if created_cores:
-            logging.info(
-                f"Partial legacy lock ({len(created_cores)}/{total_physical_cores}) on {self.ssh_alias}, cleaning up"
-            )
-            cleanup = " ; ".join(
-                f"rmdir {self.remote_lock_dir}/core_{i}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m 2>/dev/null"
-                for i in created_cores
-            )
-            self.__temp_flock_run__(cleanup)
-        else:
-            logging.info(f"Legacy locks blocked (old code running?) on {self.ssh_alias}")
-        return False
-
-    def __temp_release_cores_and_maybe_legacy__(self, physical_core_ids: list[int]):
-        """
-        TEMPORARY: Release physical locks, then atomically check if last test.
-        If no physical locks remain, release legacy_lock_all_timeout_1m and all core_* locks.
-        """
-        if not physical_core_ids:
-            return
-
-        logging.info(f"Releasing cores {physical_core_ids} on {self.ssh_alias}")
-        physical_lock_dirs = " ".join(
-            f"{self.remote_lock_dir}/physical_lock_{core_id}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m"
-            for core_id in physical_core_ids
-        )
-
-        script = f"""
-            rmdir {physical_lock_dirs} 2>/dev/null
-            if ! ls -d {self.remote_lock_dir}/physical_lock_* >/dev/null 2>&1; then
-                rmdir {self.remote_lock_dir}/legacy_lock_all_timeout_1m 2>/dev/null
-                rmdir {self.remote_lock_dir}/core_*_timeout_*m 2>/dev/null
-                echo "CLEANED_LEGACY"
-            else
-                echo "OTHER_TESTS_RUNNING"
-            fi
-        """
-        stdout = self.__temp_flock_run__(script)
-        if "CLEANED_LEGACY" in stdout:
-            logging.info(
-                f"No physical locks remain - removed legacy_lock_all_timeout_1m and core_* locks on {self.ssh_alias}"
-            )
-        elif "OTHER_TESTS_RUNNING" in stdout:
-            logging.info(f"Released physical cores {physical_core_ids}, other tests still running on {self.ssh_alias}")
-
-    # --- END TEMPORARY: Legacy blocking for migration ---
-
-    def __try_lock_remote_physical_cores__(self, physical_core_ids: list[int]) -> list[int]:
-        """
-        Try to lock multiple physical cores in a single SSH command.
-        Returns list of successfully locked physical core IDs.
-
-        Timeout is encoded in directory name for coordination between processes.
-        Locks are per physical core to prevent conflicts between LNC1 and LNC2 tests.
-        """
-        if not physical_core_ids:
-            return []
-
-        logging.info(f"Trying to lock physical cores {physical_core_ids} on {self.ssh_alias}")
-        # Atomic lock acquisition via mkdir - prints core_id on success
-        # Use 777 so any user can delete stale locks
-        lock_cmds = " ; ".join(
-            f"mkdir -m 777 {self.remote_lock_dir}/physical_lock_{core_id}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m 2>/dev/null && echo {core_id}"
-            for core_id in physical_core_ids
-        )
-        stdout = self.__temp_flock_run__(lock_cmds)
-        locked = [int(x) for x in stdout.strip().split('\n') if x.strip().isdigit()]
-        if locked:
-            logging.info(f"Locked physical cores {locked} on {self.ssh_alias}")
-        return locked
-
-    def __unlock_remote_physical_cores__(self, physical_core_ids: list[int]):
-        """Release remote locks for physical cores."""
-        if not physical_core_ids:
-            return
-        lock_dirs = " ".join(
-            f"{self.remote_lock_dir}/physical_lock_{core_id}_timeout_{self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES}m"
-            for core_id in physical_core_ids
-        )
-        logging.info(f"Releasing physical cores {physical_core_ids} on {self.ssh_alias}")
-        self.__temp_flock_run__(f"rmdir {lock_dirs} 2>/dev/null || true")
-
-    def __initialize_core_allocation_file__(self):
-        """
-        Initialize the core allocation state file with run_id tracking.
-        Creates new file or resets if run_id doesn't match (stale from previous run).
-        """
-        lock_file = FileLock(f"{self.core_allocation_file}.lock", timeout=10000)
-        with lock_file.acquire():
-            needs_reset = False
-
-            if os.path.isfile(self.core_allocation_file):
-                # File exists - check if it's from current run
-                with open(self.core_allocation_file, "r") as f:
-                    try:
-                        existing_state = json.load(f)
-                        if existing_state.get("run_id") != self.run_id:
-                            needs_reset = True
-                    except (json.JSONDecodeError, KeyError):
-                        needs_reset = True
-            else:
-                needs_reset = True
-
-            if needs_reset:
-                # Get device info to build initial state
-                devices = self.get_neuron_device_info()
-
-                # Count total physical cores available across devices
-                total_physical_cores = 0
-                lnc_mode: int | None = None
-                for device in devices:
-                    if lnc_mode is None:
-                        lnc_mode = device.logical_neuroncore_config
-                    else:
-                        assert (
-                            lnc_mode == device.logical_neuroncore_config
-                        ), f"Not all attached neuron devices have the same lnc config: {lnc_mode} vs {device.logical_neuroncore_config}"
-                    # neuron-ls returns logical cores, multiply by lnc_mode to get physical
-                    total_physical_cores += len(device.neuroncore_ids) * lnc_mode
-
-                core_state = {
-                    "physical_cores_in_use": 0,
-                    "total_physical_cores": total_physical_cores,
-                    "run_id": self.run_id,
-                }
-
-                with open(self.core_allocation_file, "w") as f:
-                    json.dump(core_state, f)
-
-    @staticmethod
-    def __physical_to_logical_cores__(physical_core_ids: list[int], lnc_config: int) -> list[int]:
-        """Convert contiguous physical core IDs to contiguous logical core IDs.
-
-        Physical cores must be contiguous (NEURON_RT_VISIBLE_CORES requires it) and
-        aligned to lnc_config boundary.
-
-        Examples:
-            LNC2 (lnc_config=2): physical [0,1,2,3] -> logical [0,1]
-            LNC1 (lnc_config=1): physical [0,1,2] -> logical [0,1,2]
-        """
-        first_logical = physical_core_ids[0] // lnc_config
-        num_logical = len(physical_core_ids) // lnc_config
-        # Verify physical cores are contiguous and aligned
-        expected = list(range(first_logical * lnc_config, (first_logical + num_logical) * lnc_config))
-        assert (
-            physical_core_ids == expected
-        ), f"Physical cores must be contiguous and aligned (lnc_config={lnc_config}): expected {expected}, got {physical_core_ids}"
-        return list(range(first_logical, first_logical + num_logical))
-
-    def __allocate_cores__(self, num_logical_cores: int, lnc_config: int) -> tuple[list[int], list[int]]:
-        """
-        Allocate logical cores by locking physical cores.
-
-        Locking is done on physical cores to prevent conflicts between LNC1 and LNC2 tests.
-        For example, LNC2 logical core 0 maps to physical cores [0,1], while LNC1 logical
-        cores 0-1 also map to physical cores [0,1]. By locking physical cores, we ensure
-        these tests don't run simultaneously on the same hardware.
-
-        Args:
-            num_logical_cores: Number of logical cores to allocate
-            lnc_config: LNC configuration (1 or 2) - physical cores per logical core
-
-        Returns:
-            Tuple of (logical_core_ids, physical_core_ids) or ([], []) if not enough available.
-            Physical cores are locked via mkdir; logical cores are for NEURON_RT_VISIBLE_CORES.
-        """
-        num_physical_cores = num_logical_cores * lnc_config
-
-        lock_file = FileLock(f"{self.core_allocation_file}.lock", timeout=10000)
-        with lock_file.acquire():
-            with open(self.core_allocation_file, "r+") as f:
-                core_state = json.load(f)
-
-                total_physical_cores = core_state["total_physical_cores"]
-                available_physical = total_physical_cores - core_state["physical_cores_in_use"]
-                if available_physical < num_physical_cores:
-                    logging.info(f"Not enough cores available: need {num_physical_cores}, have {available_physical}")
-                    return [], []  # Not enough cores
-
-                allocated_physical_cores = self.__try_allocate_physical_cores__(
-                    total_physical_cores, num_physical_cores, lnc_config
-                )
-
-                # Update local count only if we got enough cores
-                if len(allocated_physical_cores) == num_physical_cores:
-                    core_state["physical_cores_in_use"] += num_physical_cores
-
-                    # Write back
-                    f.seek(0)
-                    f.truncate()
-                    json.dump(core_state, f)
-
-                    # Convert physical cores to logical cores for NEURON_RT_VISIBLE_CORES
-                    logical_core_ids = self.__physical_to_logical_cores__(allocated_physical_cores, lnc_config)
-
-                    return logical_core_ids, allocated_physical_cores
-                else:
-                    return [], []
-
-    def __try_allocate_physical_cores__(
-        self, total_physical_cores: int, num_physical_cores: int, lnc_config: int
-    ) -> list[int]:
-        """Try to lock contiguous physical cores via remote mkdir locks.
-
-        Returns list of locked physical core IDs, or empty list if unable to lock.
-        """
-        # TEMPORARY: First ensure legacy locks are in place to block old code
-        if not self.__temp_ensure_legacy_locks__(total_physical_cores):
-            return []  # Legacy code is running, retry later
-
-        # Collectives require start positions aligned to num_physical_cores.
-        # Since num_physical_cores is always a multiple of lnc_config, aligning to
-        # num_physical_cores automatically satisfies the lnc_config alignment requirement.
-        # Example: 128 physical cores, 4 collective ranks with LNC2 (num_physical_cores=8)
-        #   start_positions = [0, 8, 16, 24, ...] -> shuffled to e.g. [16, 0, 24, 8, ...]
-        # Example: 128 physical cores, 4 collective ranks with LNC1 (num_physical_cores=4)
-        #   start_positions = [0, 4, 8, 12, ...] -> shuffled to e.g. [8, 0, 12, 4, ...]
-        assert (
-            num_physical_cores % lnc_config == 0
-        ), f"num_physical_cores ({num_physical_cores}) must be a multiple of lnc_config ({lnc_config})"
-        num_start_positions = total_physical_cores - num_physical_cores + 1
-        start_positions = list(range(0, num_start_positions, num_physical_cores))
-        random.shuffle(start_positions)
-
-        for start_pcore in start_positions:
-            # Try to lock all physical cores in this contiguous range
-            pcores_to_lock = list(range(start_pcore, start_pcore + num_physical_cores))
-            locked = self.__try_lock_remote_physical_cores__(pcores_to_lock)
-
-            if len(locked) == num_physical_cores:
-                return locked
-            else:
-                # Failed to lock all cores, release what we got
-                self.__unlock_remote_physical_cores__(locked)
-
-        return []
-
-    def __release_cores__(self, physical_core_ids: list[int]):
-        """
-        Release previously allocated physical cores in both local state and remote locks.
-        """
-        # TEMPORARY: Release physical locks, and if last test, release legacy locks too
-        self.__temp_release_cores_and_maybe_legacy__(physical_core_ids)
-
-        # Then update local state
-        lock_file = FileLock(f"{self.core_allocation_file}.lock", timeout=10000)
-        with lock_file.acquire():
-            with open(self.core_allocation_file, "r+") as f:
-                core_state = json.load(f)
-
-                # Decrement count (tracked in physical cores)
-                core_state["physical_cores_in_use"] -= len(physical_core_ids)
-
-                # Write back
-                f.seek(0)
-                f.truncate()
-                json.dump(core_state, f)
 
     @override
     @contextlib.contextmanager
@@ -780,36 +771,30 @@ class SshHost(Host):
         Logical core IDs are returned for use with NEURON_RT_VISIBLE_CORES.
         """
         # Get locking version from host (creates infra_version.json with default if missing)
-        locking_version = get_host_locking_version(self.connection)
+        if self._total_physical_cores is None:
+            devices = self.get_neuron_device_info()
+            self._total_physical_cores = sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in devices)
+        if self._host_locking_version is not None:
+            locking_version = self._host_locking_version
+        else:
+            executor = self._get_remote_executor()
+            with collector.timer(MetricName.CORE_LOCK_INIT_TIME):
+                self._host_locking_version = lock_client.initialize_and_deploy(executor)
+            if self._host_locking_version > lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION:
+                raise LockVersionError(
+                    required_version=self._host_locking_version,
+                    current_version=lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION,
+                )
+            locking_version = self._host_locking_version
         logging.info(f"[{self.ssh_alias}] Using locking protocol v{locking_version}")
 
-        if locking_version >= 2:
-            yield from self._get_core_allocation_v2(
-                collector, collective_ranks, lnc_config, timeout_seconds, poll_period_seconds
-            )
-            return
-
-        yield from self._get_core_allocation_v1(
-            collector, collective_ranks, lnc_config, timeout_seconds, poll_period_seconds
+        core_lock_manager = CoreLockManager(
+            self.ssh_alias,
+            self._total_physical_cores,
+            collector,
+            executor=self._get_remote_executor(),
+            host_locking_version=self._host_locking_version,
         )
-
-    def _get_core_allocation_v2(
-        self,
-        collector: IMetricsCollector,
-        collective_ranks: int,
-        lnc_config: int,
-        timeout_seconds: int,
-        poll_period_seconds: int,
-    ) -> Generator[CoreAllocation, None, None]:
-        """New locking path using CoreLockManager (flock + JSON state)."""
-        # Lazy initialize CoreLockManager (outside timer to avoid skewing metrics)
-        if self._core_lock_manager is None:
-            # Get total physical cores from device info
-            if self._total_physical_cores is None:
-                devices = self.get_neuron_device_info()
-                self._total_physical_cores = sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in devices)
-            self._core_lock_manager = CoreLockManager(self.connection, self._total_physical_cores, collector)
-            self._core_lock_manager.initialize()
 
         with collector.timer(MetricName.CORE_ALLOCATION_TIME):
             logging.info(
@@ -817,16 +802,26 @@ class SshHost(Host):
             )
 
             # Poll until we get cores or timeout
+            max_retryable_errors = 10
+            consecutive_retryable_errors = 0
             start_time = time.time()
             result = None
             while time.time() - start_time < timeout_seconds:
                 try:
-                    result = self._core_lock_manager.acquire(collective_ranks, lnc_config)
+                    result = core_lock_manager.acquire(collective_ranks, lnc_config)
                     if result:
                         break
+                    consecutive_retryable_errors = 0
                 except (LockAcquisitionError, LockVersionError) as e:
                     logging.warning(f"[{self.ssh_alias}] Lock error (retryable={e.retryable}): {e}")
-                    raise
+                    if not e.retryable:
+                        raise
+                    consecutive_retryable_errors += 1
+                    if consecutive_retryable_errors >= max_retryable_errors:
+                        raise OSError(
+                            f"[{self.ssh_alias}] Lock acquisition failed after {max_retryable_errors} "
+                            f"consecutive retryable errors. Last error: {e}"
+                        ) from e
                 jitter = random.uniform(0, 0.5)
                 time.sleep(poll_period_seconds + jitter)
 
@@ -836,85 +831,31 @@ class SshHost(Host):
                 )
 
             logical_cores, physical_cores = result
-            self._core_lock_manager.record_contention_metrics()
+            core_lock_manager.record_contention_metrics()
             logging.info(f"[{self.ssh_alias}] Allocated logical cores {logical_cores} (physical: {physical_cores})")
 
         try:
             yield CoreAllocation(host_id=self.ssh_alias, logical_core_ids=logical_cores, lnc_config=lnc_config)
         finally:
-            self._core_lock_manager.release(physical_cores)
-
-    def _get_core_allocation_v1(
-        self,
-        collector: IMetricsCollector,
-        collective_ranks: int,
-        lnc_config: int,
-        timeout_seconds: int,
-        poll_period_seconds: int,
-    ) -> Generator[CoreAllocation, None, None]:
-        """Old locking path using mkdir-based locks (protocol version 1)."""
-        with collector.timer(MetricName.CORE_ALLOCATION_TIME):
-            # Initialize lock system if needed
-            if not self._lock_system_initialized:
-                self.__initialize_remote_lock_dir__()
-                self.__initialize_core_allocation_file__()
-                self._lock_system_initialized = True
-
-            logging.info(
-                f"Trying to lock {collective_ranks} logical cores (lnc_config={lnc_config}) on {self.ssh_alias}"
-            )
-
-            current_time = time.time()
-            done_at_time = current_time + timeout_seconds
-            allocated_logical_cores: list[int] = []
-            allocated_physical_cores: list[int] = []
-            last_cleanup_time = current_time
-
-            # Cleanup interval matches minimum lock timeout
-            cleanup_interval_seconds = self.DEFAULT_CORE_LOCK_TIMEOUT_MINUTES * 60
-
-            while current_time <= done_at_time:
-                allocated_logical_cores, allocated_physical_cores = self.__allocate_cores__(
-                    collective_ranks, lnc_config
-                )
-                if allocated_logical_cores:
-                    break
-
-                if current_time - last_cleanup_time >= cleanup_interval_seconds:
-                    # Cleanup stale locks
-                    self.__cleanup_stale_remote_locks__()
-                    last_cleanup_time = current_time
-
-                jitter = random.uniform(0, 0.5)
-                time.sleep(poll_period_seconds + jitter)
-                current_time = time.time()
-
-            if not allocated_logical_cores:
-                raise TimeoutException(
-                    f"Unable to allocate {collective_ranks} logical cores on {self.ssh_alias} within {timeout_seconds} seconds"
-                )
-
-            logging.info(f"Allocated logical cores {allocated_logical_cores} (physical: {allocated_physical_cores})")
-        try:
-            yield CoreAllocation(
-                host_id=self.ssh_alias, logical_core_ids=allocated_logical_cores, lnc_config=lnc_config
-            )
-        finally:
-            # Always release physical cores, even on exception
-            self.__release_cores__(allocated_physical_cores)
+            core_lock_manager.release(physical_cores)
 
     @override
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
-        """Get Neuron device information from remote host with retry logic."""
+        """Get Neuron device information from remote host with retry logic. Cached after first call."""
+        if self._cached_device_info is not None:
+            return list(self._cached_device_info)
         result: fabric2.Result = self.__run_with_retry__(
             f"NEURON_LOGICAL_NC_CONFIG={NeuronDeviceInfo.logical_neuroncore_config} {self.neuron_ls_path} --json-output",
+            hide=True,
         )
         if result.failed:
             raise RemoteExecutionException(f"Unable to find neuron device on {self.ssh_alias}", result)
+        logging.debug("neuron-ls output: %s", result.stdout)
         data = json.loads(result.stdout)
         if not data:
             raise NoNeuronDevicesException(self.ssh_alias)
-        return [NeuronDeviceInfo.from_dict(device) for device in data]
+        self._cached_device_info = [NeuronDeviceInfo.from_dict(device) for device in data]
+        return self._cached_device_info
 
 
 @dataclass
@@ -922,7 +863,7 @@ class HostInfo:
     host_alias: str
     work_queue_depth: int
     run_id: str
-    host_type: str
+    host_type: str | None
 
     def to_json(self):
         return {
@@ -950,7 +891,6 @@ class HostManager:
         target_hosts: list[TargetHost],
         neuron_installation_path: str,
         ssh_config_path: str,
-        default_platform_target: Platforms,
         s3_config: S3ArtifactUploadConfig | None = None,
     ) -> None:
         self.run_id = str(os.getppid())
@@ -960,7 +900,6 @@ class HostManager:
             target_hosts,
             neuron_installation_path=neuron_installation_path,
             base_host_info_path=base_host_info_path,
-            default_platform_target=default_platform_target,
         )
         self.is_local: bool = len(target_hosts) < 1
         self.host_info_path: str = os.path.join(base_host_info_path, "host_stats.json")
@@ -971,15 +910,15 @@ class HostManager:
         target_hosts: list[TargetHost],
         neuron_installation_path: str,
         base_host_info_path: str,
-        default_platform_target: Platforms,
-    ) -> tuple[dict[str, Host], dict[str, Platforms]]:
+    ) -> tuple[dict[str, Host], dict[str, Platforms | None]]:
         if len(target_hosts) == 0:
-            # TODO: Using default_platform_target for localhost is a workaround because we
-            # cannot yet query the local host type. Replace with host type discovery when available.
             local_host_id = "localhost"
+            detected_platform = detect_local_platform(neuron_installation_path)
+            if detected_platform:
+                logging.info(f"Auto-detected local platform: {detected_platform.value}")
             return (
-                {local_host_id: LocalHost(neuron_installation_path, local_host_id)},
-                {local_host_id: default_platform_target},
+                {local_host_id: LocalHost(neuron_installation_path, local_host_id, base_host_info_path)},
+                {local_host_id: detected_platform},
             )
         else:
             hosts: dict[str, Host] = dict()
@@ -1039,7 +978,7 @@ class HostManager:
                             host_alias,
                             work_queue_depth=0,
                             run_id=self.run_id,
-                            host_type=self.host_types.get(host_alias, Platforms.TRN2).value,
+                            host_type=pt.value if (pt := self.host_types.get(host_alias)) else None,
                         )
                         for host_alias in self.target_hosts.keys()
                     ]
@@ -1068,7 +1007,7 @@ class HostManager:
                                 host_alias,
                                 work_queue_depth=0,
                                 run_id=self.run_id,
-                                host_type=self.host_types.get(host_alias, Platforms.TRN2).value,
+                                host_type=pt.value if (pt := self.host_types.get(host_alias)) else None,
                             )
                             for host_alias in current_hosts
                         ]

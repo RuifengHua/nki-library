@@ -14,31 +14,29 @@
 """
 Test to ensure all intra-package imports use relative imports instead of absolute imports.
 
-This test walks through all Python files in src/nkilib_src/nkilib and verifies
-that imports referencing modules within the same package use relative import syntax
-(e.g., `from .module import foo`) instead of absolute imports
-(e.g., `from nkilib.module import foo`).
+Walks through all Python files in two package trees and verifies that imports
+referencing modules within the same package use relative import syntax
+(e.g., ``from .module import foo``) instead of absolute imports
+(e.g., ``from nkilib.module import foo``).
+
+Checked packages:
+  - ``src/nkilib_src/nkilib/`` — shipped as nki-library wheel
+  - ``test/utils/``            — shipped as nki-library-testing wheel (remapped to nkilib_testing)
 """
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, NamedTuple, Union
 
+import pytest
 
-class AbsoluteImportViolation(NamedTuple):
-    """Represents a single absolute import violation."""
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-    filepath: Path
-    lineno: int
-    import_statement: str
-    suggestion: str
-
-
-# Package prefixes that should use relative imports when imported from within the package
-INTRA_PACKAGE_PREFIXES = (
-    "nkilib.",
-    "nkilib_src.",
-)
+# Package prefixes that should use relative imports from within each package.
+# Ordered longest-first so the most-specific prefix matches first.
+NKILIB_PREFIXES = ("nkilib_src.nkilib.", "nkilib_src.", "nkilib.")
+TEST_UTILS_PREFIXES = ("test.utils.", "test.")
 
 # Directories to exclude from checks
 EXCLUDED_DIR_PATTERNS = {
@@ -51,9 +49,14 @@ EXCLUDED_DIR_PATTERNS = {
     "nkilib/__init__.py",
 }
 
-SRC_DIR = "src"
-NKILIB_NAMESPACE = "nkilib_src"
-NKILIB_DIR = "nkilib"
+
+class AbsoluteImportViolation(NamedTuple):
+    """Represents a single absolute import violation."""
+
+    filepath: Path
+    lineno: int
+    import_statement: str
+    suggestion: str
 
 
 def should_skip_path(path: Path) -> bool:
@@ -71,7 +74,19 @@ def get_import_statement(node: Union[ast.ImportFrom, ast.Import]) -> str:
         return f"import {names}"
 
 
-def compute_relative_import_suggestion(module: str, file_path: Path, package_root: Path) -> str:
+def _strip_prefix_parts(module: str, prefixes: tuple[str, ...]) -> list[str]:
+    """Strip the longest matching prefix and return remaining module parts."""
+    parts = module.split(".")
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        if module.startswith(prefix):
+            n = len(prefix.rstrip(".").split("."))
+            return parts[n:]
+    return parts
+
+
+def compute_relative_import_suggestion(
+    module: str, file_path: Path, package_root: Path, prefixes: tuple[str, ...]
+) -> str:
     """
     Compute a suggested relative import for a given absolute import.
 
@@ -79,32 +94,20 @@ def compute_relative_import_suggestion(module: str, file_path: Path, package_roo
         module: The absolute module path (e.g., 'nkilib.core.utils')
         file_path: Path to the file containing the import
         package_root: Root path of the package (e.g., src/nkilib_src/nkilib)
+        prefixes: Absolute prefixes to strip (e.g., ("nkilib.",))
 
     Returns:
         A suggestion string for the relative import
     """
-    # Get the directory containing the importing file, relative to package root
     try:
         file_relative = file_path.parent.relative_to(package_root)
     except ValueError:
         return "from .<module> import ..."
 
-    # Count how many levels up we need to go
     file_parts = list(file_relative.parts)
     file_depth = len(file_parts)
+    module_parts = _strip_prefix_parts(module, prefixes)
 
-    # Parse the module path - strip the package prefix
-    module_parts = module.split(".")
-
-    # Remove the package prefix (nkilib or nkilib_src.nkilib)
-    if module.startswith("nkilib_src.nkilib."):
-        module_parts = module_parts[2:]  # Remove 'nkilib_src', 'nkilib'
-    elif module.startswith("nkilib_src."):
-        module_parts = module_parts[1:]  # Remove 'nkilib_src'
-    elif module.startswith("nkilib."):
-        module_parts = module_parts[1:]  # Remove 'nkilib'
-
-    # Find common prefix between file path and module path
     common_depth = 0
     for i, (file_part, mod_part) in enumerate(zip(file_parts, module_parts)):
         if file_part == mod_part:
@@ -133,13 +136,16 @@ def compute_relative_import_suggestion(module: str, file_path: Path, package_roo
             return f"from {dots} import ..."
 
 
-def check_file_for_absolute_imports(file_path: Path, package_root: Path) -> List[AbsoluteImportViolation]:
+def check_file_for_absolute_imports(
+    file_path: Path, package_root: Path, prefixes: tuple[str, ...]
+) -> List[AbsoluteImportViolation]:
     """
     Check a single Python file for absolute imports that should be relative.
 
     Args:
         file_path: Path to the Python file to check
         package_root: Root path of the package
+        prefixes: Absolute prefixes that indicate an intra-package import
 
     Returns:
         List of AbsoluteImportViolation for each violation found
@@ -158,7 +164,8 @@ def check_file_for_absolute_imports(file_path: Path, package_root: Path) -> List
         # check "import xxx as xxx"
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if any((alias.name + ".").endswith(prefix) for prefix in INTRA_PACKAGE_PREFIXES):
+                if any(alias.name == prefix.rstrip(".") for prefix in prefixes):
+                    # Bare top-level import like ``import nkilib`` or ``import test``
                     violations.append(
                         AbsoluteImportViolation(
                             filepath=file_path,
@@ -167,14 +174,16 @@ def check_file_for_absolute_imports(file_path: Path, package_root: Path) -> List
                             suggestion="remove importing top-level module",
                         )
                     )
-                elif any(alias.name.startswith(prefix) for prefix in INTRA_PACKAGE_PREFIXES):
+                elif any(alias.name.startswith(prefix) for prefix in prefixes):
                     parent_alias = ".".join(alias.name.split(".")[:-1])
                     violations.append(
                         AbsoluteImportViolation(
                             filepath=file_path,
                             lineno=node.lineno,
                             import_statement=get_import_statement(node),
-                            suggestion=compute_relative_import_suggestion(parent_alias, file_path, package_root),
+                            suggestion=compute_relative_import_suggestion(
+                                parent_alias, file_path, package_root, prefixes
+                            ),
                         )
                     )
         # check "from xxx import xxx"
@@ -186,11 +195,9 @@ def check_file_for_absolute_imports(file_path: Path, package_root: Path) -> List
             # Skip if no module (e.g., `from . import foo`)
             if node.module is None:
                 continue
-
-            # Check if this is an intra-package absolute import
-            if any(node.module.startswith(prefix) for prefix in INTRA_PACKAGE_PREFIXES):
+            if any(node.module.startswith(prefix) for prefix in prefixes):
                 import_stmt = get_import_statement(node)
-                suggestion = compute_relative_import_suggestion(node.module, file_path, package_root)
+                suggestion = compute_relative_import_suggestion(node.module, file_path, package_root, prefixes)
                 violations.append(
                     AbsoluteImportViolation(
                         filepath=file_path,
@@ -203,23 +210,8 @@ def check_file_for_absolute_imports(file_path: Path, package_root: Path) -> List
     return violations
 
 
-def test_relative_imports():
-    """
-    Test that all intra-package imports use relative import syntax.
-
-    This test:
-    - Checks all .py files in src/nkilib_src/nkilib/
-    - Identifies absolute imports that reference modules within the same package
-    - Reports all violations with line numbers and suggested fixes
-    - Fails if any absolute intra-package imports are found
-    """
-    # Get the project root directory
-    test_file_path = Path(__file__)
-    project_root = test_file_path.parent.parent.parent
-
-    # Directory to check
-    package_root = project_root / SRC_DIR / NKILIB_NAMESPACE / NKILIB_DIR
-
+def _run_check(label: str, package_root: Path, prefixes: tuple[str, ...]):
+    """Scan *package_root* for absolute intra-package imports and fail with a report."""
     assert package_root.exists(), (
         f"Expected package directory does not exist at {package_root}. "
         "This test may have been moved or the package structure has changed."
@@ -232,7 +224,7 @@ def test_relative_imports():
     # Check each file and collect violations
     all_violations: List[AbsoluteImportViolation] = []
     for file_path in all_files:
-        violations = check_file_for_absolute_imports(file_path, package_root)
+        violations = check_file_for_absolute_imports(file_path, package_root, prefixes)
         all_violations.extend(violations)
 
     # Report all violations at once
@@ -244,12 +236,13 @@ def test_relative_imports():
 
         error_lines = [
             f"\n{'=' * 70}",
-            f"Relative import check failed: {len(all_violations)} violation(s) in {len(violations_by_file)} file(s)",
+            f"Relative import check failed ({label}): "
+            f"{len(all_violations)} violation(s) in {len(violations_by_file)} file(s)",
             f"{'=' * 70}\n",
         ]
 
         for filepath, violations in sorted(violations_by_file.items()):
-            relative_path = filepath.relative_to(project_root)
+            relative_path = filepath.relative_to(PROJECT_ROOT)
             error_lines.append(f"\n{relative_path}:")
             for v in sorted(violations, key=lambda x: x.lineno):
                 error_lines.append(f"  Line {v.lineno}: {v.import_statement}")
@@ -268,4 +261,31 @@ def test_relative_imports():
 
     # Success message
     assert len(all_files) > 0, "No Python files found to check"
-    print(f"✓ Relative import check passed for {len(all_files)} Python file(s)")
+    print(f"✓ Relative import check passed for {len(all_files)} file(s) in {label}")
+
+
+@dataclass(frozen=True)
+class PackageConfig:
+    label: str
+    package_root: Path
+    prefixes: tuple[str, ...]
+
+    def __str__(self):
+        return self.label
+
+
+PACKAGES = [
+    PackageConfig("nkilib", PROJECT_ROOT / "src" / "nkilib_src" / "nkilib", NKILIB_PREFIXES),
+    PackageConfig("test_utils", PROJECT_ROOT / "test" / "utils", TEST_UTILS_PREFIXES),
+]
+
+
+@pytest.mark.parametrize("pkg", PACKAGES, ids=str)
+def test_relative_imports(pkg: PackageConfig):
+    """Ensure intra-package imports use relative syntax.
+
+    Checked packages:
+      - src/nkilib_src/nkilib/ — shipped as nki-library wheel
+      - test/utils/            — shipped as nki-library-testing wheel (remapped to nkilib_testing)
+    """
+    _run_check(label=pkg.label, package_root=pkg.package_root, prefixes=pkg.prefixes)

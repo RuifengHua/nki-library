@@ -39,6 +39,7 @@ from .output_projection_cte_tensor_io import (
     load_mx_quantized_weights,
     load_mx_weight_scales,
     load_quantized_weights,
+    load_row_weight_dequant_scales,
     load_static_quant_input_scales,
     load_static_quant_weight_scales,
 )
@@ -454,6 +455,453 @@ def _perform_input_static_quantization(
         op1=nl.maximum,
         operand1=-max_val,
     )
+
+
+# ============================================================================
+# Row FP8 Quantization Functions (TRN2)
+# ============================================================================
+
+_FP8_E4M3_MAX = 240.0
+_ROW_QUANT_MIN_SCALE = 1e-5
+
+
+def perform_row_quantized_projection(
+    attention_hbm: nl.ndarray,
+    weight_hbm: nl.ndarray,
+    output_hbm: nl.ndarray,
+    bias_hbm: Optional[nl.ndarray],
+    weight_scale_hbm: nl.ndarray,
+    prg_id: int,
+    cfg: TilingConfig,
+    quant_config: QuantizationConfig,
+) -> None:
+    """
+    Perform ROW FP8 quantized output projection for TRN2.
+
+    Input is [B, S, N*D] bf16, dynamically row-quantized per token on-device.
+    Weights are FP8 with per-row dequant scales [P_MAX, H].
+
+    Flow per tile:
+    1. Load attention [S_tile, D] per head (S=partition, D=free)
+    2. Per-token quantize: absmax over D, scale, clamp to FP8
+    3. nc_transpose to [D, S] for matmul
+    4. nc_matmul(attn[D, S], weight[D, H]) -> [S, H]
+    5. Dequant: tensor_tensor(psum * weight_row_scale) then activation(result * input_dequant_scale)
+
+    Args:
+        attention_hbm: [B, S, N*D], Input attention tensor (bf16).
+        weight_hbm: [N*D, H], FP8 weight tensor.
+        output_hbm: [B, S, H], Output tensor.
+        bias_hbm: Optional [1, H] bias tensor.
+        weight_scale_hbm: [P_MAX, H], Per-row weight dequant scale.
+        prg_id: Program ID for LNC sharding.
+        cfg: Tiling configuration.
+        quant_config: Quantization configuration.
+    """
+    weight_hbm = weight_hbm.reshape((cfg.n_size, cfg.d_size, cfg.h_size))
+    # Track original N, D from attention shape (cfg values may differ due to double row)
+    n_orig = attention_hbm.shape[2]
+    d_orig = attention_hbm.shape[3]
+
+    for h_block_idx in range(cfg.h_tile.tile_count):
+        h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
+        curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
+
+        weight_view = TensorView(weight_hbm).slice(dim=2, start=h_start, end=h_start + curr_h_block_size)
+        w_sbuf_list = load_quantized_weights(weight_view=weight_view, cfg=cfg, quant_config=quant_config)
+
+        weight_row_scale_sbuf = load_row_weight_dequant_scales(
+            weight_scale_hbm,
+            h_start,
+            curr_h_block_size,
+            cfg.h_tile.tile_size,
+        )
+
+        bias_sbuf = None
+        if bias_hbm != None:
+            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+            bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
+
+        for batch_idx in range(cfg.b_size):
+            for s_block_idx in range(cfg.s_tile.tile_count):
+                curr_s_tile_size = cfg.s_tile.get_tile_bound(s_block_idx)
+                s_start = s_block_idx * cfg.s_tile.tile_size
+
+                # attention_hbm is [B, S, N, D] — select batch, slice S
+                attention_view = (
+                    TensorView(attention_hbm)
+                    .select(dim=0, index=batch_idx)
+                    .slice(dim=0, start=s_start, end=s_start + curr_s_tile_size)
+                )
+                output_view = (
+                    TensorView(output_hbm)
+                    .select(dim=0, index=batch_idx)
+                    .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+                )
+
+                _process_row_quantized_batch_tile(
+                    attention_view=attention_view,
+                    output_view=output_view,
+                    w_sbuf_list=w_sbuf_list,
+                    bias_sbuf=bias_sbuf,
+                    weight_row_scale_sbuf=weight_row_scale_sbuf,
+                    s_block_idx=s_block_idx,
+                    h_block_idx=h_block_idx,
+                    n_orig=n_orig,
+                    d_orig=d_orig,
+                    cfg=cfg,
+                    quant_config=quant_config,
+                )
+
+
+def _process_row_quantized_batch_tile(
+    attention_view: TensorView,
+    output_view: TensorView,
+    w_sbuf_list: List[nl.ndarray],
+    bias_sbuf: Optional[nl.ndarray],
+    weight_row_scale_sbuf: nl.ndarray,
+    s_block_idx: int,
+    h_block_idx: int,
+    n_orig: int,
+    d_orig: int,
+    cfg: TilingConfig,
+    quant_config: QuantizationConfig,
+) -> None:
+    """Process a single batch tile with ROW FP8 quantization.
+
+    Loads attention as [S_sub, N*D] bf16, row-quantizes, dma_transposes per head
+    to [D_orig, S_sub], reshapes to [D, 2, S] for double row. Falls back to [D, S]
+    when double row is disabled.
+
+    Args:
+        attention_view: View of attention [curr_s_tile, N_orig, D_orig].
+        output_view: View of output [S, curr_h_block_size].
+        w_sbuf_list: Quantized weight tensors in SBUF.
+        bias_sbuf: Optional bias tensor in SBUF.
+        weight_row_scale_sbuf: [P_MAX, h_tile_size], Per-row weight dequant scale.
+        s_block_idx: Current S block index.
+        h_block_idx: Current H block index.
+        n_orig: Original number of heads.
+        d_orig: Original head dimension.
+        cfg: Tiling configuration.
+        quant_config: Quantization configuration.
+    """
+    curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
+    s_start = s_block_idx * cfg.s_tile.tile_size
+
+    # Step 1: Load [S_sub, N*D] bf16, row-quantize, dma_transpose per orig head, reshape for matmul
+
+    h_dim = n_orig * d_orig  # N*D (original, same as cfg.n_size * cfg.d_size)
+    num_matmul_heads = cfg.n_size // 2 if quant_config.use_double_row else cfg.n_size
+    quant_attention_sb = []
+    global_dequant_scales = []
+
+    # Reshape attention_view from [curr_s_tile, N_orig, D_orig] to [curr_s_tile, N*D]
+    attn_flat_view = attention_view.reshape((attention_view.shape[0], h_dim))
+
+    # Pre-allocate transposed buffers per original head
+    # Double row: FP8 (nc_transpose path), non-double-row: bf16 (dma_transpose path)
+    xpose_dtype = quant_config.quant_data_type if quant_config.use_double_row else nl.bfloat16
+    transposed_heads = []
+    for head_idx in range(n_orig):
+        transposed_heads.append(nl.ndarray((d_orig, cfg.s_tile.tile_size), dtype=xpose_dtype, buffer=nl.sbuf))
+
+    for s_sub_idx in range(cfg.s_tile.subtile_dim_info.tile_count):
+        curr_s_sub = cfg.s_tile.get_local_subtile_bound(s_block_idx, s_sub_idx)
+        if curr_s_sub <= 0:
+            break
+        s_sub_start = cfg.s_tile.get_local_subtile_start(s_sub_idx)
+
+        # Load [S_sub, N*D] bf16
+        attn_sub = nl.ndarray((P_MAX, h_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+        sub_view = attn_flat_view.slice(dim=0, start=s_sub_start, end=s_sub_start + curr_s_sub)
+        nisa.dma_copy(attn_sub[:curr_s_sub, :h_dim], sub_view.get_view())
+
+        # Row-quantize: absmax, scale, clamp — stays bf16
+        quant_sub, dequant_scale = _perform_input_row_quantization(
+            input_sbuf=attn_sub[:curr_s_sub, :h_dim],
+            quant_dtype=quant_config.quant_data_type,
+        )
+        global_dequant_scales.append(dequant_scale)
+
+        quant_nd = quant_sub.reshape((curr_s_sub, n_orig, d_orig))
+        for head_idx in range(n_orig):
+            if quant_config.use_double_row:
+                # Double row: cast to FP8, nc_transpose with step-of-2 PSUM (HW constraint for 1-byte dtype)
+                fp8_head = nl.ndarray((curr_s_sub, d_orig), dtype=quant_config.quant_data_type, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=fp8_head, src=quant_nd[:curr_s_sub, head_idx, :d_orig])
+
+                _FP8_PSUM_STEP = 2
+                xpose_psum = nl.ndarray(
+                    (d_orig, curr_s_sub, _FP8_PSUM_STEP),
+                    dtype=quant_config.quant_data_type,
+                    buffer=nl.psum,
+                )
+                nisa.nc_transpose(
+                    dst=xpose_psum.ap(
+                        [[curr_s_sub * _FP8_PSUM_STEP, d_orig], [_FP8_PSUM_STEP, curr_s_sub]],
+                        offset=0,
+                    ),
+                    data=fp8_head,
+                )
+                nisa.tensor_copy(
+                    dst=transposed_heads[head_idx][:d_orig, s_sub_start : s_sub_start + curr_s_sub],
+                    src=xpose_psum[:d_orig, :curr_s_sub, 0],
+                )
+            else:
+                # No double row: dma_transpose bf16 [S_sub, D_orig] -> [D_orig, S_sub]
+                nisa.dma_transpose(
+                    dst=transposed_heads[head_idx][:d_orig, s_sub_start : s_sub_start + curr_s_sub],
+                    src=quant_nd[:curr_s_sub, head_idx, :d_orig],
+                )
+
+    # Pass transposed heads — for double row, pack into [D, 2, S]
+    if quant_config.use_double_row:
+        if n_orig == cfg.n_size // 2:
+            # D was split: n_orig heads, each [D_orig, S] -> split into [D, 2, S]
+            for head_idx in range(n_orig):
+                packed_sb = nl.ndarray((cfg.d_size, 2, cfg.s_tile.tile_size), dtype=xpose_dtype, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=packed_sb[: cfg.d_size, 0:1, : cfg.s_tile.tile_size],
+                    src=transposed_heads[head_idx][: cfg.d_size, : cfg.s_tile.tile_size],
+                )
+                nisa.dma_copy(
+                    dst=packed_sb[: cfg.d_size, 1:2, : cfg.s_tile.tile_size],
+                    src=transposed_heads[head_idx][cfg.d_size : d_orig, : cfg.s_tile.tile_size],
+                )
+                quant_attention_sb.append(packed_sb)
+        else:
+            # N is even, pair heads: [D, S] + [D, S] -> [D, 2, S]
+            for pair_idx in range(n_orig // 2):
+                packed_sb = nl.ndarray((cfg.d_size, 2, cfg.s_tile.tile_size), dtype=xpose_dtype, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=packed_sb[: cfg.d_size, 0:1, : cfg.s_tile.tile_size],
+                    src=transposed_heads[pair_idx * 2][: cfg.d_size, : cfg.s_tile.tile_size],
+                )
+                nisa.dma_copy(
+                    dst=packed_sb[: cfg.d_size, 1:2, : cfg.s_tile.tile_size],
+                    src=transposed_heads[pair_idx * 2 + 1][: cfg.d_size, : cfg.s_tile.tile_size],
+                )
+                quant_attention_sb.append(packed_sb)
+    else:
+        quant_attention_sb = transposed_heads
+
+    input_dequant_scale_sb = [global_dequant_scales]
+
+    # Step 2: Compute matmul and dequantize
+    result_sb = _compute_row_matmul_dequantize(
+        quant_attention_sb=quant_attention_sb,
+        w_sbuf_list=w_sbuf_list,
+        bias_sbuf=bias_sbuf,
+        weight_row_scale_sbuf=weight_row_scale_sbuf,
+        input_dequant_scale_sb=input_dequant_scale_sb,
+        s_block_idx=s_block_idx,
+        h_block_idx=h_block_idx,
+        curr_h_block_size=curr_h_block_size,
+        attention_dtype=nl.bfloat16,
+        cfg=cfg,
+        quant_config=quant_config,
+    )
+
+    # Step 3: Write results to output
+    _write_results_to_output(
+        result_sb=result_sb,
+        output_view=output_view,
+        s_start=s_start,
+        s_block_idx=s_block_idx,
+        curr_h_block_size=curr_h_block_size,
+        cfg=cfg,
+    )
+
+
+def _perform_input_row_quantization(
+    input_sbuf: nl.ndarray,
+    quant_dtype,
+) -> tuple:
+    """Row-quantize input per token: absmax over free dim, scale, quantize.
+
+    Args:
+        input_sbuf: [S, H] input tensor in SBUF (S=partition, H=free).
+        quant_dtype: Target FP8 dtype for max value lookup.
+
+    Returns:
+        Tuple of (quantized [S, H], dequant_scale [S, 1]).
+    """
+    s_size = input_sbuf.shape[0]
+    h_size = input_sbuf.shape[1]
+    max_val = get_max_positive_value_for_dtype(quant_dtype)
+
+    # absmax = max(abs(input), dim=-1) → fp32[S, 1]
+    absmax = nl.ndarray((s_size, 1), dtype=nl.float32, buffer=nl.sbuf)
+    abs_sbuf = nl.ndarray((s_size, h_size), dtype=input_sbuf.dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar_reduce(
+        dst=abs_sbuf,
+        data=input_sbuf,
+        op0=nl.abs,
+        operand0=0.0,
+        reduce_op=nl.maximum,
+        reduce_res=absmax,
+    )
+
+    # dequant_scale = max(absmax / fp8_max, MINVAL) → fp32[S, 1]
+    dequant_scale = nl.ndarray((s_size, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=dequant_scale,
+        data=absmax,
+        op0=nl.multiply,
+        operand0=1.0 / max_val,
+        op1=nl.maximum,
+        operand1=_ROW_QUANT_MIN_SCALE,
+    )
+
+    # quant_scale = 1 / dequant_scale → fp32[S, 1]
+    quant_scale = nl.ndarray((s_size, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.reciprocal(dst=quant_scale, data=dequant_scale)
+
+    # quantized = input * quant_scale → [S, H], quant_scale [S, 1] broadcasts over H
+    quantized = nl.ndarray((s_size, h_size), dtype=input_sbuf.dtype, buffer=nl.sbuf)
+    nisa.activation(
+        dst=quantized,
+        op=nl.copy,
+        data=input_sbuf,
+        scale=quant_scale,
+    )
+
+    return quantized, dequant_scale
+
+
+def _compute_row_matmul_dequantize(
+    quant_attention_sb: List[nl.ndarray],
+    w_sbuf_list: List[nl.ndarray],
+    bias_sbuf: Optional[nl.ndarray],
+    weight_row_scale_sbuf: nl.ndarray,
+    input_dequant_scale_sb: List[nl.ndarray],
+    s_block_idx: int,
+    h_block_idx: int,
+    curr_h_block_size: int,
+    attention_dtype,
+    cfg: TilingConfig,
+    quant_config: QuantizationConfig,
+) -> List[nl.ndarray]:
+    """Compute matmul across heads and apply two-step ROW dequant.
+
+    After matmul accumulation:
+    1. tensor_tensor: multiply by per-row weight dequant scale [S, H]
+    2. activation: multiply by per-token input dequant scale [S, 1]
+    3. Optional bias add
+
+    Args:
+        quant_attention_sb: Quantized attention per head [D, S] in SBUF.
+        w_sbuf_list: Quantized weight tensors per head in SBUF.
+        bias_sbuf: Optional bias tensor.
+        weight_row_scale_sbuf: [P_MAX, h_tile_size], Per-row weight dequant scale.
+        input_dequant_scale_sb: Per-head input dequant scales [S, 1].
+        s_block_idx: Current S block index.
+        h_block_idx: Current H block index.
+        curr_h_block_size: Current H block size.
+        attention_dtype: Output data type.
+        cfg: Tiling configuration.
+        quant_config: Quantization configuration.
+
+    Returns:
+        List[nl.ndarray]: Result tensors per s_subtile.
+    """
+    zero_bias = get_zero_bias_vector_sbuf(P_MAX)
+
+    # input_dequant_scale_sb is [head][s_subtile] -> [P_MAX, 1]
+    # Use first head's scales (all heads have same per-token scale)
+    input_dequant_scales = input_dequant_scale_sb[0]
+
+    result_sb = []
+    for s_subtile_idx in range(cfg.s_tile.subtile_dim_info.tile_count):
+        curr_s_subtile_size = cfg.s_tile.get_local_subtile_bound(s_block_idx, s_subtile_idx)
+        if curr_s_subtile_size <= 0:
+            break
+        result_sb.append(nl.ndarray((P_MAX, curr_h_block_size), dtype=attention_dtype, buffer=nl.sbuf))
+
+    for s_subtile_idx in range(cfg.s_tile.subtile_dim_info.tile_count):
+        curr_s_subtile_size = cfg.s_tile.get_local_subtile_bound(s_block_idx, s_subtile_idx)
+        if curr_s_subtile_size <= 0:
+            break
+        s_subtile_start = cfg.s_tile.get_local_subtile_start(s_subtile_idx)
+
+        for h_subtile_idx in range(cfg.h_tile.subtile_dim_info.tile_count):
+            curr_h_subtile_size = cfg.h_tile.get_local_subtile_bound(h_block_idx, h_subtile_idx)
+            if curr_h_subtile_size <= 0:
+                break
+            h_subtile_start = cfg.h_tile.get_local_subtile_start(h_subtile_idx)
+
+            res_psum = nl.ndarray(
+                (curr_s_subtile_size, curr_h_subtile_size),
+                dtype=nl.float32,
+                buffer=nl.psum,
+            )
+
+            # Accumulate matmul across heads
+            num_matmul_heads = cfg.n_size // 2 if quant_config.use_double_row else cfg.n_size
+            for head_idx in range(num_matmul_heads):
+                if quant_config.use_double_row:
+                    attention_slice = quant_attention_sb[head_idx][
+                        : cfg.d_size,
+                        0:2,
+                        s_subtile_start : s_subtile_start + curr_s_subtile_size,
+                    ]
+                    weight_slice = w_sbuf_list[head_idx][
+                        : cfg.d_size,
+                        0:2,
+                        h_subtile_start : h_subtile_start + curr_h_subtile_size,
+                    ]
+                    nisa.nc_matmul(
+                        res_psum[:curr_s_subtile_size, :curr_h_subtile_size],
+                        attention_slice,
+                        weight_slice,
+                        perf_mode=nisa.matmul_perf_mode.double_row,
+                    )
+                else:
+                    attention_slice = quant_attention_sb[head_idx][
+                        : cfg.d_size,
+                        s_subtile_start : s_subtile_start + curr_s_subtile_size,
+                    ]
+                    weight_slice = w_sbuf_list[head_idx][
+                        : cfg.d_size,
+                        h_subtile_start : h_subtile_start + curr_h_subtile_size,
+                    ]
+                    nisa.nc_matmul(
+                        res_psum[:curr_s_subtile_size, :curr_h_subtile_size],
+                        attention_slice,
+                        weight_slice,
+                    )
+
+            h_indices = h_subtile_idx * cfg.h_tile.subtile_dim_info.tile_size
+            dst_tile = result_sb[s_subtile_idx][:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)]
+
+            # Dequant step 1: multiply by per-row weight dequant scale [S, H]
+            nisa.tensor_tensor(
+                dst=dst_tile,
+                data1=res_psum[:curr_s_subtile_size, :curr_h_subtile_size],
+                data2=weight_row_scale_sbuf[:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)],
+                op=nl.multiply,
+            )
+
+            # Dequant step 2: multiply by per-token input dequant scale [S, 1]
+            nisa.activation(
+                dst=dst_tile,
+                op=nl.copy,
+                data=dst_tile,
+                scale=input_dequant_scales[s_subtile_idx][:curr_s_subtile_size, :1],
+                bias=zero_bias[:curr_s_subtile_size, :1],
+            )
+
+            # Add bias if present
+            if bias_sbuf != None:
+                nisa.tensor_tensor(
+                    dst=dst_tile,
+                    data1=dst_tile,
+                    data2=bias_sbuf[:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)],
+                    op=nl.add,
+                )
+
+    return result_sb
 
 
 # ============================================================================
@@ -1147,6 +1595,273 @@ def _compute_static_mx_matmul(
                     result_sb[s_subtile_idx][:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)],
                     bias_sbuf[:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)],
                     nl.add,
+                )
+
+    return result_sb
+
+
+# ============================================================================
+# Row MX FP8 Quantization Functions
+# ============================================================================
+
+
+def perform_row_mx_quantized_projection(
+    attention_hbm: nl.ndarray,
+    weight_hbm: nl.ndarray,
+    output_hbm: nl.ndarray,
+    bias_hbm: Optional[nl.ndarray],
+    input_scale_hbm: nl.ndarray,
+    weight_scale_hbm: nl.ndarray,
+    prg_id: int,
+    cfg: TilingConfig,
+    quant_config: QuantizationConfig,
+) -> None:
+    """
+    Perform ROW_MX quantized output projection.
+
+    Input is MXFP4 quantized on-device (same as MX path), weights are row FP8
+    quantized with per-row dequant scales. Uses nc_matmul_mx with real MX scales
+    for attention and constant 127 MX scales for weights (dummy), then applies
+    per-row weight dequant scale after matmul.
+
+    Args:
+        attention_hbm (nl.ndarray): [B, N, D, S], Input attention tensor (bf16).
+        weight_hbm (nl.ndarray): [N*D, H], Pre-quantized FP8 weights (float8_e4m3fn).
+        output_hbm (nl.ndarray): [B, S, H], Output tensor.
+        bias_hbm (Optional[nl.ndarray]): [1, H], Optional bias tensor.
+        input_scale_hbm (nl.ndarray): Unused for ROW_MX (input quantized on-device).
+        weight_scale_hbm (nl.ndarray): [128, H], Per-row weight dequant scale.
+        prg_id (int): Program ID for LNC sharding.
+        cfg (TilingConfig): Tiling configuration.
+        quant_config (QuantizationConfig): Quantization configuration.
+    """
+    # Create constant MX scales (127) for weights (dummy — actual dequant is per-row)
+    w_scale_sbuf = create_constant_mx_scales(cfg.d_tile.tile_info.tile_size, cfg.h_tile.subtile_dim_info.tile_size)
+
+    # Reshape attention to [B, D, _q_width, S] for interleaved loading
+    attention_hbm = attention_hbm.reshape((cfg.b_size, cfg.d_tile.get_actual_dim_size(), _q_width, cfg.s_size))
+    # Reshape weights: pre-shuffled [N*D//4, H, 4]
+    weight_hbm = weight_hbm.reshape((cfg.n_size * cfg.d_size // _q_width, cfg.h_size, _q_width))
+
+    for h_block_idx in range(cfg.h_tile.tile_count):
+        h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
+        curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
+
+        # Load FP8 weights (same loader as STATIC_MX)
+        weight_view = TensorView(weight_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+        w_sbuf_list = load_mx_quantized_weights(weight_view, nl.float8_e4m3fn, cfg, quant_config)
+
+        # Load per-row weight dequant scales for this h_block
+        weight_row_scale_sbuf = load_row_weight_dequant_scales(
+            weight_scale_hbm,
+            h_start,
+            curr_h_block_size,
+            cfg.h_tile.tile_size,
+        )
+
+        bias_sbuf = None
+        if bias_hbm != None:
+            bias_view = TensorView(bias_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+            bias_sbuf = load_bias(bias_view=bias_view, cfg=cfg)
+
+        for batch_idx in range(cfg.b_size):
+            for s_block_idx in range(cfg.s_tile.tile_count):
+                curr_s_tile_size = cfg.s_tile.get_tile_bound(s_block_idx)
+                s_start = s_block_idx * cfg.s_tile.tile_size
+
+                attention_view = (
+                    TensorView(attention_hbm)
+                    .select(dim=0, index=batch_idx)
+                    .slice(dim=2, start=s_start, end=s_start + curr_s_tile_size)
+                )
+                output_view = (
+                    TensorView(output_hbm)
+                    .select(dim=0, index=batch_idx)
+                    .slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
+                )
+
+                _process_row_mx_batch_tile(
+                    attention_view=attention_view,
+                    output_view=output_view,
+                    w_sbuf_list=w_sbuf_list,
+                    w_scale_sbuf=w_scale_sbuf,
+                    bias_sbuf=bias_sbuf,
+                    weight_row_scale_sbuf=weight_row_scale_sbuf,
+                    s_block_idx=s_block_idx,
+                    h_block_idx=h_block_idx,
+                    cfg=cfg,
+                    quant_config=quant_config,
+                )
+
+
+def _process_row_mx_batch_tile(
+    attention_view: TensorView,
+    output_view: TensorView,
+    w_sbuf_list: List[nl.ndarray],
+    w_scale_sbuf: nl.ndarray,
+    bias_sbuf: Optional[nl.ndarray],
+    weight_row_scale_sbuf: nl.ndarray,
+    s_block_idx: int,
+    h_block_idx: int,
+    cfg: TilingConfig,
+    quant_config: QuantizationConfig,
+) -> None:
+    """Process a single batch tile with ROW_MX quantization.
+
+    Input is MXFP4 quantized on-device, weights are FP8 with constant 127 MX scales.
+    After matmul, applies per-row weight dequant.
+
+    Args:
+        attention_view: View of attention [D//4, 4, curr_s_tile_size].
+        output_view: View of output [S, curr_h_block_size].
+        w_sbuf_list: Weight tensors per d_tile.
+        w_scale_sbuf: Constant MX weight scales (127).
+        bias_sbuf: Optional bias tensor in SBUF.
+        weight_row_scale_sbuf: [P_MAX, h_tile_size], Per-row weight dequant scale.
+        s_block_idx: Current S block index.
+        h_block_idx: Current H block index.
+        cfg: Tiling configuration.
+        quant_config: Quantization configuration.
+    """
+    curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
+    s_start = s_block_idx * cfg.s_tile.tile_size
+
+    # Step 1: Load and transpose attention for MX quantization
+    attn_sbuf_list, padded_s_tile_size = load_mx_input_interleaved(attention_view, cfg, quant_config)
+
+    # Step 2: Quantize attention using quantize_mx (real MX scales)
+    quant_attn_list, attn_scale_list = _quantize_mx_attention_tensors(
+        attn_sbuf_list=attn_sbuf_list,
+        padded_s_tile_size=padded_s_tile_size,
+        cfg=cfg,
+    )
+
+    # Step 3: Compute MX matmul with constant 127 weight scales, then ROW_MX dequant
+    result_sb = _compute_row_mx_matmul(
+        quant_attn_list=quant_attn_list,
+        attn_scale_list=attn_scale_list,
+        w_sbuf_list=w_sbuf_list,
+        w_scale_sbuf=w_scale_sbuf,
+        bias_sbuf=bias_sbuf,
+        weight_row_scale_sbuf=weight_row_scale_sbuf,
+        s_block_idx=s_block_idx,
+        h_block_idx=h_block_idx,
+        curr_h_block_size=curr_h_block_size,
+        padded_s_tile_size=padded_s_tile_size,
+        cfg=cfg,
+    )
+
+    # Step 4: Write results to output
+    _write_results_to_output(
+        result_sb=result_sb,
+        output_view=output_view,
+        s_start=s_start,
+        s_block_idx=s_block_idx,
+        curr_h_block_size=curr_h_block_size,
+        cfg=cfg,
+    )
+
+
+def _compute_row_mx_matmul(
+    quant_attn_list: List[nl.ndarray],
+    attn_scale_list: List[nl.ndarray],
+    w_sbuf_list: List[nl.ndarray],
+    w_scale_sbuf: nl.ndarray,
+    bias_sbuf: Optional[nl.ndarray],
+    weight_row_scale_sbuf: nl.ndarray,
+    s_block_idx: int,
+    h_block_idx: int,
+    curr_h_block_size: int,
+    padded_s_tile_size: int,
+    cfg: TilingConfig,
+) -> List[nl.ndarray]:
+    """Compute MX matmul with FP8 x4 weights and per-row weight dequant.
+
+    Matmul uses nc_matmul_mx with real attention MX scales and constant 127
+    weight MX scales. After matmul:
+    1. tensor_tensor: multiply by per-row weight dequant scale (per H column)
+    2. Optionally add bias
+
+    Args:
+        quant_attn_list: Quantized attention per d_tile (from quantize_mx).
+        attn_scale_list: Attention MX scales per d_tile (from quantize_mx).
+        w_sbuf_list: FP8 weight tensors per d_tile.
+        w_scale_sbuf: Constant MX weight scales (127).
+        bias_sbuf: Optional bias tensor.
+        weight_row_scale_sbuf: [P_MAX, h_tile_size], Per-row weight dequant scale.
+        s_block_idx: Current S block index.
+        h_block_idx: Current H block index.
+        curr_h_block_size: Current H block size.
+        padded_s_tile_size: Padded S tile size (for .ap() access pattern).
+        cfg: Tiling configuration.
+
+    Returns:
+        List[nl.ndarray]: Result tensors per s_subtile.
+    """
+    result_sb = []
+    for s_subtile_idx in range(cfg.s_tile.subtile_dim_info.tile_count):
+        curr_s_subtile_size = cfg.s_tile.get_local_subtile_bound(s_block_idx, s_subtile_idx)
+        if curr_s_subtile_size <= 0:
+            break
+        result_sb.append(nl.ndarray((P_MAX, curr_h_block_size), dtype=nl.bfloat16, buffer=nl.sbuf))
+
+    for s_subtile_idx in range(cfg.s_tile.subtile_dim_info.tile_count):
+        curr_s_subtile_size = cfg.s_tile.get_local_subtile_bound(s_block_idx, s_subtile_idx)
+        if curr_s_subtile_size <= 0:
+            break
+        s_subtile_start = cfg.s_tile.get_local_subtile_start(s_subtile_idx)
+        padded_s_subtile_size = curr_s_subtile_size + (curr_s_subtile_size % 2)
+
+        for h_subtile_idx in range(cfg.h_tile.subtile_dim_info.tile_count):
+            curr_h_subtile_size = cfg.h_tile.get_local_subtile_bound(h_block_idx, h_subtile_idx)
+            if curr_h_subtile_size <= 0:
+                break
+            h_subtile_start = cfg.h_tile.get_local_subtile_start(h_subtile_idx)
+
+            res_psum = nl.ndarray((padded_s_subtile_size, curr_h_subtile_size), dtype=nl.bfloat16, buffer=nl.psum)
+
+            # Accumulate matmul across all d_tiles (same as STATIC_MX)
+            for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
+                curr_d_tile_size, _ = cfg.d_tile.get_bounds(d_tile_idx)
+                # Attention: real MX quantized, [D, S] as float8_e4m3fn_x4
+                attn_slice = quant_attn_list[d_tile_idx][:, s_subtile_start : s_subtile_start + padded_s_subtile_size]
+                attn_scale_slice = attn_scale_list[d_tile_idx][
+                    :, s_subtile_start : s_subtile_start + padded_s_subtile_size
+                ]
+                # Weights: FP8 x4 packed, use .ap() to reinterpret
+                w_slice = w_sbuf_list[d_tile_idx].ap(
+                    pattern=[[cfg.h_tile.tile_size, curr_d_tile_size], [1, curr_h_subtile_size]],
+                    offset=h_subtile_start,
+                    dtype=nl.float8_e4m3fn_x4,
+                )
+                w_scale_slice = w_scale_sbuf[:, :curr_h_subtile_size]
+
+                nisa.nc_matmul_mx(
+                    dst=res_psum[:padded_s_subtile_size, :curr_h_subtile_size],
+                    stationary=attn_slice,
+                    moving=w_slice,
+                    stationary_scale=attn_scale_slice,
+                    moving_scale=w_scale_slice,
+                )
+
+            h_indices = h_subtile_idx * cfg.h_tile.subtile_dim_info.tile_size
+            dst_tile = result_sb[s_subtile_idx][:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)]
+
+            # ROW_MX dequant: multiply by per-row weight dequant scale
+            nisa.tensor_tensor(
+                dst=dst_tile,
+                data1=res_psum[:curr_s_subtile_size, :curr_h_subtile_size],
+                data2=weight_row_scale_sbuf[:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)],
+                op=nl.multiply,
+            )
+
+            # Add bias if present
+            if bias_sbuf != None:
+                nisa.tensor_tensor(
+                    dst=dst_tile,
+                    data1=dst_tile,
+                    data2=bias_sbuf[:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)],
+                    op=nl.add,
                 )
 
     return result_sb

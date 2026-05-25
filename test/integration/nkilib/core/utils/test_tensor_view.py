@@ -15,16 +15,6 @@
 """Unit tests for TensorView module - compile-time validation only."""
 
 from dataclasses import dataclass
-from test.utils.common_dataclasses import (
-    CompilerArgs,
-    KernelArgs,
-    LazyGoldenGenerator,
-    Platforms,
-    ValidationArgs,
-)
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import Tuple, final
 
 import nki
@@ -33,8 +23,15 @@ import nki.language as nl
 import numpy as np
 import pytest
 import torch
+
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib_src.nkilib.core.utils.tensor_view import TensorView
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    Platforms,
+)
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 @dataclass
@@ -208,29 +205,33 @@ def kernel_test_view_ops(
 # =============================================================================
 
 
-def run_test(test_manager: Orchestrator, platform_target: Platforms, shape, buffer, ops, nki_dtype=nl.float32):
+def run_test(test_manager, platform_target: Platforms, shape, buffer, ops, nki_dtype=nl.float32):
     expected = pytorch_ref_ops(shape, ops, src_dtype=nki_dtype)
     # Dummy output required because NKI kernels must have at least one output.
     # The .must_alias_input suffix tells the framework this output aliases the input.
     dummy = np.zeros((1,), dtype=np.float32)
-    test_manager.execute(
-        KernelArgs(
-            kernel_func=kernel_test_view_ops,
-            compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-            kernel_input={
-                "dummy_out.must_alias_input": dummy,
-                "shape": shape,
-                "buffer": buffer,
-                "ops": ops,
-                "expected_shape": expected.shape,
-                "expected_strides": expected.strides,
-                "expected_offset": expected.offset,
-                "src_dtype": nki_dtype,
-            },
-            validation_args=ValidationArgs(
-                golden_output=LazyGoldenGenerator(output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None)
-            ),
-        )
+
+    def input_generator(test_config):
+        return {
+            "dummy_out.must_alias_input": dummy,
+            "shape": shape,
+            "buffer": buffer,
+            "ops": ops,
+            "expected_shape": expected.shape,
+            "expected_strides": expected.strides,
+            "expected_offset": expected.offset,
+            "src_dtype": nki_dtype,
+        }
+
+    framework = UnitTestFramework(
+        test_manager=test_manager,
+        kernel_entry=kernel_test_view_ops,
+        kernel_input_generator=input_generator,
+        trace_only=True,
+    )
+    framework.run_test(
+        test_config=None,
+        compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
     )
 
 
@@ -239,10 +240,8 @@ def run_test(test_manager: Orchestrator, platform_target: Platforms, shape, buff
 # =============================================================================
 
 
-@pytest_test_metadata(
-    name="TensorView",
-    pytest_marks=["tensor_view"],
-)
+@pytest_test_metadata(name="TensorView")
+@pytest_marks(["tensor_view"])
 @final
 class TestTensorView:
     @pytest.mark.trace_only
@@ -438,26 +437,28 @@ class TestTensorView:
     )
     def test_negative_chain(self, test_manager, platform_target, shape, ops, buffer, match):
         dummy = np.zeros((1,), dtype=np.float32)
+
+        def input_generator(test_config):
+            return {
+                "dummy_out.must_alias_input": dummy,
+                "shape": shape,
+                "buffer": buffer,
+                "ops": ops,
+                "expected_shape": (1,),
+                "expected_strides": (1,),
+                "expected_offset": 0,
+            }
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kernel_test_view_ops,
+            kernel_input_generator=input_generator,
+            trace_only=True,
+        )
         with pytest.raises(Exception, match=match):
-            test_manager.execute(
-                KernelArgs(
-                    kernel_func=kernel_test_view_ops,
-                    compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-                    kernel_input={
-                        "dummy_out.must_alias_input": dummy,
-                        "shape": shape,
-                        "buffer": buffer,
-                        "ops": ops,
-                        "expected_shape": (1,),
-                        "expected_strides": (1,),
-                        "expected_offset": 0,
-                    },
-                    validation_args=ValidationArgs(
-                        golden_output=LazyGoldenGenerator(
-                            output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None
-                        )
-                    ),
-                )
+            framework.run_test(
+                test_config=None,
+                compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
             )
 
     @pytest.mark.trace_only
@@ -583,7 +584,7 @@ def generate_dynamic_ops_inputs(input_shape, ops):
 
 
 @final
-@pytest_test_metadata(name="TensorView", pytest_marks=["tensor_view"])
+@pytest_marks(["tensor_view"])
 class TestDynamicTensorView:
     """Tests for TensorView with dynamic indexing - requires full compilation."""
 
@@ -729,7 +730,7 @@ def kernel_test_chained_ops_on_tensorview_input(dummy_out, shape: tuple):
 
 
 @final
-@pytest_test_metadata(name="TensorView", pytest_marks=["tensor_view"])
+@pytest_marks(["tensor_view"])
 class TestTensorViewConstructor:
     """Tests for TensorView constructor accepting TensorView as input."""
 
@@ -737,136 +738,128 @@ class TestTensorViewConstructor:
     @pytest.mark.fast
     def test_tensorview_from_tensorview(self, test_manager, platform_target):
         """Test TensorView can be constructed from another TensorView."""
-        dummy = np.zeros((1,), dtype=np.float32)
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=kernel_test_tensorview_from_tensorview,
-                compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-                kernel_input={
-                    "dummy_out.must_alias_input": dummy,
-                    "shape": (128, 64),
-                },
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None)
-                ),
-            )
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kernel_test_tensorview_from_tensorview,
+            kernel_input_generator=lambda _: {
+                "dummy_out.must_alias_input": np.zeros((1,), dtype=np.float32),
+                "shape": (128, 64),
+            },
+            trace_only=True,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
         )
 
     @pytest.mark.trace_only
     @pytest.mark.fast
     def test_chained_ops_on_tensorview_input(self, test_manager, platform_target):
         """Test ops can be chained on TensorView constructed from TensorView."""
-        dummy = np.zeros((1,), dtype=np.float32)
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=kernel_test_chained_ops_on_tensorview_input,
-                compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-                kernel_input={
-                    "dummy_out.must_alias_input": dummy,
-                    "shape": (128, 64),
-                },
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None)
-                ),
-            )
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kernel_test_chained_ops_on_tensorview_input,
+            kernel_input_generator=lambda _: {
+                "dummy_out.must_alias_input": np.zeros((1,), dtype=np.float32),
+                "shape": (128, 64),
+            },
+            trace_only=True,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
         )
 
 
 @final
-@pytest_test_metadata(name="TensorView", pytest_marks=["tensor_view"])
+@pytest_marks(["tensor_view"])
 class TestTensorViewReinterpretCast:
     """Tests for TensorView.reinterpret_cast method."""
+
+    def _run_trace_only(self, test_manager, platform_target, kernel_func, kernel_input):
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=kernel_func,
+            kernel_input_generator=lambda _: kernel_input,
+            trace_only=True,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
+        )
 
     @pytest.mark.trace_only
     @pytest.mark.fast
     def test_reinterpret_cast(self, test_manager, platform_target):
         """Test reinterpret_cast changes dtype but preserves view state."""
-        dummy = np.zeros((1,), dtype=np.float32)
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=kernel_test_reinterpret_cast,
-                compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-                kernel_input={
-                    "dummy_out.must_alias_input": dummy,
-                    "shape": (128, 64),
-                },
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None)
-                ),
-            )
+        self._run_trace_only(
+            test_manager,
+            platform_target,
+            kernel_test_reinterpret_cast,
+            {
+                "dummy_out.must_alias_input": np.zeros((1,), dtype=np.float32),
+                "shape": (128, 64),
+            },
         )
 
     @pytest.mark.trace_only
     @pytest.mark.fast
     def test_reinterpret_cast_cross_size_indirect_blocked(self, test_manager, platform_target):
         """Test cross-size reinterpret_cast is blocked when indirect_dim is set."""
-        dummy = np.zeros((1,), dtype=np.float32)
         with pytest.raises(
             Exception,
             match="reinterpret_cast with different element sizes is not supported after dynamic/vector select",
         ):
-            test_manager.execute(
-                KernelArgs(
-                    kernel_func=kernel_test_reinterpret_cast_cross_size_indirect,
-                    compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-                    kernel_input={
-                        "dummy_out.must_alias_input": dummy,
-                        "shape": (128, 64),
-                    },
-                    validation_args=ValidationArgs(
-                        golden_output=LazyGoldenGenerator(
-                            output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None
-                        )
-                    ),
-                )
+            self._run_trace_only(
+                test_manager,
+                platform_target,
+                kernel_test_reinterpret_cast_cross_size_indirect,
+                {
+                    "dummy_out.must_alias_input": np.zeros((1,), dtype=np.float32),
+                    "shape": (128, 64),
+                },
             )
 
     @pytest.mark.trace_only
     @pytest.mark.fast
     def test_reinterpret_cast_mxfp4(self, test_manager, platform_target):
         """Test reinterpret_cast uint16 -> float4_e2m1fn_x4 (MXFP4)."""
-        dummy = np.zeros((1,), dtype=np.float32)
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=kernel_test_reinterpret_cast_mxfp4,
-                compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-                kernel_input={"dummy_out.must_alias_input": dummy, "shape": (128, 64)},
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None)
-                ),
-            )
+        self._run_trace_only(
+            test_manager,
+            platform_target,
+            kernel_test_reinterpret_cast_mxfp4,
+            {
+                "dummy_out.must_alias_input": np.zeros((1,), dtype=np.float32),
+                "shape": (128, 64),
+            },
         )
 
     @pytest.mark.trace_only
     @pytest.mark.fast
     def test_reinterpret_cast_mxfp8(self, test_manager, platform_target):
         """Test reinterpret_cast uint32 -> float8_e4m3fn_x4 (MXFP8)."""
-        dummy = np.zeros((1,), dtype=np.float32)
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=kernel_test_reinterpret_cast_mxfp8,
-                compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-                kernel_input={"dummy_out.must_alias_input": dummy, "shape": (128, 64)},
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None)
-                ),
-            )
+        self._run_trace_only(
+            test_manager,
+            platform_target,
+            kernel_test_reinterpret_cast_mxfp8,
+            {
+                "dummy_out.must_alias_input": np.zeros((1,), dtype=np.float32),
+                "shape": (128, 64),
+            },
         )
 
     @pytest.mark.trace_only
     @pytest.mark.fast
     def test_reinterpret_cast_bf16_fp16(self, test_manager, platform_target):
         """Test reinterpret_cast bfloat16 <-> float16."""
-        dummy = np.zeros((1,), dtype=np.float32)
-        test_manager.execute(
-            KernelArgs(
-                kernel_func=kernel_test_reinterpret_cast_bf16_fp16,
-                compiler_input=CompilerArgs(platform_target=platform_target, logical_nc_config=1),
-                kernel_input={"dummy_out.must_alias_input": dummy, "shape": (128, 64)},
-                validation_args=ValidationArgs(
-                    golden_output=LazyGoldenGenerator(output_ndarray={"dummy_out": dummy}, lazy_golden_generator=None)
-                ),
-            )
+        self._run_trace_only(
+            test_manager,
+            platform_target,
+            kernel_test_reinterpret_cast_bf16_fp16,
+            {
+                "dummy_out.must_alias_input": np.zeros((1,), dtype=np.float32),
+                "shape": (128, 64),
+            },
         )
 
     @pytest.mark.trace_only

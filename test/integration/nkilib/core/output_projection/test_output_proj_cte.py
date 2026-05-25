@@ -14,9 +14,26 @@
 
 """Integration tests for the output projection CTE kernel using UnitTestFramework."""
 
-from test.integration.nkilib.core.output_projection.test_output_proj_cte_model_config import (
-    OUTPUT_PROJ_CTE_MODEL_CONFIGS,
+from typing import final
+
+import nki.language as nl
+import numpy as np
+import pytest
+
+from nkilib_src.nkilib.core.output_projection.output_projection_cte import output_projection_cte
+from nkilib_src.nkilib.core.output_projection.output_projection_cte.output_projection_cte_torch import (
+    output_projection_cte_mx_torch_ref,
+    output_projection_cte_torch_ref,
 )
+from nkilib_src.nkilib.core.utils.common_types import QuantizationType
+
+try:
+    from test.integration.nkilib.core.output_projection.test_output_proj_cte_model_config import (
+        output_proj_cte_model_configs,
+    )
+except ImportError:
+    output_proj_cte_model_configs = {}
+
 from test.integration.nkilib.utils.tensor_generators import (
     gaussian_tensor_generator,
     generate_stabilized_mx_data,
@@ -25,25 +42,16 @@ from test.integration.nkilib.utils.tensor_generators import (
 )
 from test.utils.common_dataclasses import (
     CompilerArgs,
+    ModelTestType,
     Platforms,
+    prepare_model_parametrize,
 )
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_parametrize import pytest_parametrize
-from test.utils.pytest_test_metadata import pytest_test_metadata
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
-from typing import final
-
-import nki.language as nl
-import numpy as np
-import pytest
-from nkilib_src.nkilib.core.output_projection.output_projection_cte import output_projection_cte
-from nkilib_src.nkilib.core.output_projection.output_projection_cte.output_projection_cte_torch import (
-    output_projection_cte_mx_torch_ref,
-    output_projection_cte_torch_ref,
-)
-from nkilib_src.nkilib.core.utils.common_types import QuantizationType
 
 
 def generate_output_proj_cte_inputs(
@@ -62,18 +70,36 @@ def generate_output_proj_cte_inputs(
 
     random_gen = np_random_sample()
     attention = random_gen(shape=(batch, n_head, d_head, seqlen), dtype=dtype)
-    bias = gaussian_tensor_generator(std=100)(shape=(1, hidden), dtype=dtype, name="bias") if test_bias else None
+    bias = gaussian_tensor_generator(std=1)(shape=(1, hidden), dtype=dtype, name="bias") if test_bias else None
 
     if quantization_type == QuantizationType.NONE:
         weight = random_gen(shape=(n_head * d_head, hidden), dtype=dtype)
     else:
-        quant_dtype = nl.float8_e4m3fn if quantization_type == QuantizationType.STATIC_MX else nl.float8_e4m3
+        quant_dtype = (
+            nl.float8_e4m3fn
+            if quantization_type in (QuantizationType.STATIC_MX, QuantizationType.ROW_MX)
+            else nl.float8_e4m3
+        )
         static_quant_gen = np_random_sample_static_quantize_inp()
         weight, weight_scale_val, input_scale_val = static_quant_gen(shape=(n_head * d_head, hidden), dtype=quant_dtype)
-        input_scales = np.full(shape=(128, 1), fill_value=input_scale_val, dtype=np.float32)
-        weight_scales = np.full(shape=(128, 1), fill_value=weight_scale_val, dtype=np.float32)
 
-        if quantization_type == QuantizationType.STATIC_MX:
+        if quantization_type == QuantizationType.ROW_MX:
+            # Per-row weight dequant scale: [128, H], no input scales
+            weight_scales = np.broadcast_to(
+                np.random.random_sample((1, hidden)).astype(np.float32) / 512.0, (128, hidden)
+            ).copy()
+        elif quantization_type == QuantizationType.ROW:
+            # Per-row weight dequant scale: [128, H], no input scales
+            # Reshape attention to [B, S, N, D] for ROW quant
+            attention = attention.transpose(0, 3, 1, 2)
+            weight_scales = np.broadcast_to(
+                np.random.random_sample((1, hidden)).astype(np.float32) / 256.0, (128, hidden)
+            ).copy()
+        else:
+            input_scales = np.full(shape=(128, 1), fill_value=input_scale_val, dtype=np.float32)
+            weight_scales = np.full(shape=(128, 1), fill_value=weight_scale_val, dtype=np.float32)
+
+        if quantization_type in (QuantizationType.STATIC_MX, QuantizationType.ROW_MX):
             nd = n_head * d_head
             if nd % 4 == 0:
                 w = weight.reshape(nd // 4, 4, hidden)
@@ -204,19 +230,35 @@ OUTPUT_PROJ_CTE_UNIT_CASES = [
     (1, 8192 + 1120, 16384, 7, 128, False),
     (1, 10240 + 1234, 16384, 8, 128, False),
     (1, 16384 + 4321, 16384, 9, 128, False),
+    # Test cases for d_head > 128 (D folded back into N)
+    (1, 1024, 8192, 4, 256, False),
+    (1, 1024, 3072, 8, 192, False),
+    (1, 512, 8192, 2, 384, False),
+    (1, 512, 3072, 4, 160, False),
+    (1, 1024, 8192, 4, 256, True),
+    (1, 1024, 3072, 8, 192, True),
+    (1, 1024, 8192, 3, 256, False),
+    (1, 512, 3072, 5, 192, True),
+    (1, 128 + 64, 1024, 1, 256, False),
+    (1, 256 + 64, 2048, 2, 256, False),
+    (1, 512 + 64, 3072, 3, 256, False),
+    (1, 1024 + 64, 7168, 4, 256, False),
+    (1, 2048 + 120, 8192, 5, 256, False),
+    (1, 4096 + 1000, 16384, 6, 256, False),
+    (1, 8192 + 1120, 16384, 7, 256, False),
+    (1, 10240 + 1234, 16384, 8, 256, False),
+    (1, 16384 + 4321, 16384, 9, 256, False),
 ]
 
 OUTPUT_PROJ_CTE_UNIT_PARAMS = "batch, seqlen, hidden, n_head, d_head, test_bias"
 _ABBREVS = {"batch": "b", "seqlen": "s", "hidden": "h", "n_head": "nh", "d_head": "dh", "test_bias": "bias"}
 
-# Combined unit + model configs (deduplicated)
-OUTPUT_PROJ_CTE_UNIT_AND_MODEL_CASES = list(dict.fromkeys(OUTPUT_PROJ_CTE_UNIT_CASES + OUTPUT_PROJ_CTE_MODEL_CONFIGS))
-
 # Kernel constraints
 _MAX_B_TIMES_S = 128 * 1024
 _MAX_H = 20705
 _MAX_N = 17
-_MAX_D = 128
+_MAX_D = 256
+_MAX_D_ROW = 128  # ROW quantization uses [B, S, N, D] layout, no D-folding support
 
 # Max sizes to run validation on (to avoid OOM during testing)
 _MAX_BxS_VALIDATE = 64 * 1024
@@ -240,6 +282,12 @@ def filter_output_proj_combinations(batch, seqlen, hidden, n_head, d_head, test_
     if _exceeds_int32_tensor_elements(batch, seqlen, hidden, n_head, d_head):
         return FilterResult.REDUNDANT
     if batch * seqlen > _MAX_B_TIMES_S:
+        return FilterResult.INVALID
+    if hidden > _MAX_H:
+        return FilterResult.INVALID
+    if n_head > _MAX_N:
+        return FilterResult.INVALID
+    if d_head > _MAX_D and d_head % 2 != 0:
         return FilterResult.INVALID
     return FilterResult.VALID
 
@@ -280,15 +328,14 @@ _SWEEP_D_HEAD = BoundedRange(
     values=sorted(
         _sweep_rng.choice(range(1, 64), size=2, replace=False).tolist()
         + _sweep_rng.choice(range(64, 129), size=2, replace=False).tolist()
+        + _sweep_rng.choice(range(128, 257, 2), size=2, replace=False).tolist()
     ),
     boundary_values=[_MAX_D + 1],
 )
 
 
-@pytest_test_metadata(
-    name="Output Projection CTE",
-    pytest_marks=["output_projection", "cte"],
-)
+@pytest_test_metadata(name="Output Projection CTE", tags=["model"])
+@pytest_marks(["output_projection", "cte", "mx"])
 @final
 class TestOutputProjCteKernel:
     """Test class for output_projection_cte using UnitTestFramework."""
@@ -641,7 +688,7 @@ class TestOutputProjCteKernel:
 
     @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_MODEL_CONFIGS, abbrevs=_ABBREVS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
     def test_output_proj_cte_static_mxfp8_unit(
         self,
         test_manager: Orchestrator,
@@ -687,3 +734,206 @@ class TestOutputProjCteKernel:
             atol=1e-5,
             is_negative_test=is_negative_test_case,
         )
+
+    # ============================================================================
+    # ROW_MX Quantization Tests
+    # ============================================================================
+
+    @pytest.mark.fast
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    def test_output_proj_cte_row_mxfp8_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        n_head: int,
+        d_head: int,
+        test_bias: bool,
+    ):
+        """Unit test for ROW_MX FP8 output projection."""
+        n_d = n_head * d_head
+        is_negative_test_case = (n_d < 128) or (n_d % 128 != 0)
+        dtype = nl.bfloat16
+
+        def input_generator(test_config):
+            return generate_output_proj_cte_inputs(
+                batch=batch,
+                seqlen=seqlen,
+                hidden=hidden,
+                n_head=n_head,
+                d_head=d_head,
+                test_bias=test_bias,
+                quantization_type=QuantizationType.ROW_MX,
+            )
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch, seqlen, hidden), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_cte,
+            torch_ref=torch_ref_wrapper(output_projection_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=0.036,
+            atol=1e-5,
+            is_negative_test=is_negative_test_case,
+        )
+
+    # ============================================================================
+    # ROW FP8 Quantization Tests (TRN2)
+    # ============================================================================
+
+    @pytest.mark.fast
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    def test_output_proj_cte_row_fp8_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        n_head: int,
+        d_head: int,
+        test_bias: bool,
+    ):
+        """Unit test for ROW FP8 output projection (TRN2). Input is [B, S, N, D]."""
+        dtype = nl.bfloat16
+
+        def input_generator(test_config):
+            return generate_output_proj_cte_inputs(
+                batch=batch,
+                seqlen=seqlen,
+                hidden=hidden,
+                n_head=n_head,
+                d_head=d_head,
+                test_bias=test_bias,
+                quantization_type=QuantizationType.ROW,
+            )
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch, seqlen, hidden), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_cte,
+            torch_ref=torch_ref_wrapper(output_projection_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=0.036,
+            atol=1e-5,
+            is_negative_test=d_head > _MAX_D_ROW,
+        )
+
+
+@pytest_marks(["output_projection", "cte", "model", "mx"])
+@final
+class TestOutputProjCteModel:
+    """Model-driven tests for Output Projection CTE kernel, organized by tier."""
+
+    _OPROJ_MODEL_PARAMS = f"{OUTPUT_PROJ_CTE_UNIT_PARAMS}, quant_type"
+
+    _OPTIMAL_PARAMS, _OPTIMAL_IDS = (
+        prepare_model_parametrize({ModelTestType.OPTIMAL: output_proj_cte_model_configs.get(ModelTestType.OPTIMAL, [])})
+        if output_proj_cte_model_configs
+        else ([], [])
+    )
+
+    def _run_model_test(self, **kwargs):
+        """Common test logic for model tiers."""
+        test_manager = kwargs["test_manager"]
+        platform_target = kwargs["platform_target"]
+        batch = kwargs["batch"]
+        seqlen = kwargs["seqlen"]
+        hidden = kwargs["hidden"]
+        n_head = kwargs["n_head"]
+        d_head = kwargs["d_head"]
+        test_bias = kwargs["test_bias"]
+        quantization_type = kwargs["quant_type"]
+
+        if quantization_type == QuantizationType.STATIC and platform_target != Platforms.TRN2:
+            pytest.skip("STATIC (fp8) only supported on TRN2")
+        if (
+            quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX)
+            and not platform_target.is_trn3()
+        ):
+            pytest.skip("MX/STATIC_MX only supported on TRN3")
+
+        n_d = n_head * d_head
+        is_negative_test_case = quantization_type in (
+            QuantizationType.MX,
+            QuantizationType.STATIC_MX,
+            QuantizationType.ROW_MX,
+        ) and (n_d < 128 or n_d % 128 != 0)
+        dtype = nl.bfloat16
+
+        if quantization_type == QuantizationType.MX:
+            rtol = 5e-2
+            torch_ref = torch_ref_wrapper(output_projection_cte_mx_torch_ref)
+
+            def input_generator(test_config):
+                return generate_output_proj_cte_mx_inputs(batch, seqlen, hidden, n_head, d_head, test_bias=test_bias)
+        else:
+            rtol = 2e-2 if quantization_type == QuantizationType.NONE else 0.036
+            torch_ref = torch_ref_wrapper(output_projection_cte_torch_ref)
+
+            def input_generator(test_config):
+                return generate_output_proj_cte_inputs(
+                    batch=batch,
+                    seqlen=seqlen,
+                    hidden=hidden,
+                    n_head=n_head,
+                    d_head=d_head,
+                    test_bias=test_bias,
+                    quantization_type=quantization_type,
+                )
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch, seqlen, hidden), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_cte,
+            torch_ref=torch_ref,
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=rtol,
+            atol=1e-5,
+            is_negative_test=is_negative_test_case,
+        )
+
+    @pytest.mark.optimal
+    @pytest.mark.parametrize(_OPROJ_MODEL_PARAMS, _OPTIMAL_PARAMS, ids=_OPTIMAL_IDS)
+    def test_optimal(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        n_head: int,
+        d_head: int,
+        test_bias: bool,
+        quant_type: QuantizationType,
+    ):
+        """OPTIMAL: Performance-optimized model configs."""
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        self._run_model_test(**kwargs)

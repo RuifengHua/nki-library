@@ -22,17 +22,18 @@ Files can opt-out of this check by including the comment @IGNORE_FAST anywhere i
 """
 
 import ast
+from typing import List
+
+import pytest
+
 from test.utils.test_validation_utils import (
     IntegrationFileCollector,
     ParsedFileInfo,
     ValidationErrorReporter,
     ValidationViolation,
-    get_decorator_kwargs,
+    get_decorator_args,
     get_decorator_name,
 )
-from typing import List
-
-import pytest
 
 # Comment marker to exclude a file from @fast marker validation
 IGNORE_FAST_MARKER = "@IGNORE_FAST"
@@ -60,13 +61,10 @@ FAST_MARKER_FIX_INSTRUCTIONS = [
     "       def test_case_1(self):",
     "           ...",
     "",
-    "Option 3: Include 'fast' in @pytest_test_metadata pytest_marks:",
+    "Option 3: Include 'fast' in @pytest_marks:",
     "",
-    "   @pytest_test_metadata(",
-    "       name=\"My Test\",",
-    "       pytest_marks=[\"category\", \"fast\"],",
-    "   )",
-    "   class TestMyKernel:",
+    "   @pytest_marks([\"category\", \"fast\"])",
+    "   class TestMyKernelFast:",
     "       ...",
     "",
     "Option 4: Add @IGNORE_FAST comment to opt-out of this check:",
@@ -77,6 +75,13 @@ FAST_MARKER_FIX_INSTRUCTIONS = [
     "",
     "NOTE: @fast tests should be quick to run and cover basic functionality.",
     "      They are used for fast CI validation before running full sweeps.",
+    "",
+    "Option 5: Apply @fast via pytest.param marks in parametrize:",
+    "",
+    "   ALL_PARAMS = [",
+    "       pytest.param(*c, marks=pytest.mark.fast) if is_fast(c) else c",
+    "       for c in TEST_PARAMS",
+    "   ]",
 ]
 
 
@@ -110,24 +115,19 @@ def _has_fast_marker_on_decorator(decorator: ast.expr) -> bool:
     return False
 
 
-def _check_pytest_test_metadata_for_fast(decorator: ast.expr) -> bool:
+def _check_pytest_marks_for_fast(decorator: ast.expr) -> bool:
     """
-    Check if @pytest_test_metadata decorator contains 'fast' in pytest_marks.
+    Check if @pytest_marks decorator contains 'fast'.
 
     Example:
-        @pytest_test_metadata(
-            name="Test Name",
-            pytest_marks=["attention", "fast"],
-        )
+        @pytest_marks(["attention", "fast"])
     """
     decorator_name = get_decorator_name(decorator)
-    if decorator_name != "pytest_test_metadata":
+    if decorator_name != "pytest_marks":
         return False
 
-    kwargs = get_decorator_kwargs(decorator)
-    pytest_marks = kwargs.get("pytest_marks", [])
-
-    return isinstance(pytest_marks, list) and "fast" in pytest_marks
+    args = get_decorator_args(decorator)
+    return len(args) > 0 and isinstance(args[0], list) and "fast" in args[0]
 
 
 def _has_fast_marker(decorators: List[ast.expr]) -> bool:
@@ -135,8 +135,53 @@ def _has_fast_marker(decorators: List[ast.expr]) -> bool:
     for decorator in decorators:
         if _has_fast_marker_on_decorator(decorator):
             return True
-        if _check_pytest_test_metadata_for_fast(decorator):
+        if _check_pytest_marks_for_fast(decorator):
             return True
+    return False
+
+
+def _is_pytest_param_call(node: ast.Call) -> bool:
+    """Check if a Call node is pytest.param(...)."""
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr == "param":
+        if isinstance(func.value, ast.Name) and func.value.id == "pytest":
+            return True
+    return False
+
+
+def _marks_value_contains_fast(value: ast.expr) -> bool:
+    """
+    Check if a marks= keyword value contains pytest.mark.fast.
+
+    Handles:
+    - marks=pytest.mark.fast (single mark)
+    - marks=[pytest.mark.fast, ...] (list of marks)
+    """
+    if _has_fast_marker_on_decorator(value):
+        return True
+    if isinstance(value, (ast.List, ast.Tuple)):
+        for elt in value.elts:
+            if _has_fast_marker_on_decorator(elt):
+                return True
+    return False
+
+
+def _has_fast_in_pytest_params(tree: ast.Module) -> bool:
+    """
+    Check if any pytest.param() call in the module has marks=pytest.mark.fast.
+
+    Handles:
+    - pytest.param(..., marks=pytest.mark.fast)
+    - pytest.param(..., marks=[pytest.mark.fast, ...])
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not _is_pytest_param_call(node):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "marks" and _marks_value_contains_fast(kw.value):
+                return True
     return False
 
 
@@ -147,7 +192,8 @@ def _extract_fast_marker_info(file_info: ParsedFileInfo) -> dict:
     Returns a dict with:
     - has_fast_class: True if any Test* class has @fast decorator
     - has_fast_method: True if any test_* method has @fast decorator
-    - has_fast_in_metadata: True if any @pytest_test_metadata has 'fast' in pytest_marks
+    - has_fast_in_metadata: True if any @pytest_marks has 'fast'
+    - has_fast_param: True if any pytest.param() has marks=pytest.mark.fast
     - test_class_names: Set of test class names found
     - test_method_names: Set of test method names found
     """
@@ -155,6 +201,7 @@ def _extract_fast_marker_info(file_info: ParsedFileInfo) -> dict:
         "has_fast_class": False,
         "has_fast_method": False,
         "has_fast_in_metadata": False,
+        "has_fast_param": False,
         "test_class_names": set(),
         "test_method_names": set(),
     }
@@ -167,9 +214,9 @@ def _extract_fast_marker_info(file_info: ParsedFileInfo) -> dict:
         if _has_fast_marker(test_class.decorator_list):
             result["has_fast_class"] = True
 
-        # Check @pytest_test_metadata for 'fast' in pytest_marks
+        # Check @pytest_marks for 'fast'
         for decorator in test_class.decorator_list:
-            if _check_pytest_test_metadata_for_fast(decorator):
+            if _check_pytest_marks_for_fast(decorator):
                 result["has_fast_in_metadata"] = True
 
         # Check methods within the class
@@ -187,6 +234,10 @@ def _extract_fast_marker_info(file_info: ParsedFileInfo) -> dict:
         if _has_fast_marker(test_func.decorator_list):
             result["has_fast_method"] = True
 
+    # Check for pytest.param(..., marks=pytest.mark.fast) anywhere in the file
+    if file_info.tree is not None:
+        result["has_fast_param"] = _has_fast_in_pytest_params(file_info.tree)
+
     return result
 
 
@@ -199,7 +250,7 @@ def test_all_integration_test_files_have_fast_marker():
     achieved through:
     - Method-level annotation: @pytest.mark.fast on a test_* method
     - Class-level annotation: @pytest.mark.fast on a Test* class
-    - Metadata annotation: 'fast' in pytest_marks of @pytest_test_metadata
+    - Metadata annotation: 'fast' in @pytest_marks decorator
 
     The test will report ALL missing files rather than failing on the first one,
     allowing developers to fix all issues in a single pass.
@@ -228,8 +279,9 @@ def test_all_integration_test_files_have_fast_marker():
     for file_info in test_files:
         info = _extract_fast_marker_info(file_info)
 
-        # Check if the file has any @fast marker
-        has_fast = info["has_fast_class"] or info["has_fast_method"] or info["has_fast_in_metadata"]
+        has_fast = (
+            info["has_fast_class"] or info["has_fast_method"] or info["has_fast_in_metadata"] or info["has_fast_param"]
+        )
 
         if not has_fast:
             reporter.add_violation(

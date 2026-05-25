@@ -19,6 +19,7 @@ with expert affinity scattering.
 """
 
 import neuronxcc.nki.typing as nt
+import nki
 import nki.isa as nisa
 import nki.language as nl
 from nki.isa import core_barrier, engine, reduce_cmd
@@ -52,6 +53,7 @@ XSBLayout_tp201__2 = 2
 XSBLayout__128_Hdiv128_T__3 = 3
 
 
+@nki.jit
 def router_topk(
     x: nl.ndarray,
     w: nl.ndarray,
@@ -253,16 +255,6 @@ def router_topk(
 
     # E is expected to be less than max moving free-dim
     kernel_assert(E <= F_MAX, f"E ({E}) must be <= gemm_moving_fmax ({F_MAX})")
-
-    # skip_store_router_logits is not yet supported due to a compiler limitation:
-    # the compiler requires every mutable_tensor to have at least one store operation,
-    # but router_logits is always returned as a mutable_tensor output.
-    kernel_assert(
-        not skip_store_router_logits,
-        "skip_store_router_logits=True is not currently supported due to a compiler limitation "
-        "(NCC_IGCA090: mutable_tensor must have at least one store). "
-        "Set skip_store_router_logits=False as a workaround.",
-    )
 
     # Check 'w_bias'
     has_bias = w_bias != None
@@ -1685,15 +1677,35 @@ def router_topk_input_w_load(w: nl.ndarray, x_sb_layout, name=''):
         # As we move down one column of SBUF we get H data with a stride of num_h_tiles_by_2, which matches the
         #   the stride of the corresponding 'x' layout.
 
-        w_reshape = w.reshape((2, P_MAX, num_h_tiles_by_2, E))
-        w_sb = nl.ndarray((P_MAX, 2, num_h_tiles_by_2, E), dtype=w.dtype, buffer=nl.sbuf, name=name)
-        nisa.dma_copy(
-            src=tensor_view.TensorView(w_reshape).permute([1, 0, 2, 3]).get_view(),
-            dst=tensor_view.TensorView(w_sb).get_view(),
-        )
-        # We always return a 3D shape. The extra H-dimension of [0:2], while necessary for loading from HBM->SBUF above,
-        # is not necessary when an eventual matmul reads from SBUF. It will simply read the entire free-dim in order.
-        w_sb = w_sb.reshape((P_MAX, num_h_tiles, E))
+        w_sb = nl.ndarray((P_MAX, num_h_tiles, E), dtype=w.dtype, buffer=nl.sbuf, name=name)
+        if num_h_tiles % 2 == 0:
+            # Balanced: single vectorized reshape+permute DMA
+            w_reshape = w.reshape((2, P_MAX, num_h_tiles_by_2, E))
+            w_sb_4d = w_sb.reshape((P_MAX, 2, num_h_tiles_by_2, E))
+            nisa.dma_copy(
+                src=tensor_view.TensorView(w_reshape).permute([1, 0, 2, 3]).get_view(),
+                dst=tensor_view.TensorView(w_sb_4d).get_view(),
+            )
+        else:
+            # Unbalanced: load each half with correct stride to match x layout
+            h2_first = num_h_tiles_by_2  # floor(num_h_tiles / 2)
+            h2_second = num_h_tiles - h2_first
+            # Half 0: [h2_first * P_MAX, E] -> [P_MAX, h2_first, E]
+            w_half0_view = (
+                tensor_view.TensorView(w)
+                .slice(dim=0, start=0, end=h2_first * P_MAX)
+                .reshape_dim(dim=0, shape=[P_MAX, h2_first])
+            )
+            w_sb_half0 = tensor_view.TensorView(w_sb).slice(dim=1, start=0, end=h2_first)
+            nisa.dma_copy(src=w_half0_view.get_view(), dst=w_sb_half0.get_view())
+            # Half 1: [h2_second * P_MAX, E] -> [P_MAX, h2_second, E]
+            w_half1_view = (
+                tensor_view.TensorView(w)
+                .slice(dim=0, start=h2_first * P_MAX, end=H)
+                .reshape_dim(dim=0, shape=[P_MAX, h2_second])
+            )
+            w_sb_half1 = tensor_view.TensorView(w_sb).slice(dim=1, start=h2_first, end=num_h_tiles)
+            nisa.dma_copy(src=w_half1_view.get_view(), dst=w_sb_half1.get_view())
 
     else:  # x_sb_layout = 2,3
         # HBM tensor shape [H,E] reshaped (new view) as [num_h_tiles, 128, E].

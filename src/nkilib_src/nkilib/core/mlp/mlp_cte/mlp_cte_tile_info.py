@@ -119,10 +119,19 @@ def calc_batch_seqlen_dim_tile_size(
         aligned_bxs_dim = get_ceil_aligned_size(bxs_dim_size, nl.tile_size.pmax)
         tile_size = min(tile_size, aligned_bxs_dim)
 
-    kernel_assert(
-        not mlp_params.quant_params.is_quant_static_mx() or tile_size >= 256,
-        f"Static MX quant requires I < 8096, but got I = {mlp_params.intermediate_size}",
-    )
+    """
+    MX quantization requires a minimum BxS subtile of 2*pmax (256) for the MX projection path's
+    PSUM bank layout. We validate PSUM capacity here but do NOT pad tile_size — padding is applied
+    only to mx_src_proj_bxs_dim_tile in build_mlp_cte_tile_info to avoid inflating bxs_dim_tile
+    subtile counts (which would create zero-sized phantom subtiles in I/O and transpose paths).
+    """
+    if mlp_params.quant_params.is_quant_static_mx():
+        mx_min_tile = 2 * nl.tile_size.pmax
+        kernel_assert(
+            bxs_dim_subtile_size * bxs_dim_max_subtiles >= mx_min_tile,
+            f"Static MX quant requires PSUM capacity for at least {mx_min_tile} BxS elements, "
+            f"but intermediate_size={mlp_params.intermediate_size} is too large",
+        )
 
     # There are assumptions in the code that this is true
     kernel_assert(
@@ -221,9 +230,15 @@ def build_mlp_cte_tile_info(
         src_proj_intermediate_dim_tile.tile_count * src_proj_intermediate_dim_tile.tile_size,
     )
     bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
-    mx_src_proj_bxs_dim_tile = TiledDimInfo.build_with_subtiling(
-        bxs_dim_size, bxs_dim_tile_size, 2 * bxs_dim_subtile_size
+
+    # MX projection uses a wider BxS subtile (2*pmax); pad tile size to fit at least one full subtile
+    mx_bxs_subtile_size = 2 * bxs_dim_subtile_size
+    mx_bxs_tile_size = (
+        max(bxs_dim_tile_size, mx_bxs_subtile_size)
+        if mlp_params.quant_params.is_quant_static_mx()
+        else bxs_dim_tile_size
     )
+    mx_src_proj_bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, mx_bxs_tile_size, mx_bxs_subtile_size)
 
     return MLPCTETileInfo(
         bxs_dim_tile=bxs_dim_tile,

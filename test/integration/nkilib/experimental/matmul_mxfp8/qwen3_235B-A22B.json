@@ -1,0 +1,21 @@
+{
+"vocab_size": 151936,
+"max_seq_len": 4096,
+"head_dim": 128,
+"dim": 4096,
+"n_layers": 94,
+"n_heads": 64,
+"n_kv_heads": 4,
+"qk_norm": "True",
+"hidden_dim": 12288,
+"rope_theta": 5000000,
+"moe_enabled": "True",
+"moe_inter_dim": 1536,
+"moe_args.num_experts": 128,
+"moe_args.num_shared_experts": 0,
+"moe_args.top_k": 8,
+"moe_args.score_func": "softmax",
+"moe_args.route_norm": "True",
+"moe_args.route_scale": 1.0,
+"moe_args.score_before_experts": "False"
+}

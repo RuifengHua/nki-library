@@ -62,9 +62,10 @@ make test ARGS="test/integration/nkilib/core/mlp/test_mlp_tkg.py --platform-targ
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
-| `simulation` | Run kernel on CPU via NkiCpuSimulator (no hardware required) | Numerical accuracy validation without hardware |
+| `simulation` | Run kernel on CPU via nki.simulate (no hardware required) | Numerical accuracy validation without hardware |
 | `compile-only` | Compile kernel without running on hardware | Quick syntax/structure validation |
 | `compile-and-infer` | Compile and run inference on hardware | Full validation (default) |
+| `debugger` | Compile with device dumps, run inference, then debug via nki.debug | Interactive kernel debugging (single test only) |
 
 ```bash
 # Simulation mode (no hardware required, verifies numerical accuracy on CPU)
@@ -240,13 +241,70 @@ For complete examples, see [`test/integration/nkilib/core/cumsum/test_cumsum.py`
 | `@pytest.mark.skip_compilation` | Skip compilation phase |
 | `@pytest.mark.slow_simulation` | Mark test as slow for CPU simulation (large tensor shapes) |
 
-## Simulation Mode (NkiCpuSimulator)
+## Simulation Mode (nki.simulate)
 
-Run tests on CPU without Trainium hardware via NkiCpuSimulator. See `simulation.md` for requirements, limitations, and details.
+Run tests on CPU without Trainium hardware via `nki.simulate_kernel()`. See `simulation.md` for requirements, limitations, and details.
 
 ```bash
-make test ARGS="test/integration --test-mode simulation -k 'test_name' -n auto"
+make test ARGS="test/integration --test-mode simulation -k 'test_name' -n auto --maxprocesses 64"
 ```
+
+## Debugger Mode (nki.debug)
+
+Debug kernels by compiling with device dumps enabled, running inference on hardware, then invoking `nki.debug()` on the dumps. This mode:
+
+1. Compiles the kernel with `enable_device_dump=True` (automatically enabled)
+2. Runs inference on Trainium hardware to generate debug dumps
+3. Disables Python `breakpoint()` calls during compile+infer (restored before debugging)
+4. Calls `nki.debug()` on the resulting dumps — no automated validation is performed
+
+**Constraint:** Exactly one test must be selected. Use `-k` to select a single test.
+
+### Debugger CLI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--debugger-interactive` | `False` | Enable interactive mode for `nki.debug` (requires `-s`) |
+| `--debugger-core-id` | `0` | NeuronCore ID to debug |
+| `--debugger-replay` | `False` | Skip compile+infer and replay `nki.debug()` against device dumps from a previous run |
+
+The `rtol` and `atol` tolerances are sourced from the test's `ValidationArgs` (`relative_accuracy` and `absolute_accuracy`). If the test has no `ValidationArgs`, defaults of `rtol=1e-2` and `atol=1e-1` are used.
+
+Raw device dumps are saved in the test's `infer_result/debug_output/` folder.
+
+### Inserting breakpoints
+
+Add `breakpoint()` directly into the NKI kernel source code. When the debugger hits it, you can inspect any SBUF tensor's dual values:
+
+```python
+# Inside your NKI kernel:
+breakpoint()
+# Then in the pdb prompt:
+# tensor.sim_value   — value computed by the simulator
+# tensor.device_value — value captured from the device dump
+```
+
+### Interactive mode
+
+Interactive mode launches after kernel execution completes, allowing you to browse all device dumps and find mismatches.
+
+Available commands:
+
+| Command | Description |
+|---------|-------------|
+| `n`, `next` | Move to the next instruction |
+| `p`, `prev` | Move to the previous instruction |
+| `g`, `goto <id>` | Jump to instruction by dump_id |
+| `m`, `mismatch` | Jump to next mismatch (wraps around) |
+| `ls`, `list [s] [e]` | List instructions with status (optional dump_id range) |
+| `i`, `inspect` | Show full details of current instruction |
+| `c`, `compare` | Show sim, device, and abs diff side-by-side |
+| `d`, `diff` | Show diff metrics for all instructions |
+| `di`, `diffi [atol]` | Show abs diff tensor with highlighted outliers |
+| `sim` | Print sim_value of current instruction |
+| `dev` | Print device_value of current instruction |
+| `core <0\|1>` | Switch to a different core (LNC=2) |
+| `q`, `quit` | Exit the debugger |
 
 ## Performance Metrics Collection
 
@@ -275,4 +333,4 @@ The CSV contains: `TestName`, `TpbSgCyclesSum` (cycles), `MbuEstimatedPercent` (
 ### Tips
 
 - **Always rebuild before testing** - Tests run against built artifacts
-- **Use parallelism** (`-n auto --dist worksteal`) - Always use unless <20 test configs
+- **Use parallelism** (`-n auto --maxprocesses 64 --dist worksteal`) - Always use unless <20 test configs

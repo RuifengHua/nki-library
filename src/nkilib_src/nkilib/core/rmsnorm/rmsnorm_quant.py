@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""8-bit Quantization and RMS Normalization Kernel for NKI. Performs optional RMS normalization followed by FP8 quantization along the last dimension."""
+"""RMS Normalization and FP8 Quantization kernel for NKI.
+
+Performs optional RMS normalization followed by FP8 quantization along the last dimension.
+"""
 
 from dataclasses import dataclass
 
@@ -89,6 +92,9 @@ def rmsnorm_quant_kernel(
     ln_w: nl.ndarray,
     kargs: RmsNormQuantKernelArgs,
     input_dequant_scale: nl.ndarray = None,
+    pre_norm_gamma: nl.ndarray = None,
+    residual: nl.ndarray = None,
+    auto_resolve_fp8_dtype: bool = False,
 ) -> nl.ndarray:
     """
     Perform optional RMS normalization followed by FP8 quantization along the last dimension.
@@ -96,6 +102,24 @@ def rmsnorm_quant_kernel(
     This kernel performs quantization down to 8 bits along the last dimension of the input tensor.
     For each last dimension vector, the maximum absolute value is found and used with the FP8 range
     to scale values. RMS normalization is optional and computed prior to quantization.
+
+    When ``pre_norm_gamma`` is provided, a first RMSNorm is applied to ``hidden``
+    before any residual add::
+
+        hidden = RMSNorm(hidden, pre_norm_gamma, eps)
+
+    When ``residual`` is provided, a residual add is performed (after the optional
+    pre-norm) and the result is written back to HBM::
+
+        residual_out = hidden + residual          # (or norm1 + residual when pre_norm_gamma is set)
+
+    The two options can be used independently or together.  When both are set the
+    full fused path is::
+
+        norm1 = RMSNorm(hidden, pre_norm_gamma, eps)
+        residual_out = norm1 + residual
+        output = [optional RMSNorm(residual_out, ln_w, eps) ->] Quantize(...)
+
     TODO: Specify intended usage range (e.g., sequence length, batch size).
 
     Dimensions:
@@ -110,11 +134,20 @@ def rmsnorm_quant_kernel(
         ln_w (nl.ndarray): [H] or [1, H], Gamma multiplicative bias vector for RMS norm
         kargs (RmsNormQuantKernelArgs): Kernel configuration arguments
         input_dequant_scale (nl.ndarray): [128, 1], Input dequantization scale for static quant
+        pre_norm_gamma (nl.ndarray): [H] or [1, H], Optional gamma for a first RMSNorm applied
+            to ``hidden`` before the residual add.  Can be used with or without ``residual``.
+        residual (nl.ndarray): [B, S, H], Optional residual tensor on HBM.  Can be used
+            with or without ``pre_norm_gamma``.
 
     Returns:
-        output (nl.ndarray): [B, S, H+4] for row quant or [B, S, H] for static quant,
-            Quantized output tensor on HBM. For row quant, last 4 elements per row
-            store the fp32 dequantization scale as 4 fp8 values.
+        When ``residual`` is None (default path):
+            output (nl.ndarray): [B, S, H+4] for row quant or [B, S, H] for static quant,
+                Quantized output tensor on HBM. For row quant, last 4 elements per row
+                store the fp32 dequantization scale as 4 fp8 values.
+        When ``residual`` is provided (fused path):
+            tuple of (quant_output, residual_output) where
+                quant_output: same as above
+                residual_output: [B, S, H], the post-residual-add result on HBM
 
     Notes:
         - Supports no specialization or 1D SPMD grid sharding
@@ -126,6 +159,12 @@ def rmsnorm_quant_kernel(
         # Reshape input to [OD, PD] where OD = B*S, PD = H
         for outer_tile_idx in range(num_outer_tiles):
             tile = load_tile(hidden, outer_tile_idx)
+            if pre_norm_gamma != None:
+                tile = rms_normalize(tile, pre_norm_gamma, eps)
+            if residual != None:
+                res_tile = load_tile(residual, outer_tile_idx)
+                tile = tile + res_tile
+                store_tile(residual_output, tile)
             if needs_rms_norm:
                 tile = rms_normalize(tile, ln_w, eps)
             if row_quant:
@@ -134,17 +173,29 @@ def rmsnorm_quant_kernel(
                 quant_tile = static_quantize(tile, input_scale)
             store_tile(output, quant_tile, dequant_scale)
     """
+    has_pre_norm = pre_norm_gamma != None
+    has_residual = residual != None
+    if has_pre_norm:
+        kernel_assert(has_residual, "pre_norm_gamma requires residual to be provided")
+    if has_residual:
+        kernel_assert(
+            hidden.shape == residual.shape,
+            f"hidden and residual must have the same shape, got {hidden.shape} vs {residual.shape}",
+        )
+
     # Either we aren't sharding (grid_ndim == 0) or we can shard on a single dimension (grid_ndim == 1)
     get_verified_program_sharding_info("rmsnorm_quant", (0, 1))
 
-    # We can handle any input by processing along its last dimension and reshaping to collapse all other dimensions into one.
-    # This way, we don't have to be so specific that we require inputs with shape [B, S, H] for example.
+    # We can handle any input by processing along its last dimension and reshaping to collapse all
+    # other dimensions into one. We don't have to require inputs with shape [B, S, H] for example.
     tsr_proc_shape = _collapse_shape_major_dimensions(hidden.shape)
     # Build data structures with info that we need throughout the kernel
     tile_info = build_rms_norm_quant_tile_info(tsr_proc_shape)
-    constants = build_rms_norm_quant_constants(tile_info, kargs.eps, tsr_proc_shape)
+    constants = build_rms_norm_quant_constants(
+        tile_info, kargs.eps, tsr_proc_shape, auto_resolve_fp8_dtype=auto_resolve_fp8_dtype
+    )
 
-    _validate_kernel_input(hidden, ln_w, input_dequant_scale, kargs, constants)
+    _validate_kernel_input(hidden, ln_w, input_dequant_scale, kargs, constants, pre_norm_gamma)
 
     if kargs.is_row_quant():
         # Create the output tensor with the same shape as the input tensor but with the
@@ -155,19 +206,51 @@ def rmsnorm_quant_kernel(
     out_tsr_proc_shape = _collapse_shape_major_dimensions(out_tsr_shape)
     out_tsr_hbm = nl.ndarray(out_tsr_shape, dtype=constants.quant_data_type, buffer=nl.shared_hbm)
 
+    # Allocate residual output when residual is provided
+    if has_residual:
+        residual_out_hbm = nl.ndarray(hidden.shape, dtype=hidden.dtype, buffer=nl.shared_hbm)
+        res_out_proc_shape = _collapse_shape_major_dimensions(hidden.shape)
+        res_tsr_hbm_view = residual.reshape(tsr_proc_shape)
+        res_out_hbm_view = residual_out_hbm.reshape(res_out_proc_shape)
+    else:
+        residual_out_hbm = None
+        res_tsr_hbm_view = None
+        res_out_hbm_view = None
+
     # Set the input and output shapes up based on an outer dimension and the dimension that we process along
     in_tsr_hbm_view = hidden.reshape(tsr_proc_shape)
     out_tsr_hbm_view = out_tsr_hbm.reshape(out_tsr_proc_shape)
 
-    # Check if we were launched for single program multiple data and if so, call the code to do the appropriate sharding.
+    # Check if we were launched for SPMD and if so, call the code to do the appropriate sharding.
     # Otherwise, just do a single invocation of the kernel to process all the data.
     if is_launched_as_spmd():
-        _rmsnorm_quant_sharded_kernel(kargs, in_tsr_hbm_view, ln_w, input_dequant_scale, out_tsr_hbm_view)
+        _rmsnorm_quant_sharded_kernel(
+            kargs,
+            in_tsr_hbm_view,
+            ln_w,
+            input_dequant_scale,
+            out_tsr_hbm_view,
+            pre_norm_gamma,
+            res_tsr_hbm_view,
+            res_out_hbm_view,
+            auto_resolve_fp8_dtype=auto_resolve_fp8_dtype,
+        )
     else:
         _rmsnorm_quant_single_core_kernel(
-            kargs, tile_info, constants, in_tsr_hbm_view, ln_w, input_dequant_scale, out_tsr_hbm_view
+            kargs,
+            tile_info,
+            constants,
+            in_tsr_hbm_view,
+            ln_w,
+            input_dequant_scale,
+            out_tsr_hbm_view,
+            pre_norm_gamma,
+            res_tsr_hbm_view,
+            res_out_hbm_view,
         )
 
+    if has_residual:
+        return out_tsr_hbm, residual_out_hbm
     return out_tsr_hbm
 
 
@@ -177,6 +260,7 @@ def _validate_kernel_input(
     input_sc: nl.ndarray,
     kargs: RmsNormQuantKernelArgs,
     constants: RMSNormQuantConstants,
+    pre_norm_gamma: nl.ndarray = None,
 ) -> None:
     """
     Validate all input parameters for the RMS norm quantization kernel.
@@ -187,6 +271,7 @@ def _validate_kernel_input(
         input_sc (nl.ndarray): Input dequantization scale for static quant
         kargs (RmsNormQuantKernelArgs): Kernel configuration arguments
         constants (RMSNormQuantConstants): Kernel constants
+        pre_norm_gamma (nl.ndarray): Optional pre-norm gamma vector
 
     Notes:
         - Input tensor must have at least 2 dimensions
@@ -270,6 +355,17 @@ def _validate_kernel_input(
                 ln_w.shape[0] <= constants.MAX_H,
                 f"ln_w dimension {ln_w.shape[0]} exceeds maximum {constants.MAX_H}",
             )
+
+    # Validate pre_norm_gamma when provided
+    if pre_norm_gamma != None:
+        kernel_assert(
+            len(pre_norm_gamma.shape) == 1 or len(pre_norm_gamma.shape) == 2,
+            f"Rank of pre_norm_gamma must be 1 or 2 but got {len(pre_norm_gamma.shape)}",
+        )
+        kernel_assert(
+            pre_norm_gamma.shape[-1] == constants.proc_dim_size,
+            f"pre_norm_gamma vector length must equal {constants.proc_dim_size} but got {pre_norm_gamma.shape[-1]}",
+        )
 
 
 def _local_prod(x: tuple[int, ...]) -> int:
@@ -398,7 +494,7 @@ def _store_tensor_tile_and_dequant_scales(
                     [constants.dequant_scale_size, num_p],
                     [1, constants.dequant_scale_size],
                 ],
-                dtype=nl.float8_e4m3,
+                dtype=constants.quant_data_type,
             ),
         )
 
@@ -441,8 +537,8 @@ def _rms_normalize_tile(
         src=gamma_hbm[0 : gamma_hbm.shape[0], 0 : gamma_hbm.shape[1]],
     )
 
-    # Find the sum of the squares of all elements in the processing dimension and store that in inverse_rms_scale_sbuf.
-    # NOTE: squared_in_tsr_sbuf is each individual element squared.  We don't use that result data but have to provide storage for it.
+    # Find the sum of the squares of all elements in the processing dimension.
+    # NOTE: squared_in_tsr_sbuf stores each element squared. We don't use that data but must provide storage.
     nisa.activation_reduce(
         dst=squared_in_tsr_sbuf[0:num_p, 0 : constants.proc_dim_size],
         op=nl.square,
@@ -452,7 +548,8 @@ def _rms_normalize_tile(
         bias=constants.outer_dim_tile_zero_bias_vector_sbuf[0:num_p, 0:1],
         scale=1.0,
     )
-    # Calculate the reciprocal of the RMS being sure to add epsilon for numerical stability.  Store the result back in inverse_rms_scale_sbuf.
+    # Calculate the reciprocal of the RMS, adding epsilon for numerical stability.
+    # Store the result back in inverse_rms_scale_sbuf.
     nisa.activation(
         dst=inverse_rms_scale_sbuf[0:num_p, 0:1],
         op=nl.rsqrt,
@@ -549,9 +646,9 @@ def _row_quantize_tile(
     outer_dim_offset = tile_info.outer_dim_tile.tile_size * outer_dim_tile_num
     num_p = min(outer_dim_tile_size, constants.outer_dim_size - outer_dim_offset)
 
-    # abs_tile_sbuf stores the absolute values of the tile being processed.  We don't end up using these values but need a place to store them.
-    # out_dequant_scales_sbuf stores abs_group reduced over abs_group's last dimension (i.e. the processing dimension)
-    # to get the maximum absolute value.
+    # abs_tile_sbuf stores the absolute values of the tile being processed.
+    # We don't end up using these values but need a place to store them.
+    # out_dequant_scales_sbuf stores the max absolute value reduced over the processing dimension.
     abs_tile_sbuf = nl.ndarray(
         (num_p, constants.proc_dim_size),
         dtype=constants.compute_data_type,
@@ -708,9 +805,18 @@ def _rmsnorm_quant_single_core_kernel(
     rmsn_gamma_hbm: nl.ndarray,
     in_sc_hbm: nl.ndarray,
     out_tsr_hbm: nl.ndarray,
+    pre_norm_gamma_hbm: nl.ndarray = None,
+    res_tsr_hbm: nl.ndarray = None,
+    res_out_hbm: nl.ndarray = None,
 ) -> None:
     """
     Process all tiles along the outer dimension with optional RMS norm and quantization.
+
+    When ``pre_norm_gamma_hbm`` and ``res_tsr_hbm`` are provided the tile loop becomes:
+        tile = load(hidden); tile = RMSNorm(tile, pre_norm_gamma)
+        res  = load(residual); tile = tile + res; store(residual_out, tile)
+        tile = RMSNorm(tile, ln_w)  [if kargs.needs_rms_normalization()]
+        tile = Quantize(tile); store(quant_out, tile)
 
     Args:
         kargs (RmsNormQuantKernelArgs): Kernel configuration arguments
@@ -720,10 +826,19 @@ def _rmsnorm_quant_single_core_kernel(
         rmsn_gamma_hbm (nl.ndarray): [1, PD] or [PD], RMS norm gamma on HBM
         in_sc_hbm (nl.ndarray): [128, 1], Static dequant scale on HBM (or None)
         out_tsr_hbm (nl.ndarray): [OD, PDS], Output tensor on HBM
+        pre_norm_gamma_hbm (nl.ndarray): [1, PD] or [PD], Optional pre-norm gamma on HBM
+        res_tsr_hbm (nl.ndarray): [OD, PD], Optional residual tensor on HBM
+        res_out_hbm (nl.ndarray): [OD, PD], Optional residual output tensor on HBM
     """
+    has_pre_norm = pre_norm_gamma_hbm != None
+    has_residual = res_tsr_hbm != None
+
     if kargs.needs_rms_normalization():
         # Ensure the shape that the code requires
         rmsn_gamma_hbm_view = rmsn_gamma_hbm.reshape((1, constants.proc_dim_size))
+
+    if has_pre_norm:
+        pre_norm_gamma_hbm_view = pre_norm_gamma_hbm.reshape((1, constants.proc_dim_size))
 
     if kargs.is_static_quant():
         static_quant_scale_sbuf = nl.ndarray((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -733,7 +848,8 @@ def _rmsnorm_quant_single_core_kernel(
 
     # Loop over all the tiles in the outer dimension and process them one at a time
     for outer_tile_num in range(tile_info.outer_dim_tile.tile_count):
-        if kargs.needs_rms_normalization():
+        # We need RMS norm scratch buffers when either the main norm or the pre-norm path is active
+        if kargs.needs_rms_normalization() or has_pre_norm:
             # Declare some allocations required throughout RMS norm calculations
             squared_in_tsr_sbuf = nl.ndarray(
                 (tile_info.outer_dim_tile.tile_size, constants.proc_dim_size),
@@ -764,13 +880,48 @@ def _rmsnorm_quant_single_core_kernel(
         else:
             row_dequant_scales_tile_sbuf = None
 
-        # Conceptually, our loop is simple:
-        #   - Load a tile into SBUF
-        #   - Apply RMS normalization if the caller has elected to do so
-        #   - Quantize the tile
-        #   - Store the resulting quantized tile data along with the associated dequantization scales into HBM
         _load_input_tensor_tile(tile_info, constants, in_tsr_hbm, outer_tile_num, in_tile_sbuf)
 
+        # --- Optional pre-norm: RMSNorm(hidden, pre_norm_gamma) ---
+        if has_pre_norm:
+            _rms_normalize_tile(
+                tile_info,
+                constants,
+                outer_tile_num,
+                in_tile_sbuf,
+                pre_norm_gamma_hbm_view,
+                squared_in_tsr_sbuf,
+                inverse_rms_scale_sbuf,
+            )
+
+        # --- Optional residual add ---
+        if has_residual:
+            outer_dim_offset = tile_info.outer_dim_tile.tile_size * outer_tile_num
+            num_p = min(tile_info.outer_dim_tile.tile_size, constants.outer_dim_size - outer_dim_offset)
+
+            # Load residual tile
+            res_tile_sbuf = nl.ndarray(
+                (tile_info.outer_dim_tile.tile_size, constants.proc_dim_size),
+                dtype=constants.compute_data_type,
+                buffer=nl.sbuf,
+            )
+            _load_input_tensor_tile(tile_info, constants, res_tsr_hbm, outer_tile_num, res_tile_sbuf)
+
+            # Residual add
+            nisa.tensor_tensor(
+                dst=in_tile_sbuf[0:num_p, 0 : constants.proc_dim_size],
+                data1=in_tile_sbuf[0:num_p, 0 : constants.proc_dim_size],
+                data2=res_tile_sbuf[0:num_p, 0 : constants.proc_dim_size],
+                op=nl.add,
+            )
+
+            # Store residual_out to HBM
+            nisa.dma_copy(
+                dst=res_out_hbm[outer_dim_offset : outer_dim_offset + num_p, 0 : constants.proc_dim_size],
+                src=in_tile_sbuf[0:num_p, 0 : constants.proc_dim_size],
+            )
+
+        # --- Main RMSNorm (on the residual_out when fused, or on hidden when not) ---
         if kargs.needs_rms_normalization():
             _rms_normalize_tile(
                 tile_info,
@@ -810,6 +961,10 @@ def _rmsnorm_quant_sharded_kernel(
     rmsn_gamma_hbm: nl.ndarray,
     in_sc_hbm: nl.ndarray,
     out_tsr_hbm: nl.ndarray,
+    pre_norm_gamma_hbm: nl.ndarray = None,
+    res_tsr_hbm: nl.ndarray = None,
+    res_out_hbm: nl.ndarray = None,
+    auto_resolve_fp8_dtype: bool = False,
 ) -> None:
     """
     Handle 1D SPMD sharding for the RMS norm quantization kernel.
@@ -824,18 +979,24 @@ def _rmsnorm_quant_sharded_kernel(
         rmsn_gamma_hbm (nl.ndarray): [1, PD] or [PD], RMS norm gamma on HBM
         in_sc_hbm (nl.ndarray): [128, 1], Static dequant scale on HBM (or None)
         out_tsr_hbm (nl.ndarray): [OD, PDS], Output tensor on HBM
+        pre_norm_gamma_hbm (nl.ndarray): [1, PD] or [PD], Optional pre-norm gamma on HBM
+        res_tsr_hbm (nl.ndarray): [OD, PD], Optional residual tensor on HBM
+        res_out_hbm (nl.ndarray): [OD, PD], Optional residual output tensor on HBM
 
     Notes:
         - Supports 1D launch grid only (or no launch grid)
         - Allows outer dimensions not divisible by number of shards
     """
+    has_residual = res_tsr_hbm != None
+
     outer_dim, _ = in_tsr_hbm.shape
     _, num_shards, shard_id = get_program_sharding_info()
     nominal_shard_size = outer_dim // num_shards
 
     kernel_assert(
         nominal_shard_size > 0,
-        f"Outer dimension of size {outer_dim} is not big enough to distribute work among {num_shards} programs. Reduce SPMD launch grid, so that each program gets at least a single shard to work on",
+        f"Outer dimension of size {outer_dim} is not big enough to distribute work among"
+        f" {num_shards} programs. Reduce SPMD launch grid so each program gets at least one shard",
     )
 
     # Allow outer dimensions that are not a multiple of the number of shards.  For the last shard,
@@ -850,11 +1011,21 @@ def _rmsnorm_quant_sharded_kernel(
     outer_dim_idx = nl.ds(shard_offset, shard_size)
     in_tile_shard_hbm = in_tsr_hbm[outer_dim_idx, :]
     out_tile_shard_hbm = out_tsr_hbm[outer_dim_idx, :]
+
+    if has_residual:
+        res_tile_shard_hbm = res_tsr_hbm[outer_dim_idx, :]
+        res_out_shard_hbm = res_out_hbm[outer_dim_idx, :]
+    else:
+        res_tile_shard_hbm = None
+        res_out_shard_hbm = None
+
     # Figure out the shape in terms of [outer dim, processing dim]
     tsr_proc_shape = _collapse_shape_major_dimensions(in_tile_shard_hbm.shape)
     # Build data structures with info that we need throughout the kernel
     tile_info = build_rms_norm_quant_tile_info(tsr_proc_shape)
-    constants = build_rms_norm_quant_constants(tile_info, kargs.eps, tsr_proc_shape)
+    constants = build_rms_norm_quant_constants(
+        tile_info, kargs.eps, tsr_proc_shape, auto_resolve_fp8_dtype=auto_resolve_fp8_dtype
+    )
 
     return _rmsnorm_quant_single_core_kernel(
         kargs,
@@ -864,4 +1035,7 @@ def _rmsnorm_quant_sharded_kernel(
         rmsn_gamma_hbm,
         in_sc_hbm,
         out_tile_shard_hbm,
+        pre_norm_gamma_hbm,
+        res_tile_shard_hbm,
+        res_out_shard_hbm,
     )

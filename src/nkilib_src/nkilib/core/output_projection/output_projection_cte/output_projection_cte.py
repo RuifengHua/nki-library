@@ -20,6 +20,7 @@ import nki
 import nki.language as nl
 
 from ...utils.common_types import QuantizationType
+from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info
 from .output_projection_cte_float import perform_float_projection
 from .output_projection_cte_parameters import (
@@ -29,6 +30,8 @@ from .output_projection_cte_parameters import (
 )
 from .output_projection_cte_quantization import (
     perform_mx_quantized_projection,
+    perform_row_mx_quantized_projection,
+    perform_row_quantized_projection,
     perform_static_mx_quantized_projection,
     perform_static_quantized_projection,
 )
@@ -75,7 +78,7 @@ def output_projection_cte(
 
     Notes:
         - Product B * S must not exceed 131072.
-        - Head dimension D must not exceed 128.
+        - Head dimension D > 128 is supported by folding D back into N (D must have a divisor that brings it to <= 128).
         - Hidden dimension H must not exceed 20705 (not fully tested beyond).
         - Number of heads N must not exceed 17 (not fully tested beyond).
         - Hidden dimension H must be divisible by LNC (1 or 2).
@@ -98,7 +101,16 @@ def output_projection_cte(
                             out[b, s_block, h_block] = res_psum + bias_sbuf
         return out
     """
-    b_size, n_size, d_size, s_size = attention.shape
+    if quantization_type == QuantizationType.ROW:
+        # ROW: attention is [B, S, N, D]
+        kernel_assert(
+            len(attention.shape) == 4,
+            f"ROW quantization expects attention shape [B, S, N, D], got {len(attention.shape)}D tensor",
+        )
+        b_size, s_size, n_size, d_size = attention.shape
+    else:
+        # All other paths: attention is [B, N, D, S]
+        b_size, n_size, d_size, s_size = attention.shape
     _, h_size = weight.shape
 
     _, n_prgs, prg_id = get_program_sharding_info()
@@ -146,7 +158,7 @@ def output_projection_cte(
     # Execution
     if output_dtype != None:
         out_dtype = output_dtype
-    elif quantization_type == QuantizationType.MX:
+    elif quantization_type in (QuantizationType.MX, QuantizationType.ROW_MX):
         out_dtype = nl.bfloat16
     else:
         out_dtype = attention.dtype
@@ -176,6 +188,18 @@ def output_projection_cte(
             cfg=tiling_config,
             quant_config=quant_config,
         )
+    elif quant_config.is_enabled and quantization_type == QuantizationType.ROW_MX:
+        perform_row_mx_quantized_projection(
+            attention_hbm=attention,
+            weight_hbm=weight,
+            output_hbm=out,
+            bias_hbm=bias,
+            input_scale_hbm=input_scales,
+            weight_scale_hbm=weight_scales,
+            prg_id=prg_id,
+            cfg=tiling_config,
+            quant_config=quant_config,
+        )
     elif quant_config.is_enabled and quantization_type == QuantizationType.MX:
         perform_mx_quantized_projection(
             attention_hbm=attention,
@@ -184,6 +208,17 @@ def output_projection_cte(
             bias_hbm=bias,
             weight_scale_hbm=weight_scales,
             input_scale_hbm=input_scales,
+            prg_id=prg_id,
+            cfg=tiling_config,
+            quant_config=quant_config,
+        )
+    elif quant_config.is_enabled and quantization_type == QuantizationType.ROW:
+        perform_row_quantized_projection(
+            attention_hbm=attention,
+            weight_hbm=weight,
+            output_hbm=out,
+            bias_hbm=bias,
+            weight_scale_hbm=weight_scales,
             prg_id=prg_id,
             cfg=tiling_config,
             quant_config=quant_config,

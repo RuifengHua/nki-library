@@ -33,6 +33,7 @@ from .kernel_assert import kernel_assert
 # TODO: Get this constant from the NKI API once it is available
 NUM_HW_PSUM_BANKS = 8
 PSUM_BANK_SIZE = 2048
+SBUF_QUADRANT_SIZE = 32
 
 #
 # Local constants and data structures
@@ -47,6 +48,7 @@ _act_fn_map = {
     ActFnType.GELU: nl.gelu,
     ActFnType.GELU_Tanh_Approx: nl.gelu_apprx_tanh,
     ActFnType.Swish: nl.gelu_apprx_sigmoid,
+    ActFnType.ReLU: nl.relu,
 }
 
 
@@ -162,6 +164,15 @@ def is_hbm_buffer(tensor: nl.ndarray) -> bool:
     return tensor.buffer in (nl.hbm, nl.shared_hbm, nl.private_hbm)
 
 
+def is_sbuf_tensor(tensor) -> bool:
+    """Check if a tensor resides in SBUF.
+
+    nl.is_sbuf() expects a buffer constant (e.g. nl.sbuf), not a tensor.
+    This helper inspects the tensor's .buffer attribute instead.
+    """
+    return hasattr(tensor, "buffer") and tensor.buffer == nl.sbuf
+
+
 def get_nl_act_fn_from_type(act_fn: ActFnType):
     """
     Convert ActFnType enum to NKI language activation function.
@@ -175,7 +186,7 @@ def get_nl_act_fn_from_type(act_fn: ActFnType):
         function: Corresponding NKI language activation function.
 
     Notes:
-        - Supports SiLU, GELU, GELU_Tanh_Approx, and Swish
+        - Supports SiLU, GELU, GELU_Tanh_Approx, Swish, and ReLU
         - Raises assertion error for unsupported types
 
     Pseudocode:
@@ -187,6 +198,8 @@ def get_nl_act_fn_from_type(act_fn: ActFnType):
             return nl.gelu_apprx_tanh
         elif act_fn == Swish:
             return nl.gelu_apprx_sigmoid
+        elif act_fn == ReLU:
+            return nl.relu
         else:
             raise error
     """
@@ -199,6 +212,8 @@ def get_nl_act_fn_from_type(act_fn: ActFnType):
         return nl.gelu_apprx_tanh
     elif act_fn == ActFnType.Swish:
         return nl.gelu_apprx_sigmoid
+    elif act_fn == ActFnType.ReLU:
+        return nl.relu
 
 
 def is_launched_as_spmd() -> bool:
@@ -498,3 +513,22 @@ def resolve_dtype_to_nki(dtype):
     elif dtype_str == str(nl.float8_e5m2_x4):
         return nl.float8_e5m2_x4
     kernel_assert(False, f'Unrecognized dtype {dtype_str}')
+
+
+def _sbm_alloc(sbm, shape, dtype, buffer=nl.sbuf, name=None, align=None):
+    """Allocate SBUF tensor via SbufManager if available, else fall back to nl.ndarray."""
+    if sbm is not None:
+        return sbm.alloc_stack(shape=shape, dtype=dtype, buffer=buffer, name=name, align=align)
+    return nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, name=name)
+
+
+def _psum_alloc(shape, dtype, sbm, address_offset=0):
+    """Allocate a PSUM buffer, using manual addressing when sbm is provided."""
+    if sbm is not None:
+        return nl.ndarray(
+            shape,
+            dtype=dtype,
+            buffer=nl.psum,
+            address=(0, address_offset),
+        )
+    return nl.ndarray(shape, dtype=dtype, buffer=nl.psum)

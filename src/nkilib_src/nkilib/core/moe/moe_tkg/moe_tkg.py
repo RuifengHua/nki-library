@@ -16,30 +16,38 @@
 
 from typing import Optional
 
+import nki
+import nki.isa as nisa
 import nki.language as nl
 
 # MLP utils
 from ...mlp.mlp_parameters import MLPExpertParameters, MLPParameters, get_T_from_hidden_input
+from ...utils.allocator import sizeinbytes
 
 # common utils
 from ...utils.common_types import (
     ActFnType,
     ExpertAffinityScaleMode,
+    MoEAllToAllVStrategy,
+    MoEBlockIOLayout,
     NormType,
     QuantizationType,
 )
 from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import get_verified_program_sharding_info
 from .all_expert_impl import _all_expert_moe_tkg
-from .all_expert_mx_impl import _all_expert_moe_tkg_mx
+from .all_expert_mx_impl import BF16_PER_INT32, _all_expert_moe_tkg_mx
 from .moe_tkg_affinity_masking import mask_expert_affinities
 from .selective_expert_impl import _selective_expert_moe_tkg
 from .selective_expert_mx_impl import _selective_expert_moe_tkg_mxfp4
 
 # Constants
 _SUPPORTED_MX_DTYPES = (nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4)
+_SUPPORTED_ALLTOALLV_STRATEGIES = (MoEAllToAllVStrategy.DISABLED, MoEAllToAllVStrategy.PERMUTED_OUTPUT)
 _MOE_TKG_ERROR_PREFIX = "[MoE TKG Kernel]"
 
 
+@nki.jit
 def moe_tkg(
     hidden_input: nl.ndarray,
     expert_gate_up_weights: nl.ndarray,
@@ -53,13 +61,13 @@ def moe_tkg(
     expert_gate_up_weights_scale: Optional[nl.ndarray] = None,
     expert_down_weights_scale: Optional[nl.ndarray] = None,
     hidden_input_scale: Optional[nl.ndarray] = None,
-    gate_up_input_scale: Optional[nl.ndarray] = None,
-    down_input_scale: Optional[nl.ndarray] = None,
+    expert_gate_up_input_scale: Optional[nl.ndarray] = None,
+    expert_down_input_scale: Optional[nl.ndarray] = None,
     mask_unselected_experts: bool = False,
     expert_affinities_eager: Optional[nl.ndarray] = None,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.NO_SCALE,
     activation_fn: ActFnType = ActFnType.SiLU,
-    output_dtype=None,
+    output_dtype: nki.dtype = None,
     gate_clamp_upper_limit: Optional[float] = None,
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
@@ -67,6 +75,9 @@ def moe_tkg(
     output_in_sbuf: bool = False,
     is_all_expert_dynamic: bool = False,
     block_size: int = None,
+    input_dequant_scale: Optional[nl.ndarray] = None,
+    all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
+    outp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
 ) -> nl.ndarray:
     """
     Mixture of Experts (MoE) MLP token generation kernel.
@@ -85,9 +96,12 @@ def moe_tkg(
         E_L: Number of local experts processed by this kernel
         K: Top-k experts per token
         I_p: I//4 if I <= 512 else 128
+        H_concat: H + H/4 + E_L * 2 + 4. Number of columns when hidden_input, hidden_input_scale, local expert affinities,
+            and global token index are concatenated and bitcast to a common fp8 dtype.
 
     Args:
-        hidden_input (nl.ndarray): [T, H] in HBM or [H0, T, H1] in SBUF, Input hidden states tensor.
+        hidden_input (nl.ndarray): [T, H] or [T, H_concat] in HBM or [H0, T, H1] in SBUF, Input hidden states tensor.
+            When all_to_all_v_strategy! = DISABLED, input is expected to have layout [T, H_concat] and fp8 dtype.
         expert_gate_up_weights (nl.ndarray): [E_L, H, 2, I] for bf16/fp16 or [E_L, 128, 2, ceil(H/512), I] for MxFP4,
             Fused gate and up projection weights.
         expert_down_weights (nl.ndarray): [E_L, I, H] for bf16/fp16 or [E_L, I_p, ceil(I/512), H] for MxFP4,
@@ -111,9 +125,9 @@ def moe_tkg(
             hidden_input in SBUF. When provided with MX weights in all-expert mode, indicates that hidden_input
             is already quantized and skips internal swizzle + quantization. The hidden_input buffer must be in
             SBUF when hidden_input_scale is provided. dtype: nl.uint8.
-        gate_up_input_scale (nl.ndarray, optional): [E_L, 1], FP8 dequantization scales for gate/up input.
+        expert_gate_up_input_scale (nl.ndarray, optional): [E_L, 1], FP8 dequantization scales for gate/up input.
             Used for static quantization.
-        down_input_scale (nl.ndarray, optional): [E_L, 1], FP8 dequantization scales for down input. Used for
+        expert_down_input_scale (nl.ndarray, optional): [E_L, 1], FP8 dequantization scales for down input. Used for
             static quantization.
         mask_unselected_experts (bool): Whether to apply expert affinity masking based on expert_index. When
             True, affinities are masked to zero for experts not selected by each token. Only used in all-expert
@@ -136,16 +150,25 @@ def moe_tkg(
             when is_all_expert_dynamic=True. block_size must:
             - Evenly divide T, resulting in at least 2 blocks.
             - Be divisible by 8 and less than 32, divisible by 32 and less than 128, or divisible by 128.
+        input_dequant_scale (nl.ndarray, optional): [128, 1] in SBUF, Pre-computed input FP8 dequantization
+            scale for STATIC_MX mode. Passed from moe_block_tkg which computes it during the fused
+            RMSNorm+quantize step. Used by the all-expert MX path to combine with per-expert weight
+            dequant scales for post-matmul dequantization. Derived from expert_gate_up_input_scale.
+        all_to_all_v_strategy (MoEAllToAllVStrategy): Input/output permutation strategy to use when MoE layer uses all_to_all_v collective.
+            Currently only supported on Trn3 with MX weights.
+        outp_layout (MoEBlockIOLayout): Output tensor layout. When _128_Nprgs_Hfree_T, output is
+            [128, n_prgs, H//128//n_prgs, T]. Not supported with output_in_sbuf. Default is B_S_H.
 
     Returns:
-        output (nl.ndarray): [T, H] or same shape as hidden_input if output_in_sbuf=True, Output tensor with
+        output (nl.ndarray): [T, H] or [128, n_prgs, H//128//n_prgs, T] depending on outp_layout,
+            or same shape as hidden_input if output_in_sbuf=True. Output tensor with
             MoE computation results.
 
     Notes:
         - T <= 128 (batch_size * seq_len must be <= 128, except for MX all-expert mode)
         - PRE_SCALE and PRE_SCALE_DELAYED modes are not supported
         - Column tiling is disabled for MoE kernels
-        - Static quantization is not currently supported
+        - STATIC_MX quantization requires MX weights with expert_gate_up_input_scale and expert_down_input_scale
 
     Pseudocode:
         # Mask expert affinities if needed (all-expert mode with affinity scaling)
@@ -170,12 +193,16 @@ def moe_tkg(
         expert_gate_up_weights=expert_gate_up_weights,
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
-        gate_up_input_scale=gate_up_input_scale,
-        down_input_scale=down_input_scale,
+        expert_gate_up_input_scale=expert_gate_up_input_scale,
+        expert_down_input_scale=expert_down_input_scale,
     )
 
-    # For all-expert mode with affinity scaling, mask expert affinities based on rank_id
-    if is_all_expert and expert_affinities_scaling_mode != ExpertAffinityScaleMode.NO_SCALE:
+    # For all-expert mode with affinity scaling and without A2A-v, mask expert affinities based on rank_id
+    if (
+        is_all_expert
+        and expert_affinities_scaling_mode != ExpertAffinityScaleMode.NO_SCALE
+        and all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED
+    ):
         kernel_assert(
             rank_id != None, f"{_MOE_TKG_ERROR_PREFIX} rank_id is required for all-expert mode with affinity scaling"
         )
@@ -205,9 +232,16 @@ def moe_tkg(
         expert_index=expert_index,
         expert_affinities_eager=expert_affinities_eager,
         expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+        is_all_expert_dynamic=is_all_expert_dynamic,
+        all_to_all_v_strategy=all_to_all_v_strategy,
+        block_size=block_size,
     )
 
     output_dtype = hidden_input.dtype if output_dtype == None else output_dtype
+    kernel_assert(
+        sizeinbytes(output_dtype) >= 2,
+        f"output_dtype must be at least a 2-byte dtype, got {output_dtype}",
+    )
 
     mlp_params = MLPParameters(
         hidden_tensor=hidden_input,
@@ -222,9 +256,10 @@ def moe_tkg(
         gate_w_scale=expert_gate_up_weights_scale,
         up_w_scale=expert_gate_up_weights_scale,
         down_w_scale=expert_down_weights_scale,
-        gate_up_in_scale=gate_up_input_scale,
-        down_in_scale=down_input_scale,
+        gate_up_in_scale=expert_gate_up_input_scale,
+        down_in_scale=expert_down_input_scale,
         hidden_input_scale=hidden_input_scale,
+        input_dequant_scale=input_dequant_scale,
         output_dtype=output_dtype,
         use_tkg_gate_up_proj_column_tiling=False,
         use_tkg_down_proj_column_tiling=False,
@@ -235,6 +270,7 @@ def moe_tkg(
         up_clamp_upper_limit=up_clamp_upper_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
         quantization_type=quant_type,
+        transposed_out=outp_layout == MoEBlockIOLayout._128_Nprgs_Hfree_T,
     )
 
     T = mlp_params.sequence_len
@@ -245,29 +281,42 @@ def moe_tkg(
         T=T,
         is_all_expert=is_all_expert,
         is_all_expert_dynamic=is_all_expert_dynamic,
+        all_to_all_v_strategy=all_to_all_v_strategy,
         block_size=block_size,
         is_mx_kernel=is_mx_kernel,
+        expert_weight_dtype=expert_gate_up_weights.dtype,
         expert_gate_up_weights_scale=expert_gate_up_weights_scale,
         expert_down_weights_scale=expert_down_weights_scale,
         hidden_input_scale=hidden_input_scale,
         expert_affinities_scaling_mode=expert_affinities_scaling_mode,
-        gate_up_input_scale=gate_up_input_scale,
-        down_input_scale=down_input_scale,
+        expert_gate_up_input_scale=expert_gate_up_input_scale,
+        expert_down_input_scale=expert_down_input_scale,
         expert_affinities_eager=expert_affinities_eager,
     )
 
     # Allocate output tensor
+    _T_LAYOUT = MoEBlockIOLayout._128_Nprgs_Hfree_T
+    kernel_assert(
+        not (outp_layout == _T_LAYOUT and output_in_sbuf),
+        f"{_MOE_TKG_ERROR_PREFIX} outp_layout=_128_Nprgs_Hfree_T is not supported with output_in_sbuf=True",
+    )
     if output_in_sbuf:
         output = nl.ndarray(hidden_input.shape, dtype=output_dtype, buffer=nl.sbuf, name="output_sb")
-    else:
+    elif outp_layout == _T_LAYOUT:
+        _, n_prgs, _ = get_verified_program_sharding_info("moe_tkg", (0, 1))
+        H0 = 128
+        H1_shard = H // (H0 * n_prgs)
+        output = nl.ndarray((H0, n_prgs, H1_shard, T), dtype=output_dtype, buffer=nl.shared_hbm)
+    elif all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
         output = nl.ndarray((T, H), dtype=output_dtype, buffer=nl.shared_hbm)
+    else:
+        # We add BF16_PER_INT32 additional columns to end when using all_to_all_v, to store concatenated token indices
+        output = nl.ndarray((T, H + BF16_PER_INT32), dtype=output_dtype, buffer=nl.shared_hbm)
 
     # Dispatch to expert MLP implementation
     if is_all_expert:
         if is_mx_kernel:
-            _all_expert_moe_tkg_mx(
-                mlp_params, output, is_all_expert_dynamic=is_all_expert_dynamic, block_size=block_size
-            )
+            _all_expert_moe_tkg_mx(mlp_params, output)
         else:
             _all_expert_moe_tkg(mlp_params, output)
     else:
@@ -283,8 +332,8 @@ def _extract_quantization_type(
     expert_gate_up_weights: nl.ndarray,
     expert_gate_up_weights_scale: Optional[nl.ndarray],
     expert_down_weights_scale: Optional[nl.ndarray],
-    gate_up_input_scale: Optional[nl.ndarray],
-    down_input_scale: Optional[nl.ndarray],
+    expert_gate_up_input_scale: Optional[nl.ndarray],
+    expert_down_input_scale: Optional[nl.ndarray],
 ) -> tuple[QuantizationType, bool]:
     """
     Extract quantization type from kernel parameters.
@@ -293,8 +342,8 @@ def _extract_quantization_type(
         expert_gate_up_weights (nl.ndarray): Gate/up projection weights tensor.
         expert_gate_up_weights_scale (nl.ndarray, optional): Quantization scale for gate/up weights.
         expert_down_weights_scale (nl.ndarray, optional): Quantization scale for down weights.
-        gate_up_input_scale (nl.ndarray, optional): FP8 dequantization scale for gate/up input.
-        down_input_scale (nl.ndarray, optional): FP8 dequantization scale for down input.
+        expert_gate_up_input_scale (nl.ndarray, optional): FP8 dequantization scale for gate/up input.
+        expert_down_input_scale (nl.ndarray, optional): FP8 dequantization scale for down input.
 
     Returns:
         tuple[QuantizationType, bool]: (quant_type, is_mx_kernel) tuple indicating the detected
@@ -304,9 +353,19 @@ def _extract_quantization_type(
     quant_type = QuantizationType.NONE
     is_mx_kernel = False
     if expert_gate_up_weights.dtype in _SUPPORTED_MX_DTYPES:
-        quant_type = QuantizationType.MX
         is_mx_kernel = True
-    elif gate_up_input_scale != None and down_input_scale != None:
+        if expert_gate_up_input_scale != None and expert_down_input_scale != None:
+            quant_type = QuantizationType.STATIC_MX
+        elif (
+            expert_gate_up_weights_scale != None
+            and expert_down_weights_scale != None
+            and expert_gate_up_weights_scale.dtype != nl.uint8
+            and expert_gate_up_weights_scale.shape[-1] > 1
+        ):
+            quant_type = QuantizationType.ROW_MX
+        else:
+            quant_type = QuantizationType.MX
+    elif expert_gate_up_input_scale != None and expert_down_input_scale != None:
         quant_type = QuantizationType.STATIC
     elif expert_gate_up_weights_scale != None and expert_down_weights_scale != None:
         quant_type = QuantizationType.ROW
@@ -318,14 +377,16 @@ def _validate_moe_tkg_inputs(
     T: int,
     is_all_expert: bool,
     is_all_expert_dynamic: bool,
+    all_to_all_v_strategy: MoEAllToAllVStrategy,
     block_size: int,
     is_mx_kernel: bool,
+    expert_weight_dtype: nki.dtype,
     expert_gate_up_weights_scale: Optional[nl.ndarray],
     expert_down_weights_scale: Optional[nl.ndarray],
     hidden_input_scale: Optional[nl.ndarray],
     expert_affinities_scaling_mode: ExpertAffinityScaleMode,
-    gate_up_input_scale: Optional[nl.ndarray],
-    down_input_scale: Optional[nl.ndarray],
+    expert_gate_up_input_scale: Optional[nl.ndarray],
+    expert_down_input_scale: Optional[nl.ndarray],
     expert_affinities_eager: Optional[nl.ndarray],
 ) -> None:
     """
@@ -335,13 +396,14 @@ def _validate_moe_tkg_inputs(
         T (int): Number of tokens.
         is_all_expert (bool): Whether using all-expert mode.
         is_all_expert_dynamic (bool): Whether all-expert mode uses dynamic control flow.
+        is_all_to_all_v (bool): Whether MoE layer uses all_to_all_v collective, which provides sparse input and requires shuffled output.
         is_mx_kernel (bool): Whether using MX quantization.
         expert_gate_up_weights_scale (nl.ndarray, optional): Quantization scale for gate/up weights.
         expert_down_weights_scale (nl.ndarray, optional): Quantization scale for down weights.
         hidden_input_scale (nl.ndarray, optional): MX quantization scale for hidden input.
         expert_affinities_scaling_mode (ExpertAffinityScaleMode): When to apply affinity scaling.
-        gate_up_input_scale (nl.ndarray, optional): FP8 dequantization scale for gate/up input.
-        down_input_scale (nl.ndarray, optional): FP8 dequantization scale for down input.
+        expert_gate_up_input_scale (nl.ndarray, optional): FP8 dequantization scale for gate/up input.
+        expert_down_input_scale (nl.ndarray, optional): FP8 dequantization scale for down input.
         expert_affinities_eager (nl.ndarray, optional): Eager expert affinities.
 
     Returns:
@@ -353,6 +415,10 @@ def _validate_moe_tkg_inputs(
             expert_gate_up_weights_scale != None and expert_down_weights_scale != None,
             f"{_MOE_TKG_ERROR_PREFIX} Scales must be set when using MX weights",
         )
+        kernel_assert(
+            nisa.get_nc_version() >= nisa.nc_version.gen4,
+            f"{_MOE_TKG_ERROR_PREFIX} MX weights are only supported on gen4+ (Trn3+) but got {nisa.get_nc_version()=}",
+        )
 
     # Dynamic control flow requires is_all_expert=True and block_size != None
     if is_all_expert_dynamic:
@@ -363,6 +429,21 @@ def _validate_moe_tkg_inputs(
         kernel_assert(
             block_size != None,
             f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True requires block_size != None, but got {block_size=}",
+        )
+        kernel_assert(
+            is_mx_kernel,
+            f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True is only supported with MX weights, but got {expert_weight_dtype=} ",
+        )
+        # Validate all_to_all_v_strategy supported with dynamic control flow
+        kernel_assert(
+            all_to_all_v_strategy in _SUPPORTED_ALLTOALLV_STRATEGIES,
+            f"{_MOE_TKG_ERROR_PREFIX} Unsupported all_to_all_v_strategy={all_to_all_v_strategy}. Supported: {_SUPPORTED_ALLTOALLV_STRATEGIES}",
+        )
+    # all_to_all_v requires is_all_expert_dynamic
+    else:
+        kernel_assert(
+            all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED,
+            f"{_MOE_TKG_ERROR_PREFIX} all_to_all_v_strategy != DISABLED is only supported with is_all_expert_dynamic=True, but got {is_all_expert_dynamic=}, {all_to_all_v_strategy=}",
         )
 
     # hidden_input_scale only supported with MX weights in ALL_EXPERT mode
@@ -388,11 +469,8 @@ def _validate_moe_tkg_inputs(
         f"{_MOE_TKG_ERROR_PREFIX} Kernel does not support pre-scale mode",
     )
 
-    # Static quantization not supported
-    kernel_assert(
-        gate_up_input_scale == None and down_input_scale == None,
-        f"{_MOE_TKG_ERROR_PREFIX} Static quantization is not supported in MoE TKG kernel",
-    )
+    # Static quantization without MX weights: input stays BF16, TRN2 does BF16 × FP8 matmul.
+    # gate_up_in_scale / down_in_scale are passed for detection but not used in the kernel.
 
     # All-expert mode restrictions
     if is_all_expert:

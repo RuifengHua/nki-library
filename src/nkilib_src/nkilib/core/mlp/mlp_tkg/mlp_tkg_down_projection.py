@@ -19,7 +19,6 @@ import nki.language as nl
 
 from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
-from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil
 from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
@@ -30,20 +29,20 @@ from .mlp_tkg_constants import (
     MLPTKGConstantsDownTileCounts,
     MLPTKGConstantsGateUpTileCounts,
 )
-from .mlp_tkg_utils import adaptive_dge_mode
+from .mlp_tkg_down_projection_lhs_rhs_swap import down_projection_lhs_rhs_swap
+from .mlp_tkg_utils import adaptive_dge_mode, alloc_tensor_view, prepare_down_bias_and_scale
 
 _DGE_MODE_UNKNOWN = 0  # Compiler decides best DMA mode internally
 _DGE_MODE_NONE = 3  # Use STATIC DMA mode
 
 
 def down_projection(
-    hidden: nl.ndarray,
-    weight: nl.ndarray,
-    bias: nl.ndarray,
-    output_tile: nl.ndarray,
-    weight_tiles: list[nl.ndarray],
-    bias_tile: nl.ndarray,
-    dequant_tile: nl.ndarray,
+    hidden: TensorView,
+    weight: TensorView,
+    output_tile: TensorView,
+    weight_tiles: list[TensorView],
+    bias_tile: TensorView,
+    dequant_tile: TensorView,
     dims: MLPTKGConstantsDimensionSizes,
     tiles: MLPTKGConstantsDownTileCounts,
     params: MLPParameters,
@@ -52,7 +51,9 @@ def down_projection(
     """
     Performs a single Down projection shard on the H.
 
-    Computes: Hidden[I, T] @ Weight[I, H] + Optional(Bias[1, H]) → [T, H]
+    All weight/bias inputs are pre-sharded TensorView instances — callers handle LNC/shard slicing.
+
+    Computes: Hidden[I, T] @ Weight[I, H_per_shard] + Optional(bias_tile) → [T, H_per_shard]
     - Hidden is the stationary tensor, Weight is the moving tensor.
 
     Tiled computation:
@@ -81,49 +82,31 @@ def down_projection(
     - Matrix multiplication is tiled along H and I
     - Column tiling improves PE utilization for small T
 
+    Args:
+        hidden (nl.ndarray): [I0, I1, T] — hidden activations in SBUF
+        weight (TensorView): [I, H_per_shard] — pre-sharded weight matrix
+        output_tile (nl.ndarray): [T, H_per_shard] — output buffer in SBUF
+
     Returns:
-        Output tensor with shape [T, H]
+        Output tensor with shape [T, H_per_shard]
     """
 
     # ---------- Configuration and Dimension Setup ----------
     I0, I1, T = hidden.shape
-    I, H = weight.shape[0], dims.H_per_shard
-    kernel_assert(
-        H == dims.H_per_shard,
-        f"Weight Sharding mismatch: expected {dims.H_per_shard}, got {H}",
-    )
+    I = weight.shape[0]
+    H = dims.H_per_shard
+    num_Itiles = div_ceil(I, I0)
 
-    # Calculate the starting weight index for the down projection.
-    # offset the index to avoid anti-dependencies when loading weights in sequence.
     weight_base_idx = tiles.weight_base_idx
 
-    # ---------- Bias handling ----------
-    is_bias = bias is not None
-    if is_bias:
-        # Load bias with broadcast across T dimension using TensorView
-        # [1, H_total] -> slice to [1, H_per_shard] -> broadcast to [T, H_per_shard]
-        bias_hbm_view = (
-            TensorView(bias).slice(dim=1, start=dims.shard_id * H, end=dims.shard_id * H + H).broadcast(dim=0, size=T)
-        )
-        bias_tile_view = TensorView(bias_tile)
-        nisa.dma_copy(
-            dst=bias_tile_view.get_view(),
-            src=bias_hbm_view.get_view(),
-            dge_mode=_DGE_MODE_NONE,
-        )
-
     # ---------- Compute matmul  ----------
-    # compute the number of required PSUM banks per HTile
     num_required_psums_per_HTile = div_ceil(tiles.HTile, dims._psum_fmax)
     num_required_psum_after_column_tiling = div_ceil(num_required_psums_per_HTile, dims.column_tiling_factor)
 
-    # Calculate how many HTiles can be computed in parallel
-    # Total PSUM banks (_psum_bmax=8) divided by PSUMs needed per HTile
-    # Each PSUM group processes one HTile independently
+    # Total PSUM banks divided by PSUMs needed per HTile
     num_available_psum_group = dims._psum_bmax // num_required_psum_after_column_tiling
 
     for hidden_tiles in TiledRange(H, tiles.HTile):
-        # Calculate start offset for H
         h_offset = hidden_tiles.start_offset
 
         # Allocate PSUM
@@ -139,29 +122,30 @@ def down_projection(
             )
             result_psums.append(result_psum)
 
-        for i_tiles in TiledRange(I, I0):
-            # Load weight of [I, HTile] elements into [I0, HTile]
-            weight_idx = (
-                weight_base_idx + hidden_tiles.index * dims.num_total_128_tiles_per_I + i_tiles.index
-            ) % tiles.num_allocated_w_tile
+        for i_tile in TiledRange(I, I0):
+            weight_idx = (weight_base_idx + hidden_tiles.index * num_Itiles + i_tile.index) % tiles.num_allocated_w_tile
+
+            hidden_sb_tile_slice = hidden.slice(dim=0, start=0, end=i_tile.size).slice(
+                dim=1, start=i_tile.index, end=i_tile.index + 1
+            )
+            weight_sb_tile_slice = (
+                weight_tiles[weight_idx]
+                .slice(dim=0, start=0, end=i_tile.size)
+                .slice(dim=1, start=0, end=hidden_tiles.size)
+            )
+
+            # Load weight [I0, HTile] from HBM into SBUF tile
+            weight_view = weight.slice(dim=0, start=i_tile.start_offset, end=i_tile.end_offset).slice(
+                dim=1, start=h_offset, end=h_offset + hidden_tiles.size
+            )
             nisa.dma_copy(
-                dst=weight_tiles[weight_idx].ap(
-                    pattern=[[weight_tiles[weight_idx].shape[1], i_tiles.size], [1, hidden_tiles.size]],
-                    dtype=nl.float8_e4m3 if str(weight.dtype) == "float8e4" else weight.dtype,
-                ),
-                src=weight.ap(
-                    pattern=[[weight.shape[1], i_tiles.size], [1, hidden_tiles.size]],
-                    offset=i_tiles.start_offset * weight.shape[1] + dims.shard_id * dims.H_per_shard + h_offset,
-                    dtype=nl.float8_e4m3 if str(weight.dtype) == "float8e4" else weight.dtype,
-                ),
+                dst=weight_sb_tile_slice.get_view(),
+                src=weight_view.get_view(),
                 dge_mode=_DGE_MODE_NONE,
             )
 
-            # Matmult
+            # Matmul with column tiling: distribute tiles across columns and PSUM banks
             for compute_tile in TiledRange(hidden_tiles.size, dims._psum_fmax):
-                # Distribute tiles across columns and PSUM banks for optimal memory access
-                # Example: with column_tiling_factor=4, tiles 0-3 go to columns 0-3 in bank 0,
-                #          tiles 4-7 go to columns 0-3 in bank 1, etc.
                 column_tile_index = compute_tile.index % dims.column_tiling_factor
                 psum_bank_index = compute_tile.index // dims.column_tiling_factor
                 nisa.nc_matmul(
@@ -169,223 +153,46 @@ def down_projection(
                         nl.ds(dims.column_tiling_dim * column_tile_index, T),
                         0 : compute_tile.size,
                     ],
-                    stationary=hidden[0 : i_tiles.size, i_tiles.index, 0:T],
-                    moving=weight_tiles[weight_idx][
-                        0 : i_tiles.size, nl.ds(compute_tile.index * dims._psum_fmax, compute_tile.size)
-                    ],
+                    stationary=hidden_sb_tile_slice.get_view(),
+                    moving=weight_sb_tile_slice.slice(
+                        dim=1, start=compute_tile.start_offset, end=compute_tile.end_offset
+                    ).get_view(),
                     tile_position=(0, dims.column_tiling_dim * column_tile_index),
                     tile_size=(I0, dims.column_tiling_dim),
                 )
 
-        # ---------- Accumulate partial PSUM output to SB and optionally apply dequant scale ----------
-        dequant_tile_view = TensorView(dequant_tile) if params.quant_params.is_quant() else None
+        # ---------- Copy PSUM output to SBUF, optionally applying dequant scale ----------
         for compute_tile in TiledRange(hidden_tiles.size, dims._psum_fmax):
-            # Read tiles across columns and PSUM banks
             column_tile_index = compute_tile.index % dims.column_tiling_factor
             psum_bank_index = compute_tile.index // dims.column_tiling_factor
             dst_offset = h_offset + compute_tile.index * dims._psum_fmax
             interleave_copy(
                 index=column_tile_index,
-                dst=output_tile[0:T, nl.ds(dst_offset, compute_tile.size)],
+                dst=output_tile.slice(dim=1, start=dst_offset, end=dst_offset + compute_tile.size).get_view(),
                 src=result_psums[psum_bank_index][
                     nl.ds(dims.column_tiling_dim * column_tile_index, T),
                     0 : compute_tile.size,
                 ],
-                scale=dequant_tile_view.slice(dim=1, start=dst_offset, end=dst_offset + compute_tile.size)
+                scale=dequant_tile.slice(dim=1, start=dst_offset, end=dst_offset + compute_tile.size)
                 if params.quant_params.is_quant_row()
-                else dequant_tile_view,
+                else dequant_tile,
                 bias=None,
             )
 
-    # ---------- Apply bias separately from matmul pipeline ----------
+    # ---------- Apply bias ----------
+    is_bias = bias_tile is not None
     if is_bias:
-        bias_tile_view = TensorView(bias_tile)
-        output_tile_view = TensorView(output_tile)
         nisa.tensor_tensor(
-            dst=output_tile_view.get_view(),
-            data1=output_tile_view.get_view(),
-            data2=bias_tile_view.get_view(),
+            dst=output_tile.get_view(),
+            data1=output_tile.get_view(),
+            data2=bias_tile.get_view(),
             op=nl.add,
         )
-
-
-def down_projection_lhs_rhs_swap(
-    hidden: nl.ndarray,
-    weight: nl.ndarray,
-    bias: nl.ndarray,
-    output_tile: nl.ndarray,
-    weight_tiles: list[nl.ndarray],
-    bias_tile: nl.ndarray,
-    dequant_tile: nl.ndarray,
-    dims: MLPTKGConstantsDimensionSizes,
-    tiles: MLPTKGConstantsDownTileCounts,
-    params: MLPParameters,
-    sbm: SbufManager,
-):
-    """
-    Performs a single Down projection shard on the H using regular matmult with operands swapped
-
-    Computes: Weight[I, H] @ Hidden[I, T] + Optional(Bias[1, H]) → [T, H]
-    - Hidden is the moving tensor, Weight is the stationary tensor.
-
-    Tiled computation:
-        H/128 * [ I/128 * (Weight[128, 128] @ Hidden[128, T]) ]
-
-    Returns:
-        Output tensor with shape [128, H//128, T]
-    """
-
-    # ---------- Configuration and Dimension Setup ----------
-    I0, I1, T = hidden.shape
-    I, H = weight.shape[0], dims.H_per_shard
-    H0 = dims.H0
-
-    kernel_assert(
-        H == dims.H_per_shard,
-        f"Weight sharding mismatch: expected {dims.H_per_shard}, got {H}",
-    )
-
-    # Calculate the starting weight index for the down projection.
-    # Offset to prevent anti-dependencies with gate/up weight loads, enabling efficient weight tile loading.
-    weight_base_idx = tiles.weight_base_idx
-
-    # ---------- Load Bias ----------
-    is_bias = bias != None
-    if is_bias:
-        bias_hbm_view = bias.slice(
-            dim=0, start=dims.shard_id * dims.H_per_shard, end=(dims.shard_id + 1) * dims.H_per_shard
-        ).reshape_dim(dim=0, shape=(H0, dims.H1_shard))
-        bias_tile_view = TensorView(bias_tile)
-        nisa.dma_copy(
-            src=bias_hbm_view.get_view(),
-            dst=bias_tile_view.get_view(),
-            dge_mode=adaptive_dge_mode(bias),
-        )
-
-    # ---------- Compute matmul ----------
-    perBankT = dims._psum_fmax // T
-    num_required_down_psum_banks = div_ceil(dims.H1_shard, perBankT)
-    kernel_assert(
-        num_required_down_psum_banks <= dims._psum_bmax,
-        f"Required psum banks for down projection: {num_required_down_psum_banks}, which exceeds hardware limit of {dims._psum_bmax}, please use CTE mode",
-    )
-
-    # Allocate PSUM buffers to store output
-    result_psums = []
-    for psum_idx in range(num_required_down_psum_banks):
-        result_psum = nl.ndarray(
-            (dims._pmax, dims._psum_fmax),
-            dtype=nl.float32,
-            name=f"down_psum_{sbm.get_name_prefix()}_{psum_idx}",
-            buffer=nl.psum,
-            address=None if sbm.is_auto_alloc() else (0, psum_idx * dims._psum_fmax * 4),
-        )
-        result_psums.append(result_psum)
-
-    for hidden_tiles in TiledRange(H, tiles.HTile):
-        # Calculate starting offset
-        h_offset = hidden_tiles.start_offset
-        h1_offset = h_offset // H0
-
-        i_tiles = TiledRange(I, I0)
-        for i_tile in i_tiles:
-            # Load weight of [I, HTile] elements into [128, HTile]
-            weight_idx = (
-                weight_base_idx + hidden_tiles.index * len(i_tiles) + i_tile.index
-            ) % tiles.num_allocated_w_tile
-            nisa.dma_copy(
-                dst=weight_tiles[weight_idx][0 : i_tile.size, 0 : hidden_tiles.size],
-                src=weight.slice(dim=0, start=i_tile.start_offset, end=i_tile.start_offset + i_tile.size)
-                .slice(
-                    dim=1,
-                    start=dims.shard_id * dims.H_per_shard + h_offset,
-                    end=dims.shard_id * dims.H_per_shard + h_offset + hidden_tiles.size,
-                )
-                .get_view(),
-                dge_mode=adaptive_dge_mode(weight),
-            )
-
-            # When use_tkg_down_proj_optimized_layout is disabled,
-            # the weight-tile access pattern uses a stride of H1_shard.
-            # When it is enabled, the framework is expected to permute the weights
-            # so that the weight tile can be accessed without any stride.
-            h1_tiles = TiledRange(hidden_tiles.size, H0)
-            if params.use_tkg_down_proj_optimized_layout:
-                for h1_tile in h1_tiles:
-                    psum_idx = (h1_offset + h1_tile.index) // perBankT
-                    psum_offset = (h1_offset + h1_tile.index) % perBankT
-                    nisa.nc_matmul(
-                        dst=result_psums[psum_idx][0:H0, nl.ds(psum_offset * T, T)],
-                        stationary=weight_tiles[weight_idx][0 : i_tile.size, nl.ds(h1_tile.index * H0, H0)],
-                        moving=hidden[0 : i_tile.size, i_tile.index, 0:T],
-                    )
-            else:
-                for h1_tile in h1_tiles:
-                    psum_idx = (h1_offset + h1_tile.index) // perBankT
-                    psum_offset = (h1_offset + h1_tile.index) % perBankT
-                    nisa.nc_matmul(
-                        dst=result_psums[psum_idx][0:H0, nl.ds(psum_offset * T, T)],
-                        stationary=weight_tiles[weight_idx].ap(
-                            pattern=[
-                                [hidden_tiles.size, i_tile.size],
-                                [len(h1_tiles), H0],
-                            ],
-                            offset=h1_tile.index,
-                        ),
-                        moving=hidden[0 : i_tile.size, i_tile.index, 0:T],
-                    )
-
-    # Reshape output to 2D
-    output_tile = output_tile.reshape((H0, dims.H1_shard * T))
-
-    # Copy PSUM output to SB
-    bias_tile_view = TensorView(bias_tile) if is_bias else None
-    for psum_tiles in TiledRange(dims.H1_shard, perBankT):
-        # Number of elements that each PSUM can hold
-        perBankElem = perBankT * T
-        # Actual number of elements in the current PSUM
-        numElements = psum_tiles.size * T
-
-        if params.quant_params.is_quant_row():
-            dequant_tile_view = (
-                TensorView(dequant_tile)
-                .slice(dim=1, start=psum_tiles.index * psum_tiles.size, end=(psum_tiles.index + 1) * psum_tiles.size)
-                .expand_dim(dim=2)
-                .broadcast(dim=2, size=T)
-            )
-        else:
-            dequant_tile_view = TensorView(dequant_tile) if params.quant_params.is_quant() else None
-
-        interleave_copy(
-            index=psum_tiles.index,
-            dst=output_tile[0:H0, nl.ds(psum_tiles.index * perBankElem, numElements)],
-            src=result_psums[psum_tiles.index][0:H0, 0:numElements],
-            scale=dequant_tile_view,
-            bias=None,
-        )
-
-    # ---------- Apply bias separately from matmul pipeline ----------
-    if is_bias:
-        # Broadcast bias across T dimension and add to output
-        # output_tile is [H0, H1_shard * T], bias_tile is [H0, H1_shard]
-        bias_tile_broadcasted = TensorView(bias_tile).expand_dim(dim=2).broadcast(dim=2, size=T)
-        output_tile_view = (
-            TensorView(output_tile).slice(dim=0, start=0, end=H0).slice(dim=1, start=0, end=dims.H1_shard * T)
-        )
-        nisa.tensor_tensor(
-            dst=output_tile_view.get_view(),
-            data1=output_tile_view.get_view(),
-            data2=bias_tile_broadcasted.get_view(),
-            op=nl.add,
-        )
-
-    # Reshape output back to 3D
-    output_tile = output_tile.reshape((H0, dims.H1_shard, T))
 
 
 def process_down_projection(
-    hidden: nl.ndarray,
-    output: nl.ndarray,
+    hidden: TensorView,
+    output: TensorView,
     params: MLPParameters,
     dims: MLPTKGConstantsDimensionSizes,
     gate_tile_info: MLPTKGConstantsGateUpTileCounts,
@@ -426,88 +233,49 @@ def process_down_projection(
     Caller will have the flexibility to manage sbm:sbufManager's scope and interleave degree.
 
     """
-    down_w, down_b, down_w_scale, down_in_scale = (
-        params.down_proj_weights_tensor,
-        params.bias_params.down_proj_bias_tensor,
-        params.quant_params.down_w_scale,
-        params.quant_params.down_in_scale,
-    )
+    down_w = params.down_proj_weights_tensor
+    down_b, down_w_scale = prepare_down_bias_and_scale(params, dims)
+    down_w_view = down_w.slice(dim=1, start=dims.H1_offset * dims.H0, end=dims.H1_offset * dims.H0 + dims.H_per_shard)
 
-    # ---------------- Allocate Bias Tile ----------------
+    # ---------------- Allocate and Load Bias Tile ----------------
     bias_tile = None
     if mlpp_has_down_projection_bias(params):
-        if params.use_tkg_down_proj_column_tiling:
-            bias_tile = sbm.alloc_stack(
-                (dims.T, dims.H_per_shard),
-                dtype=down_b.dtype,
-                name=f"down_broadcasted_bias",
-                buffer=nl.sbuf,
-            )
-        else:
-            bias_tile = sbm.alloc_stack(
-                (dims.H0, dims.H1_shard),
-                dtype=down_b.dtype,
-                name=f"down_bias",
-                buffer=nl.sbuf,
-            )
+        bias_tile = alloc_tensor_view(
+            sbm,
+            down_b.shape,
+            dtype=down_b.dtype,
+            name=f"down_bias",
+            buffer=nl.sbuf,
+        )
+        nisa.dma_copy(
+            dst=bias_tile.get_view(),
+            src=down_b.get_view(),
+            dge_mode=adaptive_dge_mode(down_b),
+        )
 
     dequant_tile = None
-    # ---------------- Static quantization ----------------
-    if params.quant_params.is_quant_static():
-        par_dims = dims.T if params.use_tkg_down_proj_column_tiling else dims.H0
-        down_w_scale_view = down_w_scale.slice(dim=0, start=0, end=par_dims)
-        dequant_tile = sbm.alloc_stack((par_dims, 1), dtype=down_w_scale.dtype, name=f"down_w_scale_sb", align=4)
+    # ---------------- Quantization Scale ----------------
+    if params.quant_params.is_quant():
+        dequant_tile = alloc_tensor_view(
+            sbm,
+            down_w_scale.shape,
+            dtype=down_w_scale.dtype,
+            name=f"down_w_scale_sb",
+            align=4,
+        )
         nisa.dma_copy(
-            dst=dequant_tile[:par_dims, :],
-            src=down_w_scale_view.get_view(),
-            dge_mode=adaptive_dge_mode(down_w_scale_view),
+            dst=dequant_tile.get_view(),
+            src=down_w_scale.get_view(),
+            dge_mode=adaptive_dge_mode(down_w_scale),
         )
-
-    # ---------------- Row quantization ----------------
-    elif params.quant_params.is_quant_row():
-        slice_dim = dims.T if params.use_tkg_down_proj_column_tiling else 1
-        down_w_scale_view = down_w_scale.slice(dim=0, start=0, end=slice_dim).slice(
-            dim=1, start=dims.shard_id * dims.H_per_shard, end=dims.shard_id * dims.H_per_shard + dims.H_per_shard
-        )
-
-        if params.use_tkg_down_proj_column_tiling:
-            dequant_tile = sbm.alloc_stack(
-                (dims.T, dims.H_per_shard), dtype=down_w_scale.dtype, name=f"down_w_scale_sb", align=4
-            )
-            nisa.dma_copy(
-                dst=dequant_tile[0 : dims.T, 0 : dims.H_per_shard],
-                src=down_w_scale_view.get_view(),
-                dge_mode=_DGE_MODE_NONE,
-            )
-        else:
-            dequant_tile = sbm.alloc_stack(
-                (dims.H0, dims.H1_shard), dtype=down_w_scale.dtype, name=f"down_w_scale_sb", align=4
-            )
-            down_w_scale_view = down_w_scale_view.squeeze_dim(dim=0)
-            nisa.dma_copy(
-                dst=dequant_tile[0 : dims.H0, 0 : dims.H1_shard],
-                src=down_w_scale_view.reshape_dim(dim=0, shape=(dims.H0, dims.H1_shard)).get_view(),
-                dge_mode=adaptive_dge_mode(down_w_scale_view),
-            )
 
     # ---------------- Allocate Weight Tiles ----------------
-    # By calculating the remaining SBUF space, we allocate as many weight tiles as possible
-    if sbm.is_auto_alloc():
-        remaining_space = 0
-        current_address = 0
-    else:
-        remaining_space = sbm.get_free_space()
-        kernel_assert(remaining_space > 0, f"Not enough memory for down projection weight")
-        current_address = sbm.get_stack_curr_addr()
-
-    # Calculate tile info
-    tiles = MLPTKGConstants.calculate_down_tiles(
-        current_address, remaining_space, params, dims, gate_tile_info, sbm.is_auto_alloc()
-    )
+    tiles = MLPTKGConstants.calculate_down_tiles(params, dims, gate_tile_info, sbm)
 
     weight_tiles = []
     for w_tile_idx in range(tiles.num_allocated_w_tile):
-        weight_tile = sbm.alloc_stack(
+        weight_tile = alloc_tensor_view(
+            sbm,
             (dims.I0, tiles.HTile),
             name=f"down_w_tile_{w_tile_idx}",
             dtype=nl.float8_e4m3 if str(down_w.dtype) == "float8e4" else down_w.dtype,
@@ -519,8 +287,7 @@ def process_down_projection(
     if params.use_tkg_down_proj_column_tiling:
         down_projection(
             hidden=hidden,
-            weight=down_w,
-            bias=down_b,
+            weight=down_w_view,
             output_tile=output,
             weight_tiles=weight_tiles,
             bias_tile=bias_tile,
@@ -534,8 +301,7 @@ def process_down_projection(
     else:
         down_projection_lhs_rhs_swap(
             hidden=hidden,
-            weight=down_w,
-            bias=down_b,
+            weight=down_w_view,
             output_tile=output,
             weight_tiles=weight_tiles,
             bias_tile=bias_tile,

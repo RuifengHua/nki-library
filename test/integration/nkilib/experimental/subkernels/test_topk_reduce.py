@@ -14,16 +14,17 @@
 
 """Tests for topk_reduce subkernel using UnitTestFramework."""
 
-from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
-from test.utils.pytest_test_metadata import pytest_test_metadata
-from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 from typing import final
 
 import numpy as np
 import pytest
+
 from nkilib_src.nkilib.experimental.subkernels.topk_reduce import topk_reduce
 from nkilib_src.nkilib.experimental.subkernels.topk_reduce_torch import topk_reduce_torch_ref
+from test.utils.common_dataclasses import CompilerArgs, InferenceArgs, Platforms
+from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.test_orchestrator import Orchestrator
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
 def generate_topk_reduce_inputs(T, K, H, src_ranks):
@@ -69,10 +70,8 @@ TOPK_REDUCE_PARAMS = [
 # fmt: on
 
 
-@pytest_test_metadata(
-    name="TopkReduce",
-    pytest_marks=["topk_reduce", "subkernels"],
-)
+@pytest_test_metadata(name="TopkReduce")
+@pytest_marks(["topk_reduce", "subkernels"])
 @final
 class TestTopkReduceKernel:
     """Test class for topk_reduce subkernel."""

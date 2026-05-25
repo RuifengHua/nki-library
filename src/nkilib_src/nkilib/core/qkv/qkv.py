@@ -27,16 +27,36 @@ import nki.language as nl
 from ..utils.allocator import SbufManager
 
 # NKI Library
-from ..utils.common_types import NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
+from ..utils.common_types import (
+    NormType,
+    QKNormConfig,
+    QKVOutputLayout,
+    QKVWeightLayout,
+    QuantizationType,
+    StridedInputConfig,
+)
 from ..utils.kernel_assert import kernel_assert
 
 # QKV
 from .qkv_cte import qkv_cte
 from .qkv_tkg import qkv_tkg
 
+# Sequence length threshold for CTE dispatch.
+# Note: This should be updated, and be based on BxS.
+SEQLEN_THRESHOLD_FOR_QKV_CTE = 96
+
+
+def _attach_qk_norm_weights(cfg, q_gamma, k_gamma, q_beta, k_beta):
+    """Attach tensor weights to a QKNormConfig, if the config is not None."""
+    if cfg is None:
+        return
+    cfg.q_gamma_norm_weights = q_gamma
+    cfg.k_gamma_norm_weights = k_gamma
+    cfg.q_beta_norm_weights = q_beta
+    cfg.k_beta_norm_weights = k_beta
+
 
 @nki.jit(
-    mode="auto",
     debug_kernel=True,
     show_compiler_tb=True,
     experimental_flags="skip-non-top-level-shared-hbm-check",
@@ -65,6 +85,9 @@ def qkv(
     fused_rope: Optional[bool] = False,
     cos_cache: Optional[nl.ndarray] = None,
     sin_cache: Optional[nl.ndarray] = None,
+    # Fused RoPE + QK-norm: K-specific gamma-fused caches
+    k_cos_cache: Optional[nl.ndarray] = None,
+    k_sin_cache: Optional[nl.ndarray] = None,
     d_head: Optional[int] = None,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
@@ -78,6 +101,7 @@ def qkv(
     kv_dtype: Optional[type] = None,
     # --- Block KV Cache Related
     use_block_kv: bool = False,
+    transpose_k_cache: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.ndarray] = None,
     # -----------------------------------------
@@ -92,6 +116,23 @@ def qkv(
     # ----------------------------------------
     is_h_dim_4h_transposed: bool = False,
     weight_layout: QKVWeightLayout = QKVWeightLayout.CONTIGUOUS,
+    # --- Transposed Input
+    transposed_in: bool = False,
+    # --- QK-Norm Related
+    qk_norm_pre_rope: Optional[QKNormConfig] = None,
+    qk_norm_post_rope: Optional[QKNormConfig] = None,
+    qk_norm_pre_rope_q_gamma: Optional[nl.ndarray] = None,
+    qk_norm_pre_rope_k_gamma: Optional[nl.ndarray] = None,
+    qk_norm_post_rope_q_gamma: Optional[nl.ndarray] = None,
+    qk_norm_post_rope_k_gamma: Optional[nl.ndarray] = None,
+    qk_norm_pre_rope_q_beta: Optional[nl.ndarray] = None,
+    qk_norm_pre_rope_k_beta: Optional[nl.ndarray] = None,
+    qk_norm_post_rope_q_beta: Optional[nl.ndarray] = None,
+    qk_norm_post_rope_k_beta: Optional[nl.ndarray] = None,
+    # --- Strided Input
+    strided_input_config: Optional[StridedInputConfig] = None,
+    # --- Output
+    output_hbm: Optional[nl.ndarray] = None,
 ) -> nl.ndarray:
     """
     QKV (Query, Key, Value) projection kernel with multiple (optional) fused operations.
@@ -175,6 +216,9 @@ def qkv(
         Number of query heads (required for RoPE)
     num_kv_heads : Optional[int], default=None
         Number of key/value heads (required for RoPE)
+    transpose_k_cache (bool), Default: False
+        Whether to store K in transposed layout [num_blocks*num_kv_heads, d_head, block_size]
+        in the block KV cache or [B, kv_dim, max_seq_len] for flat KV cache.
     store_output_in_sbuf : bool, default=False
         Whether to store output in SBUF (currently unsupported, must be False)
     sbm : Optional[SbufManager], default=None
@@ -198,6 +242,10 @@ def qkv(
                 Purpose: More efficent for obtaining the required swizzled layout for quantize_mx instruction.
     weight_layout : QKVWeightLayout, default=QKVWeightLayout.CONTIGUOUS
         Layout of fused_qkv_weights. See QKVWeightLayout docstring for packing instructions.
+    transposed_in : bool, default=False
+        When True, input is in transposed HBM layout [H0, n_prgs, H1_shard, BxS] instead of [B, S, H].
+        Used for zero-conversion inter-layer data flow in the transformer megakernel.
+        Only supported with qkv_tkg (small batch, B*S <= pmax). Requires LNC >= 2.
     Returns:
     --------
     nl.ndarray
@@ -229,18 +277,17 @@ def qkv(
     - MXFP8, bf16, fp16, fp32 (fp32 inputs are internally converted to bf16 for computation)
     """
     # Note: Detailed asserts done inside qkv_cte and qkv_tkg kernels.
-
-    # QKV_CTE is used for S bigger than this number.
-    # Note: This should be updated, and be based on BxS.
-    SEQLEN_THRESHOLD_FOR_QKV_CTE = 96
     # Some features like fused_rope only
     is_input_config_only_available_in_qkv_cte_kernel = False
 
     # Extend this variable if future configs become available only in one of the sub-kernels.
-    is_input_config_only_available_in_qkv_cte_kernel = fused_rope
+    is_input_config_only_available_in_qkv_cte_kernel = fused_rope or (strided_input_config != None)
 
     input_in_sbuf = input.buffer == nl.sbuf
-    if not input_in_sbuf:
+    if transposed_in:
+        # Transposed HBM input: [H0, n_prgs, H1_shard, BxS]
+        BxS = input.shape[3]
+    elif not input_in_sbuf:
         B, S, _ = input.shape
         is_input_config_only_available_in_qkv_cte_kernel = (
             is_input_config_only_available_in_qkv_cte_kernel
@@ -257,6 +304,21 @@ def qkv(
         )
 
     # TODO: Once qkv_tkg is merged, uncomment if statement.
+    _attach_qk_norm_weights(
+        qk_norm_pre_rope,
+        qk_norm_pre_rope_q_gamma,
+        qk_norm_pre_rope_k_gamma,
+        qk_norm_pre_rope_q_beta,
+        qk_norm_pre_rope_k_beta,
+    )
+    _attach_qk_norm_weights(
+        qk_norm_post_rope,
+        qk_norm_post_rope_q_gamma,
+        qk_norm_post_rope_k_gamma,
+        qk_norm_post_rope_q_beta,
+        qk_norm_post_rope_k_beta,
+    )
+
     if is_input_config_only_available_in_qkv_cte_kernel:
         output = qkv_cte(
             input=input,
@@ -274,6 +336,8 @@ def qkv(
             fused_rope=fused_rope,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
+            k_cos_cache=k_cos_cache,
+            k_sin_cache=k_sin_cache,
             d_head=d_head,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
@@ -285,6 +349,7 @@ def qkv(
             fp8_min=fp8_min,
             kv_dtype=kv_dtype,
             use_block_kv=use_block_kv,
+            transpose_k_cache=transpose_k_cache,
             block_size=block_size,
             slot_mapping=slot_mapping,
             store_output_in_sbuf=store_output_in_sbuf,
@@ -296,6 +361,10 @@ def qkv(
             qkv_in_scale=qkv_in_scale,
             is_input_swizzled=is_h_dim_4h_transposed,
             weight_layout=weight_layout,
+            qk_norm_pre_rope=qk_norm_pre_rope,
+            qk_norm_post_rope=qk_norm_post_rope,
+            strided_input_config=strided_input_config,
+            output_hbm=output_hbm,
         )
 
     else:
@@ -321,6 +390,7 @@ def qkv(
             num_kv_heads=num_kv_heads,
             num_q_heads=num_q_heads,
             sbm=sbm,
+            transposed_in=transposed_in,
         )
 
     return output

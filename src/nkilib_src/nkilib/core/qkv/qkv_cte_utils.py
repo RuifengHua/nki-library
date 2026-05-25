@@ -19,7 +19,7 @@ This module contains utility classes and functions for the QKV CTE kernel includ
 # Standard Library
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 
 import nki
 import nki.language as nl
@@ -27,7 +27,14 @@ import nki.language as nl
 from ..utils.allocator import SbufManager
 
 # NKI Library
-from ..utils.common_types import NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
+from ..utils.common_types import (
+    NormType,
+    QKNormConfig,
+    QKVOutputLayout,
+    QKVWeightLayout,
+    QuantizationType,
+    StridedInputConfig,
+)
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import (
     get_max_positive_value_for_dtype,
@@ -36,6 +43,8 @@ from ..utils.kernel_helpers import (
 from ..utils.logging import get_logger
 
 _logger = get_logger("qkv_cte")
+
+ROW_MX_TAIL_SCALE_BYTES = 4  # float32 per-row scale appended to each input row
 
 
 # Represents unmodified user inputs, no additional data members.
@@ -101,7 +110,7 @@ class QKV_CTE_UserInput(nl.NKIObject):
     d_head: Optional[int]
     num_q_heads: Optional[int]
     num_kv_heads: Optional[int]
-    # --- FP8 KV Cache Quantization Related
+    # --- KV Cache Related
     k_cache: Optional[nl.ndarray]
     v_cache: Optional[nl.ndarray]
     k_scale: Optional[nl.ndarray]
@@ -111,6 +120,7 @@ class QKV_CTE_UserInput(nl.NKIObject):
     kv_dtype: Optional[Any]
     # --- Block KV Cache Related
     use_block_kv: bool
+    transpose_k_cache: bool
     block_size: Optional[int]
     slot_mapping: Optional[nl.ndarray]
     # --- Performance Related
@@ -124,6 +134,12 @@ class QKV_CTE_UserInput(nl.NKIObject):
     qkv_in_scale: Optional[nl.ndarray]
     is_input_swizzled: bool
     weight_layout: QKVWeightLayout
+    # --- QK-Norm Related
+    qk_norm_pre_rope: Optional[QKNormConfig]
+    qk_norm_post_rope: Optional[QKNormConfig]
+    # --- Strided Input
+    strided_input_config: Optional[StridedInputConfig]
+    output_hbm: Optional[nl.ndarray]
 
 
 # Represent quantization config
@@ -134,6 +150,7 @@ class QKV_Quant_Config(nl.NKIObject):
     qkv_in_scale: Optional[nl.ndarray] = None  # in_scale are same for q, k, v
     quant_dtype: str = nl.float8_e4m3
     has_mx_static_dequant_scales: bool = False
+    has_row_mx_dequant: bool = False
 
 
 # Represents kernel config.
@@ -169,13 +186,15 @@ class QKV_CTE_Config(nl.NKIObject):
     add_layer_norm_bias: bool
     fused_rope: bool
     use_auto_allocation: bool  # functional
-    # FP8 KV Cache Quantization
+    # KV Cache
+    use_kv_cache: bool
     use_kv_quantization: bool
     kv_dtype: Any
     fp8_max: Optional[float]
     fp8_min: Optional[float]
     # Block KV Cache
     use_block_kv: bool
+    transpose_k_cache: bool
     block_size: Optional[int]
     # Additional Internal Config
     load_input_with_DMA_transpose: bool
@@ -187,6 +206,11 @@ class QKV_CTE_Config(nl.NKIObject):
     input_dtype: Any
     quantization_config: QKV_Quant_Config
     is_input_swizzled: bool
+    # QK-Norm
+    qk_norm_pre_rope: Optional[QKNormConfig]
+    qk_norm_post_rope: Optional[QKNormConfig]
+    # Strided Input
+    strided_input_config: Optional[StridedInputConfig]
 
     def print(self):
         """
@@ -303,6 +327,123 @@ class QKV_CTE_Dims(nl.NKIObject):
         print(f"")
 
 
+def _is_enum_like(x):
+    """Duck-type check for an Enum member: has str .name and int .value.
+
+    Used to validate ``QKNormConfig.q_norm``/``k_norm``. A strict
+    ``isinstance(x, NormType)`` would reject custom enum types registered by
+    callers, so we only require the enum-member shape (.name: str, .value:
+    int) and let the norm registry reject unknown members downstream.
+
+    Also avoids ``isinstance(x, Enum)`` directly because the NKI tracer can't
+    resolve the ``enum.Enum`` name when this validator runs inside a traced
+    kernel.
+    """
+    return hasattr(x, "name") and isinstance(x.name, str) and hasattr(x, "value") and isinstance(x.value, int)
+
+
+def _validate_qk_norm_config(args, config_name, config):
+    """
+    Validate norm func values, beta rejection, and gamma/beta weight shapes for a single QKNormConfig.
+    """
+    if config is None:
+        return
+    kernel_assert(
+        config.q_norm is None or _is_enum_like(config.q_norm),
+        f"[QKV CTE Kernel] {config_name}.q_norm must be an Enum or None, got {type(config.q_norm)}.",
+    )
+    kernel_assert(
+        config.k_norm is None or _is_enum_like(config.k_norm),
+        f"[QKV CTE Kernel] {config_name}.k_norm must be an Enum or None, got {type(config.k_norm)}.",
+    )
+    kernel_assert(
+        config.q_beta_norm_weights is None and config.k_beta_norm_weights is None,
+        f"[QKV CTE Kernel] {config_name} beta weights are not yet implemented.",
+    )
+    if config.q_gamma_norm_weights is not None:
+        kernel_assert(
+            config.q_gamma_norm_weights.shape == (1, args.d_head),
+            f"[QKV CTE Kernel] {config_name}.q_gamma_norm_weights must have shape"
+            f" (1, d_head)=(1, {args.d_head}), but got {config.q_gamma_norm_weights.shape}.",
+        )
+    if config.k_gamma_norm_weights is not None:
+        kernel_assert(
+            config.k_gamma_norm_weights.shape == (1, args.d_head),
+            f"[QKV CTE Kernel] {config_name}.k_gamma_norm_weights must have shape"
+            f" (1, d_head)=(1, {args.d_head}), but got {config.k_gamma_norm_weights.shape}.",
+        )
+
+
+def _validate_row_mx_inputs(
+    args: QKV_CTE_UserInput,
+    H: int,
+    I: int,
+    S: int,
+    num_shards: int,
+    _H: int,
+) -> None:
+    """Validate ROW_MX-specific input constraints.
+
+    Args:
+        args (QKV_CTE_UserInput): User inputs.
+        H (int): True hidden dimension (after tail-scale removal).
+        I (int): Output dimension (Q+K+V heads * d_head).
+        S (int): Sequence length.
+        num_shards (int): Number of LNC shards.
+        _H (int): Weight first dimension (H // 4 for MX-packed weights).
+    """
+    kernel_assert(
+        _H == H // 4,
+        f"[QKV CTE Kernel] Hidden dimensions of 'input' must be 4 * 'fused_qkv_weights' when weights are in MX,"
+        f" input.shape[2] = {H}, but fused_qkv_weights[0] = {_H}).",
+    )
+    kernel_assert(
+        (S // num_shards) % 2 == 0,
+        f"[QKV CTE Kernel] S_Shard needs to be even for mx matrix multiplication,S_shard = {S // num_shards}.",
+    )
+    kernel_assert(
+        args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn],
+        f"[QKV CTE Kernel] ROW_MX requires FP8 input, got {args.input.dtype}.",
+    )
+    kernel_assert(
+        args.qkv_in_scale is None,
+        "[QKV CTE Kernel] ROW_MX packs per-row scales in the input tensor; qkv_in_scale must be None.",
+    )
+    kernel_assert(
+        args.qkv_w_scale is not None,
+        "[QKV CTE Kernel] ROW_MX requires qkv_w_scale (per-channel weight scale).",
+    )
+    kernel_assert(
+        args.qkv_w_scale.shape == (1, I) or args.qkv_w_scale.shape == (nl.tile_size.pmax, I),
+        f"[QKV CTE Kernel] ROW_MX qkv_w_scale must be [1, I] or [128, I], got {args.qkv_w_scale.shape}.",
+    )
+    kernel_assert(
+        args.weight_layout == QKVWeightLayout.MX_CONTIGUOUS,
+        f"[QKV CTE Kernel] ROW_MX requires MX_CONTIGUOUS weight layout "
+        f"(float32 DMA transpose uses consecutive-4 packing), got {args.weight_layout}.",
+    )
+    kernel_assert(
+        args.load_input_with_DMA_transpose,
+        "[QKV CTE Kernel] ROW_MX requires load_input_with_DMA_transpose=True (no PE transpose fallback).",
+    )
+    kernel_assert(
+        args.fused_norm_type == NormType.NO_NORM,
+        f"[QKV CTE Kernel] ROW_MX does not support fused normalization.",
+    )
+    kernel_assert(
+        args.fused_residual_add == False,
+        f"[QKV CTE Kernel] ROW_MX does not support fused residual add.",
+    )
+    kernel_assert(
+        not args.is_input_swizzled,
+        f"[QKV CTE Kernel] ROW_MX does not support swizzled input.",
+    )
+    kernel_assert(
+        args.d_head is not None and args.num_q_heads is not None and args.num_kv_heads is not None,
+        "[QKV CTE Kernel] ROW_MX requires d_head, num_q_heads, and num_kv_heads to be specified.",
+    )
+
+
 def _validate_user_inputs(args: QKV_CTE_UserInput):
     """
     Validate all user inputs to the QKV CTE kernel.
@@ -328,6 +469,15 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
     _H, I = args.fused_qkv_weights.shape
     _, num_shards, _ = get_program_sharding_info()
 
+    # ROW_MX: input is [B, S, H + ROW_MX_TAIL_SCALE_BYTES] with tail-packed float32 scale. Derive true H.
+    if args.quantization_type == QuantizationType.ROW_MX:
+        kernel_assert(
+            H > ROW_MX_TAIL_SCALE_BYTES and (H - ROW_MX_TAIL_SCALE_BYTES) % 128 == 0,
+            f"[QKV CTE Kernel] ROW_MX input last dimension must be H+{ROW_MX_TAIL_SCALE_BYTES} where H is a"
+            f" multiple of 128, but got input.shape[-1]={H} (H={H - ROW_MX_TAIL_SCALE_BYTES}).",
+        )
+        H = H - ROW_MX_TAIL_SCALE_BYTES
+
     # H
     kernel_assert(
         H <= 24576,
@@ -349,7 +499,7 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         f" larger weights.shape[1] at the moment.",
     )
 
-    if args.quantization_type != QuantizationType.MX:
+    if args.quantization_type not in (QuantizationType.MX, QuantizationType.ROW_MX):
         kernel_assert(
             _H == H,
             f"[QKV CTE Kernel] Hidden dimensions of 'input' and 'fused_qkv_weights' must match,"
@@ -375,8 +525,8 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
 
     # Bias Validation.
     kernel_assert(
-        args.bias == None or args.bias.shape == (1, I),
-        f"[QKV CTE Kernel] Bias shape must be [1, fused_qkv_weights.shape[1] = heads * d_head ],"
+        args.bias == None or args.bias.shape == (1, I) or args.bias.shape == (nl.tile_size.pmax, I),
+        f"[QKV CTE Kernel] Bias shape must be [1, I] or [pmax, I] where I=fused_qkv_weights.shape[1]={I},"
         f" but got {args.bias.shape if args.bias != None else args.bias}",
     )
 
@@ -464,10 +614,16 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             f"[QKV CTE Kernel] Fused RoPE requires cos_cache, sin_cache, num_q_heads and num_kv_heads to be provided.",
         )
         d_head = args.d_head if args.d_head != None else I // (args.num_q_heads + 2 * args.num_kv_heads)
+        # Under strided input, cos/sin caches must be pre-gathered to the output S
+        # (= num_local_tokens); otherwise they match the full input S.
+        expected_S = args.strided_input_config.num_local_tokens if args.strided_input_config != None else S
         kernel_assert(
-            args.cos_cache.shape == args.sin_cache.shape == (B, S, d_head),
-            f"[QKV CTE Kernel] cos_cache and sin_cache must have the shape of (B, S, d_head),"
-            f" but got cos_cache.shape = {args.cos_cache.shape}, sin_cache.shape = {args.sin_cache.shape}.",
+            args.cos_cache.shape == args.sin_cache.shape == (B, expected_S, d_head),
+            f"[QKV CTE Kernel] cos_cache and sin_cache must have the shape of (B, S, d_head)"
+            f" where S = {expected_S}"
+            f"{' (= strided num_local_tokens)' if args.strided_input_config != None else ''},"
+            f" but got cos_cache.shape = {args.cos_cache.shape},"
+            f" sin_cache.shape = {args.sin_cache.shape}.",
         )
 
     if args.cos_cache != None or args.sin_cache != None:
@@ -476,19 +632,20 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             f"[QKV CTE Kernel] cos_cache or sin_cache have been provided, but fused_rope=False.",
         )
 
+    use_kv_cache = args.k_cache is not None or args.v_cache is not None
     use_kv_quantization = args.k_scale is not None and args.v_scale is not None
-    if use_kv_quantization:
+    if use_kv_cache:
+        kernel_assert(
+            args.k_cache is not None and args.v_cache is not None,
+            "[QKV CTE Kernel] Both k_cache and v_cache must be provided together.",
+        )
         kernel_assert(
             args.output_layout == QKVOutputLayout.BSD,
-            f"[QKV CTE Kernel] KV output quantization is only supported for BSD output layout, got {args.output_layout}",
+            f"[QKV CTE Kernel] KV cache is only supported for BSD output layout, got {args.output_layout}",
         )
         kernel_assert(
             args.num_q_heads is not None and args.num_kv_heads is not None and args.d_head is not None,
-            "[QKV CTE Kernel] Must specify num_q_heads, num_kv_heads, and d_head when KV quantization is enabled",
-        )
-        kernel_assert(
-            args.k_cache is not None and args.v_cache is not None,
-            "[QKV CTE Kernel] k_cache and v_cache must be specified for KV output quantization",
+            "[QKV CTE Kernel] Must specify num_q_heads, num_kv_heads, and d_head when KV cache is enabled",
         )
         q_dim = args.num_q_heads * args.d_head
         kv_dim = args.num_kv_heads * args.d_head
@@ -506,6 +663,15 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             args.block_size is not None,
             "[QKV CTE Kernel] block_size required for block KV cache",
         )
+        if args.transpose_k_cache == True:
+            kernel_assert(
+                args.d_head <= 128,
+                f"[QKV CTE Kernel] transpose_k_cache requires d_head <= 128 (NKI partition dimension limit), but got d_head = {args.d_head}.",
+            )
+            kernel_assert(
+                (args.block_size & (args.block_size - 1)) == 0,
+                f"[QKV CTE Kernel] transpose_k_cache requires power-of-2 block_size for block kv cache, got {args.block_size}",
+            )
 
     kernel_assert(
         args.store_output_in_sbuf == False,
@@ -519,17 +685,20 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             f" use_auto_allocation = {args.use_auto_allocation}, but sbm.is_auto_alloc = {args.sbm.is_auto_alloc()}",
         )
     # MX Quantization and is_input_swizzled validation
-    if args.quantization_type == QuantizationType.MX:
+    if args.quantization_type == QuantizationType.ROW_MX:
+        _validate_row_mx_inputs(args, H, I, S, num_shards, _H)
+    elif args.quantization_type == QuantizationType.MX:
         kernel_assert(
             _H == H // 4,
             f"[QKV CTE Kernel] Hidden dimensions of 'input' must be 4 * 'fused_qkv_weights' when weights are in MX,"
             f" input.shape[2] = {H}, but fused_qkv_weights[0] = {_H}).",
         )
 
-        kernel_assert(
-            H % 512 == 0,
-            f"[QKV CTE Kernel] Hidden dimensions of 'input' must be divisible by 512, Hidden shape = {H}.",
-        )
+        if args.is_input_swizzled:
+            kernel_assert(
+                H % 512 == 0,
+                f"[QKV CTE Kernel] Hidden dimensions of 'input' must be divisible by 512 for swizzled MX input, Hidden shape = {H}.",
+            )
 
         kernel_assert(
             (S // num_shards) % 2 == 0,
@@ -577,10 +746,11 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
                 f"[QKV CTE Kernel] Non-DMA-transpose MX path requires MX_CONTIGUOUS weight layout, got {args.weight_layout}.",
             )
     else:
-        kernel_assert(
-            args.weight_layout == QKVWeightLayout.CONTIGUOUS,
-            f"[QKV CTE Kernel] Non-MX quantization requires CONTIGUOUS weight layout, got {args.weight_layout}.",
-        )
+        if args.quantization_type != QuantizationType.ROW_MX:
+            kernel_assert(
+                args.weight_layout == QKVWeightLayout.CONTIGUOUS,
+                f"[QKV CTE Kernel] Non-MX quantization requires CONTIGUOUS weight layout, got {args.weight_layout}.",
+            )
 
     # MX static dequantization scales validation
     _is_mx_static_dequant = (
@@ -624,6 +794,153 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             f"but got num_q_heads={args.num_q_heads}, num_kv_heads={args.num_kv_heads}.",
         )
 
+    # QK-norm validation
+    if args.qk_norm_pre_rope is not None or args.qk_norm_post_rope is not None:
+        kernel_assert(
+            args.d_head is not None and args.num_q_heads is not None and args.num_kv_heads is not None,
+            "[QKV CTE Kernel] QK-norm requires d_head, num_q_heads, and num_kv_heads to be specified.",
+        )
+
+    _validate_qk_norm_config(args, "qk_norm_pre_rope", args.qk_norm_pre_rope)
+    _validate_qk_norm_config(args, "qk_norm_post_rope", args.qk_norm_post_rope)
+
+    # gamma_fused_in_rope_caches validation
+    if args.qk_norm_pre_rope is not None and args.qk_norm_pre_rope.gamma_fused_in_rope_caches:
+        kernel_assert(
+            args.fused_rope,
+            "[QKV CTE Kernel] qk_norm_pre_rope.gamma_fused_in_rope_caches=True requires fused_rope=True.",
+        )
+        kernel_assert(
+            args.qk_norm_pre_rope.q_norm == NormType.RMS_NORM and args.qk_norm_pre_rope.k_norm == NormType.RMS_NORM,
+            "[QKV CTE Kernel] gamma_fused_in_rope_caches requires both q_norm and k_norm to be NormType.RMS_NORM.",
+        )
+        kernel_assert(
+            args.qk_norm_pre_rope.q_gamma_norm_weights is None and args.qk_norm_pre_rope.k_gamma_norm_weights is None,
+            "[QKV CTE Kernel] qk_norm_pre_rope.gamma_fused_in_rope_caches=True requires"
+            " q_gamma_norm_weights=None and k_gamma_norm_weights=None"
+            " (gamma must be pre-multiplied into cos/sin caches, not passed separately).",
+        )
+    if args.qk_norm_post_rope is not None:
+        kernel_assert(
+            not args.qk_norm_post_rope.gamma_fused_in_rope_caches,
+            "[QKV CTE Kernel] gamma_fused_in_rope_caches is only valid on qk_norm_pre_rope, not qk_norm_post_rope.",
+        )
+
+    # Strided Input validation.
+    if args.strided_input_config != None:
+        _validate_strided_input_config(args)
+
+
+def _validate_strided_input_config(args: QKV_CTE_UserInput, dims: Optional[QKV_CTE_Dims] = None):
+    """
+    Validate StridedInputConfig constraints.
+
+    Cross-checks strided_input_config against other user inputs. Called from
+    _validate_user_inputs when args.strided_input_config != None, and again
+    from qkv_cte after dims are computed (with dims= set) to validate
+    S-shard alignment.
+    """
+    si = args.strided_input_config
+    _, S_full, _ = args.input.shape
+
+    # block_len must divide pmax (packed regime: multiple blocks per DMA tile)
+    # OR be a multiple of pmax (contiguous-tile regime: one block spans multiple DMA tiles).
+    kernel_assert(
+        si.block_len > 0 and (nl.tile_size.pmax % si.block_len == 0 or si.block_len % nl.tile_size.pmax == 0),
+        f"[QKV CTE Kernel] strided_input_config.block_len must divide pmax ({nl.tile_size.pmax})"
+        f" or be a multiple of pmax ({nl.tile_size.pmax}), but got block_len={si.block_len}.",
+    )
+    # block_stride must be a whole number of blocks, >= block_len (no overlap)
+    kernel_assert(
+        si.block_stride >= si.block_len and si.block_stride % si.block_len == 0,
+        f"[QKV CTE Kernel] strided_input_config.block_stride must be >= block_len and divisible by block_len,"
+        f" but got block_stride={si.block_stride}, block_len={si.block_len}.",
+    )
+    # num_local_tokens must be a whole number of blocks
+    kernel_assert(
+        si.num_local_tokens > 0 and si.num_local_tokens % si.block_len == 0,
+        f"[QKV CTE Kernel] strided_input_config.num_local_tokens must be a positive multiple of block_len,"
+        f" but got num_local_tokens={si.num_local_tokens}, block_len={si.block_len}.",
+    )
+    # Last block must be within input S bounds
+    num_blocks = si.num_local_tokens // si.block_len
+    last_block_end = si.block_offset + (num_blocks - 1) * si.block_stride + si.block_len
+    kernel_assert(
+        si.block_offset >= 0 and last_block_end <= S_full,
+        f"[QKV CTE Kernel] strided_input_config reads beyond input S: block_offset={si.block_offset},"
+        f" num_blocks={num_blocks}, block_stride={si.block_stride}, block_len={si.block_len},"
+        f" last_block_end={last_block_end}, input S={S_full}.",
+    )
+    """
+    Caller-provided output_hbm required for the standard output path (output S != input S).
+    KV cache path is an exception: the kernel allocates q_tensor_hbm itself (sized with
+    num_local_tokens), and k_cache/v_cache are caller-provided.
+    """
+    _uses_kv_cache = args.k_cache is not None or args.v_cache is not None
+    if not _uses_kv_cache:
+        kernel_assert(
+            args.output_hbm != None,
+            "[QKV CTE Kernel] strided_input_config requires a caller-provided output_hbm"
+            " (output S = num_local_tokens differs from input S).",
+        )
+    # Output layout
+    kernel_assert(
+        args.output_layout in (QKVOutputLayout.BSD, QKVOutputLayout.NBSd),
+        f"[QKV CTE Kernel] strided_input_config supports output_layout BSD or NBSd, got {args.output_layout}.",
+    )
+    # Incompatible fusions
+    kernel_assert(
+        not args.fused_residual_add,
+        "[QKV CTE Kernel] strided_input_config is incompatible with fused_residual_add"
+        " (mlp_prev/attention_prev are not strided).",
+    )
+    # Requires DMA transpose input load path
+    kernel_assert(
+        args.load_input_with_DMA_transpose,
+        "[QKV CTE Kernel] strided_input_config requires load_input_with_DMA_transpose=True.",
+    )
+    # DMA transpose path is only used when fused_norm_type == NO_NORM (see _build_config).
+    # Other norm types fall back to the PE-transpose input load which does not implement
+    # strided gather.
+    kernel_assert(
+        args.fused_norm_type == NormType.NO_NORM,
+        f"[QKV CTE Kernel] strided_input_config requires fused_norm_type=NO_NORM"
+        f" (DMA-transpose path only), got {args.fused_norm_type}.",
+    )
+    # Non-MX quantization only for now (scoped; MX path is a separate DMA-transpose helper)
+    kernel_assert(
+        args.quantization_type in (QuantizationType.NONE, QuantizationType.STATIC),
+        f"[QKV CTE Kernel] strided_input_config currently supports only non-MX quantization"
+        f" (NONE, STATIC), got {args.quantization_type}.",
+    )
+    # Validate output_hbm shape matches the chosen layout with S = num_local_tokens.
+    # Skipped for KV-cache path (kernel allocates q_tensor_hbm; output_hbm is unused).
+    if not _uses_kv_cache:
+        B_orig = args.input.shape[0]
+        _, I = args.fused_qkv_weights.shape
+        if args.output_layout == QKVOutputLayout.BSD:
+            expected_out_shape = (B_orig, si.num_local_tokens, I)
+        else:  # NBSd
+            # num_heads is derived the same way as _get_tensor_dimensions: I // d_head.
+            # d_head is validated elsewhere to be set for NBSd.
+            num_heads = I // args.d_head
+            expected_out_shape = (num_heads, B_orig, si.num_local_tokens, args.d_head)
+        kernel_assert(
+            tuple(args.output_hbm.shape) == expected_out_shape,
+            f"[QKV CTE Kernel] strided_input_config requires output_hbm.shape == {expected_out_shape}"
+            f" for output_layout={args.output_layout}, got {tuple(args.output_hbm.shape)}.",
+        )
+
+    # S-shard alignment: requires dims, so only checked on the second call (after _get_tensor_dimensions).
+    if dims is not None:
+        _bl = si.block_len
+        kernel_assert(
+            dims.S_shard_offset % _bl == 0 and dims.S_shard % _bl == 0,
+            f"[QKV CTE Kernel] strided_input_config requires block-aligned S window,"
+            f" got S_shard_offset={dims.S_shard_offset}, S_shard={dims.S_shard},"
+            f" block_len={_bl}.",
+        )
+
 
 def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     """
@@ -658,12 +975,13 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     #  - 4. The input dtype is 2-byte dtype, i.e. BF16/FP16, or FP8 with MX quantization
     _is_fp8_input = args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
     _is_2byte_input = args.input.dtype == nl.bfloat16 or args.input.dtype == nl.float16
+    _is_row_mx = args.quantization_type == QuantizationType.ROW_MX
     load_input_with_DMA_transpose = (
         args.load_input_with_DMA_transpose
         and nki.isa.get_nc_version() >= nki.isa.nc_version.gen3
         and (args.fused_norm_type == NormType.NO_NORM)
         and args.fused_residual_add == False
-        and (_is_2byte_input or (_is_fp8_input and args.quantization_type == QuantizationType.MX))
+        and (_is_2byte_input or (_is_fp8_input and (args.quantization_type == QuantizationType.MX or _is_row_mx)))
     )
 
     if _is_fp8_input and args.quantization_type == QuantizationType.MX:
@@ -713,6 +1031,9 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     use_BxS_input_reshape = (S < S_THRESHOLD_FOR_RESHAPE_DEFAULT) and (
         args.output_layout == QKVOutputLayout.BSD or args.output_layout == QKVOutputLayout.NBSd
     )  # In case "NBdS" gets added.
+    # Strided input requires output S != input S; BxS reshape is invalid.
+    if args.strided_input_config != None:
+        use_BxS_input_reshape = False
 
     # Set to maximum, unless we are restricted by the provided 'sbm'.
     total_available_sbuf_space_to_this_kernel = nl.tile_size.total_available_sbuf_size
@@ -723,7 +1044,8 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         else:
             total_available_sbuf_space_to_this_kernel = args.sbm.get_free_space()
 
-    # FP8 KV Cache Quantization config
+    # KV Cache config
+    use_kv_cache = args.k_cache is not None or args.v_cache is not None
     use_kv_quantization = args.k_scale is not None and args.v_scale is not None
     kv_dtype = args.kv_dtype if args.kv_dtype is not None else args.input.dtype
 
@@ -745,6 +1067,7 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
         and args.qkv_in_scale != None
     )
+    quant_config.has_row_mx_dequant = args.quantization_type == QuantizationType.ROW_MX
 
     return QKV_CTE_Config(
         output_layout=args.output_layout,
@@ -754,11 +1077,13 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         add_layer_norm_bias=add_layer_norm_bias,
         fused_rope=args.fused_rope,
         use_auto_allocation=args.use_auto_allocation,
+        use_kv_cache=use_kv_cache,
         use_kv_quantization=use_kv_quantization,
         kv_dtype=kv_dtype,
         fp8_max=fp8_max,
         fp8_min=fp8_min,
         use_block_kv=args.use_block_kv,
+        transpose_k_cache=args.transpose_k_cache,
         block_size=args.block_size,
         # Internal Config
         load_input_with_DMA_transpose=load_input_with_DMA_transpose,
@@ -770,6 +1095,9 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         input_dtype=args.input.dtype,
         quantization_config=quant_config,
         is_input_swizzled=args.is_input_swizzled,
+        qk_norm_pre_rope=args.qk_norm_pre_rope,
+        qk_norm_post_rope=args.qk_norm_post_rope,
+        strided_input_config=args.strided_input_config,
     )
 
 
@@ -795,6 +1123,9 @@ def _get_tensor_dimensions(args: QKV_CTE_UserInput, cfg: QKV_CTE_Config) -> QKV_
         - Infers d_head from num_q_heads and num_kv_heads if not provided
     """
     B_orig, S_orig, H = args.input.shape
+    # ROW_MX: input is [B, S, H + ROW_MX_TAIL_SCALE_BYTES] with tail-packed float32 scale. Derive true H.
+    if args.quantization_type == QuantizationType.ROW_MX:
+        H = H - ROW_MX_TAIL_SCALE_BYTES
     BxS = B_orig * S_orig
     _, I = args.fused_qkv_weights.shape
     H_actual = args.hidden_actual if args.hidden_actual else H
@@ -816,6 +1147,11 @@ def _get_tensor_dimensions(args: QKV_CTE_UserInput, cfg: QKV_CTE_Config) -> QKV_
     if cfg.use_BxS_input_reshape:
         S = BxS
         B = 1
+    elif args.strided_input_config != None:
+        # Strided input: kernel loop bounds and output sizing use num_local_tokens.
+        # S_orig is preserved above for HBM offset calculations in the strided DMA path.
+        S = args.strided_input_config.num_local_tokens
+        B = B_orig
     else:
         S = S_orig
         B = B_orig
@@ -868,3 +1204,23 @@ def _get_tensor_dimensions(args: QKV_CTE_UserInput, cfg: QKV_CTE_Config) -> QKV_
         WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT=WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT,
         MAX_S_MULTI_BUFFER_DEGREE=MAX_S_MULTI_BUFFER_DEGREE,
     )
+
+
+def _mx_partition_splits(h_packed: int) -> Tuple[List[int], List[int]]:
+    """Split a partition count into valid nc_matmul_mx sizes (32, 64, or 128).
+
+    Returns (starts, sizes) as two separate lists.
+    For 96 (3 sub-tiles), returns ([0, 64], [64, 32]).
+
+    h_packed is always min(P_MAX, H_PACKED - tile * P_MAX) where H_PACKED = H // 4
+    and H % 128 == 0, so the only possible values are 32, 64, 96, and 128.
+    """
+    if h_packed == 32:
+        return [0], [32]
+    if h_packed == 64:
+        return [0], [64]
+    if h_packed == 96:
+        return [0, 64], [64, 32]
+    if h_packed == 128:
+        return [0], [128]
+    kernel_assert(False, f"h_packed must be 32, 64, 96, or 128, got {h_packed}")

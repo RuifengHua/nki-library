@@ -15,10 +15,10 @@
 """
 Gate/Up projection sub-kernels with LNC sharding support.
 
-Supports multiple LNC sharding strategies (mutually exclusive):
-- no sharding: Used when running without LNC (LNC=1).
-- shard_on_I: Shard on I (intermediate) dimension. Default for most workloads.
-- TODO: shard_on_T: Shard on T (token) dimension. Useful when T is large.
+Supports multiple LNC sharding strategies (see SUPPORTED_MOE_SHARDING_STRATEGIES in all_expert_mx_utils.py):
+- NO_SHARD: No sharding, each NC computes full result independently. Used when LNC=1.
+- SHARD_I: Shard on I (intermediate) dimension. Default for most workloads.
+- TODO: SHARD_T: Shard on T (token) dimension. Useful when T is large.
 
 These sub-kernels can be used by any algorithm that requires LNC-sharded gate/up projection,
 including all-expert, selective-load, or custom MoE implementations.
@@ -50,7 +50,7 @@ from ...utils.tensor_view import TensorView
 
 
 @nki.jit
-def gate_up_projection_mx_shard_I(
+def gate_up_projection_mx(
     input_quant_sb: nl.ndarray,
     input_scale_sb: nl.ndarray,
     gate_weight_sb: nl.ndarray,
@@ -65,6 +65,9 @@ def gate_up_projection_mx_shard_I(
     up_clamp_lower_limit: Optional[float] = None,
     hidden_act_fn: ActFnType = ActFnType.Swish,
     activation_compute_dtype=nl.bfloat16,
+    gate_dequant_scale: Optional[nl.ndarray] = None,
+    up_dequant_scale: Optional[nl.ndarray] = None,
+    input_dequant_scale: Optional[nl.ndarray] = None,
 ) -> tuple[nl.ndarray, nl.ndarray]:
     """
     Compute gate and up projections with clamping, activation function, and MX quantization.
@@ -144,48 +147,62 @@ def gate_up_projection_mx_shard_I(
     out_quant_sb = nl.ndarray(out_quant_shape, dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
     out_scale_sb = nl.ndarray(out_quant_shape, dtype=nl.uint8, buffer=nl.sbuf)
 
+    # only memset in I padding case
+    last_tile_I_size = I_local - (n_total_I512_tiles - 1) * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
+    last_I_pdim_sz = last_tile_I_size // _q_width
+    last_qmx_I_pdim_sz = pad_to_valid_qmx_partitions(last_I_pdim_sz)
+    if last_qmx_I_pdim_sz > last_I_pdim_sz:
+        nisa.memset(dst=out_sb[...], value=0.0, engine=nisa.gpsimd_engine)
+        nisa.memset(dst=out_quant_sb[...], value=0.0, engine=nisa.gpsimd_engine)
+        nisa.memset(dst=out_scale_sb[...], value=0.0, engine=nisa.gpsimd_engine)
+
     """
     Step 3: Fused gate projection, projection clamping (optional), activation function.
-    Step 3.1: Compute W_mxfp4/8 (stationary) @ input_mxfp8 (moving) via _matmul_mx_accumulate helper.
-    TODO: consider changing loop order to T, H, I, 4_I
+    Step 3.1: Compute W_mxfp4/8 (stationary) @ input_mxfp8 (moving).
     """
     for tile_t in nl.sequential_range(n_T256_tiles):
         # T dim slicing, handling case when T tile < 256_T
         tile_T_offset = TILE_T * tile_t
         tile_T_actual = min(TILE_T, T - tile_T_offset)
         tile_T_slice = nl.ds(tile_T_offset, tile_T_actual)
-        for tile_i in nl.sequential_range(n_total_I512_tiles):
+
+        # Pre-allocate PSUM for all I tiles upfront
+        out_psum_lst = []
+        for tile_i in range(n_total_I512_tiles):
+            out_psum_lst.append(nl.ndarray((TILE_I, I_4, TILE_T), dtype=nl.bfloat16, buffer=nl.psum))
+
+        _projection_matmul_mx(
+            out_psum_lst=out_psum_lst,
+            weight_sb=gate_weight_sb,
+            weight_scale_sb=gate_weight_scale_sb,
+            input_quant_sb=input_quant_sb,
+            input_scale_sb=input_scale_sb,
+            tile_T_slice=tile_T_slice,
+            tile_T_actual=tile_T_actual,
+            n_H512_tiles=n_H512_tiles,
+            n_total_I512_tiles=n_total_I512_tiles,
+            I_local=I_local,
+        )
+
+        # Step 3.2: PSUM eviction + bias + clamp + activation (after all H tiles complete)
+        for tile_i in range(n_total_I512_tiles):
             cur_tile_I_size = min(
                 MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM, I_local - tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
             )
             cur_I_pdim_sz = cur_tile_I_size // _q_width
-            out_psum = nl.ndarray((TILE_I, I_4, TILE_T), dtype=nl.bfloat16, buffer=nl.psum)
-            cur_I128_tile_sz = cur_tile_I_size // _q_width
-            _matmul_mx_accumulate(
-                out_psum=out_psum,
-                weight_sb=gate_weight_sb,
-                weight_scale_sb=gate_weight_scale_sb,
-                input_quant_sb=input_quant_sb,
-                input_scale_sb=input_scale_sb,
-                tile_i=tile_i,
-                tile_T_slice=tile_T_slice,
-                tile_T_actual=tile_T_actual,
-                n_H512_tiles=n_H512_tiles,
-                cur_I128_tile_sz=cur_I128_tile_sz,
-            )
 
             """
-            Step 3.2: Accumulate bias during PSUM eviction.
+            Accumulate bias during PSUM eviction (skip for STATIC_MX).
             out_sb shape: [TILE_I, n_total_I512_tiles, T, I_4]
             out_psum shape: [TILE_I, I_4, TILE_T]
             gate_bias_sb shape: [TILE_I, n_total_I512_tiles, I_4]
             Use strided access pattern to reorder from [TILE_I, I_4, TILE_T] to [TILE_I, TILE_T, I_4].
-            Use cur_I_pdim_sz for actual partitions.
             """
-            if gate_bias_sb != None:
+            is_software_dequant = gate_dequant_scale != None
+            if gate_bias_sb != None and not is_software_dequant:
                 nisa.tensor_tensor(
                     dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                    data1=out_psum.ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
+                    data1=out_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
                     op=nl.add,
                     data2=gate_bias_sb.ap(
                         [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]], offset=tile_i * I_4
@@ -194,8 +211,55 @@ def gate_up_projection_mx_shard_I(
             else:
                 nisa.tensor_copy(
                     dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
-                    src=out_psum.ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
+                    src=out_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
                 )
+
+            # STATIC_MX: dequant then bias
+            if gate_dequant_scale != None and gate_dequant_scale.shape[1] == 1:
+                nisa.activation(
+                    dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                    op=nl.copy,
+                    data=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                    scale=gate_dequant_scale[:cur_I_pdim_sz, :],
+                )
+                if gate_bias_sb != None:
+                    nisa.tensor_tensor(
+                        dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                        data1=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                        op=nl.add,
+                        data2=gate_bias_sb.ap(
+                            [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]],
+                            offset=tile_i * I_4,
+                        ),
+                    )
+
+            # ROW_MX: per-column weight dequant, then per-token input dequant, then bias
+            if gate_dequant_scale != None and gate_dequant_scale.shape[1] > 1:
+                for i_q in nl.affine_range(I_4):
+                    i_col = tile_i * I_4 + i_q
+                    nisa.activation(
+                        dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, i_q],
+                        op=nl.copy,
+                        data=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, i_q],
+                        scale=gate_dequant_scale[:cur_I_pdim_sz, i_col : i_col + 1],
+                    )
+                for i_q in nl.affine_range(I_4):
+                    nisa.tensor_tensor(
+                        dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, i_q],
+                        data1=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, i_q],
+                        data2=input_dequant_scale[:cur_I_pdim_sz, :tile_T_actual, 0],
+                        op=nl.multiply,
+                    )
+                if gate_bias_sb != None:
+                    nisa.tensor_tensor(
+                        dst=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                        data1=out_sb[:cur_I_pdim_sz, tile_i, tile_T_slice, :],
+                        op=nl.add,
+                        data2=gate_bias_sb.ap(
+                            [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]],
+                            offset=tile_i * I_4,
+                        ),
+                    )
 
             # Step 3.3: Clamp projection output to [clamp_lower_limit, clamp_upper_limit] (optional)
             _clamp_tensor(
@@ -212,46 +276,55 @@ def gate_up_projection_mx_shard_I(
                     op=get_nl_act_fn_from_type(hidden_act_fn),
                 )
 
-    # Step 4: Fused up projection, projection clamp (optional), gate * up, MX quantization
-    # Step 4.1: Compute W_mxfp4/8 (stationary) @ input_mxfp8 (moving)
+    """
+    Step 4: Fused up projection, projection clamp (optional), gate * up, MX quantization.
+    Step 4.1: Compute W_mxfp4/8 (stationary) @ input_mxfp8 (moving).
+    """
     for tile_t in nl.sequential_range(n_T256_tiles):
         # T dim slicing, handling case when T tile < 256_T
         tile_T_offset = TILE_T * tile_t
         tile_T_actual = min(TILE_T, T - tile_T_offset)
         tile_T_slice = nl.ds(tile_T_offset, tile_T_actual)
-        for tile_i in nl.sequential_range(n_total_I512_tiles):
+
+        # Pre-allocate PSUM for all I tiles upfront (enables T → H → I → 4_I loop order)
+        up_psum_lst = []
+        for tile_i in range(n_total_I512_tiles):
+            up_psum_lst.append(nl.ndarray((TILE_I, I_4, TILE_T), dtype=nl.bfloat16, buffer=nl.psum))
+
+        # Matmul compute with loop order H → I → 4_I (same input H-slice reused across all I tiles)
+        _projection_matmul_mx(
+            out_psum_lst=up_psum_lst,
+            weight_sb=up_weight_sb,
+            weight_scale_sb=up_weight_scale_sb,
+            input_quant_sb=input_quant_sb,
+            input_scale_sb=input_scale_sb,
+            tile_T_slice=tile_T_slice,
+            tile_T_actual=tile_T_actual,
+            n_H512_tiles=n_H512_tiles,
+            n_total_I512_tiles=n_total_I512_tiles,
+            I_local=I_local,
+        )
+
+        # Step 4.2: PSUM eviction + bias + clamp + gate*up + quantize (after all H tiles complete)
+        for tile_i in range(n_total_I512_tiles):
             cur_tile_I_size = min(
                 MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM, I_local - tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
             )
             cur_I_pdim_sz = cur_tile_I_size // _q_width
             intermediate_tile_sb = nl.ndarray((TILE_I, 1, TILE_T, I_4), dtype=out_sb.dtype, buffer=nl.sbuf)
-            out_psum = nl.ndarray((TILE_I, I_4, TILE_T), dtype=nl.bfloat16, buffer=nl.psum)
-            cur_I128_tile_sz = cur_tile_I_size // _q_width
-            _matmul_mx_accumulate(
-                out_psum=out_psum,
-                weight_sb=up_weight_sb,
-                weight_scale_sb=up_weight_scale_sb,
-                input_quant_sb=input_quant_sb,
-                input_scale_sb=input_scale_sb,
-                tile_i=tile_i,
-                tile_T_slice=tile_T_slice,
-                tile_T_actual=tile_T_actual,
-                n_H512_tiles=n_H512_tiles,
-                cur_I128_tile_sz=cur_I128_tile_sz,
-            )
 
             """
-            Step 4.2: Accumulate bias during PSUM eviction.
+            Accumulate bias during PSUM eviction (skip for STATIC_MX).
             intermediate_tile_sb shape: [TILE_I, 1, TILE_T, I_4]
             out_psum shape: [TILE_I, I_4, TILE_T]
             up_bias_sb shape: [TILE_I, n_total_I512_tiles, I_4]
             Use strided access pattern to reorder from [TILE_I, I_4, TILE_T] to [TILE_I, TILE_T, I_4].
-            Use cur_I_pdim_sz for actual partitions.
             """
-            if up_bias_sb != None:
+            is_up_software_dequant = up_dequant_scale != None
+            if up_bias_sb != None and not is_up_software_dequant:
                 nisa.tensor_tensor(
                     dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                    data1=out_psum.ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
+                    data1=up_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
                     op=nl.add,
                     data2=up_bias_sb.ap(
                         [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]], offset=tile_i * I_4
@@ -260,8 +333,55 @@ def gate_up_projection_mx_shard_I(
             else:
                 nisa.tensor_copy(
                     dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
-                    src=out_psum.ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
+                    src=up_psum_lst[tile_i].ap([[I_4 * TILE_T, cur_I_pdim_sz], [1, tile_T_actual], [TILE_T, I_4]]),
                 )
+
+            # STATIC_MX: dequant then bias
+            if up_dequant_scale != None and up_dequant_scale.shape[1] == 1:
+                nisa.activation(
+                    dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
+                    op=nl.copy,
+                    data=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
+                    scale=up_dequant_scale[:cur_I_pdim_sz, :],
+                )
+                if up_bias_sb != None:
+                    nisa.tensor_tensor(
+                        dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
+                        data1=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
+                        op=nl.add,
+                        data2=up_bias_sb.ap(
+                            [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]],
+                            offset=tile_i * I_4,
+                        ),
+                    )
+
+            # ROW_MX: per-column weight dequant, then per-token input dequant, then bias
+            if up_dequant_scale != None and up_dequant_scale.shape[1] > 1:
+                for i_q in nl.affine_range(I_4):
+                    i_col = tile_i * I_4 + i_q
+                    nisa.activation(
+                        dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, i_q],
+                        op=nl.copy,
+                        data=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, i_q],
+                        scale=up_dequant_scale[:cur_I_pdim_sz, i_col : i_col + 1],
+                    )
+                for i_q in nl.affine_range(I_4):
+                    nisa.tensor_tensor(
+                        dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, i_q],
+                        data1=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, i_q],
+                        data2=input_dequant_scale[:cur_I_pdim_sz, :tile_T_actual, 0],
+                        op=nl.multiply,
+                    )
+                if up_bias_sb != None:
+                    nisa.tensor_tensor(
+                        dst=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
+                        data1=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
+                        op=nl.add,
+                        data2=up_bias_sb.ap(
+                            [[n_total_I512_tiles * I_4, cur_I_pdim_sz], [0, tile_T_actual], [1, I_4]],
+                            offset=tile_i * I_4,
+                        ),
+                    )
 
             # Step 4.3: Clamp projection output to [clamp_lower_limit, clamp_upper_limit]
             _clamp_tensor(
@@ -278,20 +398,24 @@ def gate_up_projection_mx_shard_I(
                 data2=intermediate_tile_sb[:cur_I_pdim_sz, 0, :tile_T_actual, :],
             )
 
-            # Step 4.5: MX quantize combined gate * up tile
-            # Pad partition count to valid quantize_mx size {32, 64, 96, 128}.
-            # Extra zero-padded partitions are harmless: downstream weight is zero-padded.
-            qmx_I_pdim_sz = pad_to_valid_qmx_partitions(cur_I_pdim_sz)
-            nisa.quantize_mx(
-                src=out_sb[:qmx_I_pdim_sz, tile_i, tile_T_slice, :],
-                dst=out_quant_sb[:qmx_I_pdim_sz, tile_i, tile_T_slice],
-                dst_scale=out_scale_sb[:qmx_I_pdim_sz, tile_i, tile_T_slice],
-            )
+            # Step 4.5: MX quantize combined gate * up tile (skip for ROW_MX — uses external row_quantization)
+            is_row_quant = gate_dequant_scale != None and gate_dequant_scale.shape[1] > 1
+            if not is_row_quant:
+                # Pad partition count to valid quantize_mx size {32, 64, 96, 128}.
+                # Extra zero-padded partitions are harmless: downstream weight is zero-padded.
+                qmx_I_pdim_sz = pad_to_valid_qmx_partitions(cur_I_pdim_sz)
+                nisa.quantize_mx(
+                    src=out_sb[:qmx_I_pdim_sz, tile_i, tile_T_slice, :],
+                    dst=out_quant_sb[:qmx_I_pdim_sz, tile_i, tile_T_slice],
+                    dst_scale=out_scale_sb[:qmx_I_pdim_sz, tile_i, tile_T_slice],
+                )
 
+    if gate_dequant_scale != None and gate_dequant_scale.shape[1] > 1:
+        # ROW_MX: return bf16 gate*up result for external row_quantization
+        return out_sb, None
     return out_quant_sb, out_scale_sb
 
 
-@nki.jit
 def load_gate_up_weight_scale_bias(
     weight: nl.ndarray,
     scale: nl.ndarray,
@@ -303,6 +427,7 @@ def load_gate_up_weight_scale_bias(
     I_local: int,
     I_offset: int,
     I_local_padded: int = 0,
+    skip_scale_load: bool = False,
 ) -> tuple[nl.ndarray, nl.ndarray, Optional[nl.ndarray]]:
     """
     Load gate or up projection weight, scale, and bias (optional) for one expert using static DMA.
@@ -351,9 +476,10 @@ def load_gate_up_weight_scale_bias(
     is_bias = bias != None
 
     # Allocate buffers
-    base_weight = weight.base_tensor
+    base_weight = TensorView(weight).base_tensor
     weight_sb = nl.ndarray(weight_sb_shape, dtype=base_weight.dtype, buffer=nl.sbuf)
-    scale_sb = nl.ndarray(weight_sb_shape, dtype=scale.dtype, buffer=nl.sbuf)
+    scale_dtype = nl.uint8 if skip_scale_load else scale.dtype
+    scale_sb = nl.ndarray(weight_sb_shape, dtype=scale_dtype, buffer=nl.sbuf)
     bias_sb = nl.ndarray(bias_sb_shape, dtype=bias.dtype, buffer=nl.sbuf) if is_bias else None
 
     # Load weight: index expert and gate/up, then slice I dimension using tile-based offset
@@ -366,9 +492,9 @@ def load_gate_up_weight_scale_bias(
     )
     if needs_padding:
         nisa.memset(dst=weight_sb[...], value=0, engine=nisa.gpsimd_engine)
-        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[:, :, :I_local])
+        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[:, :, :I_local], dge_mode=nisa.dge_mode.none)
     else:
-        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[...])
+        nisa.dma_copy(src=weight_view.get_view(), dst=weight_sb[...], dge_mode=nisa.dge_mode.none)
     weight_sb = weight_sb.view(weight.dtype)
 
     """
@@ -376,28 +502,33 @@ def load_gate_up_weight_scale_bias(
     Shape: [E_L, 16_H, 2, H/512, I] -> [16_H, H/512, I_local]
     Scale layout: 16 partitions map to partitions [0-3, 32-35, 64-67, 96-99] in 128-partition buffer.
     """
-    n_scale_partitions = TILE_H // _q_height
-    n_quadrants_needed = div_ceil(n_scale_partitions, SCALE_P_ELEM_PER_QUADRANT)
+    if skip_scale_load:
+        # STATIC_MX: fill with dummy 127 scales (scale factor 1.0)
+        nisa.memset(dst=scale_sb[...], value=127, engine=nisa.gpsimd_engine)
+    else:
+        n_scale_partitions = TILE_H // _q_height
+        n_quadrants_needed = div_ceil(n_scale_partitions, SCALE_P_ELEM_PER_QUADRANT)
 
-    if needs_padding:
-        nisa.memset(dst=scale_sb[...], value=0.0, engine=nisa.gpsimd_engine)
+        if needs_padding:
+            nisa.memset(dst=scale_sb[...], value=0.0, engine=nisa.gpsimd_engine)
 
-    for quadrant_idx in nl.affine_range(n_quadrants_needed):
-        scale_view = (
-            TensorView(scale)
-            .select(dim=0, index=expert_idx)
-            .slice(
-                dim=0,
-                start=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx,
-                end=SCALE_P_ELEM_PER_QUADRANT * (quadrant_idx + 1),
+        for quadrant_idx in nl.affine_range(n_quadrants_needed):
+            scale_view = (
+                TensorView(scale)
+                .select(dim=0, index=expert_idx)
+                .slice(
+                    dim=0,
+                    start=SCALE_P_ELEM_PER_QUADRANT * quadrant_idx,
+                    end=SCALE_P_ELEM_PER_QUADRANT * (quadrant_idx + 1),
+                )
+                .select(dim=1, index=gate_or_up_idx)
+                .slice(dim=2, start=I_offset, end=I_offset + I_local)
             )
-            .select(dim=1, index=gate_or_up_idx)
-            .slice(dim=2, start=I_offset, end=I_offset + I_local)
-        )
-        nisa.dma_copy(
-            src=scale_view.get_view(),
-            dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, SCALE_P_ELEM_PER_QUADRANT), :, :I_local],
-        )
+            nisa.dma_copy(
+                src=scale_view.get_view(),
+                dst=scale_sb[nl.ds(SBUF_QUADRANT_SIZE * quadrant_idx, SCALE_P_ELEM_PER_QUADRANT), :, :I_local],
+                dge_mode=nisa.dge_mode.none,
+            )
 
     tile_offset = I_offset // MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
 
@@ -418,12 +549,12 @@ def load_gate_up_weight_scale_bias(
         nisa.dma_copy(
             src=bias_view.get_view(),
             dst=bias_sb[:I_p_bias_in_hbm, :, :],
+            dge_mode=nisa.dge_mode.none,
         )
 
     return weight_sb, scale_sb, bias_sb
 
 
-@nki.jit
 def _clamp_tensor(
     tensor: nl.ndarray,
     clamp_upper_limit: Optional[float],
@@ -436,6 +567,9 @@ def _clamp_tensor(
         tensor (nl.ndarray): Tensor slice to clamp.
         clamp_upper_limit (Optional[float]): Upper clamp limit (None to skip).
         clamp_lower_limit (Optional[float]): Lower clamp limit (None to skip).
+
+    Returns:
+        None. Tensor is clamped in-place.
     """
     if clamp_upper_limit != None or clamp_lower_limit != None:
         nisa.tensor_scalar(
@@ -448,44 +582,50 @@ def _clamp_tensor(
         )
 
 
-@nki.jit
-def _matmul_mx_accumulate(
-    out_psum: nl.ndarray,
+def _projection_matmul_mx(
+    out_psum_lst: list,
     weight_sb: nl.ndarray,
     weight_scale_sb: nl.ndarray,
     input_quant_sb: nl.ndarray,
     input_scale_sb: nl.ndarray,
-    tile_i: int,
     tile_T_slice,
     tile_T_actual: int,
     n_H512_tiles: int,
-    cur_I128_tile_sz: int,
+    n_total_I512_tiles: int,
+    I_local: int,
 ) -> None:
     """
-    Perform MX matmul accumulation over H tiles and 4-I blocks.
-
-    This helper extracts the common matmul loop used in both gate and up projections.
+    Perform MX matmul accumulation over H tiles and I tiles.
+    Loop order: H → I → 4_I for better input tensor reuse with larger T.
 
     Args:
-        out_psum (nl.ndarray): [TILE_I, I_4, TILE_T], Output PSUM buffer.
+        out_psum_lst (list): List of PSUM buffers, one per I512 tile.
         weight_sb (nl.ndarray): [128_H, H/512, I], Weight tensor in SBUF.
         weight_scale_sb (nl.ndarray): [128_H, H/512, I], Weight scale tensor in SBUF.
         input_quant_sb (nl.ndarray): [128_H, H/512, T], Quantized input in SBUF.
         input_scale_sb (nl.ndarray): [128_H, H/512, T], Input scale in SBUF.
-        tile_i (int): Current I tile index.
         tile_T_slice: T dimension slice descriptor.
         tile_T_actual (int): Actual T tile size (may be < 256 for last tile).
         n_H512_tiles (int): Number of H/512 tiles.
-        cur_I128_tile_sz (int): Current I tile size in partitions (I_size / 4).
+        n_total_I512_tiles (int): Number of I/512 tiles.
+        I_local (int): Local intermediate dimension size.
+
+    Returns:
+        None. Results are accumulated in-place into out_psum_lst buffers.
     """
-    for q_width_I_idx in nl.sequential_range(_q_width):
-        weight_I_offset = tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM + q_width_I_idx * cur_I128_tile_sz
-        weight_I_slice = nl.ds(weight_I_offset, cur_I128_tile_sz)
-        for tile_h in nl.sequential_range(n_H512_tiles):
-            nisa.nc_matmul_mx(
-                dst=out_psum[:cur_I128_tile_sz, q_width_I_idx, :tile_T_actual],
-                stationary=weight_sb[:, tile_h, weight_I_slice],
-                moving=input_quant_sb[:, tile_h, tile_T_slice],
-                stationary_scale=weight_scale_sb[:, tile_h, weight_I_slice],
-                moving_scale=input_scale_sb[:, tile_h, tile_T_slice],
+    for tile_h in range(n_H512_tiles):
+        for tile_i in range(n_total_I512_tiles):
+            cur_tile_I_size = min(
+                MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM, I_local - tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM
             )
+            cur_I128_tile_sz = cur_tile_I_size // _q_width
+            for q_width_I_idx in range(_q_width):
+                weight_I_offset = tile_i * MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM + q_width_I_idx * cur_I128_tile_sz
+                weight_I_slice = nl.ds(weight_I_offset, cur_I128_tile_sz)
+                nisa.nc_matmul_mx(
+                    dst=out_psum_lst[tile_i][:cur_I128_tile_sz, q_width_I_idx, :tile_T_actual],
+                    stationary=weight_sb[:, tile_h, weight_I_slice],
+                    moving=input_quant_sb[:, tile_h, tile_T_slice],
+                    stationary_scale=weight_scale_sb[:, tile_h, weight_I_slice],
+                    moving_scale=input_scale_sb[:, tile_h, tile_T_slice],
+                )

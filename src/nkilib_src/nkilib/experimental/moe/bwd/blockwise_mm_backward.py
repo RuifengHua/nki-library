@@ -23,6 +23,7 @@ from .moe_bwd_parameters import (
     AffinityOption,
     ClampLimits,
     KernelTypeOption,
+    MOEBwdDroplessBlockingParams,
     MOEBwdParameters,
     ShardOption,
     SkipMode,
@@ -44,6 +45,7 @@ def blockwise_mm_bwd(
     skip_dma: SkipMode = None,
     compute_dtype: nki.dtype = nl.bfloat16,
     is_tensor_update_accumulating: bool = True,
+    skip_grad_initialization: bool = False,
     shard_option: ShardOption = ShardOption.SHARD_ON_HIDDEN,
     affinity_option: AffinityOption = AffinityOption.AFFINITY_ON_H,
     kernel_type_option: KernelTypeOption = KernelTypeOption.DROPLESS,
@@ -51,6 +53,7 @@ def blockwise_mm_bwd(
     bias: bool = False,
     activation_type: ActFnType = ActFnType.SiLU,
     block_tile_size: int = None,
+    blocking_params: MOEBwdDroplessBlockingParams = None,
 ) -> tuple:
     """
     Compute backward pass for blockwise MoE layer.
@@ -90,6 +93,12 @@ def blockwise_mm_bwd(
         bias (bool): Whether to compute bias gradients.
         activation_type (ActFnType): Activation function type.
         block_tile_size (int): Optional tile size override.
+        blocking_params (MOEBwdDroplessBlockingParams): Optional blocking hyperparameters
+            The kernel consists of 4 matrix multiplications, all using blocked matrix multiplication. This parameter
+            controls the number of tiles packed per LHS, RHS, and output block in each matmul. Increasing the number of tiles
+            for any dimension increases the amount of data loaded into SBUF before the matmul begins execution. This allows
+            more compute per load but also increases SBUF memory consumption. If None, uses defaults. It is highly recommended
+            to tune this parameter to maximize kernel performance.
 
     Returns:
         tuple: Gradient tensors:
@@ -108,9 +117,9 @@ def blockwise_mm_bwd(
     Pseudocode:
         TODO: Add pseudocode description
     """
-    if skip_dma is None:
+    if skip_dma == None:
         skip_dma = SkipMode(False, False)
-    if clamp_limits is None:
+    if clamp_limits == None:
         clamp_limits = ClampLimits()
 
     hidden_states_grad = nl.ndarray(hidden_states.shape, dtype=hidden_states.dtype, buffer=nl.shared_hbm)
@@ -144,7 +153,7 @@ def blockwise_mm_bwd(
         gate_up_proj_act_checkpoint_T=gate_up_proj_act_checkpoint_T,
         down_proj_weight=down_proj_weight,
         down_proj_weight_grad=down_proj_weight_grad,
-        down_proj_act_checkpoint=down_proj_act_checkpoint,
+        down_proj_act_checkpoint=None if affinity_option == AffinityOption.AFFINITY_ON_I else down_proj_act_checkpoint,
         token_position_to_id=token_position_to_id,
         block_to_expert=block_to_expert,
         output_hidden_states_grad=output_hidden_states_grad,
@@ -152,10 +161,14 @@ def blockwise_mm_bwd(
         skip_dma=skip_dma,
         compute_dtype=compute_dtype,
         is_tensor_update_accumulating=is_tensor_update_accumulating,
+        skip_grad_initialization=skip_grad_initialization,
         clamp_limits=clamp_limits,
         gate_and_up_proj_bias_grad=gate_and_up_proj_bias_grad,
         down_proj_bias_grad=down_proj_bias_grad,
         activation_type=activation_type,
+        affinity_option=affinity_option,
+        blocking_params=blocking_params,
+        shard_option=shard_option,
     )
 
     params.validate()

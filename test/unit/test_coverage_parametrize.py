@@ -15,15 +15,20 @@
 """Unit tests for the negative testing features in coverage_parametrized_tests."""
 
 from enum import Enum
-from test.utils.coverage_parametrized_tests import (
-    BoundedRange,
-    FilterResult,
-    _format_param_value,
-    generate_parametrized_test_case,
-)
 
 import ml_dtypes
 import numpy as np
+import pytest
+
+from test.utils.coverage_parametrized_tests import (
+    MAX_PATH_COMPONENT_LENGTH,
+    BoundedRange,
+    CoverageTestCase,
+    FilterResult,
+    extract_parametrize_args,
+    format_param_value,
+    generate_parametrized_test_case,
+)
 
 
 class QuantType(Enum):
@@ -222,6 +227,85 @@ def test_numpy_array_params():
     assert a_values == {1, 2, 3}, f"Expected {{1, 2, 3}}, got {a_values}"
 
 
+def test_test_ids_include_param_names():
+    """Test that generated test IDs include parameter names as prefixes."""
+    params = {"d_head": [8], "batch": [2], "n_heads": [4]}
+    cases = [CoverageTestCase(values=(8, 2, 4))]
+    _, _, ids = extract_parametrize_args(params, cases)
+    assert ids[0] == "d_head_8-batch_2-n_heads_4"
+
+
+def test_test_ids_with_prefix():
+    """Test that boundary/invalid prefixes are preserved with param names."""
+    params = {"x": [1], "y": [2]}
+    cases = [CoverageTestCase(values=(1, 2), is_negative=True, prefix="boundary")]
+    _, _, ids = extract_parametrize_args(params, cases)
+    assert ids[0] == "boundary_x_1-y_2"
+
+
+def test_test_ids_with_abbrev():
+    """Test that abbrev shortens parameter names in test IDs."""
+    params = {"transpose_out": [True], "n_heads": [4], "d_head": [8]}
+    cases = [CoverageTestCase(values=(True, 4, 8))]
+    _, _, ids = extract_parametrize_args(params, cases, abbrev={"transpose_out": "tout", "n_heads": "nh"})
+    assert ids[0] == "tout_1-nh_4-d_head_8"
+
+
+def test_test_ids_length_assertion():
+    """Test that overly long test IDs raise AssertionError suggesting abbrev."""
+    params = {f"long_parameter_name_{i}": [100000000000] for i in range(30)}
+    cases = [CoverageTestCase(values=tuple(100000000000 for _ in range(30)))]
+    with pytest.raises(AssertionError, match="abbrev"):
+        extract_parametrize_args(params, cases)
+
+
+def test_test_ids_length_ok_with_abbrev():
+    """Test that abbrev can bring IDs under the length limit."""
+    params = {f"long_parameter_name_{i}": [1] for i in range(30)}
+    cases = [CoverageTestCase(values=tuple(1 for _ in range(30)))]
+    abbrev = {f"long_parameter_name_{i}": f"p{i}" for i in range(30)}
+    _, _, ids = extract_parametrize_args(params, cases, abbrev=abbrev)
+    assert len(ids[0]) <= MAX_PATH_COMPONENT_LENGTH
+
+
+def test_format_param_value_handles_types():
+    """Test that format_param_value produces clean names for type objects."""
+    # Type objects should use __name__ instead of str() which produces <class '...'>
+    assert format_param_value(np.float32) == "float32"
+    assert format_param_value(np.float16) == "float16"
+    assert format_param_value(ml_dtypes.bfloat16) == "bfloat16"
+
+    # Regular values should use str() with spaces/quotes stripped
+    assert format_param_value(42) == "42"
+    assert format_param_value("hello") == "hello"
+    assert format_param_value(3.14) == "3.14"
+
+    # Bools are converted to int (0/1)
+    assert format_param_value(True) == "1"
+    assert format_param_value(False) == "0"
+
+    # Enum values should use .value
+    from enum import Enum
+
+    class Color(Enum):
+        RED = 1
+
+    assert format_param_value(Color.RED) == "1"
+
+    # Tuples/lists use _-joined format, folder-safe (no parens, commas, braces, quotes, colons)
+    assert format_param_value((1, 2, 3)) == "1_2_3"
+    assert format_param_value(('normal', '{"mean": 0}')) == "normal_mean0"
+
+    # Long values should be truncated with a hash suffix
+    long_val = ('kaiming_uniform', '{"mode": "fan_out", "nonlinearity": "leaky_relu"}')
+    result = format_param_value(long_val)
+    assert len(result) <= 40, f"Expected <=40 chars, got {len(result)}: {result}"
+    assert result.startswith("kaiming_uniform_")
+    # Different long values should produce different hashes
+    other_val = ('kaiming_normal', '{"mode": "fan_out", "nonlinearity": "relu"}')
+    assert format_param_value(long_val) != format_param_value(other_val)
+
+
 if __name__ == "__main__":
     test_bounded_range_integer_auto_boundaries()
     print("✓ test_bounded_range_integer_auto_boundaries")
@@ -256,18 +340,18 @@ if __name__ == "__main__":
     test_format_param_value_handles_types()
     print("✓ test_format_param_value_handles_types")
 
+    test_test_ids_include_param_names()
+    print("✓ test_test_ids_include_param_names")
+
+    test_test_ids_with_prefix()
+    print("✓ test_test_ids_with_prefix")
+
+    test_test_ids_with_abbrev()
+    print("✓ test_test_ids_with_abbrev")
+
+    # test_test_ids_length_assertion uses pytest.raises — run via pytest only
+
+    test_test_ids_length_ok_with_abbrev()
+    print("✓ test_test_ids_length_ok_with_abbrev")
+
     print("\nAll tests passed!")
-
-
-def test_format_param_value_handles_types():
-    """Test that _format_param_value produces clean names for type objects."""
-    # Type objects should use __name__ instead of str() which produces <class '...'>
-    assert _format_param_value(np.float32) == "float32"
-    assert _format_param_value(np.float16) == "float16"
-    assert _format_param_value(ml_dtypes.bfloat16) == "bfloat16"
-
-    # Regular values should use str()
-    assert _format_param_value(42) == "42"
-    assert _format_param_value("hello") == "hello"
-    assert _format_param_value(3.14) == "3.14"
-    assert _format_param_value(True) == "True"

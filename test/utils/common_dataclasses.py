@@ -17,13 +17,16 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional, TextIO
+from typing import Any, Callable, Optional, Protocol, TextIO, runtime_checkable
 
-import nki.isa as nisa
+try:
+    import nki.isa as nisa
+except ModuleNotFoundError:
+    nisa = None  # nki not available; get_nc_gen() will raise if called
 import numpy.typing as npt
 from typing_extensions import override
 
-from .metrics_emitter import IMetricsEmitter
+from .metrics_collector import IMetricsCollector
 
 # Directory name for inference artifacts
 INF_ARTIFACT_DIR_NAME = "infer_result"
@@ -34,7 +37,7 @@ MODEL_TEST_TYPE = "MODEL_WIP"
 
 
 class ModelTestType(Enum):
-    """Classification for MODEL_WIP test configs.
+    """Classification for model test configs.
 
     Model config files use a dict keyed by ModelTestType:
         model_configs = {
@@ -46,30 +49,73 @@ class ModelTestType(Enum):
     GENERALITY = "GENERALITY"
     OPTIMAL = "OPTIMAL"
     BROAD = "BROAD"
+    TIER0 = "TIER0"
 
     @property
     def test_id_prefix(self) -> str:
-        """Return the prefix used in pytest test IDs, e.g. 'MODEL_WIP_BROAD'."""
-        return f"{MODEL_TEST_TYPE}_{self.value}"
+        """Return the prefix used in pytest test IDs, e.g. 'BROAD'."""
+        return self.value
+
+    @property
+    def pytest_mark(self) -> str:
+        """Return the pytest marker name for this tier, e.g. 'tier0'."""
+        return self.value.lower()
 
 
 def is_model_test_type(test_type: str) -> bool:
-    """Check if a test_type string represents any MODEL_WIP variant."""
-    return test_type.startswith(MODEL_TEST_TYPE)
+    """Check if a test_type string represents any model test type."""
+    model_prefixes = tuple(t.value for t in ModelTestType)
+    return test_type.startswith(model_prefixes)
+
+
+def get_test_tier(node) -> ModelTestType | None:
+    """Return the ModelTestType for a pytest node based on its tier marks.
+
+    Args:
+        node: A pytest Item (or any object with get_closest_marker).
+
+    Returns:
+        The matching ModelTestType, or None if no tier mark is present.
+
+    Raises:
+        ValueError: If the node has more than one tier mark.
+    """
+    matched = [tier for tier in ModelTestType if node.get_closest_marker(tier.pytest_mark)]
+    if len(matched) > 1:
+        names = [t.pytest_mark for t in matched]
+        raise ValueError(f"Test has multiple tier marks: {names}. Expected at most one.")
+    return matched[0] if matched else None
 
 
 def _iter_model_configs(configs):
-    """Iterate over model configs yielding (ModelTestType, params) pairs.
+    """Iterate over model configs yielding (ModelTestType, params, supported_platforms) triples.
+
+    Each entry in the config list can be:
+      - A plain params object (list, dataclass, etc.) — runs on all platforms.
+      - A (params, supported_platforms) tuple — runs only on the specified platforms.
 
     Supports both dict format {ModelTestType: [configs...]} and legacy flat list format.
     """
     if isinstance(configs, dict):
         for model_type, entries in configs.items():
             for entry in entries:
-                yield model_type, entry
+                params, platforms = _unpack_platform_config(entry)
+                yield model_type, params, platforms
     else:
         for entry in configs:
-            yield ModelTestType.BROAD, entry
+            params, platforms = _unpack_platform_config(entry)
+            yield ModelTestType.BROAD, params, platforms
+
+
+def _unpack_platform_config(entry):
+    """Unpack a config entry that may carry platform restrictions.
+
+    Returns (params, supported_platforms). supported_platforms is None if unrestricted.
+    A platform-restricted entry is a (params, set_of_platforms) tuple.
+    """
+    if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], set):
+        return entry[0], entry[1]
+    return entry, None
 
 
 def prepare_model_parametrize(configs, id_formatter=None):
@@ -77,19 +123,29 @@ def prepare_model_parametrize(configs, id_formatter=None):
 
     Args:
         configs: Dict {ModelTestType: [configs...]} or legacy flat list.
+                 Entries may be plain params or (params, supported_platforms) tuples.
         id_formatter: Optional callable(params) -> str for the param portion of the ID.
                       Defaults to joining str(p) with '-'.
 
     Returns:
         (params_list, ids_list) tuple ready for @pytest.mark.parametrize(..., params_list, ids=ids_list).
+        When an entry has platform restrictions, it is wrapped in pytest.param with platform marks
+        so that pytest -m filtering works at collection time.
     """
+    import pytest
+
     if id_formatter is None:
         id_formatter = lambda params: "-".join(str(p.value) if hasattr(p, "value") else str(p) for p in params)
 
     params_list = []
     ids_list = []
-    for model_type, params in _iter_model_configs(configs):
-        params_list.append(params)
+    for model_type, params, supported_platforms in _iter_model_configs(configs):
+        if supported_platforms is not None:
+            excluded = set(Platforms) - supported_platforms
+            marks = [pytest.mark.platforms(exclude=list(excluded))]
+            params_list.append(pytest.param(*params, marks=marks))
+        else:
+            params_list.append(params)
         ids_list.append(f"{model_type.test_id_prefix}_{id_formatter(params)}")
     return params_list, ids_list
 
@@ -109,6 +165,7 @@ class TraceMode(Enum):
     CompileOnly = "compile_only"
     TraceOnly = "trace_only"
     Simulator = "simulation"
+    Debugger = "debugger"
     NkiStandaloneTracer = "nki_standalone_tracer"
     NkiStandaloneParser = "nki_standalone_parser"
 
@@ -117,10 +174,24 @@ class TraceMode(Enum):
         return TraceMode(mode.lower().replace("-", "_"))
 
 
+class NKICompilationMode(Enum):
+    parser = "parser"
+    tracer = "tracer"
+
+
 class SeparationPassMode(Enum):
     NONE = "none"
     DIRECT = "direct"
     INDIRECT = "indirect"
+
+
+class UploadProfileMode(Enum):
+    ALWAYS = "always"
+    ON_FAIL_ONLY = "on-fail-only"
+
+    @staticmethod
+    def from_str(value: str) -> "UploadProfileMode":
+        return UploadProfileMode(value.lower())
 
 
 class CleanupPreserve(Enum):
@@ -270,6 +341,7 @@ class ValidationArgs:
     absolute_accuracy: float = 1e-08
 
     accuracy_buffer_percent: int | None = 0
+    equal_nan_inf: bool = False
 
     def __post_init__(self):
         if isinstance(self.golden_output, (LazyGoldenGenerator, PerRankLazyGoldenGenerator)):
@@ -302,6 +374,8 @@ class Platforms(Enum):
             return self.value
 
     def get_nc_gen(self) -> str:
+        if nisa is None:
+            raise ImportError("nki.isa is required for get_nc_gen() but is not installed")
         gen_map = {
             Platforms.TRN1: nisa.nc_version.gen2,
             Platforms.TRN2: nisa.nc_version.gen3,
@@ -310,6 +384,21 @@ class Platforms(Enum):
         }
 
         return gen_map[self].name
+
+
+@runtime_checkable
+class PlatformAware(Protocol):
+    """Protocol for test config objects that declare platform restrictions.
+
+    Any dataclass or object with a ``supported_platforms`` attribute satisfying
+    this signature will be recognized by ``pytest_collection_modifyitems`` and
+    used to restrict which platform marks are applied to the test item.
+
+    When ``supported_platforms`` is ``None``, the test runs on all platforms.
+    Otherwise, it should be a set of :class:`Platforms` values the test supports.
+    """
+
+    supported_platforms: set[Platforms] | None
 
 
 @dataclass
@@ -332,8 +421,8 @@ class CompilerArgs:
 
     def __init__(
         self,
+        platform_target: Platforms,
         logical_nc_config: int | None = None,
-        platform_target: Platforms = Platforms.TRN2,
         additional_cmd_args: list[str] = [],
         enable_debugging: bool = False,
         enable_birsim: bool = False,
@@ -406,7 +495,7 @@ class KernelArgs:
     kernel_input: dict[str, Any] | PerRankLazyInputGenerator | None = None
     validation_args: ValidationArgs | None = None
     inference_args: InferenceArgs = field(default_factory=InferenceArgs)
-    emitter: IMetricsEmitter | None = None
+    collector: IMetricsCollector | None = None
 
 
 @dataclass

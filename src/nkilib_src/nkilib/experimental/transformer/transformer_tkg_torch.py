@@ -195,7 +195,7 @@ def attention_block_torch(
     sin: torch.Tensor,
     K_cache: torch.Tensor,
     V_cache: torch.Tensor,
-    mask_cache: torch.Tensor,
+    attention_mask: torch.Tensor,
     mask_active: torch.Tensor,
     position_ids: torch.Tensor,
     eps: float,
@@ -214,7 +214,7 @@ def attention_block_torch(
       sin: RoPE sine of shape (d_head//2, B, S_tkg)
       K_cache: K cache of shape (B, d_head, S_ctx) - transposed layout
       V_cache: V cache of shape (B, S_ctx, d_head)
-      mask_cache: Cache mask of shape (B, q_heads_per_core * S_tkg, S_ctx)
+      attention_mask: Attention mask of shape (B, q_heads_per_core * S_tkg, S_ctx)
       mask_active: Active mask of shape (B, q_heads_per_core * S_tkg, S_tkg)
       position_ids: Position IDs of shape (B, S_tkg)
       eps: RMSNorm epsilon
@@ -253,7 +253,7 @@ def attention_block_torch(
             v[b],  # (S_tkg, d_head)
             K_cache[b, :, :S_ctx],  # (d_head, S_ctx)
             V_cache[b, :S_ctx, :],  # (S_ctx, d_head)
-            mask_cache[b],  # (q_heads_per_core * S_tkg, S_ctx)
+            attention_mask[b],  # (q_heads_per_core * S_tkg, S_ctx)
             mask_active[b],  # (q_heads_per_core * S_tkg, S_tkg)
         )
 
@@ -433,8 +433,7 @@ def llama3_transformer_fwd_tkg_torch(
     W_gamma_mlps: list[torch.Tensor],
     RoPE_cos: torch.Tensor,
     RoPE_sin: torch.Tensor,
-    mask_cache: torch.Tensor,
-    mask_active: torch.Tensor,
+    attention_mask: torch.Tensor,
     position_ids: torch.Tensor,
     K_caches: list[torch.Tensor],
     V_caches: list[torch.Tensor],
@@ -473,8 +472,7 @@ def llama3_transformer_fwd_tkg_torch(
         W_gamma_mlps (list[torch.Tensor]): Per-layer RMSNorm gamma for MLP
         RoPE_cos (torch.Tensor): [d_head//2, B, S_tkg], RoPE cosine embeddings
         RoPE_sin (torch.Tensor): [d_head//2, B, S_tkg], RoPE sine embeddings
-        mask_cache (torch.Tensor): [S_ctx, B, q_heads_per_core, S_tkg], Attention mask for cached context
-        mask_active (torch.Tensor): Attention mask for active tokens
+        attention_mask (torch.Tensor): [S_ctx, B, q_heads_per_core, S_tkg], Attention mask
         position_ids (torch.Tensor): [B, S_tkg], KV cache write positions
         K_caches (list[torch.Tensor]): Per-layer K caches
         V_caches (list[torch.Tensor]): Per-layer V caches
@@ -512,12 +510,12 @@ def llama3_transformer_fwd_tkg_torch(
     # Only cascaded attention is supported
     kernel_assert(use_cascaded_attn, "use_cascaded_attn must be True")
 
-    # Cascaded: mask_cache shape is (S_ctx, batch, qheads_per_core, S_tkg)
-    S_ctx = mask_cache.shape[0]
-    q_heads_per_core = mask_cache.shape[2]
+    # Cascaded: attention_mask shape is (S_ctx, batch, qheads_per_core, S_tkg)
+    S_ctx = attention_mask.shape[0]
+    q_heads_per_core = attention_mask.shape[2]
 
-    # Reshape masks
-    mask_cache_reshaped = mask_cache.reshape(B, q_heads_per_core * S_tkg, S_ctx)
+    # Reshape masks: (S_ctx, B, qhpc, S_tkg) -> (B, qhpc*S_tkg, S_ctx)
+    mask_cache_reshaped = attention_mask.permute(1, 2, 3, 0).reshape(B, q_heads_per_core * S_tkg, S_ctx)
 
     # Cascaded uses one mask for both prior and active, split them into two
     mask_active_reshaped = mask_cache_reshaped[:, :, S_ctx - S_tkg :].clone()

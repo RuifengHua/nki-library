@@ -68,9 +68,10 @@ from ...core.utils.kernel_helpers import (
     get_verified_program_sharding_info,
     is_hbm_buffer,
 )
-from ...core.utils.logging import Logger
+from ...core.utils.logging import get_logger
 from ...core.utils.tensor_view import TensorView
 from .attention_block_tkg_sharding import (
+    KVDPCollectiveMode,
     _KVDP_attention_input_collectives,
     _KVDP_attention_output_collectives,
 )
@@ -127,6 +128,8 @@ def attention_block_tkg(
     transposed_out: bool,
     # -- output
     out_in_sb: bool,
+    # -- transposed input
+    transposed_in: bool = False,
     # -- optional params with defaults
     softmax_scale: Optional[float] = None,
     enable_fa_s_prior_tiling: bool = True,
@@ -134,8 +137,13 @@ def attention_block_tkg(
     v_scale: Optional[nl.ndarray] = None,
     sbm: Optional[SbufManager] = None,
     skip_attention: bool = False,
+    is_h_transposed_by_4: bool = False,
     KVDP: int = 1,
     KVDP_replica_group: Optional[ReplicaGroup] = None,
+    KVDP_collective_mode: Optional[KVDPCollectiveMode] = None,
+    pos_ids: Optional[nl.ndarray] = None,
+    swa_start_pos_ids: Optional[nl.ndarray] = None,
+    S_ctx: Optional[int] = None,
 ):
     """
     Fused Attention Block for Token Generation (TKG).
@@ -161,13 +169,19 @@ def attention_block_tkg(
     Args:
         X (nl.ndarray): Input hidden states
             Shape:
-                [B, S_tkg, H]                                when in HBM
-                [H0=pmax, BxS, H1] where H1=lnc x (H//lnc//pmax) when in SBUF
+                [B, S_tkg, H]                                       when in HBM (default)
+                [H0=pmax, BxS, H1] where H1=lnc x (H//lnc//pmax)  when in SBUF
+                [H0=pmax, n_prgs, H1_shard, BxS]                    when transposed_in=True (HBM)
 
             When in SBUF, the layout is obtained by rearranging HBM data:
                 HBM: (BxS, lnc, H0, H1//lnc) -> SBUF: (H0, BxS, (lnc, H1//lnc))
             This interleaves H1//lnc values from each lnc chunk along the H dimension,
             matching qkv_tkg() kernel's expected SBUF input format.
+
+            When transposed_in=True, X is in the transposed HBM layout produced by
+            transposed_out from a preceding layer. The kernel loads only the per-NC
+            shard (contiguous DMA), permutes to [H0, BxS, H1_shard] in SBUF, applies
+            shard_on_h RMSNorm if enabled, and passes the result to QKV.
         X_hidden_dim_actual (Optional[int]): Actual hidden dim if X is padded
 
         rmsnorm_X_enabled (bool): Apply RMSNorm to X before QKV projection
@@ -176,9 +190,10 @@ def attention_block_tkg(
 
         W_qkv (nl.ndarray): [H, d_head*(q_heads+2)] @ HBM, QKV projection weights
         bias_qkv (Optional[nl.ndarray]): [1, d_head*(q_heads+2)] @ HBM, QKV bias
-        quantization_type_qkv (QuantizationType): Type of quantization for QKV projection (NONE, STATIC).
+        quantization_type_qkv (QuantizationType): Type of quantization for QKV projection (NONE, STATIC, ROW).
         weight_dequant_scale_qkv (Optional[nl.ndarray]): Weight dequantization scale for QKV projection.
-            Shape: [PMAX, 1] @ HBM when quantization_type_qkv is STATIC.
+            Shape: [PMAX, 3] @ HBM when quantization_type_qkv is STATIC.
+            Shape: [PMAX, I] @ HBM when quantization_type_qkv is ROW.
         input_dequant_scale_qkv (Optional[nl.ndarray]): Input dequantization scale for QKV projection.
             Shape: [PMAX, 1] @ HBM when quantization_type_qkv is STATIC.
 
@@ -204,9 +219,15 @@ def attention_block_tkg(
         V_cache (nl.ndarray): Value cache @ HBM.
             Flat KV: [B, S_max_ctx, d_head].
             Block KV: [num_blocks, block_len, d_head].
-        attention_mask (nl.ndarray): [S_ctx, B, q_heads, S_tkg] @ HBM, Attention mask
+        attention_mask (nl.ndarray): Attention mask @ HBM.
+            When pos_ids is None: [S_ctx, B, q_heads, S_tkg], full pre-generated attention mask.
+            When pos_ids is provided: [S_tkg, B, q_heads, S_tkg], active-only portion of the mask.
         sink (Optional[nl.ndarray]): [H, 1] @ HBM, Attention sink tokens
-        softmax_scale (Optional[float]): Scaling factor for attention scores. If None, defaults to 1/sqrt(d_head).
+        softmax_scale (Optional[float]): Scaling factor for attention scores. If None, defaults to (1/√D) / k_scale.
+            When using FP8 KV cache (k_scale/v_scale provided) and softmax_scale is None, the kernel automatically
+            divides by k_scale to dequantize the KV cache values in the QK matmul, effectively setting
+            ``softmax_scale = (1/√D) / k_scale``. When softmax_scale is explicitly provided, the caller is
+            responsible for incorporating k_scale (e.g., ``softmax_scale = scaling / k_scale``).
         enable_fa_s_prior_tiling: bool: Whether to enable flash attention (FA) for attention computation.
             When enabled, the attention computation is tiled along the context (s_prior) to reduce peak memory usage.
 
@@ -218,23 +239,57 @@ def attention_block_tkg(
             enables FP8 KV cache quantization. Supported dtypes: float32, float16, bfloat16.
 
         update_cache (bool): Update KV cache with new tokens
-        kv_cache_update_idx (Optional[nl.ndarray]): [B, 1], Cache write positions (uint32_max = skip)
+        kv_cache_update_idx (Optional[nl.ndarray]): [B, S_tkg] for block KV, [B, 1] for flat KV.
+            Per-token cache write positions (uint32_max = skip).
+            For flat KV, only the start position is needed; consecutive tokens are assumed.
+            IMPORTANT: When update_cache=True, kv_cache_update_idx values must NOT overlap with
+            the prior cache read range (as determined by mask) used by attention. Overlapping
+            read/write positions can cause a data race between cores in the current implementation.
 
-        W_out (Optional[nl.ndarray]): [q_heads*d_head, H] @ HBM, Output projection weights
+        W_out (Optional[nl.ndarray]): [q_heads*d_head, H] @ HBM, Output projection weights.
+            When using FP8 KV cache (k_scale/v_scale provided), the attention output has
+            magnitude scaled by v_scale. The caller must absorb v_scale into W_out or its
+            dequant scale to compensate: ``W_out = W_out_original / v_scale`` (for NONE
+            quantization) or ``weight_dequant_scale_out = scale / v_scale`` (for ROW/STATIC).
         bias_out (Optional[nl.ndarray]): [1, H] @ HBM, Output projection bias
-        quantization_type_out (QuantizationType): Type of quantization for output projection (NONE, STATIC).
+        quantization_type_out (QuantizationType): Type of quantization for output projection (NONE, STATIC, ROW).
         weight_dequant_scale_out (Optional[nl.ndarray]): Weight dequantization scale for output projection.
             Shape: [PMAX, 1] @ HBM when quantization_type_out is STATIC.
+            Shape: [PMAX, H] @ HBM when quantization_type_out is ROW.
+            When using FP8 KV cache, this scale should incorporate v_scale (see W_out above).
         input_dequant_scale_out (Optional[nl.ndarray]): Input dequantization scale for output projection.
             Shape: [PMAX, 1] @ HBM when quantization_type_out is STATIC.
         transposed_out (bool): Transpose output layout (requires W_out)
         out_in_sb (bool): Return output in SBUF instead of HBM
+        transposed_in (bool): When True, X is in transposed HBM layout
+            [H0=pmax, n_prgs, H1_shard, BxS] from a preceding layer's transposed_out.
+            (Note that using [H0, n_prgs, BxS, H1_shard] instead would require an extra tensor_copy upstream
+            so all-in-all it doesn't save us from doing the equivalent in attention.)
+            Requires B*S_tkg <= pmax (small batch path). Default: False.
         sbm (Optional[SbufManager]): SBUF memory manager (otherwise auto-allocated)
         skip_attention (bool): Skip attention computation (for testing)
+        is_h_transposed_by_4 (bool): Whether input X and RMSNorm gamma have been pre-shuffled
+            along the H dimension for MXFP quantization. Required to be True when
+            quantization_type_qkv is MX, STATIC_MX, or ROW_MX. The pre-shuffle reorders
+            [B, S, H//512, 128, 4] → [B, S, 4, H//512, 128] so the data matches the layout
+            expected by the hardware quantize_mx instruction. Default: False.
 
         KVDP (int): KV cache data parallelism degree - number of ranks that shard the KV cache
             across the batch dimension (1 = disabled). Each rank processes B/KVDP batches.
         KVDP_replica_group (Optional[ReplicaGroup]): Replica group for collective ops
+
+        pos_ids (Optional[nl.ndarray]): [B, S_tkg] @ HBM, Absolute sequence position of each
+            active token. When provided, the kernel generates the prior causal mask on-chip
+            (attending to KV positions < pos_id) instead of loading a full pre-generated mask
+            from HBM. In this mode, attention_mask carries only the active portion.
+        swa_start_pos_ids (Optional[nl.ndarray]): [B, S_tkg] @ HBM, Per-query SWA window start positions.
+            When provided together with pos_ids, generates a banded sliding window attention mask
+            where each token attends to positions in [start_pos, pos_id). When None, standard
+            causal attention mask is generated (token attends to all positions < pos_id).
+
+        S_ctx (Optional[int]): Explicit context length for flat KV with pos_ids. Required when
+            pos_ids is provided and block KV is not used, since S_ctx cannot be derived from
+            the attention mask. Must be None otherwise.
 
     KV Data Parallelism (KVDP > 1):
         KV-DP partitions the KV cache across ranks along the batch dimension. Each rank holds
@@ -248,6 +303,8 @@ def attention_block_tkg(
         Input shape changes:
         - K_cache, V_cache: [B_attn, ...] instead of [B, ...]
         - attention_mask: [S_ctx, B_attn, q_heads_attn, S_tkg]
+        - pos_ids: [B_attn, S_tkg] instead of [B, S_tkg]
+        - swa_start_pos_ids: [B_attn, S_tkg] instead of [B, S_tkg]
         - kv_cache_update_idx: [B_attn, 1] (caller must slice per rank)
 
         Output shape changes (when update_cache=False):
@@ -275,7 +332,6 @@ def attention_block_tkg(
         - Requires NeuronCore v3+
         - d_head must be even
         - H must be multiple of pmax
-        - Requires batch * sequence_tkg * q_heads <= pmax (=pmax)
         - Supports grouped-query attention (GQA) with single key/value head
         - LNC-2 sharding support for KV cache updates
 
@@ -336,9 +392,20 @@ def attention_block_tkg(
         KVDP_replica_group,
         out_in_sb,
         skip_attention,
+        transposed_in,
+        pos_ids,
+        swa_start_pos_ids,
+        S_ctx,
+        quantization_type_qkv,
+        is_h_transposed_by_4,
     )
 
     B, S_tkg = config['B'], config['S_tkg']
+    if not transposed_in and B * S_tkg <= nl.tile_size.pmax:
+        print(
+            f"WARNING: B*S_tkg={B * S_tkg} <= {nl.tile_size.pmax} and transposed_in=False. "
+            f"Consider enabling transposed_in=True for zero-conversion inter-layer data flow."
+        )
     d_head, q_heads = config['d_head'], config['q_heads']
     S_ctx, S_max_ctx = config['S_ctx'], config['S_max_ctx']
     is_block_kv, blk_len = config['is_block_kv'], config['blk_len']
@@ -346,23 +413,26 @@ def attention_block_tkg(
     do_out_proj = config['do_out_proj']
     K_cache, V_cache = config['K_cache'], config['V_cache']
     kv_quant = config['kv_quant']
+    kv_quant_dtype = config['kv_quant_dtype']
     B, B_attn, q_heads_attn = config['B'], config['B_attn'], config['q_heads_attn']
     is_KVDP = config['is_KVDP']
+    use_pos_id = config['use_pos_id']
     n_bxs_tiles = config['n_bxs_tiles']
     bxs_tile = config['bxs_tile']
     kv_heads = 1
     I = d_head * (q_heads + 2 * kv_heads)
 
-    sbm = sbm if sbm != None else create_auto_alloc_manager(logger=Logger("attn-block-tkg"))
+    sbm = sbm if sbm != None else create_auto_alloc_manager(logger=get_logger("attn-block-tkg"))
     sbm.open_scope(name="attn-blk-tkg-scope")
 
     # ========== QKV Projection ==========
     # Input:  X [B, S_tkg, H] @ HBM
-    # Output: QKV [B*S_tkg, I] @ SBUF (small batch) or HBM (large batch)
+    # Output: QKV [B*S_tkg, I] @ SBUF (small batch, non-MX) or HBM (large batch or MX)
     # where I = d_head * (q_heads + 2)
     # qkv() routes to qkv_tkg (SBUF output) or qkv_cte (HBM output) based on B*S_tkg
     rmsnorm_X_eps = 1e-3 if rmsnorm_X_eps == None else rmsnorm_X_eps
-    output_in_sbuf = n_bxs_tiles == 1
+    # MX quantization requires output on HBM (SBUF output not yet supported by qkv_tkg_mx_impl)
+    output_in_sbuf = n_bxs_tiles == 1 and not quantization_type_qkv.is_mx()
     QKV_out = qkv(
         input=X,
         fused_qkv_weights=W_qkv,
@@ -381,6 +451,8 @@ def attention_block_tkg(
         store_output_in_sbuf=output_in_sbuf,
         sbm=sbm,
         use_auto_allocation=True,
+        transposed_in=transposed_in,
+        is_h_dim_4h_transposed=is_h_transposed_by_4,
     )
     QKV_out = QKV_out.reshape((B * S_tkg, I))
 
@@ -411,6 +483,7 @@ def attention_block_tkg(
         rmsnorm_post_W_Q=rmsnorm_QK_post_rope_W_Q,
         rmsnorm_post_W_K=rmsnorm_QK_post_rope_W_K,
         kv_quant=kv_quant,
+        kv_quant_dtype=kv_quant_dtype,
         k_scale=k_scale,
         v_scale=v_scale,
         io_dtype=X.dtype,
@@ -438,6 +511,7 @@ def attention_block_tkg(
             S_tkg,
             KVDP_replica_group,
             sbm,
+            collective_mode=KVDP_collective_mode,
         )
 
     # ========== Attention Computation ==========
@@ -448,9 +522,31 @@ def attention_block_tkg(
     if skip_attention:
         attn_out = Q_tkg_sb
     else:
-        # Scale Q by softmax_scale (default: 1/sqrt(d_head))
+        # Scale Q by softmax_scale. When softmax_scale is not explicitly provided,
+        # default to 1/sqrt(d_head). When using FP8 KV cache (k_scale provided)
+        # without explicit softmax_scale, also divide by k_scale to dequantize
+        # the KV cache values in the QK matmul.
         _softmax_scale = softmax_scale if softmax_scale != None else d_head ** (-0.5)
-        nisa.tensor_scalar(dst=Q_tkg_sb, data=Q_tkg_sb, op0=nl.multiply, operand0=_softmax_scale)
+        if softmax_scale == None and kv_quant and k_scale != None:
+            # Fuse 1/k_scale into the Q scaling to dequantize KV cache in QK matmul.
+            # Load k_scale to SBUF, compute reciprocal, apply both scales in one instruction.
+            _q_pdim = Q_tkg_sb.shape[0]
+            _k_scale_sb = nl.ndarray(shape=(_q_pdim, 1), dtype=nl.float32, buffer=nl.sbuf)
+            if k_scale.shape == (nl.tile_size.pmax, 1):
+                nisa.dma_copy(_k_scale_sb, k_scale[0:_q_pdim, 0:1])
+            else:
+                nisa.dma_copy(_k_scale_sb, TensorView(k_scale).broadcast(dim=0, size=_q_pdim).get_view())
+            nisa.reciprocal(_k_scale_sb, _k_scale_sb)
+            nisa.tensor_scalar(
+                dst=Q_tkg_sb,
+                data=Q_tkg_sb,
+                op0=nl.multiply,
+                operand0=_softmax_scale,
+                op1=nl.multiply,
+                operand1=_k_scale_sb,
+            )
+        else:
+            nisa.tensor_scalar(dst=Q_tkg_sb, data=Q_tkg_sb, op0=nl.multiply, operand0=_softmax_scale)
         # Allocate attention output buffer
         allocate_attn_out_on_HBM = not do_out_proj and not out_in_sb and not is_KVDP
         if allocate_attn_out_on_HBM:
@@ -483,7 +579,7 @@ def attention_block_tkg(
             # K is already transposed in HBM, so the kernel does NOT need to transpose it.
             tp_k_prior=not K_cache_transposed,
             strided_mm1=not is_block_kv,
-            use_pos_id=False,
+            use_pos_id=use_pos_id,
             fuse_rope=False,
             use_gpsimd_sb2sb=True,
             qk_in_sb=True,
@@ -502,6 +598,8 @@ def attention_block_tkg(
             out=attn_out,  # OUT
             cfg=attn_cfg,
             sbm=sbm,
+            rope_pos_ids=pos_ids,  # attention_tkg uses rope_pos_ids for in-kernel causal mask generation
+            start_pos_ids=swa_start_pos_ids,
             sink=sink,
             active_blocks_table=active_blocks_table,
         )
@@ -523,6 +621,7 @@ def attention_block_tkg(
             S_tkg,
             KVDP_replica_group,
             sbm,
+            collective_mode=KVDP_collective_mode,
         )
 
     # ========== KV Cache Update ==========
@@ -552,8 +651,21 @@ def attention_block_tkg(
     # Input:  attn_out [d_head, B, q_heads, S_tkg] @ SBUF/HBM
     # Output: kernel_output layout depends on transposed_out and out_in_sb
     if do_out_proj:
+        attn_for_proj = attn_out.reshape((d_head, B, q_heads, S_tkg))
+        # MX output projection requires attention input on HBM for reshaping over the partition dimension.
+        # We cannot output attention directly to HBM earlier because KVDP requires the input in SBUF.
+        # We defer the SBUF-to-HBM copy here, preserving the [D, B, N, S] layout.
+        if quantization_type_out.is_mx() and attn_for_proj.buffer == nl.sbuf:
+            attn_hbm = nl.ndarray(
+                attn_for_proj.shape,
+                dtype=attn_for_proj.dtype,
+                buffer=nl.shared_hbm,
+                name=f"{sbm.get_name_prefix()}attn_for_mx_out_proj",
+            )
+            nisa.dma_copy(attn_hbm, attn_for_proj)
+            attn_for_proj = attn_hbm
         kernel_output = output_projection_tkg(
-            attention=attn_out.reshape((d_head, B, q_heads, S_tkg)),
+            attention=attn_for_proj,
             weight=W_out,
             bias=bias_out,
             quantization_type=quantization_type_out,
@@ -604,6 +716,12 @@ def _validate_and_extract_config(
     KVDP_replica_group: Optional[ReplicaGroup],
     out_in_sb: bool,
     skip_attention: bool,
+    transposed_in: bool = False,
+    pos_ids: Optional[nl.ndarray] = None,
+    swa_start_pos_ids: Optional[nl.ndarray] = None,
+    S_ctx_param: Optional[int] = None,
+    quantization_type_qkv: QuantizationType = QuantizationType.NONE,
+    is_h_transposed_by_4: bool = False,
 ) -> Dict[str, Any]:
     """
     Validate inputs and extract configuration parameters for attention block.
@@ -637,14 +755,38 @@ def _validate_and_extract_config(
         f"Kernel requires nc-version >= gen3, got {nisa.get_nc_version()}",
     )
 
-    _, B, _, _ = attention_mask.shape
-    if X.buffer == nl.sbuf:
+    kernel_assert(
+        not quantization_type_qkv.is_mx() or is_h_transposed_by_4,
+        "is_h_transposed_by_4 must be True when using MX quantization for QKV",
+    )
+
+    use_pos_id = pos_ids is not None
+
+    is_block_kv = active_blocks_table != None
+    if use_pos_id and not is_block_kv:
+        kernel_assert(S_ctx_param is not None, "S_ctx is required when using pos_ids with flat KV")
+    else:
+        kernel_assert(S_ctx_param is None, "S_ctx must be None when not using pos_ids or with block KV")
+
+    if transposed_in:
+        # X.shape = (H0, n_prgs, H1_shard, BxS) @ HBM
+        kernel_assert(len(X.shape) == 4, "transposed_in X must have 4 dimensions [H0, n_prgs, H1_shard, BxS]")
+        kernel_assert(X.shape[0] == nl.tile_size.pmax, f"transposed_in X dim0 must be {nl.tile_size.pmax}")
+        kernel_assert(is_hbm_buffer(X), "transposed_in X must be in HBM")
+        kernel_assert(X.shape[1] >= 2, f"transposed_in requires LNC>=2, got n_prgs={X.shape[1]}")
+        H = X.shape[0] * X.shape[1] * X.shape[2]  # H0 * n_prgs * H1_shard = full H
+        BxS = X.shape[3]
+        S_tkg = attention_mask.shape[3]  # mask is (_, B_attn, q_heads, S_tkg)
+        kernel_assert(BxS % S_tkg == 0, f"transposed_in BxS={BxS} must be divisible by S_tkg={S_tkg}")
+        B = BxS // S_tkg
+    elif X.buffer == nl.sbuf:
         # X.shape = (pmax, B*S, H // pmax) @ SBUF
         kernel_assert(len(X.shape) == 3, "SBUF input X must have 3 dimensions")
         kernel_assert(X.shape[0] == nl.tile_size.pmax, f"SBUF input X dim0 must be {nl.tile_size.pmax}")
-        kernel_assert(X.shape[1] % B == 0, f"SBUF input X dim1 must be divisible by B={B}")
         H = X.shape[2] * nl.tile_size.pmax
-        S_tkg = X.shape[1] // B
+        S_tkg = attention_mask.shape[3]  # mask is (_, B_attn, q_heads, S_tkg)
+        kernel_assert(X.shape[1] % S_tkg == 0, f"SBUF input X dim1={X.shape[1]} must be divisible by S_tkg={S_tkg}")
+        B = X.shape[1] // S_tkg
     else:
         # X.shape = (B,S,H) @ HBM
         kernel_assert(is_hbm_buffer(X), "Input X must be in HBM or SBUF")
@@ -696,7 +838,6 @@ def _validate_and_extract_config(
         q_heads_attn = q_heads
 
     # Process KV cache
-    is_block_kv = active_blocks_table != None
     K_cache, V_cache, cache_had_head_dim = __internal_squeeze_head_dim(K_cache, V_cache, is_block_kv)
 
     if is_block_kv:
@@ -707,8 +848,8 @@ def _validate_and_extract_config(
             f"Block KV cache shape mismatch: K={K_cache.shape} vs V={V_cache.shape}",
         )
     else:
-        S_ctx = attention_mask.shape[0]
         S_max_ctx = V_cache.shape[1]
+        S_ctx = attention_mask.shape[0] if not use_pos_id else S_ctx_param
         blk_len = 0
         kernel_assert(
             V_cache.shape[0] == B_attn,
@@ -720,12 +861,27 @@ def _validate_and_extract_config(
             f"K_cache shape mismatch: expected {expected_K_shape}, got {K_cache.shape}",
         )
 
-    # Validate attention mask
-    expected_mask_shape = (S_ctx, B_attn, q_heads_attn, S_tkg)
+    # Validate attention mask and pos_ids
+    if use_pos_id:
+        kernel_assert(
+            tuple(pos_ids.shape) == (B_attn, S_tkg),
+            f"pos_ids shape mismatch: expected ({B_attn}, {S_tkg}), got {pos_ids.shape}",
+        )
+    expected_mask_dim0 = S_tkg if use_pos_id else S_ctx
+    expected_mask_shape = (expected_mask_dim0, B_attn, q_heads_attn, S_tkg)
     kernel_assert(
         tuple(attention_mask.shape) == expected_mask_shape,
         f"attention_mask shape mismatch: expected {expected_mask_shape}, got {attention_mask.shape}",
     )
+    if swa_start_pos_ids is not None:
+        kernel_assert(
+            use_pos_id,
+            "pos_ids is required when swa_start_pos_ids is provided",
+        )
+        kernel_assert(
+            tuple(swa_start_pos_ids.shape) == (B_attn, S_tkg),
+            f"swa_start_pos_ids shape mismatch: expected ({B_attn}, {S_tkg}), got {swa_start_pos_ids.shape}",
+        )
 
     # Validate RMSNorm weights
     if rmsnorm_X_gamma != None:
@@ -750,8 +906,10 @@ def _validate_and_extract_config(
         kernel_assert(is_fp8_e4m3(K_cache.dtype), f'KV quantization requires float8_e4m3 K_cache, got {K_cache.dtype}')
         kernel_assert(is_fp8_e4m3(V_cache.dtype), f'KV quantization requires float8_e4m3 V_cache, got {V_cache.dtype}')
         kv_quant = True
+        kv_quant_dtype = K_cache.dtype
     else:
         kv_quant = False
+        kv_quant_dtype = None
 
     return {
         'B': B,
@@ -769,10 +927,12 @@ def _validate_and_extract_config(
         'K_cache': K_cache,
         'V_cache': V_cache,
         'kv_quant': kv_quant,
+        'kv_quant_dtype': kv_quant_dtype,
         'B': B,
         'B_attn': B_attn,
         'q_heads_attn': q_heads_attn,
         'is_KVDP': is_KVDP,
+        'use_pos_id': use_pos_id,
         'n_bxs_tiles': n_bxs_tiles,
         'bxs_tile': bxs_tile,
     }
@@ -933,6 +1093,7 @@ def _QKV_processing(
     rmsnorm_post_W_Q: Optional[nl.ndarray],
     rmsnorm_post_W_K: Optional[nl.ndarray],
     kv_quant: bool,
+    kv_quant_dtype: Optional[str],
     k_scale: Optional[nl.ndarray],
     v_scale: Optional[nl.ndarray],
     io_dtype,
@@ -965,6 +1126,7 @@ def _QKV_processing(
         rmsnorm_post_W_Q: Post-RoPE Q weights (optional)
         rmsnorm_post_W_K: Post-RoPE K weights (optional)
         kv_quant: whether to quantize K/V to FP8
+        kv_quant_dtype: target dtype for quantized KV cache
         k_scale: scale for K quantization (optional)
         v_scale: scale for V quantization (optional)
         io_dtype: input/output dtype
@@ -983,7 +1145,7 @@ def _QKV_processing(
     K_sb = sbm.alloc_stack((d_head, B * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
     V_hbm = nl.ndarray(
         (B, 1, S_tkg, d_head),
-        dtype=nl.float8_e4m3 if kv_quant else io_dtype,
+        dtype=kv_quant_dtype if kv_quant else io_dtype,
         buffer=nl.shared_hbm,
         name=f"{sbm.get_name_prefix()}v_attention_hbm",
     )
@@ -1072,7 +1234,7 @@ def _QKV_processing(
         nisa.tensor_copy(V_tile_sb, qkv_sb[:, nl.ds(d_head * (q_heads + kv_heads), d_head)])
         # Quantize V to FP8 for attention when kv_quant=True
         if kv_quant:
-            V_tile_sb = _quantize_to_fp8(V_tile_sb, v_scale, sbm)
+            V_tile_sb = _quantize_to_fp8(V_tile_sb, v_scale, sbm, kv_quant_dtype)
         # Write V tile to HBM
         V_hbm_view = TensorView(V_hbm.reshape((B * S_tkg, d_head))).slice(
             0, start=tile_start, end=tile_start + tile_size
@@ -1081,7 +1243,7 @@ def _QKV_processing(
 
     # Quantize K to FP8 for attention when kv_quant=True
     if kv_quant:
-        K_sb = _quantize_to_fp8(K_sb, k_scale, sbm)
+        K_sb = _quantize_to_fp8(K_sb, k_scale, sbm, kv_quant_dtype)
 
     # V_tile_sb from the last (or only) tile is kept for KV cache update (small batch only).
     # For large batch (n_bxs_tiles > 1), V is only on HBM.
@@ -1116,13 +1278,19 @@ def _rms_norm_inplace(
     x_squared = sbm.alloc_stack((d_head, BnS), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(x_squared, x, x, nl.multiply)
 
-    # Compute sum(x^2) via matmul with all-ones matrix
-    psum_sb = nl.ndarray((d_head, BnS), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(psum_sb, stationary=ones_sb, moving=x_squared)
-
-    # Compute rsqrt(mean(x^2) + eps)
+    total_free_dim = BnS
+    fmax = nl.tile_size.gemm_moving_fmax
     rsqrt_sb = sbm.alloc_stack((d_head, BnS), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.activation(dst=rsqrt_sb, op=nl.rsqrt, data=psum_sb, bias=eps_sb, scale=1.0 / d_head)
+    for t_start in range(0, total_free_dim, fmax):
+        t_size = min(fmax, total_free_dim - t_start)
+        # Compute sum(x^2) via matmul with all-ones matrix
+        psum_sb = nl.ndarray((d_head, t_size), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(psum_sb, stationary=ones_sb, moving=x_squared[:, nl.ds(t_start, t_size)])
+
+        # Compute rsqrt(mean(x^2) + eps)
+        nisa.activation(
+            dst=rsqrt_sb[:, nl.ds(t_start, t_size)], op=nl.rsqrt, data=psum_sb, bias=eps_sb, scale=1.0 / d_head
+        )
 
     # Normalize: x * rsqrt
     out_sb = sbm.alloc_stack((d_head, BnS), dtype=nl.float32, buffer=nl.sbuf)
@@ -1167,7 +1335,7 @@ def _kv_cache_update(
             - Flat: [B, S_max_ctx, d_head]
         K_tkg: [d_head, B*S_tkg] @ SBUF
         V_tkg: [B*S_tkg, d_head] @ SBUF or [B, 1, S_tkg, d_head] @ HBM
-        kv_cache_update_idx: [B] slot indices for cache writes
+        kv_cache_update_idx: [B, S_tkg] for block KV, [B, 1] for flat KV (consecutive tokens assumed)
         B: batch size
         d_head: head dimension
         S_tkg: number of new tokens
@@ -1180,6 +1348,17 @@ def _kv_cache_update(
     """
 
     # TODO: oob_mode.skip not supported for flat cache. Using oob_mode.skip causes accuracy failures (root cause unknown).
+
+    if is_block_kv:
+        kernel_assert(
+            kv_cache_update_idx.shape == (B, S_tkg),
+            f"kv_cache_update_idx shape mismatch: expected {(B, S_tkg)}, got {kv_cache_update_idx.shape}",
+        )
+    else:
+        kernel_assert(
+            kv_cache_update_idx.shape == (B, 1),
+            f"kv_cache_update_idx shape mismatch for flat KV: expected {(B, 1)}, got {kv_cache_update_idx.shape}",
+        )
 
     if is_block_kv:
         _update_block_cache(K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B)
@@ -1231,14 +1410,14 @@ def _update_flat_cache_batched(
     This optimized version writes batches in vector DMA operations using vector_offset
     for indirect addressing.
     Tiles over the batch dimension in chunks of pmax to support B > pmax.
-    Currently limited to S_tkg=1 due to access pattern bug.
+    Currently assuming consecutive tokens due to NKILIB-693
 
     Args:
         K_cache: [B, S_max_ctx, d_head] or [B, d_head, S_max_ctx] K cache in HBM
         V_cache: [B, S_max_ctx, d_head] V cache in HBM
         K_tkg: [d_head, B*S_tkg] new K tokens in SBUF
         V_tkg: [B*S_tkg, d_head] @ SBUF or [B, 1, S_tkg, d_head] @ HBM
-        kv_cache_update_idx: [B, 1] per-batch write positions
+        kv_cache_update_idx: [B, 1] start write position per batch (consecutive tokens assumed)
         S_tkg: number of new tokens per batch (must be 1)
         S_max_ctx: maximum cache sequence length
         B: batch size
@@ -1268,10 +1447,6 @@ def _update_flat_cache_batched(
         K_tkg.shape == (d_head, B * S_tkg),
         f"K_tkg shape mismatch: expected {(d_head, B * S_tkg)}, got {K_tkg.shape}",
     )
-    kernel_assert(
-        kv_cache_update_idx.shape == (B, 1),
-        f"kv_cache_update_idx shape mismatch: expected {(B, 1)}, got {kv_cache_update_idx.shape}",
-    )
 
     tile_sz = nl.tile_size.pmax
     v_on_hbm = V_tkg.buffer != nl.sbuf
@@ -1288,7 +1463,7 @@ def _update_flat_cache_batched(
         #   token_indices[b] = kv_cache_update_idx[b] + b * S_max_ctx
         if needs_token_indices:
             token_indices = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
-            nisa.dma_copy(token_indices, kv_cache_update_idx[nl.ds(b_start, tile_B)])
+            nisa.dma_copy(token_indices, kv_cache_update_idx[nl.ds(b_start, tile_B), 0])
             batch_offset = nl.ndarray((tile_B, 1), dtype=nl.uint32, buffer=nl.sbuf)
             nisa.iota(batch_offset, [[0, 1]], offset=b_start * S_max_ctx, channel_multiplier=S_max_ctx)
             nisa.tensor_tensor(token_indices, token_indices, batch_offset, nl.add)
@@ -1331,7 +1506,7 @@ def _update_flat_cache_batched(
                 nisa.iota(
                     k_batch_offset, [[0, 1]], offset=b_start * d_head * S_max_ctx, channel_multiplier=d_head * S_max_ctx
                 )
-                nisa.dma_copy(k_token_indices, kv_cache_update_idx[nl.ds(b_start, tile_B)])
+                nisa.dma_copy(k_token_indices, kv_cache_update_idx[nl.ds(b_start, tile_B), 0])
                 nisa.tensor_tensor(k_token_indices, k_token_indices, k_batch_offset, nl.add)
 
                 nisa.dma_copy(
@@ -1381,7 +1556,7 @@ def _update_flat_cache(
         K_tkg: [d_head, B*S_tkg] @ SBUF
         V_tkg: [B*S_tkg, d_head] @ SBUF or [B, 1, S_tkg, d_head] @ HBM
         K_cache_transposed: K cache layout flag
-        kv_cache_update_idx: [B, 1] per-batch write positions
+        kv_cache_update_idx: [B, 1] start write position per batch (consecutive tokens assumed)
         S_tkg: number of new tokens per batch
         S_max_ctx: maximum cache sequence length
         B: batch size
@@ -1393,10 +1568,6 @@ def _update_flat_cache(
     v_on_hbm = V_tkg.buffer != nl.sbuf
 
     # Validate tensor shapes
-    kernel_assert(
-        kv_cache_update_idx.shape == (B, 1),
-        f"kv_cache_update_idx shape mismatch: expected {(B, 1)}, got {kv_cache_update_idx.shape}",
-    )
     kernel_assert(
         V_cache.shape == (B, S_max_ctx, d_head),
         f"V_cache shape mismatch: expected {(B, S_max_ctx, d_head)}, got {V_cache.shape}",
@@ -1414,7 +1585,7 @@ def _update_flat_cache(
     if n_prgs == 1 or prg_id == 0:
         start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
         for batch_idx in range(B):
-            nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+            nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx, 0])
             if v_on_hbm:
                 v_src = V_tkg.reshape((B * S_tkg, d_head))[nl.ds(batch_idx * S_tkg, S_tkg), :]
             else:
@@ -1439,7 +1610,7 @@ def _update_flat_cache(
             # K_tkg is already in correct layout [d_head, B*S_tkg]
             start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
             for batch_idx in range(B):
-                nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+                nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx, 0])
                 nisa.dma_copy(
                     dst=K_cache.ap(
                         pattern=[[S_max_ctx, d_head], [1, S_tkg]],
@@ -1457,7 +1628,7 @@ def _update_flat_cache(
             # Write transposed K to cache — index into tiled K_transposed_sb
             start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
             for batch_idx in range(B):
-                nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+                nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx, 0])
                 k_src = _get_k_transposed_slice(K_transposed_sb, tile_sz, batch_idx, S_tkg)
                 nisa.dma_copy(
                     dst=K_cache.ap(
@@ -1482,27 +1653,21 @@ def _update_block_cache(
     """
     Update block KV cache with new tokens.
 
-    Routes to batched or scalar_offset implementation based on S_tkg.
+    Delegates to vectorized scatter DMA implementation.
 
     Args:
         K_cache: [num_blocks, block_len, d_head]
         V_cache: [num_blocks, block_len, d_head]
         K_tkg: [d_head, B*S_tkg]
         V_tkg: [B*S_tkg, d_head]
-        kv_cache_update_idx: [B, 1] slot indices for cache update (uint32 max = skip)
+        kv_cache_update_idx: [B, S_tkg] per-token slot indices for cache update (uint32 max = skip)
         S_tkg: number of new tokens
         B: batch size
     """
-    # TODO: Use batched case for all S_tkg values once vector DMA access pattern supports S_tkg > 1
-    if S_tkg == 1:
-        # one vector DMA, S_tkg = 1
-        _update_block_cache_batched(K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B)
-    else:
-        # B scalar DMAs, with any S_tkg
-        _update_block_cache_scalar(K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B)
+    _update_block_cache_vectorized(K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B)
 
 
-def _update_block_cache_batched(
+def _update_block_cache_vectorized(
     K_cache: nl.ndarray,
     V_cache: nl.ndarray,
     K_tkg: nl.ndarray,
@@ -1512,190 +1677,91 @@ def _update_block_cache_batched(
     B: int,
 ) -> None:
     """
-    Update block KV cache with new tokens using batched DMA operations.
+    Update block KV cache with new tokens using vectorized scatter DMA.
 
-    Writes batches in vector DMA operations using vector_offset for indirect addressing.
-    Tiles over the batch dimension in chunks of pmax to support B > pmax.
-    Currently limited to S_tkg=1 due to access pattern bug.
+    Flattens (B, S_tkg) into B*S_tkg entries and uses vector_offset to scatter
+    each token's (1, d_head) row to its physical position in a single vectorized
+    DMA per tile of pmax entries. Supports any S_tkg value.
 
     Args:
         K_cache: [num_blocks, block_len, d_head]
         V_cache: [num_blocks, block_len, d_head]
         K_tkg: [d_head, B*S_tkg]
         V_tkg: [B*S_tkg, d_head] @ SBUF or [B, 1, S_tkg, d_head] @ HBM
-        kv_cache_update_idx: [B, 1] slot indices for cache update (uint32 max = skip)
-        S_tkg: number of new tokens (must be 1)
+        kv_cache_update_idx: [B, S_tkg] per-token slot indices for cache update (uint32 max = skip)
+        S_tkg: number of new tokens
         B: batch size
     """
     _, n_prgs, prg_id = get_verified_program_sharding_info("kv_cache update", (0, 1), 2)
     kernel_assert(n_prgs <= 2, f"Expected lnc in [1,2], got {n_prgs}")
-    kernel_assert(S_tkg == 1, f"_update_block_cache_batched() only supports S_tkg=1, got {S_tkg}")
+
+    v_on_hbm = V_tkg.buffer != nl.sbuf
 
     num_blocks, blk_len, d_head = K_cache.shape
+    BxS = B * S_tkg
 
-    kernel_assert(
-        kv_cache_update_idx.shape == (B, 1),
-        f"kv_cache_update_idx shape mismatch: expected {(B, 1)}, got {kv_cache_update_idx.shape}",
-    )
     kernel_assert(
         K_cache.shape == V_cache.shape,
         f"K/V cache shape mismatch: K={K_cache.shape} vs V={V_cache.shape}",
     )
     kernel_assert(
-        K_tkg.shape == (d_head, B * S_tkg),
-        f"K_tkg shape mismatch: expected {(d_head, B * S_tkg)}, got {K_tkg.shape}",
+        K_tkg.shape == (d_head, BxS),
+        f"K_tkg shape mismatch: expected {(d_head, BxS)}, got {K_tkg.shape}",
     )
 
     tile_sz = nl.tile_size.pmax
-    v_on_hbm = V_tkg.buffer != nl.sbuf
 
-    for b_start in range(0, B, tile_sz):
-        tile_B = min(tile_sz, B - b_start)
+    # Flatten positions: (B, S_tkg) -> (B*S_tkg, 1) for per-token scatter
+    idx_flat = kv_cache_update_idx.reshape((BxS, 1))
 
-        # Load cache update indices for this tile
+    for b_start in range(0, BxS, tile_sz):
+        tile_B = min(tile_sz, BxS - b_start)
+
         idx_tile = nl.ndarray((tile_B, 1), dtype=kv_cache_update_idx.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(idx_tile, kv_cache_update_idx[nl.ds(b_start, tile_B)])
+        nisa.dma_copy(idx_tile, idx_flat[nl.ds(b_start, tile_B)])
 
-        # V tile: Vector DGE requires source in SBUF, so load from HBM if needed
         if v_on_hbm:
             v_tile = nl.ndarray((tile_B, d_head), dtype=V_tkg.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(v_tile, V_tkg.reshape((B * S_tkg, d_head))[nl.ds(b_start, tile_B), :])
+            nisa.dma_copy(v_tile, V_tkg.reshape((BxS, d_head))[nl.ds(b_start, tile_B), :])
         else:
-            v_tile = V_tkg  # single tile
+            v_tile = V_tkg[nl.ds(b_start, tile_B), :]
 
-        # Vector DMA with indirect addressing:
-        # - Reshape cache to (num_blocks*blk_len, d_head) so each row has stride d_head
-        # - vector_offset provides per-batch global token indices: idx_tile[b]
-        # - DMA engine scales by d_head
-
-        # Update V_cache on lnc=0
         if n_prgs == 1 or prg_id == 0:
             nisa.dma_copy(
                 dst=V_cache.reshape((num_blocks * blk_len, d_head)).ap(
-                    pattern=[[1, tile_B], [d_head, S_tkg], [1, d_head]],
+                    pattern=[[d_head, tile_B], [1, d_head]],
                     offset=0,
                     vector_offset=idx_tile,
                     indirect_dim=0,
                 ),
-                src=v_tile.ap(pattern=[[S_tkg * d_head, tile_B], [d_head, S_tkg], [1, d_head]]),
-                oob_mode=oob_mode.skip,  # skip writes for invalid batch (position_id = uint32_max)
+                src=v_tile,
+                oob_mode=oob_mode.skip,
             )
 
-        # Update K_cache on lnc=1
         if n_prgs == 1 or prg_id == 1:
-            # Transpose K tile: (d_head, tile_B) → (tile_B, d_head)
-            K_tile_sb = nl.ndarray((tile_B * S_tkg, d_head), dtype=K_tkg.dtype, buffer=nl.sbuf)
-            _transpose_sbuf(K_tkg[:, nl.ds(b_start * S_tkg, tile_B * S_tkg)], K_tile_sb)
+            K_tile_sb = nl.ndarray((tile_B, d_head), dtype=K_tkg.dtype, buffer=nl.sbuf)
+            _transpose_sbuf(K_tkg[:, nl.ds(b_start, tile_B)], K_tile_sb)
 
             nisa.dma_copy(
                 dst=K_cache.reshape((num_blocks * blk_len, d_head)).ap(
-                    pattern=[[1, tile_B], [d_head, S_tkg], [1, d_head]],
+                    pattern=[[d_head, tile_B], [1, d_head]],
                     offset=0,
                     vector_offset=idx_tile,
                     indirect_dim=0,
                 ),
-                src=K_tile_sb.ap(pattern=[[S_tkg * d_head, tile_B], [d_head, S_tkg], [1, d_head]]),
-                oob_mode=oob_mode.skip,  # skip writes for invalid batch (position_id = uint32_max)
-            )
-
-
-def _update_block_cache_scalar(
-    K_cache: nl.ndarray,
-    V_cache: nl.ndarray,
-    K_tkg: nl.ndarray,
-    V_tkg: nl.ndarray,
-    kv_cache_update_idx: nl.ndarray,
-    S_tkg: int,
-    B: int,
-) -> None:
-    """
-    Update block KV cache with new tokens using per-batch scalar_offset.
-
-    This version iterates over batches and uses scalar_offset for indirect addressing.
-    Supports any B*S_tkg via tiling, and handles both transposed and non-transposed
-    K cache layouts. When V_tkg is on HBM, V is loaded per-batch.
-
-    Args:
-        K_cache: [num_blocks, block_len, d_head]
-        V_cache: [num_blocks, block_len, d_head]
-        K_tkg: [d_head, B*S_tkg]
-        V_tkg: [B*S_tkg, d_head] @ SBUF or [B, 1, S_tkg, d_head] @ HBM
-        kv_cache_update_idx: [B, 1] slot indices for cache update (uint32 max = skip)
-        S_tkg: number of new tokens
-        B: batch size
-    """
-    _, n_prgs, prg_id = get_verified_program_sharding_info("kv_cache update", (0, 1), 2)
-    kernel_assert(n_prgs <= 2, f"Expected lnc in [1,2], got {n_prgs}")
-
-    v_on_hbm = V_tkg.buffer != nl.sbuf
-
-    num_blocks, blk_len, d_head = K_cache.shape
-
-    kernel_assert(
-        kv_cache_update_idx.shape == (B, 1),
-        f"kv_cache_update_idx shape mismatch: expected {(B, 1)}, got {kv_cache_update_idx.shape}",
-    )
-    kernel_assert(
-        K_cache.shape == V_cache.shape,
-        f"K/V cache shape mismatch: K={K_cache.shape} vs V={V_cache.shape}",
-    )
-    kernel_assert(
-        K_tkg.shape == (d_head, B * S_tkg),
-        f"K_tkg shape mismatch: expected {(d_head, B * S_tkg)}, got {K_tkg.shape}",
-    )
-
-    # Tiled K transpose
-    if n_prgs == 1 or prg_id == 1:
-        K_transposed_sb, tile_sz = _tiled_k_transpose(K_tkg, B, S_tkg)
-
-    # Update cache per batch element using scalar_offset
-    for batch_idx in range(B):
-        start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
-        nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
-
-        # Update V_cache on lnc=0
-        if n_prgs == 1 or prg_id == 0:
-            if v_on_hbm:
-                v_src = V_tkg.reshape((B * S_tkg, d_head))[nl.ds(batch_idx * S_tkg, S_tkg), :]
-            else:
-                v_src = V_tkg[nl.ds(batch_idx * S_tkg, S_tkg), :]
-            nisa.dma_copy(
-                dst=V_cache.ap(
-                    pattern=[[d_head, S_tkg], [1, d_head]],
-                    offset=0,
-                    scalar_offset=start_position,
-                    indirect_dim=1,
-                ),
-                src=v_src,
-                oob_mode=oob_mode.skip,  # skip writes for invalid batch (position_id = uint32_max)
-            )
-
-        # Update K_cache on lnc=1
-        if n_prgs == 1 or prg_id == 1:
-            k_src = _get_k_transposed_slice(K_transposed_sb, tile_sz, batch_idx, S_tkg)
-            nisa.dma_copy(
-                dst=K_cache.ap(
-                    pattern=[[d_head, S_tkg], [1, d_head]],
-                    offset=0,
-                    scalar_offset=start_position,
-                    indirect_dim=1,
-                ),
-                src=k_src,
-                oob_mode=oob_mode.skip,  # skip writes for invalid batch (position_id = uint32_max)
+                src=K_tile_sb,
+                oob_mode=oob_mode.skip,
             )
 
 
 ############################# FP8 Quantization Helpers #############################
 
-_FP8_E4M3_MAX = get_max_positive_value_for_dtype(nl.float8_e4m3)
-_FP8_E4M3_MIN = -_FP8_E4M3_MAX
 
-
-def _quantize_to_fp8(tensor, scale, sbm):
+def _quantize_to_fp8(tensor, scale, sbm, dtype):
     """
     Quantize a tensor to FP8 E4M3 format using a single scalar scale.
 
-    Computes: output = cast_to_fp8(clip(tensor * scale, [-240, 240]))
+    Computes: output = cast_to_fp8(clip(tensor * scale, [-max, max]))
 
     The scale must represent a single scalar value. Two shapes are supported for
     compatibility with different APIs:
@@ -1708,12 +1774,16 @@ def _quantize_to_fp8(tensor, scale, sbm):
                Must contain a single scalar value (broadcast or replicated).
                Supported dtypes: float32, float16, bfloat16.
         sbm: SbufManager for allocations
+        dtype: Target quantized dtype (e.g. nl.float8_e4m3)
 
     Returns:
         FP8 E4M3 quantized tensor in SBUF, same shape as input
     """
     kernel_assert(tensor.buffer == nl.sbuf, "quantize_to_fp8 requires tensor in SBUF")
     kernel_assert(not is_fp8_e4m3(tensor.dtype), f"quantize_to_fp8 input already FP8: {tensor.dtype}")
+
+    fp8_max = get_max_positive_value_for_dtype(dtype)
+    fp8_min = -fp8_max
 
     partition_dim = tensor.shape[0]
 
@@ -1731,8 +1801,8 @@ def _quantize_to_fp8(tensor, scale, sbm):
     nisa.tensor_scalar(tensor_scaled, tensor, nl.multiply, scale_sb)
 
     # Clip to FP8 range and cast
-    tensor_fp8 = sbm.alloc_stack(tensor.shape, dtype=nl.float8_e4m3, buffer=nl.sbuf)
-    nisa.tensor_scalar(tensor_fp8, tensor_scaled, nl.minimum, _FP8_E4M3_MAX, op1=nl.maximum, operand1=_FP8_E4M3_MIN)
+    tensor_fp8 = sbm.alloc_stack(tensor.shape, dtype=dtype, buffer=nl.sbuf)
+    nisa.tensor_scalar(tensor_fp8, tensor_scaled, nl.minimum, fp8_max, op1=nl.maximum, operand1=fp8_min)
 
     return tensor_fp8
 
