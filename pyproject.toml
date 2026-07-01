@@ -32,10 +32,10 @@ test = [
     "pytest-xdist",
     "pytest-metadata",
     "pytest-html",
+    "pytest-timeout",
     "ruff==0.14.13",
     "pre-commit",
     "debugpy",
-    "pytest-cov",
     "allpairspy"
 ]
 
