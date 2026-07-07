@@ -22,6 +22,7 @@ import nki
 import nki.language as nl
 
 from ....core.utils.allocator import align_to, sizeinbytes
+from ....core.utils.common_types import ActFnType
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
 
@@ -38,23 +39,6 @@ class SkipMode(nl.NKIObject):
 
     skip_token: bool = False
     skip_weight: bool = False
-
-
-class ActFnType(Enum):
-    """
-    Activation function types for MoE layers.
-
-    Attributes:
-        SiLU: Sigmoid Linear Unit activation.
-        GELU: Gaussian Error Linear Unit activation.
-        GELU_Tanh_Approx: GELU with tanh approximation.
-        Swish: Swish activation (sigmoid-weighted linear unit).
-    """
-
-    SiLU = 0
-    GELU = 1
-    GELU_Tanh_Approx = 2
-    Swish = 3
 
 
 @dataclass(frozen=True)
@@ -587,6 +571,9 @@ class MOEBwdParameters(nl.NKIObject):
     blocking_params: MOEBwdDroplessBlockingParams = None
     affinity_option: AffinityOption = AffinityOption.AFFINITY_ON_H
     shard_option: ShardOption = ShardOption.SHARD_ON_FREE
+    # Opt-in high-precision bias-grad accumulation. None = compute_dtype (baseline, unchanged).
+    # Set to nl.float32 to accumulate bias gradients in fp32 (aligns with fp32 reference accumulation).
+    accumulation_dtype: nki.dtype = None
 
     # Derived dimensions (computed in __post_init__)
     T: int = None
@@ -673,9 +660,13 @@ class MOEBwdParameters(nl.NKIObject):
         Returns:
             tuple: (forward_fn, backward_fn) activation function pair.
         """
-        if self.activation_type == ActFnType.SiLU:
-            return nl.silu, nl.silu_dx
-        elif self.activation_type == ActFnType.Swish:
+        if self.activation_type == ActFnType.Swish:
             return nl.gelu_apprx_sigmoid, nl.gelu_apprx_sigmoid_dx
-        else:
+        elif self.activation_type == ActFnType.SiLU:
             return nl.silu, nl.silu_dx
+        # The dropless backward only implements SiLU and Swish. GELU / GELU_Tanh_Approx exist
+        # in the shared ActFnType but are not supported by this kernel
+        kernel_assert(
+            False,
+            "moe dropless backward supports only SiLU and Swish activations",
+        )

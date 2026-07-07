@@ -81,6 +81,8 @@ class TopkEdgeCaseValidator:
             return FilterResult.INVALID
         if BxS < 1:
             return FilterResult.INVALID
+        if vocab_size == k:
+            return FilterResult.INVALID
 
         n_prgs = 1 if BxS == 1 else lnc_degree
         per_lnc_BxS = (BxS + n_prgs - 1) // n_prgs
@@ -227,12 +229,30 @@ class TestTopKKernel:
                     k = inputs["config"].topk_config.k
                     output = np.frombuffer(actual_raw_output, dtype=input_tensor.dtype).reshape(BxS, k)
                     self._print_with_log("Results for topk_values:")
-                    return maxAllClose(
+                    values_correct = maxAllClose(
                         np.sort(output, axis=-1),
                         np.sort(golden_values, axis=-1),
                         verbose=1,
                         logfile=self.logfile,
                     )
+                    if not values_correct:
+                        return False
+                    vocab_size = inputs["config"].vocab_size
+                    if sorted and k > 1 and k < vocab_size:
+                        output_f32 = output.astype(np.float32)
+                        diffs = np.diff(output_f32, axis=-1)
+                        # diffs > 0 means value increased (violates descending).
+                        # Allow ties (diffs == 0) — only flag strict increases.
+                        non_descending = int(np.sum(diffs > 0))
+                        if non_descending > 0:
+                            worst_row = int(np.argmax(np.sum(diffs > 0, axis=-1)))
+                            self._print_with_log(
+                                f"FAIL: output not in descending order. "
+                                f"{non_descending} violations. "
+                                f"Worst row {worst_row}: {output_f32[worst_row, :8]}..."
+                            )
+                            return False
+                    return True
 
             class IndicesValidator(CustomValidator):
                 @override
@@ -273,8 +293,6 @@ class TestTopKKernel:
             compiler_args=CompilerArgs(
                 logical_nc_config=lnc_degree,
                 platform_target=platform_target,
-                # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
-                additional_cmd_args=["--internal-backend-options=--skip-pass=address_rotation_sb"],
             ),
             rtol=1e-3,
             atol=1e-5,
@@ -373,6 +391,11 @@ class TestTopKKernel:
     # fmt: on
     topk_unit_perms.extend(large_batch_perms)
 
+    # Full-only: large batch + large vocab (>30s compile)
+    topk_full_only_perms = [
+        [2, 1024, 1, 8192, 2048, nl.float32],
+    ]
+
     @pytest.mark.fast
     @pytest_parametrize(topk_unit_params, topk_unit_perms, abbrevs=_ABBREVS)
     def test_topk_unit(
@@ -399,6 +422,21 @@ class TestTopKKernel:
                 k=K,
                 dtype=dtype,
             )
+
+    @pytest_parametrize(topk_unit_params, topk_full_only_perms, abbrevs=_ABBREVS)
+    def test_topk_unit_slow(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        vocab_size,
+        K,
+        dtype,
+    ):
+        self.test_topk_unit(test_manager, collector, platform_target, lnc_degree, batch, seqlen, vocab_size, K, dtype)
 
     topk_unsorted_params = "lnc_degree, batch, seqlen, vocab_size, K, dtype"
     topk_unsorted_perms = [

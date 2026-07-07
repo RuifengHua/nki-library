@@ -56,74 +56,77 @@ DEFAULT_BP = MOEBwdDroplessBlockingParams(gate_up_output_grad=GateUpOutputGradBl
                                           gate_up_weight_grad=GateUpWeightGradBlocking())
 
 PARAM_NAMES = \
-    "hidden, tokens, expert, block_size, top_k, intermediate, dtype, skip, clamp_limits, bias_flag, activation_type, affinity_option, blocking_params, shard_option"
+    "hidden, tokens, expert, block_size, top_k, intermediate, dtype, skip, clamp_limits, bias_flag, activation_type, affinity_option, blocking_params, shard_option, preallocate_grad_out"
 TEST_PARAMS = [
-# H,    T,    E,   B,   TOPK, I_TP, dtype,    skip, clamp_limits,                        bias,  activation_type,  affinity, blocking_params,                                                                                                                                                                                          shard_option
-[5120,  8192, 16,  512, 1,    256,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[5120,  8192, 16,  256, 4,    1024, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[5120,  8192, 128, 256, 1,    128,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
+# H,    T,    E,   B,   TOPK, I_TP, dtype,    skip, clamp_limits,                        bias,  activation_type,  affinity, blocking_params,                                                                                                                                                                                          shard_option, preallocate_grad_out
+[5120,  8192, 16,  512, 1,    256,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[5120,  8192, 16,  256, 4,    1024, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[5120,  8192, 128, 256, 1,    128,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
-[6144,  4096, 16,  512, 4,    1024, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[6144,  4096, 16,  512, 4,    128,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[6144,  4096, 1,   512, 1,    128,  bfloat16, 0,    ClampLimits(7, -7, 7, -7),            False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
+[6144,  4096, 16,  512, 4,    1024, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[6144,  4096, 16,  512, 4,    128,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[6144,  4096, 1,   512, 1,    128,  bfloat16, 0,    ClampLimits(7, -7, 7, -7),            False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
-[2880,  4096, 2,   512, 2,    2880, bfloat16, 0,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[2880,  4096, 2,   512, 2,    2880, bfloat16, 1,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[2880,  4096, 2,   256, 2,    2880, bfloat16, 1,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[4096,  4096, 2,   512, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[4096,  4096, 4,   512, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[4096,  4096, 4,   128, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
+[2880,  4096, 2,   512, 2,    2880, bfloat16, 0,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[2880,  4096, 2,   512, 2,    2880, bfloat16, 1,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[2880,  4096, 2,   256, 2,    2880, bfloat16, 1,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 2,   512, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 4,   512, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 4,   128, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
-[4096,  4096, 4,   128, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[4096,  4096, 4,   256, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
+[4096,  4096, 4,   128, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 4,   256, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
-[4096,  4096, 4,   128, 2,    1536,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[4096,  4096, 4,   256, 2,    1536,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE],
+[4096,  4096, 4,   128, 2,    1536,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 4,   256, 2,    1536,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
-[2880,  4096, 2,   128, 2,    720, bfloat16, 0,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_H, DEFAULT_BP, SHARD_FREE],
+[2880,  4096, 2,   128, 2,    720, bfloat16, 0,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
-[5120,  4096, 4,   128, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_H, DEFAULT_BP, SHARD_FREE],
-[5120,  4096, 4,   256, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_H, DEFAULT_BP, SHARD_FREE],
+[5120,  4096, 4,   128, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
+[5120,  4096, 4,   256, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_H, DEFAULT_BP, SHARD_FREE, False],
 
 # Affinity I test cases
-[4096,  4096, 4,   128, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[4096,  4096, 4,   256, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
+[4096,  4096, 4,   128, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 4,   256, 2,    384,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 
-[4096,  4096, 4,   128, 2,    1536,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[4096,  4096, 4,   256, 2,    1536,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
+[4096,  4096, 4,   128, 2,    1536,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[4096,  4096, 4,   256, 2,    1536,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 
-[5120,  4096, 4,   128, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[5120,  4096, 4,   256, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE],
+[5120,  4096, 4,   128, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[5120,  4096, 4,   256, 1,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),   False,  ActFnType.SiLU,  AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 
-[2880,  4096, 2,  128, 2,    2880, bfloat16, 0,    ClampLimits(7, -7, 7, -7),  True, ActFnType.Swish,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[2048,  4096, 2, 128, 2,    768,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[2048,  4096, 2, 128, 2,    192,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[5120,  4096, 2,  128, 2,    8192, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[5120,  4096, 2,  128, 2,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[2048,  4096, 2,  128, 2,    1408, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
-[2048,  4096, 2,  128, 2,    352,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE],
+[2880,  4096, 2,  128, 2,    2880, bfloat16, 0,    ClampLimits(7, -7, 7, -7),  True, ActFnType.Swish,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[2048,  4096, 2, 128, 2,    768,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[2048,  4096, 2, 128, 2,    192,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[5120,  4096, 2,  128, 2,    8192, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[5120,  4096, 2,  128, 2,    2048, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[2048,  4096, 2,  128, 2,    1408, bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
+[2048,  4096, 2,  128, 2,    352,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, DEFAULT_BP, SHARD_FREE, False],
 
 [2048,  512, 2, 512, 2,    256,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, MOEBwdDroplessBlockingParams(gate_up_output_grad=GateUpOutputGradBlocking(block_h=16, block_b=4, block_i=2),
                                                                                                                                                            down_weight_grad=DownWeightGradBlocking(block_h=16, block_b=4, block_i=2),
                                                                                                                                                            hidden_grad=HiddenGradBlocking(block_h=16, block_b=4, block_i=2),
-                                                                                                                                                   gate_up_weight_grad=GateUpWeightGradBlocking(block_h=16, block_b=4, block_i=2)), SHARD_FREE],
+                                                                                                                                                   gate_up_weight_grad=GateUpWeightGradBlocking(block_h=16, block_b=4, block_i=2)), SHARD_FREE, False],
 
 # Shard H Test
 [2048,  512,  2,  512, 2,    352,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, MOEBwdDroplessBlockingParams(gate_up_output_grad=GateUpOutputGradBlocking(block_h=16, block_b=4, block_i=3),
                                                                                                                                                            down_weight_grad=DownWeightGradBlocking(block_h=16, block_b=4, block_i=3),
                                                                                                                                                            hidden_grad=HiddenGradBlocking(block_h=16, block_b=4, block_i=3),
-                                                                                                                                                   gate_up_weight_grad=GateUpWeightGradBlocking(block_h=16, block_b=4, block_i=3)), SHARD_H],
+                                                                                                                                                   gate_up_weight_grad=GateUpWeightGradBlocking(block_h=16, block_b=4, block_i=3)), SHARD_H, False],
 
 [2048,  16384, 64, 512, 6,    352,  bfloat16, 0,    ClampLimits(None, None, None, None),  False, ActFnType.SiLU,   AFFINITY_I, MOEBwdDroplessBlockingParams(gate_up_output_grad=GateUpOutputGradBlocking(block_h=16, block_b=4, block_i=3),
                                                                                                                                                            down_weight_grad=DownWeightGradBlocking(block_h=16, block_b=4, block_i=3),
                                                                                                                                                            hidden_grad=HiddenGradBlocking(block_h=16, block_b=4, block_i=3),
-                                                                                                                                                   gate_up_weight_grad=GateUpWeightGradBlocking(block_h=16, block_b=4, block_i=3)), SHARD_H],
+                                                                                                                                                   gate_up_weight_grad=GateUpWeightGradBlocking(block_h=16, block_b=4, block_i=3)), SHARD_H, False],
 
 [3072,  8192, 32,   1024, 6,    720, bfloat16, 0,    ClampLimits(7, -7, 7, -7),            True,  ActFnType.Swish,  AFFINITY_I, MOEBwdDroplessBlockingParams(gate_up_output_grad=GateUpOutputGradBlocking(block_h=8, block_b=4, block_i=2),
                                                                                                                                                            down_weight_grad=DownWeightGradBlocking(block_h=16, block_b=8, block_i=6),
                                                                                                                                                            hidden_grad=HiddenGradBlocking(block_h=2, block_b=8, block_i=6),
-                                                                                                                                                   gate_up_weight_grad=GateUpWeightGradBlocking(block_h=16, block_b=8, block_i=6)), SHARD_H],
+                                                                                                                                                   gate_up_weight_grad=GateUpWeightGradBlocking(block_h=16, block_b=8, block_i=6)), SHARD_H, False],
 
+# Pre-allocated grad output test cases
+[4096,  4096, 2, 512, 2, 384, bfloat16, 0, ClampLimits(None, None, None, None), False, ActFnType.SiLU, AFFINITY_H, DEFAULT_BP, SHARD_FREE, True],
+[2880,  4096, 2, 512, 2, 2880, bfloat16, 1, ClampLimits(7, -7, 7, -7), True, ActFnType.Swish, AFFINITY_H, DEFAULT_BP, SHARD_FREE, True],
 ]
 # fmt: on
 
@@ -178,6 +181,7 @@ _ABBREVS = {
     "affinity_option": "aff",
     "blocking_params": "bp",
     "shard_option": "sh",
+    "preallocate_grad_out": "pgo",
 }
 
 
@@ -206,6 +210,7 @@ class TestMoeBlockwiseMatMulBwdShardHDroplessLnc2:
         affinity_option: AffinityOption,
         blocking_params,
         shard_option: ShardOption,
+        preallocate_grad_out: bool,
     ):
         dma_skip = map_skip_mode(skip)
 
@@ -226,6 +231,18 @@ class TestMoeBlockwiseMatMulBwdShardHDroplessLnc2:
                 blocking_params=blocking_params,
                 shard_option=shard_option,
             )
+            if preallocate_grad_out:
+                T_out = tokens if dma_skip.skip_token else tokens + 1
+                inputs["hidden_states_grad_out.must_alias_input"] = np.zeros((T_out, hidden), dtype=dtype)
+                inputs["expert_affinities_masked_grad_out.must_alias_input"] = np.zeros(
+                    (T_out * expert, 1), dtype=dtype
+                )
+                inputs["gate_up_proj_weight_grad_out.must_alias_input"] = np.zeros(
+                    (expert, hidden, 2, intermediate), dtype=dtype
+                )
+                inputs["down_proj_weight_grad_out.must_alias_input"] = np.zeros(
+                    (expert, intermediate, hidden), dtype=dtype
+                )
             return inputs
 
         def output_tensors(kernel_input):

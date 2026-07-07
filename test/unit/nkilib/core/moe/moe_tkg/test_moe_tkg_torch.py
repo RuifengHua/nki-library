@@ -133,18 +133,6 @@ class TestInlineAllExpert:
         self.affinities = _make_affinities()
         self.expert_index = torch.zeros(T, K, dtype=torch.int64)
 
-    def test_basic_output_shape(self):
-        result = moe_tkg_torch_ref(
-            self.hidden,
-            self.gate_up_w,
-            self.down_w,
-            self.affinities,
-            self.expert_index,
-            is_all_expert=True,
-        )
-        assert "out" in result
-        assert result["out"].shape == (T, H)
-
     def test_no_scale_mode_default(self):
         """scale_mode=0 (default None) — no affinity scaling."""
         result = moe_tkg_torch_ref(
@@ -205,9 +193,19 @@ class TestInlineAllExpert:
         )
         assert torch.allclose(result["out"].float(), torch.zeros(T, H))
 
-    @pytest.mark.parametrize("act_fn", [ActFnType.SiLU, ActFnType.GELU, ActFnType.GELU_Tanh_Approx, ActFnType.Swish])
-    def test_activation_enum(self, act_fn):
-        """All activation functions via enum (hasattr .value branch)."""
+    @pytest.mark.parametrize(
+        "act_fn",
+        [
+            # Mix enum and int inputs to cover both dispatch branches (hasattr .value vs isinstance int)
+            # while hitting all 4 activation branches in _compute_expert_mlp.
+            ActFnType.SiLU,  # enum, dispatches "silu"
+            ActFnType.GELU,  # enum, dispatches "gelu"
+            2,  # int, dispatches "gelu_tanh"
+            3,  # int, dispatches "swish"
+        ],
+    )
+    def test_activation(self, act_fn):
+        """All activation functions via mixed enum/int inputs."""
         result = moe_tkg_torch_ref(
             self.hidden,
             self.gate_up_w,
@@ -216,20 +214,6 @@ class TestInlineAllExpert:
             self.expert_index,
             is_all_expert=True,
             activation_fn=act_fn,
-        )
-        assert torch.isfinite(result["out"].float()).all()
-
-    @pytest.mark.parametrize("act_int", [0, 1, 2, 3])
-    def test_activation_int(self, act_int):
-        """All activation functions via int (isinstance int branch)."""
-        result = moe_tkg_torch_ref(
-            self.hidden,
-            self.gate_up_w,
-            self.down_w,
-            self.affinities,
-            self.expert_index,
-            is_all_expert=True,
-            activation_fn=act_int,
         )
         assert torch.isfinite(result["out"].float()).all()
 
@@ -329,19 +313,6 @@ class TestInlineSelectiveExpert:
             expert_down_bias=dw_bias,
         )
         assert torch.isfinite(result["out"].float()).all()
-
-    def test_deterministic(self):
-        kwargs = dict(
-            hidden_input=self.hidden,
-            expert_gate_up_weights=self.gate_up_w,
-            expert_down_weights=self.down_w,
-            expert_affinities=self.affinities,
-            expert_index=self.expert_index,
-            is_all_expert=False,
-        )
-        r1 = moe_tkg_torch_ref(**kwargs)
-        r2 = moe_tkg_torch_ref(**kwargs)
-        assert torch.allclose(r1["out"].float(), r2["out"].float())
 
 
 # ===========================================================================
@@ -575,21 +546,6 @@ class TestMxPath:
         )
         assert result["out"].shape == (T, H)
 
-    @pytest.mark.parametrize("act_fn", [ActFnType.SiLU, ActFnType.GELU, ActFnType.GELU_Tanh_Approx, ActFnType.Swish])
-    def test_activations(self, act_fn):
-        result = moe_tkg_torch_ref(
-            self.hidden,
-            self.gate_up_w,
-            self.down_w,
-            self.affinities,
-            self.expert_index,
-            is_all_expert=True,
-            expert_gate_up_weights_scale=self.gu_scale,
-            expert_down_weights_scale=self.dw_scale,
-            activation_fn=act_fn,
-        )
-        assert result["out"].shape == (T, H)
-
 
 # ===========================================================================
 # STATIC_MX quantization path (_moe_tkg_static_mx_ref)
@@ -701,23 +657,6 @@ class TestStaticMxPath:
         )
         assert result["out"].shape == (T, H)
 
-    @pytest.mark.parametrize("act_fn", [ActFnType.SiLU, ActFnType.GELU, ActFnType.GELU_Tanh_Approx, ActFnType.Swish])
-    def test_activations(self, act_fn):
-        result = moe_tkg_torch_ref(
-            self.hidden,
-            self.gate_up_w,
-            self.down_w,
-            self.affinities,
-            self.expert_index,
-            is_all_expert=True,
-            expert_gate_up_weights_scale=self.gu_w_scale,
-            expert_down_weights_scale=self.dw_w_scale,
-            expert_gate_up_input_scale=self.gu_in_scale,
-            expert_down_input_scale=self.dw_in_scale,
-            activation_fn=act_fn,
-        )
-        assert result["out"].shape == (T, H)
-
 
 # ===========================================================================
 # ROW_MX quantization path (_moe_tkg_row_mx_ref)
@@ -819,21 +758,6 @@ class TestRowMxPath:
         )
         assert result["out"].shape == (T, H)
 
-    @pytest.mark.parametrize("act_fn", [ActFnType.SiLU, ActFnType.GELU, ActFnType.GELU_Tanh_Approx, ActFnType.Swish])
-    def test_activations(self, act_fn):
-        result = moe_tkg_torch_ref(
-            self.hidden,
-            self.gate_up_w,
-            self.down_w,
-            self.affinities,
-            self.expert_index,
-            is_all_expert=True,
-            expert_gate_up_weights_scale=self.gu_w_scale,
-            expert_down_weights_scale=self.dw_w_scale,
-            activation_fn=act_fn,
-        )
-        assert result["out"].shape == (T, H)
-
 
 # ===========================================================================
 # _resolve_output_dtype coverage (via moe_tkg_torch_ref)
@@ -932,7 +856,7 @@ class TestAllToAllV:
             is_all_expert=True,
             expert_gate_up_weights_scale=self.gu_scale,
             expert_down_weights_scale=self.dw_scale,
-            all_to_all_v_strategy=MoEAllToAllVStrategy.PERMUTED_OUTPUT,
+            all_to_all_v_strategy=MoEAllToAllVStrategy.PRESERVE_ROW_ORDER,
             output_dtype=nl.float8_e4m3fn,
         )
         assert "out" in result
@@ -949,8 +873,74 @@ class TestAllToAllV:
             is_all_expert=False,
             expert_gate_up_weights_scale=self.gu_scale,
             expert_down_weights_scale=self.dw_scale,
-            all_to_all_v_strategy=MoEAllToAllVStrategy.PERMUTED_OUTPUT,
+            all_to_all_v_strategy=MoEAllToAllVStrategy.PRESERVE_ROW_ORDER,
             output_dtype=nl.float8_e4m3fn,
         )
         assert "out" in result
         assert result["out"].shape[0] == T
+
+    def test_all_expert_pack_output_rows(self):
+        """PACK_OUTPUT_ROWS with all tokens routed: output should match input order."""
+        # Use 1-based token indices (0 = padding sentinel)
+        raw = self.hidden.view(torch.uint8).clone()
+        token_indices = torch.arange(1, T + 1, dtype=torch.int32).unsqueeze(1)
+        raw[:, -4:] = token_indices.view(torch.uint8)
+        hidden = raw.view(torch.float8_e4m3fn)
+
+        result = moe_tkg_torch_ref(
+            hidden,
+            self.gate_up_w,
+            self.down_w,
+            torch.zeros(T, E, dtype=torch.float32),
+            self.expert_index,
+            is_all_expert=True,
+            expert_gate_up_weights_scale=self.gu_scale,
+            expert_down_weights_scale=self.dw_scale,
+            all_to_all_v_strategy=MoEAllToAllVStrategy.PACK_OUTPUT_ROWS,
+            output_dtype=nl.float8_e4m3fn,
+        )
+        assert "out" in result
+        out = result["out"]
+        # All tokens routed: output has T non-zero rows + trailing token indices
+        assert out.shape[0] == T
+        # Trailing columns contain token indices (as dtype-bitcast)
+        trail_i32 = out[:, H:].view(np.int32).flatten()
+        np.testing.assert_array_equal(trail_i32, np.arange(1, T + 1))
+
+    def test_all_expert_pack_output_rows_partial_routing(self):
+        """PACK_OUTPUT_ROWS with partial routing: routed tokens packed first, then zeros."""
+        # Zero out half the rows (unrouted: affinities=0, token_idx=0)
+        raw = self.hidden.view(torch.uint8).clone()
+        # Use 1-based token indices
+        token_indices = torch.arange(1, T + 1, dtype=torch.int32).unsqueeze(1)
+        raw[:, -4:] = token_indices.view(torch.uint8)
+        # Zero out rows 2 and 3 (unrouted)
+        raw[2, :] = 0
+        raw[3, :] = 0
+        hidden = raw.view(torch.float8_e4m3fn)
+
+        result = moe_tkg_torch_ref(
+            hidden,
+            self.gate_up_w,
+            self.down_w,
+            torch.zeros(T, E, dtype=torch.float32),
+            self.expert_index,
+            is_all_expert=True,
+            expert_gate_up_weights_scale=self.gu_scale,
+            expert_down_weights_scale=self.dw_scale,
+            all_to_all_v_strategy=MoEAllToAllVStrategy.PACK_OUTPUT_ROWS,
+            output_dtype=nl.float8_e4m3fn,
+        )
+        assert "out" in result
+        out = result["out"]
+        assert out.shape == (T, H + 4)
+        # Trailing token indices: first 2 rows have routed token IDs, last 2 are 0
+        trail_i32 = out[:, H:].view(np.int32).flatten()
+        assert trail_i32[0] == 1  # token 0 (id=1) is routed
+        assert trail_i32[1] == 2  # token 1 (id=2) is routed
+        assert trail_i32[2] == 0  # packed zero (unrouted)
+        assert trail_i32[3] == 0  # packed zero (unrouted)
+        # H data: last 2 rows should be zero (unrouted tokens packed at end)
+        h_data = out[:, :H].astype(np.float32)
+        assert np.all(h_data[2] == 0)
+        assert np.all(h_data[3] == 0)

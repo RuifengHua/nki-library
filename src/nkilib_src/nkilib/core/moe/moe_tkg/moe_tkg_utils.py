@@ -17,13 +17,13 @@
 import nki.isa as nisa
 import nki.language as nl
 
-from ...mlp.mlp_tkg.mlp_tkg_constants import MLPTKGConstantsDimensionSizes
 from ...utils.allocator import SbufManager
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
+from .mlp_tkg_constants import MLPTKGConstantsDimensionSizes
 
 
 def gather_expert_affinities(
@@ -63,16 +63,12 @@ def gather_expert_affinities(
         # Optimized path for small token counts (T <= 16)
 
         # Convert expert indices to uint16 for local_gather operation
-        expert_idx_u16 = sbm.alloc_stack(
-            (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="expert_idx_u16"
-        )
+        expert_idx_u16 = sbm.alloc_stack((dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf)
         nisa.memset(dst=expert_idx_u16, value=0)
         nisa.tensor_copy(dst=expert_idx_u16[0 : dims.T, 0 : dims.K], src=expert_idx[0 : dims.T, 0 : dims.K])
 
         # Prepare index values for gathering
-        index_values = sbm.alloc_stack(
-            (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="index_values"
-        )
+        index_values = sbm.alloc_stack((dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf)
         nisa.memset(dst=index_values, value=0)
         expert_indices_trans = sbm.alloc_stack(
             (PARTITIONS_PER_GPSIMD_CORE, PARTITIONS_PER_GPSIMD_CORE),
@@ -96,15 +92,13 @@ def gather_expert_affinities(
         active_channels = (dims.T + PARTITIONS_PER_GPSIMD_CORE - 1) // PARTITIONS_PER_GPSIMD_CORE
 
         # Convert expert indices to uint16 for local_gather operation
-        expert_idx_u16 = sbm.alloc_stack(
-            (128, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="expert_idx_u16"
-        )
+        expert_idx_u16 = sbm.alloc_stack((128, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf)
         nisa.memset(dst=expert_idx_u16, value=0)
         nisa.tensor_copy(dst=expert_idx_u16[0 : dims.T, 0 : dims.K], src=expert_idx[0 : dims.T, 0 : dims.K])
 
         # Fill out 16 partition layout requirement in blocks of 16 partitions up to 128 partitions total
         index_values = sbm.alloc_stack(
-            (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, name="index_values", align=32
+            (dims._pmax, PARTITIONS_PER_GPSIMD_CORE), dtype=nl.uint16, buffer=nl.sbuf, align=32
         )
         nisa.memset(dst=index_values, value=0)
         for channel_idx in range(active_channels):
@@ -269,13 +263,11 @@ def load_all_expert_affinities(expert_affinities, expert_affinities_in_sbuf, T_t
 
     aff_tile_T = min(T_total, pmax)
     if aff_num_tiles == 1:
-        expert_affinities_sb = allocator(
-            (T_total, dims.E), dtype=expert_affinities.dtype, buffer=nl.sbuf, name="expertAffinityAll"
-        )
+        expert_affinities_sb = allocator((T_total, dims.E), dtype=expert_affinities.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=expert_affinities_sb[:T_total, : dims.E], src=expert_affinities[:T_total, : dims.E])
     else:
         expert_affinities_sb = allocator(
-            (aff_tile_T, aff_num_tiles, dims.E), dtype=expert_affinities.dtype, buffer=nl.sbuf, name="expertAffinityAll"
+            (aff_tile_T, aff_num_tiles, dims.E), dtype=expert_affinities.dtype, buffer=nl.sbuf
         )
         for t_tile in TiledRange(T_total, aff_tile_T):
             nisa.dma_copy(
@@ -306,16 +298,12 @@ def get_all_expert_tile_affinities(expert_affinities_sb, aff_num_tiles, t_offset
     aff_start = t_offset // pmax
     aff_count = div_ceil(current_tile_T, pmax)
     if aff_count == 1:
-        result = allocator(
-            (current_tile_T, dims.E), dtype=expert_affinities_sb.dtype, buffer=nl.sbuf, name="expertAffinityLoc"
-        )
+        result = allocator((current_tile_T, dims.E), dtype=expert_affinities_sb.dtype, buffer=nl.sbuf)
         nisa.tensor_copy(
             dst=result[:current_tile_T, : dims.E], src=expert_affinities_sb[:current_tile_T, aff_start, : dims.E]
         )
     else:
-        result = allocator(
-            (pmax, aff_count, dims.E), dtype=expert_affinities_sb.dtype, buffer=nl.sbuf, name="expertAffinityLoc"
-        )
+        result = allocator((pmax, aff_count, dims.E), dtype=expert_affinities_sb.dtype, buffer=nl.sbuf)
         for ai in range(aff_count):
             chunk_size = min(pmax, current_tile_T - ai * pmax)
             nisa.tensor_copy(
@@ -357,9 +345,7 @@ def broadcast_all_expert_affinity(
         expert_affinities_broadcast: SBUF tensor (pmax, current_tile_T).
     """
     pmax = dims._pmax
-    expert_affinities_broadcast = allocator(
-        (pmax, current_tile_T), dtype=io_dtype, buffer=nl.sbuf, name="expert_affinities_sb"
-    )
+    expert_affinities_broadcast = allocator((pmax, current_tile_T), dtype=io_dtype, buffer=nl.sbuf)
     aff_chunks = div_ceil(current_tile_T, pmax)
     for ac in range(aff_chunks):
         chunk_t_start = ac * pmax
@@ -370,7 +356,7 @@ def broadcast_all_expert_affinity(
             else nl.shared_identity_matrix(chunk_size, dtype=io_dtype)
         )
 
-        chunk_affinity_cast = allocator((chunk_size, 1), dtype=io_dtype, buffer=nl.sbuf, name=f"affinity_cast_c{ac}")
+        chunk_affinity_cast = allocator((chunk_size, 1), dtype=io_dtype, buffer=nl.sbuf)
         if aff_num_tiles == 1:
             nisa.activation(
                 dst=chunk_affinity_cast[:chunk_size, :],

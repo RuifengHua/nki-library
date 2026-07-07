@@ -54,6 +54,9 @@ def argsort_unstable(data, descending=False, output_in_sbuf=False):
     """
 
     # Extract shapes, validate
+    input_1d = len(data.shape) == 1
+    if input_1d:
+        data = data.reshape((1, data.shape[0]))
     N = data.shape[1]
     kernel_assert(data.shape[0] == 1, f"Expected data.shape=[1, N], got {data.shape}")
     kernel_assert(N >= _ELEMS_PER_PASS, f"Expected N >= {_ELEMS_PER_PASS}, got {N}")
@@ -89,8 +92,9 @@ def argsort_unstable(data, descending=False, output_in_sbuf=False):
 
     # Optionally store output to HBM
     if output_in_sbuf:
-        return argsort_indices_sb
+        return argsort_indices_sb.reshape((N,)) if input_1d else argsort_indices_sb
     else:
-        argsort_indices_hbm = nl.ndarray((1, N), dtype=nl.uint32, buffer=nl.shared_hbm, name="argsort_indices_hbm")
-        nisa.dma_copy(argsort_indices_hbm, argsort_indices_sb)
+        out_shape = (N,) if input_1d else (1, N)
+        argsort_indices_hbm = nl.ndarray(out_shape, dtype=nl.uint32, buffer=nl.shared_hbm, name="argsort_indices_hbm")
+        nisa.dma_copy(argsort_indices_hbm.reshape((1, N)) if input_1d else argsort_indices_hbm, argsort_indices_sb)
         return argsort_indices_hbm

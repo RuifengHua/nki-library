@@ -292,10 +292,10 @@ def rmsnorm_mx_quantize_tkg(
         output_quant_transposed_sb = nl.ndarray((dims.pmax, n_BxS_tiles, H_packed), dtype=nl.float32, buffer=nl.sbuf)
         _transpose_qmx_output(dims=dims, cfg=cfg, src_sb=output_quant_sb, dst_sb=output_quant_transposed_sb)
 
-        # Reinterpret f32 -> f8 (unpacks to desired f8 output type), then spill quant data to [B*S, 0:H]
-        output_quant_transposed_sb = output_quant_transposed_sb.view(cfg.output_quant_dtype)
+        # Reinterpret f32 -> f8 (unpacks x4 to individual f8 elements), then spill quant data to [B*S, 0:H]
+        output_quant_transposed_view = TensorView(output_quant_transposed_sb).reinterpret_cast(cfg.output_quant_dtype)
         _spill_tiled_sb_to_hbm(
-            src_sb=output_quant_transposed_sb,
+            src_sb=output_quant_transposed_view,
             dst_hbm=output_quant,
             shard_size=cfg.shard_size,
             BxS_offset=cfg.BxS_offset,
@@ -311,7 +311,7 @@ def rmsnorm_mx_quantize_tkg(
         _transpose_qmx_output(dims=dims, cfg=cfg, src_sb=output_scale_sb, dst_sb=output_scale_transposed_sb)
 
         # Reinterpret f8 -> f8 used by packed output_quant, then spill scales to [B*S, H:H+H/4]
-        output_scale_transposed_sb = output_scale_transposed_sb.view(cfg.output_quant_dtype)
+        output_scale_transposed_sb = TensorView(output_scale_transposed_sb).reinterpret_cast(cfg.output_quant_dtype)
         _spill_tiled_sb_to_hbm(
             src_sb=output_scale_transposed_sb,
             dst_hbm=output_quant,
@@ -649,50 +649,77 @@ def _spill_tiled_sb_to_hbm(src_sb, dst_hbm, shard_size, BxS_offset, total_free, 
     """DMA spill from tiled SBUF [pmax, n_tiles, total_free] to a region of HBM [..., dst_total_free].
 
     Args:
+        src_sb: Source SBUF tensor or TensorView of shape [pmax, n_tiles, total_free].
+        dst_hbm: Destination HBM tensor or TensorView.
+        shard_size: Total number of token rows to spill.
+        BxS_offset: Row offset in dst_hbm.
+        total_free: Number of elements in the free dimension per tile.
         dst_free_offset: Starting offset along the free (last) dimension of dst_hbm.
     """
     pmax = nl.tile_size.pmax
     num_full_tiles = shard_size // pmax
     remainder = shard_size % pmax
-    dst_total_free = dst_hbm.shape[-1]
+    src_view = src_sb if isinstance(src_sb, TensorView) else TensorView(src_sb)
+    dst_view = dst_hbm if isinstance(dst_hbm, TensorView) else TensorView(dst_hbm)
+    dst_total_free = dst_view.shape[-1]
 
     if remainder == 0 and num_full_tiles > 1:
-        """
-        All tiles are full and multiple tiles - one vectorized DMA with 3D AP.
-        SBUF: (128, N, H) -> AP: [[N*H, 128], [H, N], [1, H]]
-        DRAM: (shard_size, H) -> AP: [[H, 128], [128*H, N], [1, H]]
-        """
-        src_ap = [[num_full_tiles * total_free, pmax], [total_free, num_full_tiles], [1, total_free]]
-        dst_ap = [[dst_total_free, pmax], [pmax * dst_total_free, num_full_tiles], [1, total_free]]
+        # All tiles are full and multiple tiles - one vectorized DMA.
+        # Reshape dst region [N*pmax, total_free] -> [N, pmax, total_free] -> [pmax, N, total_free]
+        src_3d = src_view.slice(dim=1, start=0, end=num_full_tiles)
+        dst_tile = (
+            dst_view.slice(dim=0, start=BxS_offset, end=BxS_offset + shard_size)
+            .slice(dim=1, start=dst_free_offset, end=dst_free_offset + total_free)
+            .reshape_dim(dim=0, shape=(num_full_tiles, pmax))
+            .permute((1, 0, 2))
+        )
         nisa.dma_copy(
-            src=src_sb.ap(src_ap),
-            dst=dst_hbm.ap(dst_ap, offset=BxS_offset * dst_total_free + dst_free_offset),
+            src=src_3d.get_view(),
+            dst=dst_tile.get_view(),
         )
     elif remainder == 0:
         # Single full tile
+        src_tile = src_view.select(dim=1, index=0)
+        dst_tile = dst_view.slice(dim=0, start=BxS_offset, end=BxS_offset + pmax).slice(
+            dim=1, start=dst_free_offset, end=dst_free_offset + total_free
+        )
         nisa.dma_copy(
-            src=src_sb[0:pmax, 0, 0:total_free],
-            dst=dst_hbm[nl.ds(BxS_offset, pmax), nl.ds(dst_free_offset, total_free)],
+            src=src_tile.get_view(),
+            dst=dst_tile.get_view(),
         )
     else:
-        # Has partial last tile# Has partial last tile
+        # Has partial last tile
         if num_full_tiles > 1:
-            # Vectorized DMA for full tiles with 3D AP
-            src_ap = [[num_full_tiles * total_free, pmax], [total_free, num_full_tiles], [1, total_free]]
-            dst_ap = [[dst_total_free, pmax], [pmax * dst_total_free, num_full_tiles], [1, total_free]]
+            # Vectorized DMA for full tiles
+            src_3d = src_view.slice(dim=1, start=0, end=num_full_tiles)
+            full_size = num_full_tiles * pmax
+            dst_tile = (
+                dst_view.slice(dim=0, start=BxS_offset, end=BxS_offset + full_size)
+                .slice(dim=1, start=dst_free_offset, end=dst_free_offset + total_free)
+                .reshape_dim(dim=0, shape=(num_full_tiles, pmax))
+                .permute((1, 0, 2))
+            )
             nisa.dma_copy(
-                src=src_sb.ap(src_ap),
-                dst=dst_hbm.ap(dst_ap, offset=BxS_offset * dst_total_free + dst_free_offset),
+                src=src_3d.get_view(),
+                dst=dst_tile.get_view(),
             )
         elif num_full_tiles == 1:
             # Single full tile
+            src_tile = src_view.select(dim=1, index=0)
+            dst_tile = dst_view.slice(dim=0, start=BxS_offset, end=BxS_offset + pmax).slice(
+                dim=1, start=dst_free_offset, end=dst_free_offset + total_free
+            )
             nisa.dma_copy(
-                src=src_sb[0:pmax, 0, 0:total_free],
-                dst=dst_hbm[nl.ds(BxS_offset, pmax), nl.ds(dst_free_offset, total_free)],
+                src=src_tile.get_view(),
+                dst=dst_tile.get_view(),
             )
         # Single DMA for partial last tile
         partial_offset = num_full_tiles * pmax
+        src_partial = src_view.slice(dim=0, start=0, end=remainder).select(dim=1, index=num_full_tiles)
+        dst_partial = dst_view.slice(
+            dim=0, start=BxS_offset + partial_offset, end=BxS_offset + partial_offset + remainder
+        ).slice(dim=1, start=dst_free_offset, end=dst_free_offset + total_free)
         nisa.dma_copy(
-            src=src_sb[0:remainder, num_full_tiles, 0:total_free],
-            dst=dst_hbm[nl.ds(BxS_offset + partial_offset, remainder), nl.ds(dst_free_offset, total_free)],
+            src=src_partial.get_view(),
+            dst=dst_partial.get_view(),
         )

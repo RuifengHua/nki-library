@@ -88,6 +88,66 @@ def load_hidden_tensor_tile(
             )
 
 
+def load_hidden_tensor_tile_mx(
+    mlp_params: MLPParameters,
+    tile_info: MLPCTETileInfo,
+    constants: MLPCTEConstants,
+    indices: MlpBxsIndices,
+    output_tile_sbuf_list: list[nl.ndarray],
+):
+    # Alias this to cut down on the code size for tile information references
+    bxs_dim_tile = tile_info.bxs_dim_tile
+    hidden_dim_tile = tile_info.mx_src_proj_hidden_dim_tile
+    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size  # 128
+    H_TILE_SIZE = hidden_dim_tile.tile_size  # 512
+    # H_SUBTILE_COUNT = hidden_dim_tile.subtile_dim_info.tile_count  # 128
+    H_SUBTILE_SIZE = hidden_dim_tile.subtile_dim_info.tile_size  # 4
+    BXS_BUFFER_COUNT = tile_info.mx_src_proj_bxs_dim_tile.subtile_dim_info.tile_size // nl.tile_size.pmax  # 2
+
+    # Ensure we have the shapes we need
+    hidden_tensor_hbm_view = _reshape_io_tensor(constants, mlp_params.hidden_tensor)
+    hidden_size_hbm = hidden_tensor_hbm_view.shape[-1]
+
+    # This is the offset into the original tensor and the total size from the tensor that we are computing
+    bxs_tiles = TiledRange(constants.get_bxs_size(mlp_params), bxs_dim_tile.tile_size)
+    current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
+    tensor_bxs_offset = constants.get_bxs_offset()
+
+    for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):  # 128 in BxS
+        # Decompose the bxs subtile index into two components
+        bxs_256_subtile_idx = bxs_subtile.index // 2
+        bxs_buffer_idx = bxs_subtile.index % 2
+        # reshape [128_H, H/512, 256_T, 4_H] -> [128_T, H/512, 2_T, 4_H * 128_H]
+        output_tile_sbuf_view = output_tile_sbuf_list[bxs_256_subtile_idx].reshape(
+            (
+                nl.tile_size.pmax,  # 128_T
+                hidden_dim_tile.tile_count,  # H/512
+                BXS_BUFFER_COUNT,  # 2_T
+                H_SUBTILE_SIZE,  # 4_H
+                nl.tile_size.pmax,  # 128_H
+            )
+        )
+        for h_tile in TiledRange(mlp_params.hidden_size, H_TILE_SIZE):  # 512 in H
+            h_subtile_count = h_tile.size // H_SUBTILE_SIZE
+            nisa.dma_copy(
+                src=hidden_tensor_hbm_view.ap(
+                    pattern=[
+                        [hidden_size_hbm, bxs_subtile.size],
+                        [h_subtile_count, H_SUBTILE_SIZE],
+                        [1, h_subtile_count],
+                    ],
+                    offset=((tensor_bxs_offset + bxs_subtile.start_offset) * hidden_size_hbm + h_tile.start_offset),
+                ),
+                dst=output_tile_sbuf_view[
+                    : bxs_subtile.size,
+                    h_tile.index,
+                    bxs_buffer_idx,
+                    :H_SUBTILE_SIZE,
+                    :h_subtile_count,
+                ],
+            )
+
+
 # The hidden (input) tensor is tiled along the S dimension while fusing it with the given fuse input
 # tensor. This method loads and entire tile into SBUF as subtiles.
 
@@ -217,55 +277,45 @@ def load_and_transpose_mx_quant_hidden_tile(
     bxs_dim_tile = tile_info.bxs_dim_tile
     hidden_dim_tile = tile_info.mx_src_proj_hidden_dim_tile
     H_TILE_COUNT = hidden_dim_tile.tile_count  # H/512
-    H_SUBTILE_COUNT = hidden_dim_tile.subtile_dim_info.tile_count  # 128
     H_SUBTILE_SIZE = hidden_dim_tile.subtile_dim_info.tile_size  # 4
-    BXS_SUBTILE_SIZE = bxs_dim_tile.subtile_dim_info.tile_size  # 128
-    BF16_FP8_SIZE_RATIO = 2
+    BXS_SUBTILE_SIZE = 2 * bxs_dim_tile.subtile_dim_info.tile_size  # 256
+    FP32_FP8_SIZE_RATIO = 4
 
     # This is the total BxS size from the tensor that we are loading
-    tensor_bxs_size = constants.get_bxs_size(mlp_params)
-    bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
+    bxs_tiles = TiledRange(constants.get_bxs_size(mlp_params), bxs_dim_tile.tile_size)
     current_bxs_tile = bxs_tiles[indices.bxs_tile_idx]
-    bxs_size = mlp_params.batch_size * mlp_params.sequence_len
     tensor_bxs_offset = constants.get_bxs_offset()
 
-    # Ensure we have the shapes we need
-    hidden_tensor_hbm_view = _reshape_io_tensor(constants, mlp_params.hidden_tensor).reshape(
-        (bxs_size * 2, mlp_params.hidden_size // 2)
-    )
+    hidden_size_hbm = mlp_params.hidden_tensor.shape[-1]
 
-    for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):  # 128 in BXS
+    for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):  # 256 in BXS
         for hidden_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):  # 512 in H
             hidden_subtiles = TiledRange(hidden_tile, H_SUBTILE_SIZE)
 
-            # (hidden_size // 4) because we divide by 2 once to align with the HBM tensor reshape above
-            # and again because we are going to view the tensor in bf16
             src_pattern = [
-                [mlp_params.hidden_size // 4, 2 * bxs_subtile.size],
+                [hidden_size_hbm // FP32_FP8_SIZE_RATIO, bxs_subtile.size],
                 [1, 1],
                 [1, 1],
                 [1, len(hidden_subtiles)],
             ]
             src_offset = (
-                (tensor_bxs_offset + bxs_subtile.start_offset) * mlp_params.hidden_size
-            ) // BF16_FP8_SIZE_RATIO + hidden_tile.index * H_SUBTILE_COUNT
+                (tensor_bxs_offset + bxs_subtile.start_offset) * hidden_size_hbm + hidden_tile.start_offset
+            ) // FP32_FP8_SIZE_RATIO
 
             # the hidden tensor tile has shape fp8[P(128_H), H/512, 256_S, 4_H], or using the aliases defined here:
-            #                                  fp8[H_SUBTILE_COUNT, H_TILE_COUNT, 2 * BXS_SUBTILE_SIZE, H_SUBTILE_SIZE]
-            bxs_x4_subtile_size_bf16 = 2 * BXS_SUBTILE_SIZE * H_SUBTILE_SIZE // BF16_FP8_SIZE_RATIO
+            #                                  fp8[H_SUBTILE_COUNT, H_TILE_COUNT, BXS_SUBTILE_SIZE, H_SUBTILE_SIZE]
+            bxs_x4_subtile_size_fp32 = BXS_SUBTILE_SIZE * H_SUBTILE_SIZE // FP32_FP8_SIZE_RATIO
             dst_pattern = [
-                [H_TILE_COUNT * bxs_x4_subtile_size_bf16, len(hidden_subtiles)],
+                [H_TILE_COUNT * bxs_x4_subtile_size_fp32, len(hidden_subtiles)],
                 [1, 1],
                 [1, 1],
-                [1, 2 * bxs_subtile.size],
+                [1, bxs_subtile.size],
             ]
-            dst_offset = (hidden_tile.index * bxs_x4_subtile_size_bf16) + (
-                (bxs_subtile.index % 2) * (2 * BXS_SUBTILE_SIZE)
-            )
+            dst_offset = hidden_tile.index * bxs_x4_subtile_size_fp32
 
             nisa.dma_transpose(
-                src=hidden_tensor_hbm_view.ap(src_pattern, dtype=nl.bfloat16, offset=src_offset),
-                dst=output_tile_sbuf_list[bxs_subtile.index // 2].ap(dst_pattern, dtype=nl.bfloat16, offset=dst_offset),
+                src=mlp_params.hidden_tensor.ap(src_pattern, dtype=nl.float32, offset=src_offset),
+                dst=output_tile_sbuf_list[bxs_subtile.index].ap(dst_pattern, dtype=nl.float32, offset=dst_offset),
             )
 
 
@@ -278,8 +328,11 @@ def load_hidden_tensor_tile_opt_fused_add(
     output_tile_scales_sbuf_list: Optional[nl.ndarray],
     output_stored_add_tensor_hbm: Optional[nl.ndarray],
 ):
-    if mlpp_has_dma_xpose(mlp_params):
-        load_and_transpose_mx_quant_hidden_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
+    if mlp_params.quant_params.is_dtype_mx():
+        if mlpp_has_dma_xpose(mlp_params):
+            load_and_transpose_mx_quant_hidden_tile(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
+        else:
+            load_hidden_tensor_tile_mx(mlp_params, tile_info, constants, indices, output_tile_sbuf_list)
     else:
         if mlpp_has_fused_add(mlp_params):
             # Load the hidden tensor tile with the fused add applied

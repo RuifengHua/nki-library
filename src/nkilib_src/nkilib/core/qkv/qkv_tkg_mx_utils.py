@@ -102,14 +102,18 @@ def _validate_user_inputs(args: QKV_TKG_MXFP_UserInput) -> None:
             "[QKV TKG MXFP] weight_scales_hbm (per-column weight dequant scale) must be provided for ROW_MX quantization.",
         )
     kernel_assert(B * S <= P_MAX, f"[QKV TKG MXFP] BxS must be <= {P_MAX} for TKG, got BxS={B * S}.")
-    kernel_assert(
-        (B * S) % 4 == 0, f"[QKV TKG MXFP] BxS must be divisible by 4 for MXFP quantization, got BxS={B * S}."
-    )
 
     # Dtypes
+    # HBM-side dtype may be the canonical ``nl.float8_e4m3fn_x4`` (kernel
+    # tests build it via ``static_cast``) or a torch-compatible alt-dtype
+    # ``nl.uint32`` (vllm-neuron, since torch has no ``float8_e4m3fn_x4``
+    # dtype). Both have a 4-byte element width; the kernel internals
+    # allocate SBUF with the source dtype and view-cast to
+    # ``nl.float8_e4m3fn_x4`` after the DMA. Mirrors the QKV CTE fix in
+    # commit ``560a5f16`` (CR-277644685).
     kernel_assert(
-        args.weights_qtz_hbm.dtype == nl.float8_e4m3fn_x4,
-        f"[QKV TKG MXFP] weights_qtz_hbm.dtype must be nl.float8_e4m3fn_x4, got {args.weights_qtz_hbm.dtype}.",
+        args.weights_qtz_hbm.dtype in (nl.float8_e4m3fn_x4, nl.uint32),
+        f"[QKV TKG MXFP] weights_qtz_hbm.dtype must be nl.float8_e4m3fn_x4 or nl.uint32, got {args.weights_qtz_hbm.dtype}.",
     )
     if args.quantization_type == QuantizationType.MX:
         kernel_assert(

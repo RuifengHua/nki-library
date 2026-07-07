@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Generator, final
 
@@ -32,8 +33,9 @@ from typing_extensions import override
 
 from . import core_lock_client as lock_client
 from .common_dataclasses import INF_ARTIFACT_DIR_NAME, NeuronDeviceInfo, Platforms, TargetHost
-from .core_lock_client import REMOTE_LOCKS_JSON
+from .core_lock_client import POLL_JITTER_MAX, POLL_PERIOD, REMOTE_LOCKS_JSON, STALE_THRESHOLD
 from .core_lock_manager import (
+    AllocationStatus,
     CoreAllocation,
     CoreLockManager,
     LockAcquisitionError,
@@ -43,6 +45,7 @@ from .exceptions import (
     InferenceException,
     LocalExecutionException,
     NoNeuronDevicesException,
+    QueuePatienceRotation,
     RemoteExecutionException,
     TimeoutException,
     UnimplementedException,
@@ -52,6 +55,53 @@ from .remote_executor import RemoteExecutor
 from .resources import RemoteDirectory
 from .s3_utils import S3ArtifactUploadConfig
 from .scripts.remote_lock_scripts import LockState, find_contiguous_cores
+
+# Caller-side patience for FIFO core allocation.
+# If a host's worst-case ETA exceeds this, the caller dequeues and rotates to
+# another host rather than camping. Capped well under the per-test pytest
+# timeout so the caller can cycle through a few hosts before the test is killed.
+PATIENCE_SECONDS = 3 * lock_client.DEFAULT_LOCK_TIMEOUT_SECONDS  # = 180
+
+# Wall-clock deadline for acquiring a host + core allocation. A busy FIFO queue
+# is transient (not a host failure), so the caller keeps rotating across hosts
+# until this deadline elapses rather than giving up after a fixed attempt count.
+# ~2.5h, capped under the overall suite budget.
+DEFAULT_ACQUISITION_DEADLINE_SECONDS = 9000
+# Backoff between host rotations when the whole fleet is momentarily busy, so a
+# fully-busy fleet re-cycles at a bounded rate instead of hot-spinning.
+HOST_ROTATION_BACKOFF_SECONDS = 1
+
+# Short poll cadence for a near-front waiter. 1 s is the empirical FCFS hand-off
+# floor (bounded by the SSH round-trip), so polling this fast near the front
+# closes the per-hand-off idle gap without spending extra load for no gain.
+# Must stay below POLL_PERIOD (FAST_POLL_PERIOD < POLL_PERIOD).
+FAST_POLL_PERIOD = 1
+
+
+def select_poll_base(position: int | None, *, fast: int = FAST_POLL_PERIOD, slow: int = POLL_PERIOD) -> int:
+    """Return the poll-loop sleep base for a queued caller.
+
+    A caller at or one slot from the front of the queue (``position <= 1``)
+    polls at the short ``fast`` cadence so it commits its reserved block
+    within ~1 s of a hand-off instead of waiting a full slow poll cycle; any
+    deeper position (or an unknown position) uses the normal ``slow`` cadence.
+    The ``fast``/``slow`` arguments are injectable so callers can pass a
+    customized slow period.
+    """
+    if position is not None and position <= 1:
+        return fast
+    return slow
+
+
+def should_rotate(worst_case_eta: int | None, draining: bool) -> bool:
+    """Pure predicate: should a queued caller abandon this host and rotate away?
+
+    Returns True only for a non-draining caller whose worst-case ETA exceeds
+    ``PATIENCE_SECONDS``. A draining host never triggers rotation (ETA is
+    meaningless mid-drain, so the caller stays and keeps probing),
+    and a missing ETA is treated as "stay". Kept pure/host-free for unit testing.
+    """
+    return (not draining) and worst_case_eta is not None and worst_case_eta > PATIENCE_SECONDS
 
 
 @contextlib.contextmanager
@@ -141,6 +191,8 @@ class Host(ABC):
                     self._get_debug_output_dir(target_directory),
                 )
 
+                neuron_env.update(self._setup_neuron_tags())
+
                 stdout = self._run_command(command, target_directory, neuron_env, collector)
 
         if post_lock_command:
@@ -197,7 +249,7 @@ class Host(ABC):
         collective_ranks: int = 1,
         lnc_config: int = 2,
         timeout_seconds: int = 9000,
-        poll_period_seconds: int = 5,
+        poll_period_seconds: int = POLL_PERIOD,
     ) -> contextlib.AbstractContextManager[CoreAllocation, Any]:
         """
         Allocate logical cores for execution by locking physical cores.
@@ -229,6 +281,19 @@ class Host(ABC):
     def _should_run_post_lock(self) -> bool:
         """Check if post-lock commands should run. Override to check drain state."""
         return True
+
+    def soft_join_queue(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int = 1,
+        lnc_config: int = 2,
+    ) -> None:
+        """Reserve a FIFO core-queue slot before/while artifacts upload.
+
+        Default no-op. Only SshHost participates in the remote FIFO queue;
+        LocalHost uses the file-lock path and must NOT enqueue.
+        """
+        return None
 
     @abstractmethod
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
@@ -263,6 +328,16 @@ class Host(ABC):
             "NEURON_RT_ROOT_COMM_ID": f"localhost:{unique_port}",
             "NEURON_RT_DEBUG_OUTPUT_DIR": debug_output_dir,
         }
+
+    @staticmethod
+    def _setup_neuron_tags() -> dict[str, str]:
+        """Build the NEURON_TAG_* dict that ships to the remote workload:
+        every NEURON_TAG_* in the local env, plus a fresh per-invocation
+        REQUEST_ID. Future tags are picked up automatically.
+        """
+        tags = {k: v for k, v in os.environ.items() if k.startswith("NEURON_TAG_")}
+        tags["NEURON_TAG_REQUEST_ID"] = str(uuid.uuid4())
+        return tags
 
     def __lock__(self, lock_file_path: str, timeout_seconds: int):
         return FileLock(f"{lock_file_path}.lock", timeout=timeout_seconds * 1000)
@@ -402,7 +477,7 @@ class LocalHost(Host):
         collective_ranks: int = 1,
         lnc_config: int = 2,
         timeout_seconds: int = 9000,
-        poll_period_seconds: int = 5,
+        poll_period_seconds: int = POLL_PERIOD,
     ) -> Generator[CoreAllocation, None, None]:
         # Guard against running LocalHost on a machine also used as a remote SshHost target.
         # SshHost uses locks.json for core locking — if it has active (non-expired) locks,
@@ -413,6 +488,7 @@ class LocalHost(Host):
             devices = self.get_neuron_device_info()
             # neuron-ls returns logical core IDs; multiply by lnc_config to get physical count
             device_lnc = devices[0].logical_neuroncore_config if devices else lnc_config
+            collector.add_dimension({MetricName.INSTANCE_TYPE: devices[0].instance_type})
             total_physical_cores = sum(len(d.neuroncore_ids) * device_lnc for d in devices)
 
             # We lock at the physical core level to prevent conflicts between
@@ -546,6 +622,11 @@ class SshHost(Host):
         self._total_physical_cores: int | None = None
         self._remote_executor = None
         self._host_locking_version: int | None = None
+        # Cached during one allocation attempt so a manager created by
+        # soft_join_queue during artifact upload is reused (same entry_id) at
+        # commit time. Bound to the owning collector and cleared on teardown so
+        # it never bleeds across tests/attempts (see _ensure_core_lock_manager).
+        self._core_lock_manager: CoreLockManager | None = None
         self.neuron_ls_path: str = os.path.join(remote_neuron_install_dir, "neuron-ls")
         # Cached for the lifetime of this SshHost — device topology is assumed stable during a test run.
         self._cached_device_info: list[NeuronDeviceInfo] | None = None
@@ -754,29 +835,27 @@ class SshHost(Host):
 
         raise Exception("Retry logic failed unexpectedly")
 
-    @override
-    @contextlib.contextmanager
-    def get_core_allocation(
-        self,
-        collector: IMetricsCollector,
-        collective_ranks: int = 1,
-        lnc_config: int = 2,
-        timeout_seconds: int = 9000,
-        poll_period_seconds: int = 5,
-    ) -> Generator[CoreAllocation, None, None]:
-        """
-        Allocate logical cores for execution by locking physical cores.
+    def _ensure_core_lock_manager(self, collector: IMetricsCollector) -> CoreLockManager:
+        """Create or return a CoreLockManager bound to the given collector.
 
-        Physical cores are locked to prevent conflicts between LNC1 and LNC2 tests.
-        Logical core IDs are returned for use with NEURON_RT_VISIBLE_CORES.
+        Resolves the host's physical-core count and locking version (creating
+        infra_version.json with the default if missing), then returns a manager.
+        The cached manager is reused ONLY while it belongs to the same
+        ``collector`` (the per-test/per-attempt owner): a manager created by
+        ``soft_join_queue`` during artifact upload is the SAME instance
+        ``get_core_allocation`` later commits with, so the FIFO slot anchored at
+        soft-join time is reused (same ``entry_id``). When the collector differs
+        (a new test/attempt) the cache is rebuilt, which re-mints ``entry_id``,
+        rebinds the collector, and resets all fairness counters — making
+        cross-test metric bleed impossible.
         """
-        # Get locking version from host (creates infra_version.json with default if missing)
+        if self._core_lock_manager is not None and self._core_lock_manager.collector is collector:
+            return self._core_lock_manager
+
         if self._total_physical_cores is None:
             devices = self.get_neuron_device_info()
             self._total_physical_cores = sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in devices)
-        if self._host_locking_version is not None:
-            locking_version = self._host_locking_version
-        else:
+        if self._host_locking_version is None:
             executor = self._get_remote_executor()
             with collector.timer(MetricName.CORE_LOCK_INIT_TIME):
                 self._host_locking_version = lock_client.initialize_and_deploy(executor)
@@ -785,16 +864,106 @@ class SshHost(Host):
                     required_version=self._host_locking_version,
                     current_version=lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION,
                 )
-            locking_version = self._host_locking_version
-        logging.info(f"[{self.ssh_alias}] Using locking protocol v{locking_version}")
+        logging.info(f"[{self.ssh_alias}] Using locking protocol v{self._host_locking_version}")
 
-        core_lock_manager = CoreLockManager(
+        self._core_lock_manager = CoreLockManager(
             self.ssh_alias,
             self._total_physical_cores,
             collector,
             executor=self._get_remote_executor(),
             host_locking_version=self._host_locking_version,
         )
+        return self._core_lock_manager
+
+    @override
+    def soft_join_queue(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int = 1,
+        lnc_config: int = 2,
+    ) -> None:
+        """Reserve a FIFO core-queue slot before/while artifacts upload.
+
+        Synchronous pre-enqueue (no background threads): construct/cache the
+        ``CoreLockManager`` and perform ONE ``ready=False`` poll so this attempt
+        anchors its FIFO position at soft-join time rather than paying the
+        upload latency. This ONLY reserves the slot — the real commit happens
+        later in ``get_core_allocation``, which reuses the SAME cached
+        manager/``entry_id``. If the slot is pruned/bumped during a long upload,
+        the first ``ready=True`` poll transparently re-enqueues at tail (handled
+        by the ``poll`` verb), so no resume code is needed here.
+
+        Best-effort poll: a genuine soft-join (poll) failure is logged at
+        warning and swallowed; normal acquisition in ``get_core_allocation``
+        still works. However, this is NOT a pure no-op on control flow: if the
+        just-reserved slot already has a worst-case ETA exceeding patience, the
+        slot is freed and ``QueuePatienceRotation`` is raised so the surrounding
+        host-assignment retry rotates to another host BEFORE paying the upload
+        cost. No contention metrics are flushed on this early rotation because no
+        queue-wait has accrued yet at soft-join time.
+        """
+        outcome = None
+        manager = None
+        try:
+            manager = self._ensure_core_lock_manager(collector)
+            outcome = manager.acquire(collective_ranks, lnc_config, ready=False)
+            logging.info(
+                f"[{self.ssh_alias}] Soft-joined core queue (ready=False): "
+                f"status={outcome.status} position={outcome.position}"
+            )
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"[{self.ssh_alias}] Best-effort soft-join failed: {e}")
+            outcome = None  # genuine poll failure: swallow and let get_core_allocation run normally
+
+        # Patience gate — OUTSIDE the best-effort swallow so it propagates (the
+        # whole point of pre-upload rotation). A successful poll that landed an
+        # over-patience QUEUED slot triggers rotation; DRAINING is suppressed
+        # inside should_rotate (ETA is meaningless mid-drain, so it returns
+        # False and the caller stays and keeps probing).
+        if (
+            outcome is not None
+            and outcome.status in (AllocationStatus.QUEUED, AllocationStatus.DRAINING)
+            and should_rotate(
+                outcome.worst_case_eta,
+                draining=(outcome.status == AllocationStatus.DRAINING),
+            )
+        ):
+            try:
+                manager.dequeue()  # free the just-joined slot (TTL prune is the safety net)
+            except Exception as dq_err:  # noqa: BLE001
+                logging.warning(f"[{self.ssh_alias}] Best-effort dequeue failed: {dq_err}")
+            # Drop the cached manager so the next attempt — even a re-selection
+            # of THIS host (a patience rotation does not mark it failed) —
+            # re-mints a fresh manager (new entry_id + reset fairness counters)
+            # instead of inheriting this abandoned soft-join's queue-wait.
+            # Mirrors the per-attempt teardown in get_core_allocation.
+            self._core_lock_manager = None
+            raise QueuePatienceRotation(
+                f"[{self.ssh_alias}] Queue ETA {outcome.worst_case_eta}s exceeds "
+                f"patience {PATIENCE_SECONDS}s, rotating host"
+            )
+
+    @override
+    @contextlib.contextmanager
+    def get_core_allocation(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int = 1,
+        lnc_config: int = 2,
+        timeout_seconds: int = 9000,
+        poll_period_seconds: int = POLL_PERIOD,
+    ) -> Generator[CoreAllocation, None, None]:
+        """
+        Allocate logical cores for execution by locking physical cores.
+
+        Physical cores are locked to prevent conflicts between LNC1 and LNC2 tests.
+        Logical core IDs are returned for use with NEURON_RT_VISIBLE_CORES.
+        """
+        collector.add_dimension({MetricName.INSTANCE_TYPE: self.get_instance_type()})
+
+        # Reuse the cached manager (and its entry_id) if soft_join_queue already
+        # created one during artifact upload; otherwise build it now.
+        core_lock_manager = self._ensure_core_lock_manager(collector)
 
         with collector.timer(MetricName.CORE_ALLOCATION_TIME):
             logging.info(
@@ -803,34 +972,90 @@ class SshHost(Host):
 
             # Poll until we get cores or timeout
             max_retryable_errors = 10
+            # Liveness invariant: STALE_THRESHOLD must cover the poll loop's full
+            # retry budget *including jitter* so a caller actively retrying
+            # through transient SSH disruption is never pruned out from under
+            # itself mid-budget. The real inter-refresh gap is POLL_PERIOD +
+            # up to POLL_JITTER_MAX, so the budget is max_retryable_errors
+            # refreshes at that spacing.
+            assert STALE_THRESHOLD >= max_retryable_errors * (POLL_PERIOD + POLL_JITTER_MAX)
             consecutive_retryable_errors = 0
             start_time = time.time()
-            result = None
+            outcome = None
+
+            def _dequeue_best_effort() -> None:
+                # Free the abandoned host's FIFO slot. Best-effort: a failed
+                # dequeue is non-fatal (TTL prune is the crash safety net).
+                try:
+                    core_lock_manager.dequeue()
+                except Exception as dq_err:  # noqa: BLE001
+                    logging.warning(f"[{self.ssh_alias}] Best-effort dequeue failed: {dq_err}")
+
+            def _abandon_attempt() -> None:
+                # Terminal abandon teardown. Flush this attempt's queue-wait /
+                # contention / drain-wait metrics BEFORE freeing the slot so the
+                # starved attempts the observability was built to measure are not
+                # invisible (success and abandon are mutually exclusive within an
+                # attempt, so this never double-counts the success path's flush).
+                core_lock_manager.record_contention_metrics()
+                _dequeue_best_effort()
+
             while time.time() - start_time < timeout_seconds:
                 try:
-                    result = core_lock_manager.acquire(collective_ranks, lnc_config)
-                    if result:
-                        break
+                    # Artifacts are uploaded before acquisition in the current
+                    # ordering, so the caller is always ready to commit.
+                    outcome = core_lock_manager.acquire(
+                        collective_ranks,
+                        lnc_config,
+                        timeout_seconds=lock_client.INFERENCE_LOCK_TIMEOUT_SECONDS,
+                        ready=True,
+                    )
                     consecutive_retryable_errors = 0
+                    if outcome.status == AllocationStatus.ALLOCATED:
+                        break
+                    if outcome.status == AllocationStatus.DRAINING:
+                        # Host draining: stay-and-probe. Keep polling
+                        # the same host without counting this as a retryable error
+                        # and without aborting. Drains are typically fleet-wide, so
+                        # rotating off would just land on another draining host, so
+                        # position is preserved organically as last_seen_ts keeps
+                        # refreshing.
+                        logging.info(
+                            f"[{self.ssh_alias}] Host draining; continuing to poll (position={outcome.position})"
+                        )
+                    # QUEUED / DRAINING: no cores yet, keep polling.
                 except (LockAcquisitionError, LockVersionError) as e:
                     logging.warning(f"[{self.ssh_alias}] Lock error (retryable={e.retryable}): {e}")
                     if not e.retryable:
                         raise
                     consecutive_retryable_errors += 1
+                    # An error is not evidence the caller is near the front, so
+                    # discard any stale near-front position from a prior
+                    # successful poll; the cadence below must fall back to the
+                    # SLOW base (select_poll_base(None) -> slow) instead of
+                    # fast-spinning and burning the retry budget early.
+                    outcome = None
                     if consecutive_retryable_errors >= max_retryable_errors:
+                        _abandon_attempt()
                         raise OSError(
                             f"[{self.ssh_alias}] Lock acquisition failed after {max_retryable_errors} "
                             f"consecutive retryable errors. Last error: {e}"
                         ) from e
-                jitter = random.uniform(0, 0.5)
-                time.sleep(poll_period_seconds + jitter)
+                base = select_poll_base(
+                    outcome.position if outcome is not None else None,
+                    slow=poll_period_seconds,
+                )
+                jitter = random.uniform(0, POLL_JITTER_MAX)
+                time.sleep(base + jitter)
 
-            if not result:
+            if outcome is None or outcome.status != AllocationStatus.ALLOCATED:
+                _abandon_attempt()
                 raise TimeoutException(
                     f"[{self.ssh_alias}] Unable to allocate {collective_ranks} logical cores within {timeout_seconds}s"
                 )
 
-            logical_cores, physical_cores = result
+            logical_cores = outcome.logical_cores
+            physical_cores = outcome.physical_cores
             core_lock_manager.record_contention_metrics()
             logging.info(f"[{self.ssh_alias}] Allocated logical cores {logical_cores} (physical: {physical_cores})")
 
@@ -838,6 +1063,12 @@ class SshHost(Host):
             yield CoreAllocation(host_id=self.ssh_alias, logical_core_ids=logical_cores, lnc_config=lnc_config)
         finally:
             core_lock_manager.release(physical_cores)
+            # Drop the cached manager so the next attempt always starts fresh
+            # (re-minted entry_id, rebound collector, reset counters) even if it
+            # skips soft-join. The collector-identity guard in
+            # _ensure_core_lock_manager already prevents cross-test reuse; this
+            # is defense in depth and a clean per-attempt teardown hook.
+            self._core_lock_manager = None
 
     @override
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
@@ -856,6 +1087,9 @@ class SshHost(Host):
             raise NoNeuronDevicesException(self.ssh_alias)
         self._cached_device_info = [NeuronDeviceInfo.from_dict(device) for device in data]
         return self._cached_device_info
+
+    def get_instance_type(self) -> str:
+        return self.get_neuron_device_info()[0].instance_type
 
 
 @dataclass
@@ -1069,9 +1303,20 @@ class HostManager:
         self,
         platform_target: Platforms,
         collector: IMetricsCollector,
-        max_retries: int = 3,
+        *,
+        deadline_seconds: float = DEFAULT_ACQUISITION_DEADLINE_SECONDS,
+        connection_failure_cap: int = 3,
+        backoff_seconds: float = HOST_ROTATION_BACKOFF_SECONDS,
     ):
-        """Execute a function with automatic retry on different hosts if connection times out."""
+        """Execute a function with automatic retry on different hosts.
+
+        A busy FIFO queue (``QueuePatienceRotation``) is transient: the host is NOT
+        marked failed and stays eligible, the caller backs off briefly and keeps
+        rotating across hosts until ``deadline_seconds`` elapses -- it never
+        self-terminates merely because all matching hosts are currently busy.
+        Genuine connection failures keep the prior behavior: mark the host failed,
+        exclude it, and stop after ``connection_failure_cap`` of them.
+        """
         # Track errors from each host attempt for better debugging
         host_errors: dict[str, str] = {}
 
@@ -1082,48 +1327,77 @@ class HostManager:
         # in case code block that's yielded to by context_manager_wrapper does not directly return
         # make sure that we record successes and terminate retries
         success = False
+        # Genuine connection failures for THIS allocation; bounded by connection_failure_cap.
+        connection_failures = 0
+        # Transient busy-queue rotations across hosts for THIS allocation (no failure).
+        rotation_count = 0
 
         def succeeded():
             nonlocal success
             success = True
 
         @contextlib.contextmanager
-        def context_manager_wrapper(notify_success: Callable[[], None], execution_host: Host, attempt: int):
+        def context_manager_wrapper(notify_success: Callable[[], None], execution_host: Host):
+            nonlocal connection_failures, rotation_count
             try:
                 yield execution_host
-            except (OSError, TimeoutError, SSHException) as e:
+            except QueuePatienceRotation as e:
+                # A busy FIFO queue is transient, NOT a host failure: do not mark the
+                # host failed, do not count it toward the connection-failure cap, and
+                # leave it eligible for re-selection. Record the rotation metric and
+                # back off so a fully-busy fleet re-cycles at a bounded rate.
+                host_id = execution_host.get_host_id() if execution_host else "unknown"
+                rotation_count += 1
+                logging.info(f"Host {host_id} queue busy (patience rotation #{rotation_count}); rotating: {e}")
+                if collector:
+                    collector.record_metric(
+                        MetricName.CORE_LOCK_HOST_ROTATION_COUNT,
+                        1.0,
+                        "Count",
+                    )
+                time.sleep(backoff_seconds)
+            except (OSError, TimeoutError, SSHException, TimeoutException) as e:
                 host_id = execution_host.get_host_id() if execution_host else "unknown"
                 error_msg = f"{type(e).__name__}: {e}"
                 host_errors[host_id] = error_msg
 
-                logging.error(f"Connection error on host {host_id}, attempt {attempt + 1}/{max_retries}: {e}")
+                connection_failures += 1
+                logging.error(
+                    f"Connection error on host {host_id}, failure {connection_failures}/{connection_failure_cap}: {e}"
+                )
                 self.mark_host_as_failed(host_id)
 
                 if collector:
+                    # Emit one datapoint of 1.0 per rotation (a delta) so that
+                    # sum/avg aggregations over EMF datapoints reflect the true
+                    # rotation count instead of over-counting the cumulative value.
+                    collector.record_metric(
+                        MetricName.CORE_LOCK_HOST_ROTATION_COUNT,
+                        1.0,
+                        "Count",
+                    )
                     collector.record_metric(
                         MetricName.FAILED_HOSTS_COUNT,
                         float(self.get_failed_host_count()),
                         "Count",
                     )
 
-                if attempt == max_retries - 1:
+                if connection_failures >= connection_failure_cap:
                     error_details = format_host_errors()
                     raise InferenceException(
-                        f"Connection error after {attempt + 1} attempts. "
+                        f"Connection error after {connection_failures} attempts. "
                         f"Hosts attempted: {', '.join(attempted_hosts)}\n"
                         f"Errors from each host:\n{error_details}"
                     ) from e
 
-                logging.warning(f"Retrying on different host (attempt {attempt + 2}/{max_retries})")
+                logging.warning("Retrying on a different host")
             else:
                 notify_success()
 
         attempted_hosts = []
 
-        for attempt in range(max_retries):
-            if success:
-                break
-
+        deadline = time.time() + deadline_seconds
+        while not success and time.time() < deadline:
             execution_host = None
 
             try:
@@ -1136,7 +1410,7 @@ class HostManager:
                 host_id = execution_host.get_host_id()
                 attempted_hosts.append(host_id)
 
-                yield context_manager_wrapper(succeeded, execution_host, attempt)
+                yield context_manager_wrapper(succeeded, execution_host)
 
             except Exception as e:
                 # Report error with details from previous failures
@@ -1147,3 +1421,12 @@ class HostManager:
             finally:
                 if execution_host:
                     self.release_host(execution_host)
+
+        if not success:
+            # Distinct from "No available hosts" and "Connection error after N attempts":
+            # the fleet was reachable but every matching host stayed busy past the deadline.
+            raise InferenceException(
+                f"Core allocation deadline ({deadline_seconds}s) exceeded after rotating across hosts; "
+                f"all matching hosts remained busy. "
+                f"Patience rotations: {rotation_count}. Hosts attempted: {', '.join(attempted_hosts)}"
+            )

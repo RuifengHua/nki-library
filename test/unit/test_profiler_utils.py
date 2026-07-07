@@ -15,6 +15,7 @@
 Unit tests for profiler command generation.
 """
 
+from ..utils.core_lock_client import INFERENCE_LOCK_TIMEOUT_SECONDS
 from ..utils.profiler_utils import (
     ProfilerCommands,
     extract_and_filter_output_files,
@@ -377,7 +378,7 @@ def test_timeout_included_in_capture_cmd():
         metrics_enabled=False,
     )
 
-    assert "timeout 55 neuron-profile capture" in cmds.capture_cmd
+    assert f"timeout {INFERENCE_LOCK_TIMEOUT_SECONDS - 5} neuron-profile capture" in cmds.capture_cmd
 
 
 def test_collectives_profile_all_ranks():

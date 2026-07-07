@@ -35,8 +35,22 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 
 
 def _rel_test_dirs(test_dirs):
-    """Convert absolute test dirs to relative paths after 'test/integration/nkilib/'."""
-    return sorted(d.split("test/integration/nkilib/")[1] for d in test_dirs)
+    """Convert absolute test paths to relative directory paths after 'test/integration/nkilib/'.
+
+    Handles both file-level paths (extracts parent directory at kernel-group level)
+    and directory-level paths (legacy fallback).
+    """
+    result = set()
+    for d in test_dirs:
+        suffix = d.split("test/integration/nkilib/")[1]
+        # If it's a file path, extract the kernel-group directory (first 2 components)
+        parts = Path(suffix).parts
+        if len(parts) >= 2 and parts[-1].endswith(".py"):
+            result.add(str(Path(parts[0]) / parts[1]))
+        else:
+            # Directory path (2 components like "core/mlp")
+            result.add(suffix.rstrip("/"))
+    return sorted(result)
 
 
 def _new_finder_with_cached_index(cached_deps):
@@ -110,12 +124,6 @@ class TestReverseImportIndex:
         mlp_tkg_files = [d for d in deps if "mlp_tkg/mlp_tkg.py" in d]
         assert len(mlp_tkg_files) > 0, f"mlp_tkg.py should import down_projection, got: {deps}"
 
-    def test_down_projection_imported_by_moe_tkg(self):
-        down_proj = "src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_down_projection.py"
-        deps = self.finder._reverse_deps.get(down_proj, set())
-        moe_files = [d for d in deps if "moe/moe_tkg/" in d]
-        assert len(moe_files) > 0, f"moe_tkg should import down_projection, got: {deps}"
-
     def test_aliased_import_tracked(self):
         """'from ..moe.moe_tkg.moe_tkg import moe_tkg as _moe_tkg' should still track the dependency."""
         moe_tkg = "src/nkilib_src/nkilib/core/moe/moe_tkg/moe_tkg.py"
@@ -161,12 +169,6 @@ class TestTransitiveDependents:
     def _inject_finder(self, relevant_test_finder_index):
         self.finder = _new_finder_with_cached_index(relevant_test_finder_index)
 
-    def test_down_projection_reaches_moe_block(self):
-        changed = ["src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_down_projection.py"]
-        affected = self.finder._get_transitive_dependents(changed)
-        moe_block_files = [f for f in affected if "moe_block" in f]
-        assert len(moe_block_files) > 0, f"Should transitively reach moe_block, got: {sorted(affected)}"
-
     def test_changed_file_included_in_result(self):
         changed = ["src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_down_projection.py"]
         affected = self.finder._get_transitive_dependents(changed)
@@ -180,39 +182,51 @@ class TestTransitiveDependents:
 
 
 class TestMapToTestDirs:
-    """Tests source file to test directory mapping."""
+    """Tests affected file to test file mapping.
+
+    _map_to_test_dirs now returns only test files that are already in the
+    affected set (placed there by BFS). Source-only inputs return empty
+    because the BFS step is what discovers dependent test files.
+    """
 
     def setup_method(self):
         self.finder = RelevantTestFinder(repo_root=REPO_ROOT)
 
-    def test_core_mlp_maps_to_core_mlp_tests(self):
+    def test_source_only_returns_empty(self):
+        """Source files alone produce no test paths (BFS adds test dependents)."""
         affected = {"src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg.py"}
-        dirs = self.finder._map_to_test_dirs(affected)
-        rel_dirs = _rel_test_dirs(dirs)
+        result = self.finder._map_to_test_dirs(affected)
+        assert len(result) == 0
+
+    def test_test_file_in_affected_set_is_returned(self):
+        """Test files present in affected set are returned directly."""
+        affected = {"test/integration/nkilib/core/mlp/test_mlp_tkg.py"}
+        result = self.finder._map_to_test_dirs(affected)
+        rel_dirs = _rel_test_dirs(result)
         assert "core/mlp" in rel_dirs
 
-    def test_core_moe_maps_to_core_moe_tests(self):
-        affected = {"src/nkilib_src/nkilib/core/moe/moe_tkg/moe_tkg.py"}
-        dirs = self.finder._map_to_test_dirs(affected)
-        rel_dirs = _rel_test_dirs(dirs)
+    def test_mixed_source_and_test_returns_only_tests(self):
+        """Only test files from the affected set are returned, source files ignored."""
+        affected = {
+            "src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg.py",
+            "test/integration/nkilib/core/mlp/test_mlp_tkg.py",
+            "test/integration/nkilib/core/moe/moe_tkg/test_moe_tkg.py",
+        }
+        result = self.finder._map_to_test_dirs(affected)
+        rel_dirs = _rel_test_dirs(result)
+        assert "core/mlp" in rel_dirs
         assert "core/moe" in rel_dirs
-
-    def test_experimental_moe_maps_to_experimental_moe_tests(self):
-        affected = {"src/nkilib_src/nkilib/experimental/moe/bwd/bwmm_bwd_dropless.py"}
-        dirs = self.finder._map_to_test_dirs(affected)
-        rel_dirs = _rel_test_dirs(dirs)
-        assert "experimental/moe" in rel_dirs
 
     def test_non_python_files_ignored(self):
         affected = {"README.md", "docs/guide.rst"}
         dirs = self.finder._map_to_test_dirs(affected)
         assert len(dirs) == 0
 
-    def test_test_files_mapped_to_test_dirs(self):
-        affected = {"test/integration/nkilib/core/mlp/test_mlp.py"}
-        dirs = self.finder._map_to_test_dirs(affected)
-        rel_dirs = _rel_test_dirs(dirs)
-        assert rel_dirs == ["core/mlp"]
+    def test_nonexistent_test_file_ignored(self):
+        """Test file paths that don't exist on disk are not returned."""
+        affected = {"test/integration/nkilib/core/mlp/test_nonexistent.py"}
+        result = self.finder._map_to_test_dirs(affected)
+        assert len(result) == 0
 
 
 class TestGetRelevantTestDirsEndToEnd:
@@ -251,10 +265,12 @@ class TestGetRelevantTestDirsEndToEnd:
         assert "experimental/transformer" in rel_dirs
 
     def test_single_qkv_cte_change(self):
-        """Single file change to qkv_cte.py should affect qkv, experimental/qkv, and transformer.
+        """Single file change to qkv_cte.py should affect qkv and transformer.
 
         qkv_cte is imported by qkv.py, which is imported by transformer_tkg.
-        experimental/qkv test imports from core/qkv test utilities.
+        Note: experimental/qkv test was previously reached via test-to-test imports
+        from core/qkv test utilities, but test-to-test propagation is now stopped
+        unless the test file itself is directly changed.
         """
         result = self._run_with_files(
             [
@@ -264,7 +280,6 @@ class TestGetRelevantTestDirsEndToEnd:
         assert result is not None
         rel_dirs = _rel_test_dirs(result)
         assert "core/qkv" in rel_dirs
-        assert "experimental/qkv" in rel_dirs
         assert "experimental/transformer" in rel_dirs
 
     def test_experimental_moe_bwd_change(self):
@@ -276,7 +291,7 @@ class TestGetRelevantTestDirsEndToEnd:
         )
         assert result is not None
         rel_dirs = _rel_test_dirs(result)
-        assert rel_dirs == ["experimental/moe"]
+        assert rel_dirs == ["experimental/moe", "experimental/moe_mxfp8"]
 
     def test_infrastructure_change_conftest_returns_none(self):
         """Changes to test/conftest.py should run all tests."""
@@ -289,7 +304,11 @@ class TestGetRelevantTestDirsEndToEnd:
         assert result is None
 
     def test_mlp_parameters_change_has_wide_blast_radius(self):
-        """Changes to mlp_parameters.py (shared by many kernels) should have wide blast radius."""
+        """Changes to mlp_parameters.py (shared by many kernels) should have wide blast radius.
+
+        mlp_parameters is imported by many source files across mlp, qkv, moe, and transformer.
+        Only tests that directly import affected source files are selected (no test-to-test propagation).
+        """
         result = self._run_with_files(
             [
                 "src/nkilib_src/nkilib/core/mlp/mlp_parameters.py",
@@ -298,11 +317,8 @@ class TestGetRelevantTestDirsEndToEnd:
         assert result is not None
         rel_dirs = _rel_test_dirs(result)
         assert "core/mlp" in rel_dirs
-        assert "core/moe" in rel_dirs
-        assert "core/moe_block" in rel_dirs
         assert "core/qkv" in rel_dirs
         assert "experimental/moe" in rel_dirs
-        assert "experimental/moe_block" in rel_dirs
         assert "experimental/transformer" in rel_dirs
 
     def test_core_utils_change_returns_none(self):
@@ -336,7 +352,12 @@ class TestGetRelevantTestDirsEndToEnd:
         assert rel_dirs == ["core/moe"]
 
     def test_down_projection_affects_mlp_and_moe(self):
-        """Changes to mlp_tkg_down_projection.py should affect mlp, moe, and transitive dependents."""
+        """Changes to mlp_tkg_down_projection.py should affect mlp and transformer.
+
+        The source-level import chain is: down_projection → mlp_tkg → mlp → transformer_tkg.
+        core/moe and core/moe_block are NOT reached via source imports (they were
+        previously reached only via test-to-test utility sharing).
+        """
         result = self._run_with_files(
             [
                 "src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_down_projection.py",
@@ -345,8 +366,7 @@ class TestGetRelevantTestDirsEndToEnd:
         assert result is not None
         rel_dirs = _rel_test_dirs(result)
         assert "core/mlp" in rel_dirs
-        assert "core/moe" in rel_dirs
-        assert "core/moe_block" in rel_dirs
+        assert "experimental/transformer" in rel_dirs
 
     def test_comma_separated_commit_ids(self):
         """Comma-separated commit IDs should union changed files from all commits."""
@@ -484,3 +504,76 @@ class TestTestToTestEndToEnd:
         rel_dirs = _rel_test_dirs(result)
         assert "core/attention" in rel_dirs
         assert "experimental/transformer" in rel_dirs
+
+
+class TestTestToTestPropagationStop:
+    """Tests verifying that test-to-test propagation is stopped for source changes.
+
+    When a source file changes, BFS should NOT propagate through test utility files
+    to reach unrelated test suites. Only test files that directly or transitively
+    import the changed source (via source-level imports) should be selected.
+    """
+
+    def setup_method(self):
+        self.finder = RelevantTestFinder(repo_root=REPO_ROOT)
+
+    def _run_with_files(self, changed_files):
+        with patch.object(self.finder, "_get_changed_files", return_value=changed_files):
+            return self.finder.get_relevant_test_dirs("mocked")
+
+    def test_gate_up_projection_does_not_reach_moe_via_test_utils(self):
+        """mlp_tkg_gate_up_projection.py should NOT select moe tests.
+
+        Previously, the chain was: gate_up_projection → mlp_tkg → mlp →
+        test_mlp_common.py → test_moe_tkg_utils.py → test_moe_tkg.py.
+        With test-to-test propagation stopped, test_mlp_common.py is a dead end.
+        """
+        result = self._run_with_files(["src/nkilib_src/nkilib/core/mlp/mlp_tkg/mlp_tkg_gate_up_projection.py"])
+        assert result is not None
+        rel_dirs = _rel_test_dirs(result)
+        assert "core/mlp" in rel_dirs
+        assert "core/moe" not in rel_dirs
+        assert "core/moe_block" not in rel_dirs
+
+    def test_rmsnorm_mx_quantize_does_not_select_layernorm(self):
+        """rmsnorm_mx_quantize_tkg.py should NOT select test_layernorm_tkg.py.
+
+        Both live in core/subkernels/ but layernorm does not import rmsnorm_mx_quantize.
+        File-level precision ensures only directly dependent tests are selected.
+        """
+        result = self._run_with_files(["src/nkilib_src/nkilib/core/subkernels/rmsnorm_mx_quantize_tkg.py"])
+        assert result is not None
+        # Should select rmsnorm_mx_quantize and moe_block (which imports it at source level)
+        test_files = sorted(p.split("test/integration/nkilib/")[1] for p in result)
+        assert any("test_rmsnorm_mx_quantize_tkg" in f for f in test_files)
+        assert any("test_moe_block_tkg" in f for f in test_files)
+        # Should NOT select unrelated subkernels tests
+        assert not any("test_layernorm_tkg" in f for f in test_files)
+        assert not any("test_find_nonzero_indices" in f for f in test_files)
+        assert not any("test_rmsnorm_tkg" in f for f in test_files)
+
+    def test_attention_tkg_does_not_select_attention_cte(self):
+        """attention_tkg.py change should NOT select test_attention_cte.py.
+
+        attention_cte tests import from attention_cte source, not attention_tkg.
+        """
+        result = self._run_with_files(["src/nkilib_src/nkilib/core/attention/attention_tkg.py"])
+        assert result is not None
+        test_files = sorted(p.split("test/integration/nkilib/")[1] for p in result)
+        assert any("test_attention_tkg" in f for f in test_files)
+        assert not any("test_attention_cte" in f for f in test_files)
+
+    def test_directly_changed_test_still_propagates(self):
+        """When a test file itself is changed, test-to-test propagation still works.
+
+        Changing test_mlp_common.py should select tests that import from it,
+        because the test file is directly in the changed set.
+        """
+        result = self._run_with_files(["test/integration/nkilib/core/mlp/test_mlp_common.py"])
+        assert result is not None
+        rel_dirs = _rel_test_dirs(result)
+        # test_mlp_common is imported by test_mlp_cte and others
+        assert "core/mlp" in rel_dirs
+        # Should propagate to moe tests that import from test_mlp_common
+        test_files = sorted(p.split("test/integration/nkilib/")[1] for p in result)
+        assert any("test_moe_block_tkg" in f for f in test_files)

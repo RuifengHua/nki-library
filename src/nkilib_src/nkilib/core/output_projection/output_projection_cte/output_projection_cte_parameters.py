@@ -19,9 +19,9 @@ from typing import Optional, Tuple
 
 import nki.language as nl
 
-from ...utils.common_types import QuantizationType
+from ...utils.common_types import DtypeMode, QuantizationType
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil
+from ...utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
 from ...utils.tile_info import TiledDimInfo
 
 # Hardware constants - use literal values since nl.tile_size.* returns -1 at module load time
@@ -81,6 +81,7 @@ class QuantizationConfig(nl.NKIObject):
     is_mxfp8_static_quantized: bool = False
     is_row_mxfp8_quantized: bool = False
     is_row_fp8_quantized: bool = False
+    compact_weight_scales: bool = False
 
 
 @dataclass
@@ -431,6 +432,8 @@ def build_quantization_config(
     weight_scales: Optional[nl.ndarray],
     input_data_type: Optional[type],
     weight_data_type: Optional[type],
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    compact_weight_scales: bool = False,
 ) -> QuantizationConfig:
     """
     Setup quantization configuration including scale loading and double row optimization.
@@ -441,6 +444,10 @@ def build_quantization_config(
         weight_scales (Optional[nl.ndarray]): Weight quantization scales.
         input_data_type (Optional[type]): Data type of input tensor.
         weight_data_type (Optional[type]): Data type of weight tensor.
+        dtype_mode (DtypeMode): Quantization dtype policy for STATIC/ROW.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
 
     Returns:
         QuantizationConfig: Configuration with quantization parameters.
@@ -452,6 +459,19 @@ def build_quantization_config(
     if quantization_type == QuantizationType.NONE:
         return QuantizationConfig(is_enabled=False)
 
+    _fp8_e4m3_dtype = resolve_fp8_e4m3_dtype(dtype_mode)
+
+    # Use the caller's concrete weight_data_type when available; resolve from
+    # dtype_mode only for the opaque "float8e4" sentinel. Avoids EOCP001
+    # mismatches when the caller passes nl.float8_e4m3 with dtype_mode=AUTO
+    # on TRN3.
+    if weight_data_type is not None and str(weight_data_type) == "float8e4":
+        _resolved_e4m3_for_static_row = _fp8_e4m3_dtype
+    elif weight_data_type in (nl.float8_e4m3, nl.float8_e4m3fn):
+        _resolved_e4m3_for_static_row = weight_data_type
+    else:
+        _resolved_e4m3_for_static_row = _fp8_e4m3_dtype
+
     quant_data_type = None
     is_fp8_quantized = False
     is_mxfp4_quantized = False
@@ -461,10 +481,14 @@ def build_quantization_config(
     input_quantized = False
 
     if quantization_type == QuantizationType.STATIC:
-        quant_data_type = nl.float8_e4m3
+        quant_data_type = _resolved_e4m3_for_static_row
         is_fp8_quantized = True
     elif quantization_type == QuantizationType.MX:
-        quant_data_type = nl.float4_e2m1fn_x4
+        # block-128 compact scales pair with FP8 weights
+        if compact_weight_scales or weight_data_type == nl.float8_e4m3fn_x4:
+            quant_data_type = nl.float8_e4m3fn_x4
+        else:
+            quant_data_type = nl.float4_e2m1fn_x4
         is_mxfp4_quantized = True
         # Pre-quantized MX input uses packed format (float8_e4m3fn_x4 or float4_e2m1fn_x4)
         packed_dtypes = (nl.float8_e4m3fn_x4, nl.float4_e2m1fn_x4)
@@ -477,7 +501,7 @@ def build_quantization_config(
         quant_data_type = nl.float8_e4m3fn_x4
         is_row_mxfp8_quantized = True
     elif quantization_type == QuantizationType.ROW:
-        quant_data_type = nl.float8_e4m3
+        quant_data_type = _resolved_e4m3_for_static_row
         is_row_fp8_quantized = True
 
     return QuantizationConfig(
@@ -494,6 +518,7 @@ def build_quantization_config(
         is_mxfp8_static_quantized=is_mxfp8_static_quantized,
         is_row_mxfp8_quantized=is_row_mxfp8_quantized,
         is_row_fp8_quantized=is_row_fp8_quantized,
+        compact_weight_scales=compact_weight_scales,
     )
 
 
@@ -509,6 +534,7 @@ def validate_output_projection_inputs(
     quantization_type: QuantizationType = QuantizationType.NONE,
     input_scales: Optional[nl.ndarray] = None,
     weight_scales: Optional[nl.ndarray] = None,
+    compact_weight_scales: bool = False,
 ) -> None:
     """
     Validate input parameters for output projection CTE kernel.
@@ -564,6 +590,12 @@ def validate_output_projection_inputs(
             weight_dtype in packed_dtypes,
             f"Weight type={weight_dtype} is not supported for MX quantization",
         )
+        if compact_weight_scales:
+            kernel_assert(
+                weight_dtype == nl.float8_e4m3fn_x4,
+                f"Weight type={weight_dtype} is not supported for MX quantization with compact_weight_scales. "
+                f"compact scales pair with float8_e4m3fn_x4 weights.",
+            )
         if attention_dtype not in packed_dtypes:
             kernel_assert(n_d >= P_MAX, f"N*D={n_d} must be >= {P_MAX} for MX quantization")
             kernel_assert(n_d % P_MAX == 0, f"N*D={n_d} must be a multiple of {P_MAX} for MX quantization")
@@ -597,8 +629,9 @@ def validate_output_projection_inputs(
 
     if quantization_type == QuantizationType.ROW:
         kernel_assert(
-            weight_dtype == nl.float8_e4m3,
-            f"Weight type={weight_dtype} is not supported for ROW quantization, expected float8_e4m3",
+            weight_dtype in (nl.float8_e4m3, nl.float8_e4m3fn),
+            f"Weight type={weight_dtype} is not supported for ROW quantization, "
+            f"expected nl.float8_e4m3 or nl.float8_e4m3fn",
         )
 
     kernel_assert(
@@ -642,7 +675,24 @@ def validate_output_projection_inputs(
         )
         n_d = n_size * d_size
         packed_dtypes = (nl.float8_e4m3fn_x4, nl.float4_e2m1fn_x4)
-        if attention_dtype not in packed_dtypes:
+        if compact_weight_scales:
+            # block-128 compact format: one uint8 scale per 128x128
+            # weight block. Used with on-device quantization of bf16 input.
+            DS_SCALE_BLOCK = 128
+            kernel_assert(
+                n_d % DS_SCALE_BLOCK == 0,
+                f"N*D={n_d} must be a multiple of {DS_SCALE_BLOCK} for compact MX weight scales.",
+            )
+            kernel_assert(
+                h_size % DS_SCALE_BLOCK == 0,
+                f"H={h_size} must be a multiple of {DS_SCALE_BLOCK} for compact MX weight scales.",
+            )
+            kernel_assert(
+                weight_scales.shape == (n_d // DS_SCALE_BLOCK, h_size // DS_SCALE_BLOCK),
+                f"weight_scales shape must be ({n_d // DS_SCALE_BLOCK}, {h_size // DS_SCALE_BLOCK}) for compact MX "
+                f"quantization. Got {weight_scales.shape}",
+            )
+        elif attention_dtype not in packed_dtypes:
             # Online quantization: input_scales not needed (computed on device)
             kernel_assert(
                 weight_scales.shape == (n_d // (_q_height * _q_width), h_size),

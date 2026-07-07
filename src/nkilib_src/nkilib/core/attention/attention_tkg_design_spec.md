@@ -12,15 +12,16 @@ Final sendrecv exchanges output between NCs (if out_in_sb) so both have full res
 ├────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                │
 │  ┌─────────────────────────────┐         ┌─────────────────────────────┐       │
-│  │           NC0               │         │           NC1               │       │
+│  │             NC0             │         │             NC1             │       │
 │  └─────────────────────────────┘         └─────────────────────────────┘       │
 │              │                                       │                         │
 │              ▼                                       ▼                         │
 │  ┌─────────────────────────────┐         ┌─────────────────────────────┐       │
-│  │ _allocate_fa_buffers()      │         │ _allocate_fa_buffers()      │       │
-│  │ - fa_running_max = -inf     │         │ - fa_running_max = -inf     │       │
-│  │ - fa_running_sum = 0        │         │ - fa_running_sum = 0        │       │
-│  │ - fa_running_output = 0     │         │ - fa_running_output = 0     │       │
+│  │ _allocate_online_softmax_   │         │ _allocate_online_softmax_   │       │
+│  │   buffers()                 │         │   buffers()                 │       │
+│  │ - running_max = -inf        │         │ - running_max = -inf        │       │
+│  │ - running_sum = 0           │         │ - running_sum = 0           │       │
+│  │ - running_output = 0        │         │ - running_output = 0        │       │
 │  └─────────────────────────────┘         └─────────────────────────────┘       │
 │              │                                       │                         │
 │              ▼                                       ▼                         │
@@ -42,7 +43,7 @@ Final sendrecv exchanges output between NCs (if out_in_sb) so both have full res
 │  ║              ▼                                   ▼                   ║      │
 │  ║  ┌─────────────────────────┐         ┌─────────────────────────┐     ║      │
 │  ║  │ _cascaded_max_reduce()  │         │ _cascaded_max_reduce()  │     ║      │
-│  ║  │ + _fa_update_running_max│         │ + _fa_update_running_max│     ║      │
+│  ║  │ + _update_running_max() │         │ + _update_running_max() │     ║      │
 │  ║  │   (NO sendrecv needed)  │         │   (NO sendrecv needed)  │     ║      │
 │  ║  └─────────────────────────┘         └─────────────────────────┘     ║      │
 │  ║              │                                   │                   ║      │
@@ -55,14 +56,14 @@ Final sendrecv exchanges output between NCs (if out_in_sb) so both have full res
 │  ║              ▼                                   ▼                   ║      │
 │  ║  ┌─────────────────────────┐         ┌─────────────────────────┐     ║      │
 │  ║  │ _cascaded_sum_reduction │         │ _cascaded_sum_reduction │     ║      │
-│  ║  │ + _fa_update_running_sum│         │ + _fa_update_running_sum│     ║      │
+│  ║  │ + _update_running_sum() │         │ + _update_running_sum() │     ║      │
 │  ║  │   (NO sendrecv needed)  │         │   (NO sendrecv needed)  │     ║      │
 │  ║  └─────────────────────────┘         └─────────────────────────┘     ║      │
 │  ║              │                                   │                   ║      │
 │  ║              ▼                                   ▼                   ║      │
 │  ║  ┌─────────────────────────┐         ┌─────────────────────────┐     ║      │
 │  ║  │ _compute_pv_matmul...() │         │ _compute_pv_matmul...() │     ║      │
-│  ║  │ + _fa_accumulate_output │         │ + _fa_accumulate_output │     ║      │
+│  ║  │ + _accumulate_output()  │         │ + _accumulate_output()  │     ║      │
 │  ║  │   (NO sendrecv needed)  │         │   (NO sendrecv needed)  │     ║      │
 │  ║  └─────────────────────────┘         └─────────────────────────┘     ║      │
 │  ║                                                                      ║      │
@@ -70,10 +71,10 @@ Final sendrecv exchanges output between NCs (if out_in_sb) so both have full res
 │              │                                       │                         │
 │              ▼                                       ▼                         │
 │  ┌─────────────────────────────────────────────────────────────────────┐       │
-│  │                    _fa_finalize_and_store()                         │       │
+│  │                    _finalize_and_store()                            │       │
 │  ├─────────────────────────────────────────────────────────────────────┤       │
-│  │  1. reciprocal(fa_running_sum)                                      │       │
-│  │  2. fa_running_output *= sum_recip  (normalize)                     │       │
+│  │  1. reciprocal(running_sum)                                         │       │
+│  │  2. running_output *= sum_recip  (normalize)                        │       │
 │  │  3. Store to out[bs_prg_id portion]                                 │       │
 │  │                                                                     │       │
 │  │  4. ════════════════ SENDRECV (if out_in_sb) ════════════════       │       │
@@ -87,13 +88,17 @@ Final sendrecv exchanges output between NCs (if out_in_sb) so both have full res
 
 ### Sequence Sharding (sprior_n_prgs=2, bs_n_prgs=1)
 
-Each NC processes different portions of s_prior. Cross-NC sendrecv for max/sum
-reduction is deferred to the LAST FA tile only (optimization). Sink contributions,
-when present, are also deferred and incorporated during this final gather/reduce step
-rather than requiring per-tile synchronization.
+Each NC processes a different portion of `s_prior`. This path runs whenever we shard on
+`s_prior`, regardless of whether FA is enabled — the kernel uses the online-softmax running
+buffers in both cases (captured by `atp.use_online_softmax = atp.use_fa or atp.sprior_n_prgs > 1`).
 
-This deferred synchronization optimization removes unnecessary sendrecvs during FA
-loop iterations, improving performance for longer sequence lengths.
+The cross-NC max/sum sync runs in `_finalize_and_store`, after the last PV matmul. No
+sendrecv runs inside the FA tile loop, so GPSIMD stays available to prefetch V throughout each
+tile's PV matmul; the `sendrecv`s for max, sum, and output all execute during finalize when
+there is no contention on GPSIMD.
+
+Sink contributions, when present, are loaded inside `_finalize_and_store` (into a
+scope-local buffer) and folded into the global max + sum during the sync block.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -102,16 +107,17 @@ loop iterations, improving performance for longer sequence lengths.
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  ┌─────────────────────────────┐         ┌─────────────────────────────┐        │
-│  │           NC0               │         │           NC1               │        │
+│  │             NC0             │         │             NC1             │        │
 │  │   (processes K[:s_prior/2]) │         │   (processes K[s_prior/2:]) │        │
 │  └─────────────────────────────┘         └─────────────────────────────┘        │
 │              │                                       │                          │
 │              ▼                                       ▼                          │
 │  ┌─────────────────────────────┐         ┌─────────────────────────────┐        │
-│  │ _allocate_fa_buffers()      │         │ _allocate_fa_buffers()      │        │
-│  │ - fa_running_max = -inf     │         │ - fa_running_max = -inf     │        │
-│  │ - fa_running_sum = 0        │         │ - fa_running_sum = 0        │        │
-│  │ - fa_running_output = 0     │         │ - fa_running_output = 0     │        │
+│  │ _allocate_online_softmax_   │         │ _allocate_online_softmax_   │        │
+│  │   buffers()                 │         │   buffers()                 │        │
+│  │ - running_max = -inf        │         │ - running_max = -inf        │        │
+│  │ - running_sum = 0           │         │ - running_sum = 0           │        │
+│  │ - running_output = 0        │         │ - running_output = 0        │        │
 │  └─────────────────────────────┘         └─────────────────────────────┘        │
 │              │                                       │                          │
 │              ▼                                       ▼                          │
@@ -135,69 +141,83 @@ loop iterations, improving performance for longer sequence lengths.
 │  ║              ▼                                   ▼                    ║      │
 │  ║  ┌───────────────────────────────────────────────────────────────┐    ║      │
 │  ║  │              _cascaded_max_reduce()                           │    ║      │
-│  ║  │  1. Compute local tile max                                    │    ║      │
-│  ║  │                                                               │    ║      │
-│  ║  │  [sync_softmax_per_fa_tile=False (default for seq sharding)]: │    ║      │
-│  ║  │  2-3. SKIP sendrecv - accumulate LOCAL max only               │    ║      │
-│  ║  │       (global sync deferred to last FA tile)                  │    ║      │
-│  ║  │       Sink prep also deferred to last FA tile                 │    ║      │
-│  ║  │                                                               │    ║      │
-│  ║  │  4. _fa_update_running_max()                                  │    ║      │
-│  ║  │     - On LAST tile: calls                                     │    ║      │
-│  ║  │       _fa_gather_and_compute_global_running_max()             │    ║      │
-│  ║  │       which incorporates sink (if present) and does           │    ║      │
-│  ║  │       the deferred sendrecv                                   │    ║      │
+│  ║  │  1. Compute local tile max from QK                            │    ║      │
+│  ║  │  2. No cross-NC sendrecv here (runs in _finalize_and_store)   │    ║      │
+│  ║  │  3. No sink fold-in here (consumed in finalize)               │    ║      │
+│  ║  │  4. _update_running_max()                                     │    ║      │
+│  ║  │     - First tile: running_max = tile_max                      │    ║      │
+│  ║  │     - Later tiles:                                            │    ║      │
+│  ║  │       running_max = max(prev, tile_max);                      │    ║      │
+│  ║  │       correction_factor = exp(prev - new) (local only)        │    ║      │
 │  ║  └───────────────────────────────────────────────────────────────┘    ║      │
 │  ║              │                                   │                    ║      │
 │  ║              ▼                                   ▼                    ║      │
 │  ║  ┌─────────────────────────┐         ┌─────────────────────────┐      ║      │
 │  ║  │ _compute_exp_qk()       │         │ _compute_exp_qk()       │      ║      │
 │  ║  │ exp(QK - running_max)   │         │ exp(QK - running_max)   │      ║      │
-│  ║  │ (uses LOCAL max until   │         │ (uses LOCAL max until   │      ║      │
-│  ║  │  last tile when global  │         │  last tile when global  │      ║      │
-│  ║  │  sync happens)          │         │  sync happens)          │      ║      │
+│  ║  │ (uses LOCAL running max │         │ (uses LOCAL running max │      ║      │
+│  ║  │  — numerically safe)    │         │  — numerically safe)    │      ║      │
 │  ║  └─────────────────────────┘         └─────────────────────────┘      ║      │
 │  ║              │                                   │                    ║      │
 │  ║              ▼                                   ▼                    ║      │
 │  ║  ┌───────────────────────────────────────────────────────────────┐    ║      │
 │  ║  │              _cascaded_sum_reduction()                        │    ║      │
-│  ║  │  1. Compute local tile sum                                    │    ║      │
-│  ║  │                                                               │    ║      │
-│  ║  │  [sync_softmax_per_fa_tile=False (default for seq sharding)]: │    ║      │
-│  ║  │  2-3. SKIP sendrecv - accumulate LOCAL sum only               │    ║      │
-│  ║  │       (global sync deferred to last FA tile)                  │    ║      │
-│  ║  │                                                               │    ║      │
-│  ║  │  4. _fa_update_running_sum()                                  │    ║      │
-│  ║  │     - On LAST tile: calls                                     │    ║      │
-│  ║  │       _fa_gather_and_compute_global_running_sum()             │    ║      │
-│  ║  │       which does the deferred sendrecv, then                  │    ║      │
-│  ║  │       computes sink_exp and adds to global sum                │    ║      │
-│  ║  │       (if sink present)                                       │    ║      │
+│  ║  │  1. Compute local tile sum via (exp @ 1_vec)                  │    ║      │
+│  ║  │  2. No cross-NC sendrecv here (runs in finalize)              │    ║      │
+│  ║  │  3. _update_running_sum()                                     │    ║      │
+│  ║  │     - First tile: running_sum = tile_sum                      │    ║      │
+│  ║  │     - Later tiles:                                            │    ║      │
+│  ║  │       running_sum = running_sum * c_tile + tile_sum           │    ║      │
+│  ║  │  4. SKIP reciprocal (done in finalize for online softmax)     │    ║      │
 │  ║  └───────────────────────────────────────────────────────────────┘    ║      │
 │  ║              │                                   │                    ║      │
 │  ║              ▼                                   ▼                    ║      │
 │  ║  ┌───────────────────────────────────────────────────────────────┐    ║      │
 │  ║  │              _compute_pv_matmul_and_store()                   │    ║      │
-│  ║  │  1. PV_tile = exp_qk @ V_tile (local computation)             │    ║      │
-│  ║  │  2. _fa_accumulate_output() - accumulate locally              │    ║      │
-│  ║  │     (NO sendrecv here - accumulation is local per NC)         │    ║      │
+│  ║  │  1. PV_tile = exp_qk @ V_tile (local, into PSUM)              │    ║      │
+│  ║  │  2. Copy PSUM → exp_v (SKIP per-tile recip multiply —         │    ║      │
+│  ║  │     reciprocal is applied in finalize)                        │    ║      │
+│  ║  │  3. _accumulate_output() — locally accumulate into            │    ║      │
+│  ║  │     running_output with per-tile correction.                  │    ║      │
+│  ║  │     No cross-NC sendrecv.                                     │    ║      │
 │  ║  └───────────────────────────────────────────────────────────────┘    ║      │
 │  ║                                                                       ║      │
 │  ╚═══════════════════════════════════════════════════════════════════════╝      │
 │              │                                       │                          │
 │              ▼                                       ▼                          │
 │  ┌─────────────────────────────────────────────────────────────────────┐        │
-│  │                    _fa_finalize_and_store()                         │        │
+│  │                _finalize_and_store()                                │        │
+│  │                (cross-NC sync runs here, not in the FA loop)        │        │
 │  ├─────────────────────────────────────────────────────────────────────┤        │
-│  │  1. reciprocal(fa_running_sum)                                      │        │
-│  │  2. fa_running_output *= sum_recip  (normalize locally)             │        │
+│  │  Cross-NC softmax sync block (sprior_n_prgs > 1):                   │        │
 │  │                                                                     │        │
-│  │  3. ═══════════ SENDRECV (fa_running_output) ═══════════            │        │
-│  │     NC0 ◄──────────────────────────────────────────────────► NC1    │        │
+│  │  a. If sink present: _prep_sink() loads sink into a scope-local     │        │
+│  │     sink_values buffer (only lives during finalize).                │        │
+│  │  b. Save local_running_max = running_max (pre-sink, pre-remote).    │        │
+│  │  c. Fold sink into running_max (local max) if present.              │        │
+│  │  d. ═════════ SENDRECV (running_max) ═══════════════════════        │        │
+│  │     NC0 ◄─────────────────────────────────────► NC1                 │        │
+│  │     running_max = max(local_with_sink, remote) = M (global).        │        │
+│  │  e. c_local = exp(local_running_max - M) → correction_factor.       │        │
+│  │  f. running_sum *= c_local.                                         │        │
+│  │  g. transpose_broadcast(c_local) → c_local_bc;                      │        │
+│  │     running_output *= c_local_bc.                                   │        │
+│  │  h. ═════════ SENDRECV (running_sum) ═══════════════════════        │        │
+│  │     NC0 ◄─────────────────────────────────────► NC1                 │        │
+│  │     running_sum += remote_running_sum.                              │        │
+│  │  i. If sink present: sink_values = exp(sink - M);                   │        │
+│  │     running_sum += sink_values.                                     │        │
+│  │                                                                     │        │
+│  │  Normalization and output gather:                                   │        │
+│  │  1. reciprocal(running_sum)                                         │        │
+│  │  2. running_output *= sum_recip_bc (normalize)                      │        │
+│  │                                                                     │        │
+│  │  3. ═════════ SENDRECV (running_output) ═══════════════════         │        │
+│  │     NC0 ◄─────────────────────────────────────► NC1                 │        │
 │  │         Exchange normalized partial outputs                         │        │
 │  │                                                                     │        │
 │  │  4. NC0: output = local_output + recv_output                        │        │
-│  │     (NC0 combines both halves, NC1 discards unless out_in_sb)       │        │
+│  │     (NC0 combines both halves; NC1 discards unless out_in_sb)       │        │
 │  │                                                                     │        │
 │  │  5. NC0 stores final output to HBM                                  │        │
 │  └─────────────────────────────────────────────────────────────────────┘        │
@@ -210,23 +230,25 @@ loop iterations, improving performance for longer sequence lengths.
 | Aspect | Batch Sharding | Sequence Sharding |
 |--------|----------------|-------------------|
 | Data split | Each NC has different batches | Each NC has different K,V portions |
-| FA loop sendrecv | None | **Only on last tile** (deferred sync) |
-| Max reduction | Local only | Local until last tile, then global (incorporates sink if present) |
-| Sum reduction | Local only | Local until last tile, then global (incorporates sink_exp if present) |
-| PV accumulation | Local only | Local only |
-| Sink handling | First FA Tile | Deferred: sink loaded & incorporated during final gather on last FA tile |
-| Final combine | sendrecv for out_in_sb | sendrecv + add partial outputs |
+| FA loop sendrecv | None | None — cross-NC sync runs in `_finalize_and_store` |
+| Max reduction | Local only | Local per-tile; cross-NC max folded in during finalize |
+| Sum reduction | Local only | Local per-tile; cross-NC sum folded in during finalize |
+| PV accumulation | Local only | Local only (no in-loop sendrecv) |
+| Sink handling | First FA Tile | Loaded in `_finalize_and_store`, consumed during finalize sync |
+| Final combine | sendrecv for out_in_sb | sendrecv for max, sum, and output (all in finalize) |
 | Who stores | Both NCs (different batches) | NC0 only (combined result) |
 
-### Function Call Graph (FA Path)
+### Function Call Graph (Online-Softmax Path)
+
+Applies when `atp.use_online_softmax = atp.use_fa or atp.sprior_n_prgs > 1`.
 
 ```
 attention_tkg()
 │
-├── _compute_tile_params()          # Compute atp.use_fa, num_fa_tiles, etc.
-├── _allocate_fa_buffers()          # Allocate running max/sum/output
+├── _compute_tile_params()          # Compute atp.use_fa, sprior_n_prgs, use_online_softmax, ...
+├── _allocate_online_softmax_buffers()          # Allocate running max/sum/output/correction_factor
 │
-├── for fa_tile_idx in range(num_fa_tiles):
+├── for fa_tile_idx in range(num_fa_tiles):   # num_fa_tiles=1 when not use_fa
 │   │
 │   ├── _compute_fa_tile_context()  # Get tile_s_prior, tile_offset, etc.
 │   ├── sbm.open_scope()
@@ -235,31 +257,40 @@ attention_tkg()
 │   │
 │   ├── _compute_qk_matmul()        # Step 1: QK = Q @ K^T
 │   │
-│   ├── _cascaded_max_reduce()      # Step 2: Max reduction
+│   ├── _cascaded_max_reduce()      # Step 2: Local max reduction (no cross-NC sendrecv)
 │   │   ├── _transpose_max_psum()
-│   │   ├── _prep_sink()            # [SEQ SHARD: on last FA tile only]
-│   │   ├── sendrecv()              # [SEQ SHARD: deferred to last FA tile]
-│   │   └── _fa_update_running_max()
-│   │       └── _fa_gather_and_compute_global_running_max()  # [last tile: gather sink + remote max]
+│   │   ├── _prep_sink()            # [single-NC sink only; sharded sink -> finalize]
+│   │   └── _update_running_max()   # Per-tile local correction factor
 │   │
-│   ├── _compute_exp_qk()           # Step 3: exp(QK - max)
+│   ├── _compute_exp_qk()           # Step 3: exp(QK - running_max)  (local max)
 │   │
-│   ├── _cascaded_sum_reduction()   # Step 4: Sum reduction
+│   ├── _cascaded_sum_reduction()   # Step 4: Local sum reduction (no cross-NC sendrecv)
 │   │   ├── _tile_sum_reduction()
-│   │   ├── sendrecv()              # [SEQ SHARD: deferred to last FA tile]
-│   │   └── _fa_update_running_sum()
-│   │       └── _fa_gather_and_compute_global_running_sum()  # [last tile: gather remote sum + sink_exp]
+│   │   └── _update_running_sum()   # Per-tile local correction + accumulate
 │   │
-│   ├── _compute_pv_matmul_and_store()  # Step 5: PV matmul
-│   │   └── _fa_accumulate_output()
+│   ├── _compute_pv_matmul_and_store()  # Step 5: PV matmul (skip per-tile recip)
+│   │   └── _accumulate_output()  # Local accumulate into running_output
 │   │
 │   └── sbm.close_scope()
 │
-└── _fa_finalize_and_store()        # Final normalization & store
-    ├── reciprocal(fa_running_sum)
-    ├── fa_running_output *= sum_recip
-    ├── sendrecv()                  # Combine partial outputs
-    └── dma_copy() to out           # Store to HBM (or copy to SBUF)
+└── _finalize_and_store()        # Final sync + normalization + store
+    │
+    ├── if sprior_n_prgs > 1:       # Cross-NC softmax sync
+    │   ├── _prep_sink()             #   sink load (scope-local buffer)
+    │   ├── tensor_copy(local_running_max, running_max)
+    │   ├── running_max = max(running_max, sink_values)   # fold sink locally
+    │   ├── sendrecv(running_max)
+    │   ├── running_max = max(local, remote) = M
+    │   ├── _update_correction_factor()   # c_local = exp(L - M)
+    │   ├── running_sum *= c_local
+    │   ├── _s_active_bqh_tile_transpose_broadcast(c_local) -> c_local_bc
+    │   ├── running_output *= c_local_bc
+    │   ├── sendrecv(running_sum); running_sum += remote
+    │   └── sink_values = exp(sink - M); running_sum += sink_values
+    │
+    ├── reciprocal(running_sum)
+    ├── running_output *= sum_recip_bc
+    └── _gather_and_store_output()  # Gather outputs across NCs, store to HBM
 ```
 ## Batch tiling
 
@@ -291,7 +322,7 @@ The batch outer loop wraps around the existing flash attention loop:
 ```
 for batch_tile_idx in range(num_batch_tiles):       # NEW: batch outer loop
     _update_atp_for_batch_tile(atp, tile_bs, TC)    # recompute batch-dependent fields
-    _allocate_fa_buffers(...)                        # sized for tile_bs
+    _allocate_online_softmax_buffers(...)                        # sized for tile_bs
 
     for fa_tile_idx in range(num_fa_tiles):          # existing FA loop (unchanged)
         _allocate_qk_buffers(...)
@@ -302,5 +333,5 @@ for batch_tile_idx in range(num_batch_tiles):       # NEW: batch outer loop
         _cascaded_sum_reduction(...)
         _compute_pv_matmul_and_store(...)
 
-    _fa_finalize_and_store(...)                      # per batch tile
+    _finalize_and_store(...)                      # per batch tile
 ```

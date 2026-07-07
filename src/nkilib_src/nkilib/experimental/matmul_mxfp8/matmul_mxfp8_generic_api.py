@@ -199,7 +199,11 @@ def _store_output_block_to_hbm(
     M_LOGICAL: int,
     N_LOGICAL: int,
 ) -> None:
-    """DMA copy one (m, n) block from the 3D SBUF accumulator to HBM."""
+    """DMA copy one (m, n) block from the 3D SBUF accumulator to HBM.
+
+    Note: If SBUF dtype is FP32 and output_dtype is BF16, the DMA engine
+    will automatically cast FP32 to BF16 during the copy.
+    """
     for tile_idx_m in range(bd.TILES_IN_BLOCK_M):
         output_idx_m = block_idx_m * bd.BLOCK_M_LOGICAL + tile_idx_m * LHS_MATMUL_TILE_M
         out_idx_n = block_idx_n * bd.BLOCK_N_LOGICAL
@@ -460,13 +464,20 @@ def generic_matmul_mxfp8_api(
     # Determine if output is HBM (need to store) or SBUF (caller manages)
     output_is_hbm = output_td.data.buffer != nl.sbuf
 
+    # Use FP32 accumulator in SBUF when multiple K blocks and BF16 output
+    # to preserve precision during cross-K-block accumulation.
+    # The cast to BF16 happens during the final DMA store to HBM.
+    # TODO: If we allow for PSUM Accumulation across multiple K blocks, then update this logic
+    num_k_blocks = k_end - k_start
+    sbuf_dtype = nl.float32 if (output_dtype == nl.bfloat16 and num_k_blocks > 1) else output_dtype
+
     for idx_m in range(m_start, m_end):
         for idx_n in range(n_start, n_end):
             # Allocate SBUF accumulator
             if output_is_hbm:
                 output_sbuf = sbm.alloc_stack(
                     shape=(LHS_MATMUL_TILE_M, bd.TILES_IN_BLOCK_M, bd.BLOCK_N_LOGICAL),
-                    dtype=output_dtype,
+                    dtype=sbuf_dtype,
                     buffer=nl.sbuf,
                 )
             else:
@@ -596,6 +607,8 @@ def generic_matmul_mxfp8_api(
                     n_log_end=n_block_size,
                     enable_scale_packing=use_scale_packing,
                     global_block_tile_k_idx=global_k_tile_start,
+                    psum_dtype=output_dtype if bd.TILES_IN_BLOCK_K == 1 and output_dtype != nl.float32 else nl.float32,
+                    enable_psum_copy_in=config.enable_psum_copy_in if config else True,
                 )
 
             # --- Store to HBM if output is HBM ---

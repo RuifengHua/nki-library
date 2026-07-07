@@ -21,7 +21,7 @@ import nki.language as nl
 from nki.language import NKIObject
 
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, get_ceil_aligned_size
+from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, get_ceil_aligned_size
 from ...utils.tile_info import TiledDimInfo
 from ..mlp_parameters import MLPParameters
 from .mlp_cte_sharding import DimShard, ShardedDim, is_sharded_dim_bxs
@@ -83,7 +83,7 @@ def calc_batch_seqlen_dim_tile_size(
     mlp_params: MLPParameters,
     bxs_dim_size: int,
     bxs_dim_subtile_size: int,
-    src_proj_int_dim_size: int,
+    src_proj_int_dim_tile_count: int,
 ) -> int:
     """Calculate the tile size for the batch/sequence dimension.
 
@@ -94,7 +94,7 @@ def calc_batch_seqlen_dim_tile_size(
         mlp_params: MLP configuration parameters
         bxs_dim_size: Size of batch×sequence dimension
         bxs_dim_subtile_size: Subtile size for batch×sequence dimension
-        src_proj_int_dim_size: Size of intermediate dim during src projection which may be rounded up to the nearest 512
+        src_proj_int_dim_tile_count: Number of tiles in source projection intermediate dimension
 
     Returns:
         Calculated tile size for batch×sequence dimension
@@ -106,10 +106,12 @@ def calc_batch_seqlen_dim_tile_size(
     # We have to ensure that the tile size not exceed the number of PSUM banks needed during up/gate
     # projection.  It is related to the structure of the inner loops.
 
-    accum_dtype_size = 2 if mlp_params.quant_params.is_quant_static_mx() else 4
-    psum_max_elts = NUM_HW_PSUM_BANKS * PSUM_BANK_SIZE // accum_dtype_size
-
-    bxs_dim_max_subtiles = psum_max_elts // src_proj_int_dim_size
+    bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS // src_proj_int_dim_tile_count
+    if mlp_params.quant_params.is_dtype_mx():
+        # In the MX setting, during src projection, we use a wider tile size of 2*pmax.
+        # A single 2*pmax size bxs tile and a single int dim tile together fill a PSUM bank
+        # in the projection result.
+        bxs_dim_max_subtiles *= 2
     # This is the max tile size we can choose
     tile_size = bxs_dim_subtile_size * bxs_dim_max_subtiles
     # Special tiling optimization for LLaMA3 70B (heuristic) is to use a tile size of 384 if we can
@@ -227,7 +229,9 @@ def build_mlp_cte_tile_info(
         mlp_params,
         bxs_dim_size,
         bxs_dim_subtile_size,
-        src_proj_intermediate_dim_tile.tile_count * src_proj_intermediate_dim_tile.tile_size,
+        src_proj_intermediate_dim_tile.tile_count
+        if not mlp_params.quant_params.is_dtype_mx()
+        else mx_intermediate_dim_tile.tile_count,
     )
     bxs_dim_tile = TiledDimInfo.build_with_subtiling(bxs_dim_size, bxs_dim_tile_size, bxs_dim_subtile_size)
 

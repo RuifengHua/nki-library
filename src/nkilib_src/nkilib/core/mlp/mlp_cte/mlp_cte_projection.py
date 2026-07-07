@@ -496,8 +496,7 @@ def perform_mx_down_projection(
     I_TILE_SIZE = int_dim_tile.tile_size  # 512
     I_SUBTILE_SIZE = int_dim_tile.subtile_dim_info.tile_size  # 4
     I_SUBTILE_COUNT = int_dim_tile.subtile_dim_info.tile_count  # 128
-    I = weights_tensor_hbm.shape[0]
-    FULL_I_TILE_COUNT = len(TiledRange(I, I_TILE_SIZE))
+    FULL_I_TILE_COUNT = weights_tensor_hbm.shape[1]  # fp8[128_I, I/512, H, 4]
 
     # This is the total size from the tensor that we are computing
     tensor_bxs_size = constants.get_bxs_size(mlp_params)
@@ -1127,7 +1126,7 @@ def project_quantized_source_tensor_tile(
             ),
             src=weights_tensor_hbm.ap(
                 pattern=[[I, H_SUBTILE_SIZE], [I * H_SUBTILE_SIZE, len(hidden_subtiles)], [1, I_SHARD_SIZE]],
-                offset=hidden_tile.index * len(hidden_subtiles) * I * H_SUBTILE_SIZE + I_SHARD_OFFSET,
+                offset=hidden_tile.index * H_SUBTILE_COUNT * H_SUBTILE_SIZE * I + I_SHARD_OFFSET,
             ),
         )
 
@@ -1147,11 +1146,11 @@ def project_quantized_source_tensor_tile(
 
                     # Get hidden tensor slice
                     st_pattern = (
-                        [[mlp_params.hidden_size, H_SUBTILE_SIZE], [bxs_subtile.size, 2], [1, bxs_subtile.size]]
+                        [[mlp_params.hidden_size, H_SUBTILE_SIZE], [BXS_SUBTILE_SIZE, 2], [1, bxs_subtile.size]]
                         if perform_doublerow_matmul
                         else [[mlp_params.hidden_size, H_SUBTILE_SIZE], [1, bxs_subtile.size]]
                     )
-                    st_offset = (hidden_tile.index * H_SUBTILE_COUNT + hidden_subtile.index * 2) * bxs_subtile.size
+                    st_offset = (hidden_tile.index * H_SUBTILE_COUNT + hidden_subtile.index * 2) * BXS_SUBTILE_SIZE
                     hidden_mm_in = source_tile_sbuf_list[bxs_subtile.index].ap(pattern=st_pattern, offset=st_offset)
 
                     # Get weight tensor slice
@@ -1192,7 +1191,8 @@ def project_mx_source_tensor_tile(
     I_TILE_COUNT = int_dim_tile.tile_count  # I/512
     I_SUBTILE_SIZE = int_dim_tile.subtile_dim_info.tile_size  # 4
     I_SUBTILE_COUNT = int_dim_tile.subtile_dim_info.tile_count  # 128
-    I = weights_tensor_hbm.shape[-1]
+    # weights_tensor_hbm shape is [128_H, H/512, I/512, 4_I, 128_I, 4_H]
+    I = weights_tensor_hbm.shape[2] * weights_tensor_hbm.shape[3] * weights_tensor_hbm.shape[4]
     I_SHARD_OFFSET = constants.get_intermediate_offset()
 
     # Create TiledRange for dimensions

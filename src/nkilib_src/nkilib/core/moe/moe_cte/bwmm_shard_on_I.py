@@ -29,6 +29,7 @@ from .moe_cte_utils import (
     DVE_CHANNELS_PER_BANK,
     PSUM_SIZE,
     TILE_SIZE,
+    ActivationQuantMode,
     Configs,
     InputTensors,
     SkipMode,
@@ -45,6 +46,8 @@ MAX_BLOCK_TILE_SIZE = 1024
 FUSE_GATE_WEIGHT_SIZE = 4096 * 1024
 P_MAX = nl.tile_size.pmax
 F_MAX = nl.tile_size.psum_fmax
+# Block quant tile size: scales are organized as 256x256 blocks along (H, I_TP).
+BLOCK_QUANT_SIZE = 256
 
 
 class OutputTensors(NKIObject):
@@ -105,6 +108,12 @@ def blockwise_mm_baseline_shard_intermediate(
     # down_proj_scale shape: [E, 1, H]
     gate_up_proj_scale=None,
     down_proj_scale=None,
+    gate_up_hidden_scale=None,
+    down_hidden_scale=None,
+    # Quant mode flags. Flat booleans (not a nested QuantConfig) because the NKI
+    # parser frontend cannot read attributes off a nested NKIObject inside a kernel.
+    is_block_quant: bool = False,
+    is_per_tensor: bool = False,
     # Meta parameters
     activation_function: ActFnType = ActFnType.SiLU,
     skip_dma: SkipMode = SkipMode(),
@@ -117,6 +126,7 @@ def blockwise_mm_baseline_shard_intermediate(
     up_clamp_upper_limit: Optional[float] = None,
     checkpoint_activation=False,
     expert_affinity_multiply_on_I=False,
+    accumulation_dtype=None,
 ):
     """
     Blockwise matrix multiplication kernel for Mixture of Experts (MoE) with intermediate dimension sharding.
@@ -154,6 +164,10 @@ def blockwise_mm_baseline_shard_intermediate(
         down_proj_bias (nl.tensor, optional): [E, H], Down projection bias.
         gate_up_proj_scale (nl.tensor, optional): [E, 1, 2 * I_TP], Quantization scale for gate/up projection (fp8 dequantization).
         down_proj_scale (nl.tensor, optional): [E, 1, H], Quantization scale for down projection (fp8 dequantization).
+        gate_up_hidden_scale (nl.tensor, optional): [T+1, 1] or [T, 1], Per-token dequantization scale for hidden states
+            in gate/up projection. Only used when is_quant=True. Combined with weight scale post-matmul.
+        down_hidden_scale (nl.tensor, optional): [T+1, 1] or [T, 1], Per-token dequantization scale for intermediate states
+            in down projection. Only used when is_quant=True. Combined with weight scale post-matmul.
         activation_function (ActFnType): Activation function for MLP block (default: SiLU).
         skip_dma (SkipMode): DMA skip mode configuration (default: SkipMode()).
         compute_dtype: Compute data type (default: nl.bfloat16).
@@ -268,12 +282,42 @@ def blockwise_mm_baseline_shard_intermediate(
         gate_and_up_proj_bias=gate_and_up_proj_bias,
         down_proj_bias=down_proj_bias,
         down_proj_weight=down_proj_weight,
-        gate_up_proj_scale=gate_up_proj_scale,
-        down_proj_scale=down_proj_scale,
+        gate_up_proj_scale=gate_up_proj_scale
+        if gate_up_proj_scale is not None
+        else nl.ndarray((dims.E, 2, dims.I_TP), dtype=nl.float32, buffer=nl.shared_hbm),
+        down_proj_scale=down_proj_scale
+        if down_proj_scale is not None
+        else nl.ndarray((dims.E, 1, dims.H), dtype=nl.float32, buffer=nl.shared_hbm),
+        gate_up_hidden_scale=gate_up_hidden_scale
+        if gate_up_hidden_scale is not None
+        else nl.ndarray((dims.E, 2, 1), dtype=nl.float32, buffer=nl.shared_hbm),
+        down_hidden_scale=down_hidden_scale
+        if down_hidden_scale is not None
+        else nl.ndarray((dims.E, 1), dtype=nl.float32, buffer=nl.shared_hbm),
         token_position_to_id=token_position_to_id,
         block_to_expert=block_to_expert,
         expert_affinities_masked=expert_affinities_masked,
     )
+
+    # Pre-reshape scale tensors at entry point (direct params work with .reshape(); inps.X doesn't).
+    # Per-channel uses E2I; block-256 uses the flat layout. Per-tensor needs no reshape.
+    if gate_up_proj_scale is not None and not is_per_tensor and not is_block_quant:
+        inps.gate_up_proj_scale_E2I = gate_up_proj_scale.reshape((dims.E, 2, dims.I_TP))
+    if gate_up_proj_scale is not None and is_block_quant:
+        H_blocks = dims.H // BLOCK_QUANT_SIZE
+        I_blocks_total = dims.I_TP // BLOCK_QUANT_SIZE
+        inps.gate_up_proj_scale_flat = gate_up_proj_scale.reshape((dims.E, H_blocks * 2 * I_blocks_total * TILE_SIZE))
+
+    # Derive quant flags from direct kernel params. The NKI parser frontend can
+    # eliminate dead branches when guards are `param != None` on direct args; it
+    # cannot do so for attribute access on a nested NKIObject.
+    _is_quant = gate_up_proj_scale != None and down_proj_scale != None
+    if is_per_tensor:
+        _quant_activation_mode = ActivationQuantMode.PER_TENSOR
+    elif gate_up_hidden_scale != None or down_hidden_scale != None:
+        _quant_activation_mode = ActivationQuantMode.PER_TOKEN
+    else:
+        _quant_activation_mode = ActivationQuantMode.NONE
 
     configs = Configs(
         skip_dma=skip_dma,
@@ -285,7 +329,7 @@ def blockwise_mm_baseline_shard_intermediate(
         use_dynamic_while=False,
         linear_bias=(gate_and_up_proj_bias != None and down_proj_bias != None),
         activation_function=activation_function,
-        is_quant=gate_up_proj_scale != None and down_proj_scale != None,
+        is_quant=_is_quant,
         fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded <= FUSE_GATE_WEIGHT_SIZE),
         gate_clamp_upper_limit=gate_clamp_upper_limit,
         gate_clamp_lower_limit=gate_clamp_lower_limit,
@@ -293,10 +337,17 @@ def blockwise_mm_baseline_shard_intermediate(
         up_clamp_upper_limit=up_clamp_upper_limit,
         checkpoint_activation=checkpoint_activation,
         expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
+        quant_activation_mode=_quant_activation_mode,
+        quant_is_per_tensor=is_per_tensor,
+        is_block_quant=is_block_quant,
+        accumulation_dtype=accumulation_dtype if accumulation_dtype is not None else hidden_states.dtype,
     )
     check_blockwise_mm_shard_I_kernel_compatibility(dims, configs)
 
-    output = nl.ndarray(hidden_states.shape, dtype=hidden_states.dtype, buffer=nl.shared_hbm)
+    # Cross-expert accumulator dtype (defaults to I/O dtype; fp32 is cast back before return).
+    _acc_dtype = configs.accumulation_dtype
+    _acc_upcast = _acc_dtype != hidden_states.dtype
+    output = nl.ndarray(hidden_states.shape, dtype=_acc_dtype, buffer=nl.shared_hbm)
     gate_up_activations_T, down_activations = None, None
     if checkpoint_activation:
         gate_up_activations_T = nl.ndarray((N, 2, _I_TP, B), dtype=gate_up_proj_weight.dtype, buffer=nl.shared_hbm)
@@ -320,13 +371,20 @@ def blockwise_mm_baseline_shard_intermediate(
         else:
             kernel_assert(False, "unsupported NUM_SHARDS")
 
+    if _acc_upcast:
+        # Cast the fp32 accumulator back to the I/O dtype via a single HBM->HBM DMA.
+        output_ret = nl.ndarray(output.shape, dtype=hidden_states.dtype, buffer=nl.shared_hbm)
+        nisa.dma_copy(dst=output_ret, src=output)
+    else:
+        output_ret = output
+
     if checkpoint_activation:
         if expert_affinity_multiply_on_I:
-            return output, gate_up_activations_T
+            return output_ret, gate_up_activations_T
         else:
-            return output, gate_up_activations_T, down_activations
+            return output_ret, gate_up_activations_T, down_activations
     else:
-        return output
+        return output_ret
 
 
 @nki.jit
@@ -541,6 +599,10 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
+        # Hybrid kernel only supports per-channel weight quant (no per-tensor / block / activation rescale).
+        quant_activation_mode=ActivationQuantMode.NONE,
+        quant_is_per_tensor=False,
+        is_block_quant=False,
     )
 
     check_blockwise_mm_shard_I_kernel_compatibility(dims, configs)
@@ -606,6 +668,10 @@ def check_blockwise_mm_shard_I_kernel_compatibility(dims: DimensionSizes, config
     kernel_assert(
         configs.skip_dma.skip_weight == False, "DMA weight skipping is not yet supported by the BWMM shard on I kernel"
     )
+    if configs.is_block_quant:
+        # Block quant size must be 256x256 to be compatible with double_row matmul (256 H contraction)
+        kernel_assert(dims.H % 256 == 0, f"Block quant requires H divisible by 256, found {dims.H}")
+        kernel_assert(dims.I_TP % 256 == 0, f"Block quant requires I_TP divisible by 256, found {dims.I_TP}")
 
 
 def output_initialization(output, shard_id=None):
@@ -751,7 +817,7 @@ def load_hidden_states(
         )
 
 
-def transpose_hidden_states_allocated(block_hidden_states, H, B, compute_dtype):
+def transpose_hidden_states_allocated(block_hidden_states, H, B, compute_dtype, is_quant=False):
     """
     Transpose block hidden states from B x H to H x B.
 
@@ -760,10 +826,17 @@ def transpose_hidden_states_allocated(block_hidden_states, H, B, compute_dtype):
         H: Hidden dimension size.
         B: Block size.
         compute_dtype: Compute data type.
+        is_quant: If True, use a 4D contiguous layout per h_outer (needed for double_row .ap() views
+            in the quant path). If False, use the mainline list-of-list-of-3D-tiles layout — the 4D
+            layout triggers backend NCC_IGCA108 (loop-carried-dependency) errors for non-power-of-2 H
+            (e.g. H=4864) when the consumer accesses tiles via direct 4D indexing.
 
     Returns:
-        block_hidden_states_T: Nested list of shape [h_outer_tripcount][h_inner_tripcount],
-                               where each element is a tensor of shape (TILE_SIZE, block_psum_tiles, free_size).
+        block_hidden_states_T:
+            - is_quant=True: list[h_outer_tripcount] of 4D tensors of shape
+              (TILE_SIZE, h_inner_tripcount, block_psum_tiles, free_size).
+            - is_quant=False: nested list[h_outer_tripcount][h_inner_tripcount] of 3D tensors of shape
+              (TILE_SIZE, block_psum_tiles, free_size).
     """
     h_outer_tripcount = div_ceil(H, PSUM_SIZE)
     h_inner_tripcount = PSUM_SIZE // TILE_SIZE
@@ -772,11 +845,18 @@ def transpose_hidden_states_allocated(block_hidden_states, H, B, compute_dtype):
     free_size = min(PSUM_SIZE, B)
     block_hidden_states_T = []
     for h_outer_idx in range(h_outer_tripcount):
-        outer_list = []
-        for h_inner_idx in range(h_inner_tripcount):
-            tile = nl.ndarray((TILE_SIZE, block_psum_tiles, free_size), dtype=compute_dtype, buffer=nl.sbuf)
-            outer_list.append(tile)
-        block_hidden_states_T.append(outer_list)
+        if is_quant:
+            # Single contiguous 4D tile so the consumer can build double_row views via .ap().
+            tile = nl.ndarray(
+                (TILE_SIZE, h_inner_tripcount, block_psum_tiles, free_size), dtype=compute_dtype, buffer=nl.sbuf
+            )
+            block_hidden_states_T.append(tile)
+        else:
+            inner_list = []
+            for _ in range(h_inner_tripcount):
+                inner_tile = nl.ndarray((TILE_SIZE, block_psum_tiles, free_size), dtype=compute_dtype, buffer=nl.sbuf)
+                inner_list.append(inner_tile)
+            block_hidden_states_T.append(inner_list)
 
     block_free_tiles = min(PSUM_SIZE // TILE_SIZE, B // TILE_SIZE)
     identity_sbuf = nl.shared_identity_matrix(TILE_SIZE, dtype=compute_dtype)
@@ -784,30 +864,64 @@ def transpose_hidden_states_allocated(block_hidden_states, H, B, compute_dtype):
     for psum_tile_idx in range(block_psum_tiles):
         for h_outer_idx in range(h_outer_tripcount):
             for h_inner_idx in range(h_inner_tripcount):
+                i_lin = h_outer_idx * h_inner_tripcount + h_inner_idx
+                if i_lin >= linearized_tripcount:
+                    continue
+                trans_f_offset = TILE_SIZE * h_inner_idx + PSUM_SIZE * h_outer_idx
                 psum_dtype = (
                     block_hidden_states[0].dtype if nisa.get_nc_version() >= nisa.nc_version.gen3 else nl.float32
                 )
                 tmp_res = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=psum_dtype, buffer=nl.psum)
                 for b_tile_idx in range(block_free_tiles):
                     offset = TILE_SIZE * b_tile_idx
-                    trans_f_offset = TILE_SIZE * h_inner_idx + PSUM_SIZE * h_outer_idx
-                    i_lin = h_outer_idx * h_inner_tripcount + h_inner_idx
-                    if i_lin < linearized_tripcount:
-                        nisa.nc_matmul(
-                            stationary=block_hidden_states[block_free_tiles * psum_tile_idx + b_tile_idx][
-                                0:TILE_SIZE, trans_f_offset : trans_f_offset + TILE_SIZE
-                            ],
-                            moving=identity_sbuf[0:TILE_SIZE, 0:TILE_SIZE],
-                            dst=tmp_res[0:TILE_SIZE, offset : offset + TILE_SIZE],
-                            is_transpose=True,
-                        )
+                    nisa.nc_matmul(
+                        stationary=block_hidden_states[block_free_tiles * psum_tile_idx + b_tile_idx][
+                            0:TILE_SIZE, trans_f_offset : trans_f_offset + TILE_SIZE
+                        ],
+                        moving=identity_sbuf[0:TILE_SIZE, 0:TILE_SIZE],
+                        dst=tmp_res[0:TILE_SIZE, offset : offset + TILE_SIZE],
+                        is_transpose=True,
+                    )
 
+                if is_quant:
+                    dst = block_hidden_states_T[h_outer_idx][0:TILE_SIZE, h_inner_idx, psum_tile_idx, 0:free_size]
+                else:
+                    dst = block_hidden_states_T[h_outer_idx][h_inner_idx][0:TILE_SIZE, psum_tile_idx, 0:free_size]
                 nisa.tensor_copy(
                     src=tmp_res[0:TILE_SIZE, 0:free_size],
-                    dst=block_hidden_states_T[h_outer_idx][h_inner_idx][0:TILE_SIZE, psum_tile_idx, 0:free_size],
+                    dst=dst,
                 )
 
     return block_hidden_states_T
+
+
+def load_block_hidden_scale(hidden_scale_hbm, token_indices, NUM_B_TILES, skip_dma):
+    """
+    Load per-token hidden scales for the current block, gathered by token_indices.
+
+    Args:
+        hidden_scale_hbm: [T+1, 1] or [T, 1], Per-token scale tensor in HBM.
+        token_indices: (TILE_SIZE, NUM_B_TILES), Token indices for the current block.
+        NUM_B_TILES: Number of B tiles.
+        skip_dma: Skip DMA configuration.
+
+    Returns:
+        block_hidden_scale: List of (TILE_SIZE, 1) tensors, one per B tile.
+    """
+    block_hidden_scale = []
+    for tile_idx in range(NUM_B_TILES):
+        scale_tile = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
+        if skip_dma.skip_token:
+            nisa.memset(dst=scale_tile, value=0.0)
+        tmp_vector_index = nl.ndarray((TILE_SIZE, 1), dtype=token_indices.dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=tmp_vector_index, src=token_indices[0:TILE_SIZE, tile_idx])
+        nisa.dma_copy(
+            src=hidden_scale_hbm.ap([[1, TILE_SIZE], [1, 1]], offset=0, vector_offset=tmp_vector_index, indirect_dim=0),
+            dst=scale_tile[0:TILE_SIZE, 0:1],
+            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+        )
+        block_hidden_scale.append(scale_tile)
+    return block_hidden_scale
 
 
 def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs: OutputTensors, cfg: Configs, shard_id):
@@ -840,45 +954,191 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
     load_hidden_states(
         inps.hidden_states, block_hidden_states, token_indices, dims.NUM_B_TILES, cfg.compute_dtype, cfg.skip_dma
     )
-    block_hidden_states_T = transpose_hidden_states_allocated(block_hidden_states, dims.H, dims.B, cfg.compute_dtype)
+
+    # Use flattened quant config fields for compiler frontend compatibility
+    quant_activation_mode = cfg.quant_activation_mode
+    quant_is_per_tensor = cfg.quant_is_per_tensor
+    down_hidden_scale_hbm = inps.down_hidden_scale
 
     # prepare gate/up dequantization scale
     if cfg.is_quant:
-        gup_scale = []
-        for _ in range(dims.GUP_N_TILES):
-            tmp = []
-            for _ in range(2):
-                tmp.append(nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf))
-            gup_scale.append(tmp)
-
-        gate_up_proj_scale_reshaped = inps.gate_up_proj_scale.reshape((dims.E, 2, dims.I_TP))
-
-        for i_i in range(dims.GUP_N_TILES):
+        if cfg.is_block_quant:
+            # Block quant scales loaded in batch below, before projection call
+            gup_scale = None  # not used for block quant
+        elif quant_is_per_tensor:
+            # Per-tensor quant: scale shape [E, 2, 1] — one scalar per expert per projection
+            gup_scale_per_tensor = []
             for gate_or_up in range(2):
-                elem_offset = TILE_SIZE * i_i + shard_id * dims.I_TP_sharded
-                num_elems = min(TILE_SIZE, dims.I_TP - elem_offset)
-
+                s = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(
-                    dst=gup_scale[i_i][gate_or_up][0:num_elems, :],
-                    src=gate_up_proj_scale_reshaped.ap(
-                        pattern=[[1, num_elems], [1, 1]],
-                        offset=gate_or_up * dims.I_TP + elem_offset,
+                    dst=s[0:1, 0:1],
+                    src=inps.gate_up_proj_scale.reshape((dims.E, 2)).ap(
+                        pattern=[[2, 1], [1, 1]],
+                        offset=gate_or_up,
                         scalar_offset=block_expert,
                         indirect_dim=0,
                     ),
                     oob_mode=oob_mode.error,
                 )
+                stream_shuffle_broadcast(s[0:1, 0:1], s)
+                gup_scale_per_tensor.append(s)
+            # Reuse same scale for all i_tiles — same code path as per-channel
+            gup_scale = []
+            for _ in range(dims.GUP_N_TILES):
+                gup_scale.append([gup_scale_per_tensor[0], gup_scale_per_tensor[1]])
+            gup_block_scale = None
+        else:
+            # Per-channel quant: scale shape [E, 1, 2*I_TP]
+            gup_scale = []
+            for _ in range(dims.GUP_N_TILES):
+                tmp = []
+                for _ in range(2):
+                    tmp.append(nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf))
+                gup_scale.append(tmp)
+
+            gate_up_proj_scale_reshaped = inps.gate_up_proj_scale.reshape((dims.E, 2, dims.I_TP))
+
+            for gup_tile_idx in range(dims.GUP_N_TILES):
+                for gate_or_up in range(2):
+                    elem_offset = TILE_SIZE * gup_tile_idx + shard_id * dims.I_TP_sharded
+                    num_elems = min(TILE_SIZE, dims.I_TP - elem_offset)
+
+                    nisa.dma_copy(
+                        dst=gup_scale[gup_tile_idx][gate_or_up][0:num_elems, :],
+                        src=gate_up_proj_scale_reshaped.ap(
+                            pattern=[[1, num_elems], [1, 1]],
+                            offset=gate_or_up * dims.I_TP + elem_offset,
+                            scalar_offset=block_expert,
+                            indirect_dim=0,
+                        ),
+                        oob_mode=oob_mode.error,
+                    )
+            gup_block_scale = None
+
+    # Load and apply hidden/activation scales for static quantization
+    gate_up_hs = None
+    down_hs = None
+    if cfg.is_quant and quant_activation_mode == ActivationQuantMode.PER_TOKEN and inps.gate_up_hidden_scale != None:
+        gate_up_hs_per_tile = load_block_hidden_scale(
+            inps.gate_up_hidden_scale, token_indices, dims.NUM_B_TILES, cfg.skip_dma
+        )
+        free_size = min(PSUM_SIZE, dims.B)
+        N_PSUM_TILE = div_ceil(dims.B, PSUM_SIZE)
+        block_free_tiles = free_size // TILE_SIZE
+        gate_up_hs = []
+        for psum_tile_idx in range(N_PSUM_TILE):
+            hs_row = nl.ndarray((1, free_size), dtype=nl.float32, buffer=nl.psum)
+            for bt in range(block_free_tiles):
+                b_tile_idx = psum_tile_idx * block_free_tiles + bt
+                num_f = min(TILE_SIZE, dims.B - b_tile_idx * TILE_SIZE)
+                nisa.nc_transpose(
+                    data=gate_up_hs_per_tile[b_tile_idx][0:num_f, 0:1],
+                    dst=hs_row[0:1, bt * TILE_SIZE : bt * TILE_SIZE + num_f],
+                )
+            hs_row_sbuf = nl.ndarray((1, free_size), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=hs_row_sbuf, src=hs_row)
+            hs_broadcast = nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.sbuf)
+            stream_shuffle_broadcast(hs_row_sbuf, hs_broadcast)
+            gate_up_hs.append(hs_broadcast)
+    elif cfg.is_quant and quant_activation_mode == ActivationQuantMode.PER_TENSOR and inps.gate_up_hidden_scale != None:
+        # Per-tensor activation: [E, 2, 1] — pre-combine with weight scale
+        # Multiply each gup_scale entry by the activation scale
+        # Note: for per-tensor, all i_tiles share the same tensor, so only multiply once
+        for gate_or_up in range(2):
+            act_s = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=act_s[0:1, 0:1],
+                src=inps.gate_up_hidden_scale.reshape((dims.E, 2)).ap(
+                    pattern=[[2, 1], [1, 1]],
+                    offset=gate_or_up,
+                    scalar_offset=block_expert,
+                    indirect_dim=0,
+                ),
+                oob_mode=oob_mode.error,
+            )
+            act_s_broadcast = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
+            stream_shuffle_broadcast(act_s[0:1, 0:1], act_s_broadcast)
+            # Only multiply once — all gup_scale[gup_tile_idx][gate_or_up] share the same tensor
+            nisa.tensor_tensor(
+                data1=gup_scale[0][gate_or_up],
+                data2=act_s_broadcast,
+                op=nl.multiply,
+                dst=gup_scale[0][gate_or_up],
+            )
+        # gate_up_hs stays None — activation scale folded into weight scale
+
+    if cfg.is_quant and quant_activation_mode == ActivationQuantMode.PER_TOKEN and down_hidden_scale_hbm != None:
+        down_hs = load_block_hidden_scale(inps.down_hidden_scale, token_indices, dims.NUM_B_TILES, cfg.skip_dma)
+    elif cfg.is_quant and quant_activation_mode == ActivationQuantMode.PER_TENSOR and down_hidden_scale_hbm != None:
+        # Per-tensor down activation: folded into down_scale inside compute_down_proj
+        # Keep down_hs as None — the down proj function handles it internally
+        pass
+
+    # 4D layout is only needed for block-quant's double_row .ap() views.
+    # Per-channel and non-quant use the mainline 3D-list-of-list layout.
+    block_hidden_states_T = transpose_hidden_states_allocated(
+        block_hidden_states, dims.H, dims.B, cfg.compute_dtype, is_quant=cfg.is_block_quant
+    )
+
+    # Cast transposed hidden states to FP8 only for block-quant, which still uses double_row.
+    # Per-channel quant falls back to mainline-style bf16-upcast + standard matmul (see below)
+    # because the double_row .ap() pattern produces a partition/free-product mismatch that the
+    # MLIR tracer rejects (and the parser frontend silently miscompiles for per-channel scales).
+    if cfg.is_quant and cfg.is_block_quant:
+        h_outer_tc = div_ceil(dims.H, PSUM_SIZE)
+        h_inner_tc = PSUM_SIZE // TILE_SIZE
+        bpt = div_ceil(dims.B, PSUM_SIZE)
+        fs = min(PSUM_SIZE, dims.B)
+        block_hidden_states_T_fp8 = []
+        for h_outer_idx in range(h_outer_tc):
+            tile_fp8 = nl.ndarray((TILE_SIZE, h_inner_tc, bpt, fs), dtype=cfg.weight_dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                dst=tile_fp8[0:TILE_SIZE, 0:h_inner_tc, 0:bpt, 0:fs],
+                src=block_hidden_states_T[h_outer_idx][0:TILE_SIZE, 0:h_inner_tc, 0:bpt, 0:fs],
+            )
+            block_hidden_states_T_fp8.append(tile_fp8)
+        block_hidden_states_T_matmul = block_hidden_states_T_fp8
+    else:
+        block_hidden_states_T_matmul = block_hidden_states_T
+
+    # Load current expert's block quant scales in one batch
+    gup_block_scale = None
+    if cfg.is_quant and cfg.is_block_quant:
+        H_blocks = dims.H // BLOCK_QUANT_SIZE
+        I_blocks_total = dims.I_TP // BLOCK_QUANT_SIZE
+        I_blocks_sharded = dims.I_TP_sharded // BLOCK_QUANT_SIZE
+        i_block_offset = shard_id * I_blocks_sharded
+        num_gup_block_scales = H_blocks * 2 * I_blocks_sharded
+        gup_block_scale_buf = nl.ndarray((TILE_SIZE, num_gup_block_scales), dtype=nl.float32, buffer=nl.sbuf)
+        gup_scale_reshaped = inps.gate_up_proj_scale.reshape((dims.E, H_blocks * 2 * I_blocks_total * TILE_SIZE))
+        for h_blk in range(H_blocks):
+            for gate_or_up_idx in range(2):
+                flat_dst = (h_blk * 2 + gate_or_up_idx) * I_blocks_sharded
+                src_offset = (h_blk * 2 + gate_or_up_idx) * I_blocks_total * TILE_SIZE + i_block_offset * TILE_SIZE
+                nisa.dma_copy(
+                    dst=gup_block_scale_buf[0:TILE_SIZE, flat_dst : flat_dst + I_blocks_sharded],
+                    src=gup_scale_reshaped.ap(
+                        pattern=[[1, TILE_SIZE], [TILE_SIZE, I_blocks_sharded]],
+                        offset=src_offset,
+                        scalar_offset=block_expert,
+                        indirect_dim=0,
+                    ),
+                    oob_mode=oob_mode.error,
+                )
+        gup_block_scale = gup_block_scale_buf
 
     gate_and_up_proj_states = compute_gate_and_up_projections_shard_on_intermediate(
         inps,
         block_expert,
-        block_hidden_states_T,
+        block_hidden_states_T_matmul,
         shard_id,
         dims,
         cfg,
-        gup_scale=gup_scale if (cfg.is_quant) else None,
+        gup_scale=gup_scale if (cfg.is_quant and not cfg.is_block_quant) else None,
         gate_up_activations_T=outs.gate_up_activations_T,
         block_idx=block_idx,
+        gate_up_hidden_scale=gate_up_hs,
+        gup_block_scale=gup_block_scale if (cfg.is_quant and cfg.is_block_quant) else None,
     )
     if cfg.scaling_mode == ExpertAffinityScaleMode.PRE_SCALE or cfg.expert_affinity_multiply_on_I:
         expert_affinity_T_broadcasted = calculate_expert_affinity_T(inps, dims, cfg, block_expert, token_indices)
@@ -914,7 +1174,13 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
         )
 
     if cfg.is_tensor_update_accumulating:
-        block_old = load_old_block(outs.output, token_indices, dims.NUM_B_TILES, cfg.compute_dtype, cfg.skip_dma)
+        # Match accumulator precision when upcasting, else original compute dtype (None=io).
+        _ad = cfg.accumulation_dtype if cfg.accumulation_dtype is not None else cfg.io_dtype
+        if _ad != cfg.io_dtype:
+            _block_old_dtype = _ad
+        else:
+            _block_old_dtype = cfg.compute_dtype
+        block_old = load_old_block(outs.output, token_indices, dims.NUM_B_TILES, _block_old_dtype, cfg.skip_dma)
     else:
         block_old = None
 
@@ -930,6 +1196,7 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
         allocate=True,
         outs=outs,
         block_idx=block_idx,
+        down_hidden_scale=down_hs,
     )
     store_block_output_shard_over_block_size(outs.output, block_new, token_indices, dims, shard_id, cfg.skip_dma)
 
@@ -946,6 +1213,8 @@ def compute_gate_and_up_projections_shard_on_intermediate(
     allocate=False,
     block_idx=None,
     activation_block_write_offset=0,
+    gate_up_hidden_scale=None,
+    gup_block_scale=None,
 ):
     """Compute gate and up projections.
 
@@ -956,11 +1225,12 @@ def compute_gate_and_up_projections_shard_on_intermediate(
         shard_id: Current shard ID.
         dims: DimensionSizes object.
         cfg: Configs object.
-        gup_scale: Optional quantization scale.
+        gup_scale: Optional weight quantization scale.
         gate_up_activations_T: Optional output tensor for activations.
         allocate: Whether to allocate new tensors.
         block_idx: Optional block index.
         activation_block_write_offset: Offset for writing activations.
+        gate_up_hidden_scale: Optional list of (TILE_SIZE, free_size) broadcasted per-token hidden scales, one per psum_tile.
 
     Returns:
         gate_and_up_proj_res_sbuf_lst: Nested list of shape [2][N_PSUM_TILE][GUP_N_TILES],
@@ -970,8 +1240,14 @@ def compute_gate_and_up_projections_shard_on_intermediate(
     N_PSUM_TILE = div_ceil(dims.B, PSUM_SIZE)
     GUP_N_TILES = div_ceil(dims.I_TP_sharded, TILE_SIZE)
     h_inner_tripcount = PSUM_SIZE // TILE_SIZE
+    block_psum_tiles = N_PSUM_TILE
 
-    free_size = block_hidden_states_T[0][0].shape[-1]
+    # block_hidden_states_T is a list of 4D tiles (block-quant only, for double_row .ap()
+    # views) or a list-of-list of 3D tiles (non-quant and per-channel quant; mainline-style).
+    if cfg.is_block_quant:
+        free_size = block_hidden_states_T[0].shape[-1]
+    else:
+        free_size = block_hidden_states_T[0][0].shape[-1]
     h_outer_tripcount = div_ceil(dims.H, PSUM_SIZE)
     linearized_h_tripcount = div_ceil(dims.H, TILE_SIZE)
 
@@ -1010,11 +1286,11 @@ def compute_gate_and_up_projections_shard_on_intermediate(
             )
 
         tmp_psum = nl.ndarray((TILE_SIZE, 2 * GUP_N_TILES), dtype=gate_up_bias.dtype, buffer=nl.psum)
-        for i_i in range(GUP_N_TILES):
-            actual_f_size = min(TILE_SIZE, dims.I_TP_sharded - i_i * TILE_SIZE)
+        for gup_tile_idx in range(GUP_N_TILES):
+            actual_f_size = min(TILE_SIZE, dims.I_TP_sharded - gup_tile_idx * TILE_SIZE)
             nisa.nc_transpose(
-                data=gate_up_bias[0:2, i_i * TILE_SIZE : i_i * TILE_SIZE + actual_f_size],
-                dst=tmp_psum[0:actual_f_size, i_i * 2 : (i_i + 1) * 2],
+                data=gate_up_bias[0:2, gup_tile_idx * TILE_SIZE : gup_tile_idx * TILE_SIZE + actual_f_size],
+                dst=tmp_psum[0:actual_f_size, gup_tile_idx * 2 : (gup_tile_idx + 1) * 2],
             )
 
         nisa.tensor_copy(
@@ -1044,132 +1320,192 @@ def compute_gate_and_up_projections_shard_on_intermediate(
             num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
 
             for h_outer_idx in range(h_outer_tripcount):
-                for h_inner_idx in range(h_inner_tripcount):
-                    if h_outer_idx * h_inner_tripcount + h_inner_idx >= linearized_h_tripcount:
-                        continue
-                    for b_psum_idx in range(N_PSUM_TILE):
-                        gup_weight_tensor = gup_weights[h_outer_idx][h_inner_idx]
-                        N_WEIGHTS = gup_weight_tensor.shape[1]
-                        I_TP_per_shard = gup_weight_tensor.shape[2]
-                        if cfg.fuse_gate_and_up_load:
-                            """
-                            Step calculation: moving 1 in dim0 and 1 in dim2 simultaneously
-                            = 1 * (N_WEIGHTS * I_TP_per_shard) + 0 * I_TP_per_shard + 1
-                            = N_WEIGHTS * I_TP_per_shard + 1
-                            Offset: 0 * (N_WEIGHTS * I_TP_per_shard) + gate_or_up * I_TP_per_shard + TILE_SIZE * i_tile_idx
-                            """
-                            if cfg.is_quant:
-                                gup_weights_upcasted = nl.ndarray(
-                                    (TILE_SIZE, 1, num_i_tile), dtype=nl.bfloat16, buffer=nl.sbuf
-                                )
-                                nisa.tensor_copy(
-                                    dst=gup_weights_upcasted,
-                                    src=gup_weights[h_outer_idx][h_inner_idx][
-                                        0:TILE_SIZE, gate_or_up, i_start : i_start + num_i_tile
+                if gup_block_scale != None:
+                    # Block quant with 256x256 blocks: double_row matmul → scale → accumulate in sbuf
+                    # Each double_row pair (256 H) = one block along H, shares one scale
+                    i_tiles_per_block = BLOCK_QUANT_SIZE // TILE_SIZE  # 2
+                    for h_inner_idx in range(0, h_inner_tripcount, 2):
+                        h_lin = h_outer_idx * h_inner_tripcount + h_inner_idx
+                        h_block = h_lin // i_tiles_per_block
+                        i_block = i_tile_idx // i_tiles_per_block
+                        for b_psum_idx in range(N_PSUM_TILE):
+                            tmp_psum = nl.ndarray((TILE_SIZE, free_size), dtype=nl.float32, buffer=nl.psum)
+                            # Double-row FP8 matmul — .ap() on contiguous weight and hidden_T buffers
+                            N_WEIGHTS = gup_weights[h_outer_idx].shape[2]
+                            I_TP_per_shard = gup_weights[h_outer_idx].shape[3]
+                            w_h_stride = N_WEIGHTS * I_TP_per_shard
+                            w_total_free = h_inner_tripcount * w_h_stride
+                            if cfg.fuse_gate_and_up_load:
+                                w_offset = h_inner_idx * w_h_stride + gate_or_up * I_TP_per_shard + i_start
+                            else:
+                                w_offset = h_inner_idx * w_h_stride + i_start
+                            dr_weight = gup_weights[h_outer_idx].ap(
+                                pattern=[[w_total_free, TILE_SIZE], [w_h_stride, 2], [1, num_i_tile]],
+                                offset=w_offset,
+                            )
+                            dr_moving = block_hidden_states_T[h_outer_idx].ap(
+                                pattern=[
+                                    [h_inner_tripcount * block_psum_tiles * free_size, TILE_SIZE],
+                                    [block_psum_tiles * free_size, 2],
+                                    [1, free_size],
+                                ],
+                                offset=h_inner_idx * block_psum_tiles * free_size + b_psum_idx * free_size,
+                            )
+                            nisa.nc_matmul(
+                                dst=tmp_psum[0:TILE_SIZE, 0:free_size],
+                                stationary=dr_weight,
+                                moving=dr_moving,
+                                perf_mode="double_row",
+                            )
+                            # Scale by block scalar and accumulate
+                            i_block = i_tile_idx // (BLOCK_QUANT_SIZE // TILE_SIZE)
+                            I_blocks_sharded = dims.I_TP_sharded // BLOCK_QUANT_SIZE
+                            flat_scale_idx = (h_block * 2 + gate_or_up) * I_blocks_sharded + i_block
+                            if h_outer_idx == 0 and h_inner_idx == 0:
+                                nisa.tensor_scalar(
+                                    data=tmp_psum[0:TILE_SIZE, 0:free_size],
+                                    op0=nl.multiply,
+                                    operand0=gup_block_scale[0:TILE_SIZE, flat_scale_idx : flat_scale_idx + 1],
+                                    dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][b_psum_idx][i_tile_idx][
+                                        0:TILE_SIZE, 0:free_size
                                     ],
                                 )
+                            else:
+                                nisa.scalar_tensor_tensor(
+                                    data=tmp_psum[0:TILE_SIZE, 0:free_size],
+                                    op0=nl.multiply,
+                                    operand0=gup_block_scale[0:TILE_SIZE, flat_scale_idx : flat_scale_idx + 1],
+                                    op1=nl.add,
+                                    operand1=gate_and_up_proj_res_sbuf_lst[gate_or_up][b_psum_idx][i_tile_idx][
+                                        0:TILE_SIZE, 0:free_size
+                                    ],
+                                    dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][b_psum_idx][i_tile_idx][
+                                        0:TILE_SIZE, 0:free_size
+                                    ],
+                                )
+                else:
+                    # Per-channel quant or non-quant: standard nc_matmul + psum auto-accumulation.
+                    # block_hidden_states_T is list[h_outer][h_inner] of 3D tiles for both paths.
+                    # For per-channel FP8 quant we upcast the FP8 weights to bf16 first (matching mainline);
+                    # the alternate FP8xFP8 + perf_mode="double_row" path produces an MLIR
+                    # partition/free-product mismatch that silently miscompiles in the parser frontend.
+                    for h_inner_idx in range(h_inner_tripcount):
+                        # Skip H tiles past the actual tensor extent (when H is not a multiple of PSUM_SIZE).
+                        if h_outer_idx * h_inner_tripcount + h_inner_idx >= linearized_h_tripcount:
+                            continue
+                        for b_psum_idx in range(N_PSUM_TILE):
+                            if cfg.is_quant:
+                                # Mainline-style: upcast FP8 weights to bf16 and do bf16xbf16 matmul.
+                                # Per mainline 21106510, the upcast dst must be 2D (matches the 2D source after
+                                # scalar gate_or_up indexing); the 3D (TILE_SIZE, 1, num_i_tile) form caused
+                                # all-zero output on some configs.
+                                if cfg.fuse_gate_and_up_load:
+                                    gup_w_upcasted = nl.ndarray(
+                                        (TILE_SIZE, num_i_tile), dtype=nl.bfloat16, buffer=nl.sbuf
+                                    )
+                                    nisa.tensor_copy(
+                                        dst=gup_w_upcasted,
+                                        src=gup_weights[h_outer_idx][
+                                            0:TILE_SIZE, h_inner_idx, gate_or_up, i_start : i_start + num_i_tile
+                                        ],
+                                    )
+                                else:
+                                    gup_w_upcasted = nl.ndarray(
+                                        (TILE_SIZE, num_i_tile), dtype=nl.bfloat16, buffer=nl.sbuf
+                                    )
+                                    nisa.tensor_copy(
+                                        dst=gup_w_upcasted,
+                                        src=gup_weights[h_outer_idx][
+                                            0:TILE_SIZE, h_inner_idx, 0, i_start : i_start + num_i_tile
+                                        ],
+                                    )
                                 nisa.nc_matmul(
                                     dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                                    stationary=gup_weights_upcasted,
+                                    stationary=gup_w_upcasted,
                                     moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
                                         0:TILE_SIZE, b_psum_idx, 0:free_size
                                     ],
                                 )
                             else:
-                                nisa.nc_matmul(
-                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                                    stationary=gup_weights[h_outer_idx][h_inner_idx][
-                                        0:TILE_SIZE,
-                                        gate_or_up,
-                                        i_start : i_start + num_i_tile,
-                                    ],
-                                    moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
-                                        0:TILE_SIZE, b_psum_idx, 0:free_size
-                                    ],
-                                )
-                        else:
-                            if cfg.is_quant:
-                                gup_weights_upcasted = nl.ndarray(
-                                    (TILE_SIZE, num_i_tile), dtype=nl.bfloat16, buffer=nl.sbuf
-                                )
-                                nisa.tensor_copy(
-                                    dst=gup_weights_upcasted,
-                                    src=gup_weights[h_outer_idx][h_inner_idx][
-                                        0:TILE_SIZE, 0, i_start : i_start + num_i_tile
-                                    ],
-                                )
-                                nisa.nc_matmul(
-                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                                    stationary=gup_weights_upcasted,
-                                    moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
-                                        0:TILE_SIZE, b_psum_idx, 0:free_size
-                                    ],
-                                )
-
-                            else:
-                                nisa.nc_matmul(
-                                    dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                                    stationary=gup_weights[h_outer_idx][h_inner_idx][
-                                        0:TILE_SIZE,
-                                        0,
-                                        i_start : i_start + num_i_tile,
-                                    ],
-                                    moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
-                                        0:TILE_SIZE, b_psum_idx, 0:free_size
-                                    ],
-                                )
+                                if cfg.fuse_gate_and_up_load:
+                                    nisa.nc_matmul(
+                                        dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
+                                        stationary=gup_weights[h_outer_idx][
+                                            0:TILE_SIZE,
+                                            h_inner_idx,
+                                            gate_or_up,
+                                            i_start : i_start + num_i_tile,
+                                        ],
+                                        moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
+                                            0:TILE_SIZE, b_psum_idx, 0:free_size
+                                        ],
+                                    )
+                                else:
+                                    nisa.nc_matmul(
+                                        dst=gate_or_up_psum_lst[b_psum_idx][i_tile_idx][0:num_i_tile, 0:free_size],
+                                        stationary=gup_weights[h_outer_idx][
+                                            0:TILE_SIZE,
+                                            h_inner_idx,
+                                            0,
+                                            i_start : i_start + num_i_tile,
+                                        ],
+                                        moving=block_hidden_states_T[h_outer_idx][h_inner_idx][
+                                            0:TILE_SIZE, b_psum_idx, 0:free_size
+                                        ],
+                                    )
 
         for psum_tile_idx in range(N_PSUM_TILE):
             for i_tile_idx in range(GUP_N_TILES):
-                num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
-                if cfg.linear_bias:
-                    if gup_scale != None:
-                        nisa.scalar_tensor_tensor(
-                            data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                            op0=nl.multiply,
-                            operand0=gup_scale[i_tile_idx][gate_or_up][0:num_i_tile, :],
-                            op1=nl.add,
-                            operand1=gate_up_bias_T.ap(
-                                pattern=[[gate_up_bias_T.shape[1], num_i_tile], [0, free_size]],
-                                offset=i_tile_idx * 2 + gate_or_up,
-                            ),
-                            dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                                0:num_i_tile, 0:free_size
-                            ],
-                        )
-                    else:
-                        nisa.tensor_tensor(
-                            data1=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                            data2=gate_up_bias_T.ap(
-                                pattern=[
-                                    [2 * GUP_N_TILES, num_i_tile],
-                                    [0, free_size],
-                                ],
-                                offset=i_tile_idx * 2 + gate_or_up,
-                            ),
-                            op=nl.add,
-                            dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                                0:num_i_tile, 0:free_size
-                            ],
-                        )
-
+                # Step 1: Apply weight scale (move from psum to sbuf)
+                # For block quant, result is already scaled and in sbuf — skip
+                if gup_block_scale != None:
+                    pass  # already in sbuf with block scale applied
+                elif gup_scale != None:
+                    nisa.tensor_scalar(
+                        data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:TILE_SIZE, 0:free_size],
+                        op0=nl.multiply,
+                        operand0=gup_scale[i_tile_idx][gate_or_up],
+                        dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, 0:free_size
+                        ],
+                    )
                 else:
-                    if gup_scale != None:
-                        nisa.tensor_scalar(
-                            data=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                            op0=nl.multiply,
-                            operand0=gup_scale[i_tile_idx][gate_or_up][0:num_i_tile, :],
-                            dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                                0:num_i_tile, 0:free_size
-                            ],
-                        )
-                    else:
-                        nisa.tensor_copy(
-                            dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
-                                0:num_i_tile, 0:free_size
-                            ],
-                            src=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
-                        )
+                    num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
+                    nisa.tensor_copy(
+                        dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
+                            0:num_i_tile, 0:free_size
+                        ],
+                        src=gate_or_up_psum_lst[psum_tile_idx][i_tile_idx][0:num_i_tile, 0:free_size],
+                    )
+
+                # Step 2: Apply per-token hidden scale (post-dequant, before bias)
+                if gate_up_hidden_scale != None:
+                    nisa.tensor_tensor(
+                        data1=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, 0:free_size
+                        ],
+                        data2=gate_up_hidden_scale[psum_tile_idx][0:TILE_SIZE, 0:free_size],
+                        op=nl.multiply,
+                        dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, 0:free_size
+                        ],
+                    )
+
+                # Step 3: Apply bias
+                if cfg.linear_bias:
+                    nisa.tensor_tensor(
+                        data1=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, 0:free_size
+                        ],
+                        data2=gate_up_bias_T.ap(
+                            pattern=[[gate_up_bias_T.shape[1], TILE_SIZE], [0, free_size]],
+                            offset=i_tile_idx * 2 + gate_or_up,
+                        ),
+                        op=nl.add,
+                        dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
+                            0:TILE_SIZE, 0:free_size
+                        ],
+                    )
 
     # Clipping section
     if (
@@ -1314,56 +1650,40 @@ def load_gate_up_proj_weights_shard_intermediate(
     if load_dst == None:
         load_dst = []
         for h_i in range(h_outer_tripcount):
-            h_j_lst = []
-            for h_j in range(h_inner_tripcount):
-                h_j_lst.append(
-                    nl.ndarray((TILE_SIZE, N_WEIGHTS, I_TP_per_shard), dtype=cfg.weight_dtype, buffer=nl.sbuf)
+            # Store all h_inner tiles contiguously for .ap() double_row views
+            load_dst.append(
+                nl.ndarray(
+                    (TILE_SIZE, h_inner_tripcount, N_WEIGHTS, I_TP_per_shard), dtype=cfg.weight_dtype, buffer=nl.sbuf
                 )
-            load_dst.append(h_j_lst)
+            )
 
     for h_i in range(h_outer_tripcount):
         for h_j in range(h_inner_tripcount):
             load_p_offset = PSUM_SIZE * h_i + TILE_SIZE * h_j
             if load_p_offset >= H:
-                nisa.memset(dst=load_dst[h_i][h_j], value=0.0)
+                nisa.memset(dst=load_dst[h_i][0:TILE_SIZE, h_j, 0:N_WEIGHTS, 0:I_TP_per_shard], value=0.0)
                 continue
             num_p_elems = min(TILE_SIZE, H - load_p_offset)
 
             if num_p_elems < TILE_SIZE:
-                nisa.memset(dst=load_dst[h_i][h_j], value=0.0)
-
-            # gate_up_proj_weight shape: (E, H, 2_or_1, I_TP)
-            # Access: [block_expert[0, 0], load_p + load_p_offset, load_fgu, load_fi + I_TP_offset]
-            # where load_p in 0:num_p_elems, load_fgu in 0:N_WEIGHTS, load_fi in 0:I_TP_per_shard
-
-            # Pattern calculation:
-            # Dim H (load_p): step = 2*_I_TP (or 1*_I_TP if not fused), num = num_p_elems
-            # Dim 2/1 (load_fgu): step = _I_TP, num = N_WEIGHTS
-            # Dim I_TP (load_fi): step = 1, num = I_TP_per_shard
-
-            # Offset: block_expert[0,0] * (H * N_WEIGHTS * _I_TP) + load_p_offset * (N_WEIGHTS * _I_TP) + 0 * _I_TP + I_TP_offset
-
-            # weight_shape_per_expert = H * (2 if cfg.fuse_gate_and_up_load else 1) * _I_TP
+                nisa.memset(dst=load_dst[h_i][0:TILE_SIZE, h_j, 0:N_WEIGHTS, 0:I_TP_per_shard], value=0.0)
 
             if cfg.fuse_gate_and_up_load:
                 offset = load_p_offset * (N_WEIGHTS * _I_TP) + I_TP_offset
                 nisa.dma_copy(
-                    dst=load_dst[h_i][h_j][0:num_p_elems, 0:N_WEIGHTS, 0:I_TP_per_shard],
+                    dst=load_dst[h_i][0:num_p_elems, h_j, 0:N_WEIGHTS, 0:I_TP_per_shard],
                     src=gate_up_proj_weight.ap(
                         pattern=[[N_WEIGHTS * _I_TP, num_p_elems], [_I_TP, N_WEIGHTS], [1, I_TP_per_shard]],
                         offset=offset,
-                        # block_expert shape is 1,1
                         scalar_offset=block_expert,
                         indirect_dim=0,
                     ),
                     oob_mode=oob_mode.skip if cfg.skip_dma.skip_weight else oob_mode.error,
                 )
             else:
-                # gate_or_up is the fixed index for dim 2
                 offset = load_p_offset * (2 * _I_TP) + gate_or_up * _I_TP + I_TP_offset
-                # We access only 1 slice in the N_WEIGHTS dimension (which is 1 here anyway)
                 nisa.dma_copy(
-                    dst=load_dst[h_i][h_j][0:num_p_elems, 0:N_WEIGHTS, 0:I_TP_per_shard],
+                    dst=load_dst[h_i][0:num_p_elems, h_j, 0:N_WEIGHTS, 0:I_TP_per_shard],
                     src=gate_up_proj_weight.ap(
                         pattern=[[2 * _I_TP, num_p_elems], [_I_TP, N_WEIGHTS], [1, I_TP_per_shard]],
                         offset=offset,
@@ -1564,6 +1884,7 @@ def compute_down_proj_shard_on_intermediate(
     outs: OutputTensors = None,
     block_idx=0,
     block_tile_index=0,
+    down_hidden_scale=None,
 ):
     """Compute the new block output with down projection and expert affinity adjustment.
 
@@ -1581,13 +1902,25 @@ def compute_down_proj_shard_on_intermediate(
         outs: OutputTensors object.
         block_idx: Block index.
         block_tile_index: Block tile index.
+        down_hidden_scale: Optional list of (TILE_SIZE, 1) per-token scales for down projection post-dequant.
 
     Returns:
         block_new_lnc_recv_sbuf_lst: List of tensors, each of shape (TILE_SIZE, dims.H).
     """
 
+    # Partials/bias precision follow the accumulator (None = io_dtype = default, no upcast).
+    _acc_dtype = cfg.accumulation_dtype if cfg.accumulation_dtype is not None else cfg.io_dtype
+    if _acc_dtype != cfg.io_dtype:
+        _acc_upcast = True
+        _bn_dtype = _acc_dtype
+        _bias_dtype = _acc_dtype
+    else:
+        _acc_upcast = False
+        _bn_dtype = cfg.io_dtype
+        _bias_dtype = cfg.compute_dtype
+
     if cfg.linear_bias:
-        down_bias = nl.ndarray((1, dims.H), dtype=cfg.compute_dtype, buffer=nl.sbuf)
+        down_bias = nl.ndarray((1, dims.H), dtype=_bias_dtype, buffer=nl.sbuf)
 
         nisa.dma_copy(
             dst=down_bias[0:1, 0 : dims.H],
@@ -1602,16 +1935,16 @@ def compute_down_proj_shard_on_intermediate(
             ),
             oob_mode=oob_mode.error,
         )
-        down_bias_broadcasted = nl.ndarray((TILE_SIZE, dims.H), dtype=cfg.compute_dtype, buffer=nl.sbuf)
+        down_bias_broadcasted = nl.ndarray((TILE_SIZE, dims.H), dtype=_bias_dtype, buffer=nl.sbuf)
         stream_shuffle_broadcast(down_bias, down_bias_broadcasted)
 
     block_new_lst = []
     for b_tile_idx in range(dims.NUM_B_TILES):
-        block_new_lst.append(nl.ndarray((TILE_SIZE, dims.H), dtype=cfg.io_dtype, buffer=nl.sbuf))
+        block_new_lst.append(nl.ndarray((TILE_SIZE, dims.H), dtype=_bn_dtype, buffer=nl.sbuf))
 
     block_new_lnc_recv_sbuf_lst = []
     for b_tile_idx in range(dims.NUM_B_TILES_SHARDED):
-        block_new_lnc_recv_sbuf_lst.append(nl.ndarray((TILE_SIZE, dims.H), dtype=cfg.io_dtype, buffer=nl.sbuf))
+        block_new_lnc_recv_sbuf_lst.append(nl.ndarray((TILE_SIZE, dims.H), dtype=_bn_dtype, buffer=nl.sbuf))
 
     GUP_N_TILES = div_ceil(dims.I_TP_sharded, TILE_SIZE)
     H_tile_size = min(1024, dims.H)
@@ -1621,33 +1954,114 @@ def compute_down_proj_shard_on_intermediate(
     for i_tile_idx in range(GUP_N_TILES):
         dp_load_dst_lst.append(nl.ndarray((TILE_SIZE, H_tile_size), dtype=inps.down_proj_weight.dtype, buffer=nl.sbuf))
 
+    # Use flattened quant config fields for compiler frontend compatibility
+    quant_is_per_tensor = cfg.quant_is_per_tensor
+    quant_activation_mode = cfg.quant_activation_mode
+
     for H_tile1024_idx in nl.sequential_range(h_i_upper):
         actual_H_tile_size = min(H_tile_size, dims.H - H_tile_size * H_tile1024_idx)
         num_h_tiles = div_ceil(actual_H_tile_size, PSUM_SIZE)
         if cfg.is_quant:
-            down_scale = nl.ndarray((TILE_SIZE, num_h_tiles, PSUM_SIZE), dtype=nl.float32, buffer=nl.sbuf)
-            for h_tile_idx in range(num_h_tiles):
-                num_psum_elems = min(PSUM_SIZE, dims.H - (PSUM_SIZE * h_tile_idx + H_tile_size * H_tile1024_idx))
-
-                elem_offset = PSUM_SIZE * h_tile_idx + H_tile_size * H_tile1024_idx
-
+            if cfg.is_block_quant:
+                # Block quant: scale shape [E, I_TP//256, H//256, TILE_SIZE] — pre-broadcasted
+                I_blocks = dims.I_TP_sharded // BLOCK_QUANT_SIZE
+                I_blocks_total = dims.I_TP // BLOCK_QUANT_SIZE
+                h_block_offset = H_tile1024_idx * H_tile_size // BLOCK_QUANT_SIZE
+                num_h_256_blocks = div_ceil(actual_H_tile_size, BLOCK_QUANT_SIZE)
+                num_dp_scales = I_blocks * num_h_256_blocks
+                dp_block_scale = nl.ndarray((TILE_SIZE, num_dp_scales), dtype=nl.float32, buffer=nl.sbuf)
+                dp_scale_reshaped = inps.down_proj_scale.reshape(
+                    (dims.E, I_blocks_total * (dims.H // BLOCK_QUANT_SIZE) * TILE_SIZE)
+                )
+                i_block_offset = shard_id * I_blocks
+                for i_blk in range(I_blocks):
+                    for h_blk in range(num_h_256_blocks):
+                        flat_idx = i_blk * num_h_256_blocks + h_blk
+                        src_offset = (
+                            (i_block_offset + i_blk) * (dims.H // BLOCK_QUANT_SIZE) + h_block_offset + h_blk
+                        ) * TILE_SIZE
+                        nisa.dma_copy(
+                            dst=dp_block_scale[0:TILE_SIZE, flat_idx : flat_idx + 1],
+                            src=dp_scale_reshaped.ap(
+                                pattern=[[1, TILE_SIZE], [TILE_SIZE, 1]],
+                                offset=src_offset,
+                                scalar_offset=block_expert,
+                                indirect_dim=0,
+                            ),
+                            oob_mode=oob_mode.error,
+                        )
+                down_scale = None
+                down_scale_pt = None
+            elif quant_is_per_tensor:
+                # Per-tensor: pre-combine weight + activation scales into (TILE_SIZE, 1)
+                # Applied during psum→sbuf copy via nisa.activation, no 3D tensor needed
+                pt_w = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(
-                    dst=down_scale[0:1, h_tile_idx, 0:num_psum_elems],
+                    dst=pt_w[0:1, 0:1],
                     src=inps.down_proj_scale.ap(
-                        pattern=[[dims.H, 1], [dims.H, 1], [1, num_psum_elems]],
-                        offset=elem_offset,
+                        pattern=[[1, 1], [1, 1]],
+                        offset=0,
                         scalar_offset=block_expert,
                         indirect_dim=0,
                     ),
+                    oob_mode=oob_mode.error,
                 )
-                for channel_bank_idx in range(4):
-                    nisa.nc_stream_shuffle(
-                        src=down_scale[0:1, h_tile_idx, :],
-                        dst=down_scale[
-                            nl.ds(DVE_CHANNELS_PER_BANK * channel_bank_idx, DVE_CHANNELS_PER_BANK), h_tile_idx, :
-                        ],
-                        shuffle_mask=[0] * DVE_CHANNELS_PER_BANK,
+                down_scale_pt = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
+                stream_shuffle_broadcast(pt_w, down_scale_pt)
+                if down_hidden_scale != None:
+                    # Per-token activation: fold per-token scale into weight scale
+                    # down_hidden_scale is per-token so we can't fold here — handle per B_tile below
+                    pass
+                elif quant_activation_mode == ActivationQuantMode.PER_TENSOR and inps.down_hidden_scale != None:
+                    # Per-tensor activation: load and fold into combined scale
+                    pt_act = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.dma_copy(
+                        dst=pt_act[0:1, 0:1],
+                        src=inps.down_hidden_scale.ap(
+                            pattern=[[1, 1], [1, 1]],
+                            offset=0,
+                            scalar_offset=block_expert,
+                            indirect_dim=0,
+                        ),
+                        oob_mode=oob_mode.error,
                     )
+                    pt_act_p = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
+                    stream_shuffle_broadcast(pt_act, pt_act_p)
+                    nisa.tensor_tensor(
+                        data1=down_scale_pt,
+                        data2=pt_act_p,
+                        op=nl.multiply,
+                        dst=down_scale_pt,
+                    )
+                down_scale = None
+                dp_block_scale = None
+            else:
+                # Per-channel: [E, 1, H]
+                down_scale = nl.ndarray((TILE_SIZE, num_h_tiles, PSUM_SIZE), dtype=nl.float32, buffer=nl.sbuf)
+                down_scale_pt = None
+                for h_tile_idx in range(num_h_tiles):
+                    num_psum_elems = min(PSUM_SIZE, dims.H - (PSUM_SIZE * h_tile_idx + H_tile_size * H_tile1024_idx))
+
+                    elem_offset = PSUM_SIZE * h_tile_idx + H_tile_size * H_tile1024_idx
+
+                    nisa.dma_copy(
+                        dst=down_scale[0:1, h_tile_idx, 0:num_psum_elems],
+                        src=inps.down_proj_scale.ap(
+                            pattern=[[dims.H, 1], [dims.H, 1], [1, num_psum_elems]],
+                            offset=elem_offset,
+                            scalar_offset=block_expert,
+                            indirect_dim=0,
+                        ),
+                    )
+                    for channel_bank_idx in range(4):
+                        nisa.nc_stream_shuffle(
+                            src=down_scale[0:1, h_tile_idx, :],
+                            dst=down_scale[
+                                nl.ds(DVE_CHANNELS_PER_BANK * channel_bank_idx, DVE_CHANNELS_PER_BANK), h_tile_idx, :
+                            ],
+                            shuffle_mask=[0] * DVE_CHANNELS_PER_BANK,
+                        )
+                dp_block_scale = None
 
         dp_weights = load_down_proj_weight_shard_intermediate_H_tile(
             inps.down_proj_weight,
@@ -1670,81 +2084,210 @@ def compute_down_proj_shard_on_intermediate(
         for B_tile_idx in range(dims.NUM_B_TILES):
             for h_j in range(num_h_tiles):
                 num_h_elems = min(PSUM_SIZE, dims.H - (H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j))
-                for i_i in range(GUP_N_TILES):
-                    num_i_elems = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_i)
-
-                    # dp_weights[i_i] has shape (TILE_SIZE, H_tile_size)
-                    # We're accessing [i, PSUM_SIZE*h_j + j] for i in 0:num_i_elems, j in 0:num_h_elems
-                    # Pattern: [[H_tile_size, num_i_elems], [1, num_h_elems]]
-                    # Offset: PSUM_SIZE * h_j
-                    if cfg.is_quant:
-                        dp_weights_upcasted = nl.ndarray((num_i_elems, num_h_elems), dtype=nl.bfloat16, buffer=nl.sbuf)
-                        nisa.tensor_copy(
-                            dst=dp_weights_upcasted,
-                            src=dp_weights[i_i].ap(
-                                pattern=[[H_tile_size, num_i_elems], [1, num_h_elems]], offset=PSUM_SIZE * h_j
-                            ),
-                        )
-                        nisa.nc_matmul(
-                            dst=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
-                            stationary=intermediate_states[i_i][
-                                0:num_i_elems, TILE_SIZE * B_tile_idx : TILE_SIZE * B_tile_idx + TILE_SIZE
+                if cfg.is_quant and cfg.is_block_quant:
+                    # Block quant 256x256: accumulate 2 i_tiles per block in psum, scale, sbuf accumulate
+                    i_tiles_per_block = BLOCK_QUANT_SIZE // TILE_SIZE  # 2
+                    num_h_256 = div_ceil(num_h_elems, BLOCK_QUANT_SIZE)
+                    for i_block in range(GUP_N_TILES // i_tiles_per_block):
+                        # Accumulate 2 i_tiles into psum
+                        tmp_dp_psum = nl.ndarray((TILE_SIZE, PSUM_SIZE), dtype=nl.float32, buffer=nl.psum)
+                        for i_sub in range(i_tiles_per_block):
+                            i_i = i_block * i_tiles_per_block + i_sub
+                            num_i_elems = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_i)
+                            nisa.nc_matmul(
+                                dst=tmp_dp_psum[0:TILE_SIZE, 0:num_h_elems],
+                                stationary=intermediate_states[i_i][
+                                    0:num_i_elems, TILE_SIZE * B_tile_idx : TILE_SIZE * B_tile_idx + TILE_SIZE
+                                ],
+                                moving=dp_weights[i_i].ap(
+                                    pattern=[[H_tile_size, num_i_elems], [1, num_h_elems]], offset=PSUM_SIZE * h_j
+                                ),
+                            )
+                        # Scale each 256-wide H chunk and accumulate into sbuf
+                        for h_256_idx in range(num_h_256):
+                            h_256_local = h_256_idx * BLOCK_QUANT_SIZE
+                            h_256_count = min(BLOCK_QUANT_SIZE, num_h_elems - h_256_local)
+                            h_256_within_H1024 = h_j * (PSUM_SIZE // BLOCK_QUANT_SIZE) + h_256_idx
+                            flat_dp_idx = i_block * num_h_256_blocks + h_256_within_H1024
+                            dst_h_start = H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j + h_256_local
+                            if i_block == 0:
+                                nisa.tensor_scalar(
+                                    data=tmp_dp_psum[0:TILE_SIZE, h_256_local : h_256_local + h_256_count],
+                                    op0=nl.multiply,
+                                    operand0=dp_block_scale[0:TILE_SIZE, flat_dp_idx : flat_dp_idx + 1],
+                                    dst=block_new_lst[B_tile_idx][0:TILE_SIZE, dst_h_start : dst_h_start + h_256_count],
+                                )
+                            else:
+                                nisa.scalar_tensor_tensor(
+                                    data=tmp_dp_psum[0:TILE_SIZE, h_256_local : h_256_local + h_256_count],
+                                    op0=nl.multiply,
+                                    operand0=dp_block_scale[0:TILE_SIZE, flat_dp_idx : flat_dp_idx + 1],
+                                    op1=nl.add,
+                                    operand1=block_new_lst[B_tile_idx][
+                                        0:TILE_SIZE, dst_h_start : dst_h_start + h_256_count
+                                    ],
+                                    dst=block_new_lst[B_tile_idx][0:TILE_SIZE, dst_h_start : dst_h_start + h_256_count],
+                                )
+                    # Apply hidden scale if present (on partition dim, broadcast across H)
+                    if down_hidden_scale != None:
+                        dst_h_start_full = H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j
+                        nisa.tensor_scalar(
+                            data=block_new_lst[B_tile_idx][
+                                0:TILE_SIZE, dst_h_start_full : dst_h_start_full + num_h_elems
                             ],
-                            moving=dp_weights_upcasted,
-                        )
-                    else:
-                        nisa.nc_matmul(
-                            dst=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
-                            stationary=intermediate_states[i_i][
-                                0:num_i_elems, TILE_SIZE * B_tile_idx : TILE_SIZE * B_tile_idx + TILE_SIZE
+                            op0=nl.multiply,
+                            operand0=down_hidden_scale[B_tile_idx][0:TILE_SIZE, 0:1],
+                            dst=block_new_lst[B_tile_idx][
+                                0:TILE_SIZE, dst_h_start_full : dst_h_start_full + num_h_elems
                             ],
-                            moving=dp_weights[i_i].ap(
-                                pattern=[[H_tile_size, num_i_elems], [1, num_h_elems]], offset=PSUM_SIZE * h_j
-                            ),
                         )
-
-                if cfg.is_quant:
-                    nisa.tensor_tensor(
-                        dst=block_new_lst[B_tile_idx][
-                            0:TILE_SIZE,
-                            H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j : H_tile_size * H_tile1024_idx
-                            + PSUM_SIZE * h_j
-                            + num_h_elems,
-                        ],
-                        data1=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
-                        data2=down_scale[0:TILE_SIZE, h_j, 0:num_h_elems],
-                        op=nl.multiply,
-                    )
                 else:
-                    nisa.tensor_copy(
-                        src=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
-                        engine=nisa.scalar_engine,
-                        dst=block_new_lst[B_tile_idx][
-                            0:TILE_SIZE,
-                            H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j : H_tile_size * H_tile1024_idx
-                            + PSUM_SIZE * h_j
-                            + num_h_elems,
-                        ],
-                    )
+                    # Per-channel quant or non-quant: auto-accumulate in psum across I tiles
+                    for i_i in range(GUP_N_TILES):
+                        num_i_elems = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_i)
+                        if cfg.is_quant:
+                            dp_weights_upcasted = nl.ndarray(
+                                (num_i_elems, num_h_elems), dtype=nl.bfloat16, buffer=nl.sbuf
+                            )
+                            nisa.tensor_copy(
+                                dst=dp_weights_upcasted,
+                                src=dp_weights[i_i].ap(
+                                    pattern=[[H_tile_size, num_i_elems], [1, num_h_elems]], offset=PSUM_SIZE * h_j
+                                ),
+                            )
+                            nisa.nc_matmul(
+                                dst=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
+                                stationary=intermediate_states[i_i][
+                                    0:num_i_elems, TILE_SIZE * B_tile_idx : TILE_SIZE * B_tile_idx + TILE_SIZE
+                                ],
+                                moving=dp_weights_upcasted,
+                            )
+                        else:
+                            nisa.nc_matmul(
+                                dst=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
+                                stationary=intermediate_states[i_i][
+                                    0:num_i_elems, TILE_SIZE * B_tile_idx : TILE_SIZE * B_tile_idx + TILE_SIZE
+                                ],
+                                moving=dp_weights[i_i].ap(
+                                    pattern=[[H_tile_size, num_i_elems], [1, num_h_elems]], offset=PSUM_SIZE * h_j
+                                ),
+                            )
+
+                    if cfg.is_quant:
+                        if quant_is_per_tensor:
+                            # Per-tensor: apply combined scale during psum→sbuf copy
+                            if down_hidden_scale != None:
+                                # Per-token activation with per-tensor weight: combine both (TILE_SIZE,1) scales
+                                combined_pt = nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf)
+                                nisa.tensor_tensor(
+                                    data1=down_scale_pt,
+                                    data2=down_hidden_scale[B_tile_idx][0:TILE_SIZE, 0:1],
+                                    op=nl.multiply,
+                                    dst=combined_pt,
+                                )
+                                nisa.tensor_scalar(
+                                    data=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
+                                    op0=nl.multiply,
+                                    operand0=combined_pt,
+                                    dst=block_new_lst[B_tile_idx][
+                                        0:TILE_SIZE,
+                                        H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j : H_tile_size * H_tile1024_idx
+                                        + PSUM_SIZE * h_j
+                                        + num_h_elems,
+                                    ],
+                                )
+                            else:
+                                nisa.tensor_scalar(
+                                    data=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
+                                    op0=nl.multiply,
+                                    operand0=down_scale_pt,
+                                    dst=block_new_lst[B_tile_idx][
+                                        0:TILE_SIZE,
+                                        H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j : H_tile_size * H_tile1024_idx
+                                        + PSUM_SIZE * h_j
+                                        + num_h_elems,
+                                    ],
+                                )
+                        elif down_hidden_scale != None:
+                            nisa.scalar_tensor_tensor(
+                                data=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
+                                op0=nl.multiply,
+                                operand0=down_hidden_scale[B_tile_idx][0:TILE_SIZE, 0:1],
+                                op1=nl.multiply,
+                                operand1=down_scale[0:TILE_SIZE, h_j, 0:num_h_elems],
+                                dst=block_new_lst[B_tile_idx][
+                                    0:TILE_SIZE,
+                                    H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j : H_tile_size * H_tile1024_idx
+                                    + PSUM_SIZE * h_j
+                                    + num_h_elems,
+                                ],
+                            )
+                        else:
+                            nisa.tensor_tensor(
+                                dst=block_new_lst[B_tile_idx][
+                                    0:TILE_SIZE,
+                                    H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j : H_tile_size * H_tile1024_idx
+                                    + PSUM_SIZE * h_j
+                                    + num_h_elems,
+                                ],
+                                data1=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
+                                data2=down_scale[0:TILE_SIZE, h_j, 0:num_h_elems],
+                                op=nl.multiply,
+                            )
+                    else:
+                        nisa.tensor_copy(
+                            src=down_proj_lst[h_j][B_tile_idx][0:TILE_SIZE, 0:num_h_elems],
+                            engine=nisa.scalar_engine,
+                            dst=block_new_lst[B_tile_idx][
+                                0:TILE_SIZE,
+                                H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j : H_tile_size * H_tile1024_idx
+                                + PSUM_SIZE * h_j
+                                + num_h_elems,
+                            ],
+                        )
 
     N_B_TILES_OFFSET = dims.NUM_B_TILES_SHARDED * shard_id
 
     for b_shard_tile_idx in range(dims.NUM_B_TILES_SHARDED):
-        sendrecv(
-            src=block_new_lst[b_shard_tile_idx + dims.NUM_B_TILES_SHARDED * (1 - shard_id)][0:TILE_SIZE, 0 : dims.H],
-            dst=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
-            send_to_rank=(1 - shard_id),
-            recv_from_rank=(1 - shard_id),
-            pipe_id=0,
-        )
+        if _acc_upcast:
+            # Send the peer partial directly in the accumulator dtype and reduce in
+            # accumulator precision (avoids a separate io-dtype downcast before the exchange).
+            block_new_acc_recv = nl.ndarray((TILE_SIZE, dims.H), dtype=_acc_dtype, buffer=nl.sbuf)
+            sendrecv(
+                src=block_new_lst[b_shard_tile_idx + dims.NUM_B_TILES_SHARDED * (1 - shard_id)][
+                    0:TILE_SIZE, 0 : dims.H
+                ],
+                dst=block_new_acc_recv[0:TILE_SIZE, 0 : dims.H],
+                send_to_rank=(1 - shard_id),
+                recv_from_rank=(1 - shard_id),
+                pipe_id=0,
+            )
 
-        nisa.tensor_tensor(
-            data1=block_new_lst[b_shard_tile_idx + N_B_TILES_OFFSET][0:TILE_SIZE, 0 : dims.H],
-            data2=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
-            op=nl.add,
-            dst=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
-        )
+            # reduce in accumulator precision
+            nisa.tensor_tensor(
+                data1=block_new_lst[b_shard_tile_idx + N_B_TILES_OFFSET][0:TILE_SIZE, 0 : dims.H],
+                data2=block_new_acc_recv[0:TILE_SIZE, 0 : dims.H],
+                op=nl.add,
+                dst=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
+            )
+        else:
+            # Default path: exchange and reduce in io dtype.
+            sendrecv(
+                src=block_new_lst[b_shard_tile_idx + dims.NUM_B_TILES_SHARDED * (1 - shard_id)][
+                    0:TILE_SIZE, 0 : dims.H
+                ],
+                dst=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
+                send_to_rank=(1 - shard_id),
+                recv_from_rank=(1 - shard_id),
+                pipe_id=0,
+            )
 
+            nisa.tensor_tensor(
+                data1=block_new_lst[b_shard_tile_idx + N_B_TILES_OFFSET][0:TILE_SIZE, 0 : dims.H],
+                data2=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
+                op=nl.add,
+                dst=block_new_lnc_recv_sbuf_lst[b_shard_tile_idx][0:TILE_SIZE, 0 : dims.H],
+            )
         if outs and outs.down_activations and not cfg.expert_affinity_multiply_on_I:
             """
             outs.down_activations shape: (N_blocks, total_tokens, H)
@@ -1985,7 +2528,7 @@ def compute_one_block_dropping(
             token_indices_offset=token_indices_offset,
         )
         block_hidden_states_T = transpose_hidden_states_allocated(
-            block_hidden_states, dims.H, MAX_BLOCK_TILE_SIZE, cfg.compute_dtype
+            block_hidden_states, dims.H, MAX_BLOCK_TILE_SIZE, cfg.compute_dtype, is_quant=cfg.is_block_quant
         )
 
         activation_block_write_offset = block_tile_index * MAX_BLOCK_TILE_SIZE
@@ -2099,6 +2642,7 @@ def blockwise_mm_shard_intermediate_dropping(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
+    accumulation_dtype=None,
 ):
     """
     Blockwise matrix multiplication kernel for MoE dropping layer with block tiling.
@@ -2185,6 +2729,7 @@ def blockwise_mm_shard_intermediate_dropping(
         up_clamp_lower_limit=up_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
+        accumulation_dtype=accumulation_dtype if accumulation_dtype is not None else hidden_states.dtype,
     )
 
     check_blockwise_mm_shard_I_kernel_compatibility(dims, configs)

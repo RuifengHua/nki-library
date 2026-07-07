@@ -34,6 +34,8 @@ from nkilib_src.nkilib.core.utils.allocator import SbufManager
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
     ComputationMode,
+    DtypeMode,
+    MLPGateUpWeightLayout,
     NormType,
     QuantizationType,
 )
@@ -47,6 +49,7 @@ from test.integration.nkilib.utils.tensor_generators import (
     generate_stabilized_mx_data,
     update_func_str,
 )
+from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
@@ -54,16 +57,19 @@ def dedup_test_vectors(vectors, ignore_indices):
     """Deduplicate test vectors, ignoring fields at the given indices.
 
     Certain fields (e.g., tpbSgCyclesSum, vnc_degree) are excluded from the
-    dedup key. Keeps the first occurrence of each unique vector.
+    dedup key. Keeps the first occurrence of each unique vector. Vectors may
+    be raw lists/tuples or pytest.param() objects; pytest.param marks are
+    preserved on the kept entry.
 
     Args:
-        vectors: List of test parameter tuples/lists.
+        vectors: List of test parameter tuples/lists or pytest.param objects.
         ignore_indices: Set/tuple of field indices to exclude from the dedup key.
     """
     seen = set()
     result = []
     for v in vectors:
-        key = tuple(val for i, val in enumerate(v) if i not in ignore_indices)
+        values = v.values if hasattr(v, "values") and hasattr(v, "marks") else v
+        key = tuple(val for i, val in enumerate(values) if i not in ignore_indices)
         if key not in seen:
             seen.add(key)
             result.append(v)
@@ -143,8 +149,18 @@ def _run_mlp_test(
     transposed_out = kernel_input.get("transposed_out", False)
     transposed_in = kernel_input.get("transposed_in", False)
 
+    # Pre-resolve DtypeMode.AUTO for the torch ref using the platform target.
+    # The kernel still receives the original dtype_mode and resolves at trace
+    # time; the torch ref runs on CPU and can't query hardware directly.
+    platform_target = compiler_args.platform_target
+    kernel_dtype_mode = kernel_input.get("dtype_mode", DtypeMode.NON_OCP)
+    torch_ref_dtype_mode = resolve_dtype_mode_for_torch_ref(kernel_dtype_mode, platform_target)
+
     @functools.wraps(mlp)
     def mlp_torch_wrapper(**kwargs):
+        # Override with the pre-resolved mode so the ref clips to the same FP8
+        # range the kernel allocates.
+        kwargs["dtype_mode"] = torch_ref_dtype_mode
         result = mlp_torch_ref[lnc](**kwargs)
         if transposed_out:
             # Convert torch ref [B, S, H] output to transposed [H0, n_prgs*H1_shard*BxS]
@@ -213,17 +229,23 @@ def build_fused_norm_mlp(
     use_tkg_gate_up_proj_column_tiling=True,
     use_tkg_down_proj_column_tiling=True,
     use_tkg_down_proj_optimized_layout=False,
+    use_contiguous_x4_gate_up=False,
     gate_clamp_lower_limit=None,
     gate_clamp_upper_limit=None,
     up_clamp_lower_limit=None,
     up_clamp_upper_limit=None,
     transposed_in=False,
     transposed_out=False,
+    gate_up_w_layout=None,
     tensor_generator: Callable = gaussian_tensor_generator(),
     mode: ComputationMode = ComputationMode.AUTO,
 ):
     np.random.seed(42)
     rng = np.random.default_rng(42)
+
+    is_tkg_mode = mode == ComputationMode.DECODE or (
+        mode == ComputationMode.AUTO and (batch * seqlen) <= TKG_BS_SEQLEN_THRESHOLD
+    )
 
     if isinstance(norm_type, bool):
         norm_type = NormType.RMS_NORM if norm_type else NormType.NO_NORM
@@ -272,6 +294,15 @@ def build_fused_norm_mlp(
 
     weight_dtype = quant_dtype if quant_dtype is not None else dtype
 
+    if gate_up_w_layout is None:
+        if quantization_type in [QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX]:
+            if use_contiguous_x4_gate_up:
+                gate_up_w_layout = MLPGateUpWeightLayout.H_X4_INNERMOST
+            else:
+                gate_up_w_layout = MLPGateUpWeightLayout.H_X4_MIDDLE
+        else:
+            gate_up_w_layout = MLPGateUpWeightLayout.CONTIGUOUS
+
     # Use pre-generated MX weights or generate regular weights
     if quantization_type == QuantizationType.MX:
         gate_w = mx_weights.gate_w_qtz
@@ -281,7 +312,6 @@ def build_fused_norm_mlp(
         # STATIC_MX weight format depends on kernel mode:
         # - TKG (BxS <= 96 or DECODE mode): x4-packed 3D weights [128, H//512, I] for nc_matmul_mx
         # - CTE (BxS > 96): 2D scalar fp8 weights [H, I] (CTE does its own internal packing)
-        is_tkg_mode = mode == ComputationMode.DECODE or (batch * seqlen) <= TKG_BS_SEQLEN_THRESHOLD
         if is_tkg_mode:
             # TKG: generate scalar fp8 weights with per-tensor scale, then pack to x4 layout.
             gate_w_scalar, gate_w_scale_extracted = generate_and_quantize_to_fp8(
@@ -311,14 +341,18 @@ def build_fused_norm_mlp(
                 scale_shape=(_pmax, 1),
                 quantize_dim=0,
             )
-            gate_w = _fp8_to_gate_up_x4(gate_w_scalar, hidden, intermediate)
-            up_w = _fp8_to_gate_up_x4(up_w_scalar, hidden, intermediate)
+            gate_w = _fp8_to_gate_up_x4(gate_w_scalar, hidden, intermediate, contiguous_x4=use_contiguous_x4_gate_up)
+            up_w = _fp8_to_gate_up_x4(up_w_scalar, hidden, intermediate, contiguous_x4=use_contiguous_x4_gate_up)
             down_w = _fp8_to_down_x4(down_w_scalar, intermediate, hidden)
         else:
             # CTE: 2D scalar fp8 weights (CTE kernel handles internal layout)
-            gate_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="gate_w")
-            up_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="up_w")
-            down_w = tensor_generator(shape=(intermediate, hidden), dtype=weight_dtype, name="down_w")
+            gate_w = tensor_generator(
+                shape=(128, hidden // 512, intermediate // 512, 4, 128, 4), dtype=weight_dtype, name="gate_w"
+            )
+            up_w = tensor_generator(
+                shape=(128, hidden // 512, intermediate // 512, 4, 128, 4), dtype=weight_dtype, name="up_w"
+            )
+            down_w = tensor_generator(shape=(128, intermediate // 512, hidden, 4), dtype=weight_dtype, name="down_w")
     elif quantization_type == QuantizationType.ROW_MX:
         # ROW_MX: weights use per-row scaling.
         # gate_up_weight [H, I] → scale [1, I] broadcast to [128, I]
@@ -350,8 +384,8 @@ def build_fused_norm_mlp(
             scale_shape=(_pmax, hidden),
             quantize_dim=0,
         )
-        gate_w = _fp8_to_gate_up_x4(gate_w_scalar, hidden, intermediate)
-        up_w = _fp8_to_gate_up_x4(up_w_scalar, hidden, intermediate)
+        gate_w = _fp8_to_gate_up_x4(gate_w_scalar, hidden, intermediate, contiguous_x4=use_contiguous_x4_gate_up)
+        up_w = _fp8_to_gate_up_x4(up_w_scalar, hidden, intermediate, contiguous_x4=use_contiguous_x4_gate_up)
         down_w = _fp8_to_down_x4(down_w_scalar, intermediate, hidden)
     else:
         gate_w = tensor_generator(shape=(hidden, intermediate), dtype=weight_dtype, name="gate_w")
@@ -460,10 +494,13 @@ def build_fused_norm_mlp(
         "use_tkg_gate_up_proj_column_tiling": use_tkg_gate_up_proj_column_tiling,
         "use_tkg_down_proj_column_tiling": use_tkg_down_proj_column_tiling,
         "use_tkg_down_proj_optimized_layout": use_tkg_down_proj_optimized_layout,
+        "use_contiguous_x4_gate_up": use_contiguous_x4_gate_up,
         "gate_clamp_upper_limit": gate_clamp_upper_limit,
         "gate_clamp_lower_limit": gate_clamp_lower_limit,
         "up_clamp_upper_limit": up_clamp_upper_limit,
         "up_clamp_lower_limit": up_clamp_lower_limit,
+        "mode": mode,
+        "gate_up_w_layout": gate_up_w_layout,
     }
     if transposed_in:
         kernel_input["transposed_in"] = transposed_in
@@ -708,7 +745,7 @@ def random_lhs_and_random_bound_weight_tensor_generator(weight_lower, weight_upp
             return full_tensor
         elif name == "fused_add_tensor":
             return rng.uniform(weight_lower, weight_upper, shape).astype(dtype)
-        elif name in ("fused_add_tensor, gate_up_in_scale", "down_w_scale"):
+        elif name.endswith("in_scale") or name.endswith("w_scale"):
             return np.full(
                 shape=shape,
                 fill_value=rng.random() * 0.01,
@@ -768,25 +805,41 @@ def generate_and_quantize_to_fp8(
     return fp8_tensor, scale_fp32
 
 
-def _fp8_to_gate_up_x4(fp8_2d, H, I):
+def _fp8_to_gate_up_x4(fp8_2d, H, I, contiguous_x4=False):
     """Convert scalar fp8 (H, I) to x4 packed (128, n_H512_tile, I) for gate/up projection.
 
-    Packs 4 consecutive H1 values per x4 element at each I column, matching the
-    kernel's natural SBUF layout where H index = p + 128 * h1.
+    Supports two x4 packing conventions controlled by ``contiguous_x4``:
 
-    In SBUF, activation at (p, h512, t) packs H indices:
-        {p + 128*(4*h512+q) : q=0..3}
+    **contiguous_x4=False (default):**
+        Packs 4 consecutive H1 values per x4 element at each I column, matching the
+        kernel's natural SBUF layout where H index = p + 128 * h1.
 
-    Weight at (p, h512, i) must pack the same H indices:
-        fp8_2d[p + 128*(4*h512+0), i], fp8_2d[p + 128*(4*h512+1), i],
-        fp8_2d[p + 128*(4*h512+2), i], fp8_2d[p + 128*(4*h512+3), i]
+        In SBUF, activation at (p, h512, t) packs H indices:
+            {p + 128*(4*h512+q) : q=0..3}   (stride-128)
+
+        Weight at (p, h512, i) must pack the same H indices:
+            fp8_2d[p + 128*(4*h512+0), i], fp8_2d[p + 128*(4*h512+1), i],
+            fp8_2d[p + 128*(4*h512+2), i], fp8_2d[p + 128*(4*h512+3), i]
+
+    **contiguous_x4=True (contiguous-4 H packing):**
+        Packs 4 contiguous H values per x4 element:
+            {4*p + q : q=0..3}   (stride-1)
+
+        Weight at (p, h512, i) packs:
+            fp8_2d[512*h512 + 4*p + 0, i], fp8_2d[512*h512 + 4*p + 1, i],
+            fp8_2d[512*h512 + 4*p + 2, i], fp8_2d[512*h512 + 4*p + 3, i]
     """
     n_H512 = H // _psum_fmax
-    # fp8_2d is [H, I] with H = p + 128*h1 (SBUF partition-minor layout).
-    # Reshape to [n_H512, 4, 128, I] to group consecutive h1 values per h512 tile.
-    # H index at (h512, q, p, i) = p + 128*(h512*4 + q)
-    arr = fp8_2d.reshape(n_H512, _q_width, _pmax, I)  # [n_H512, 4, 128, I]
-    arr = arr.transpose(2, 0, 3, 1)  # [128, n_H512, I, 4]
+    if not contiguous_x4:
+        # default: [H, I] → [n_H512, 4, 128, I] → transpose → [128, n_H512, I, 4] → pack x4
+        # H index at (h512, q, p, i) = p + 128*(h512*4 + q)
+        arr = fp8_2d.reshape(n_H512, _q_width, _pmax, I)  # [n_H512, 4, 128, I]
+        arr = arr.transpose(2, 0, 3, 1)  # [128, n_H512, I, 4]
+    else:
+        # contiguous_x4: [H, I] → [n_H512, 128, 4, I] → transpose → [128, n_H512, I, 4] → pack x4
+        # H index at (h512, p, q, i) = 512*h512 + 4*p + q
+        arr = fp8_2d.reshape(n_H512, _pmax, _q_width, I)  # [n_H512, 128, 4, I]
+        arr = arr.transpose(1, 0, 3, 2)  # [128, n_H512, I, 4]
     arr = arr.reshape(_pmax, n_H512, I * _q_width)  # [128, n_H512, I*4]
     packed = dt.static_cast(arr.astype(np.float32), nl.float8_e4m3fn_x4)  # [128, n_H512, I]
     return packed

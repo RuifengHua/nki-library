@@ -56,6 +56,17 @@ class TopkHardwareParams(nl.NKIObject):
         num_sbuf_quadrants (int): Number of SBUF quadrants
         fixed_dve_inst_overhead (int): Fixed DVE instruction overhead in cycles
         max_free_dim (int): Maximum free dimension size (2^14 for DVE instructions)
+        sort_fixed_overhead (int): Fixed overhead cycles for sort operation
+        gather_latency_per_pass (int): Cycles per nc_n_gather pass
+        rotation_latency_per_tile (int): Cycles per rotation matrix multiply tile
+        rotation_tile_size (int): Free dimension tile size for rotation cost calculation
+        insert_latency_per_element (int): Cycles per element for insert (tensor_copy) operation
+        sync_latency_per_stage (int): Synchronization cycles per rotational stage
+        tile_overhead (int): Fixed overhead cycles per BxS tile iteration
+        gather_group_size (int): Max elements per partition that nc_n_gather handles in a
+            single ISA group. A gather wider than this splits into ceil(width/group_size)
+            internal groups; the multi-group form corrupts results on hardware
+            (NKILIB-1592), so wide gathers must be tiled to this width.
     """
 
     dve_max_alus: int = 8
@@ -64,6 +75,14 @@ class TopkHardwareParams(nl.NKIObject):
     num_sbuf_quadrants: int = 4
     fixed_dve_inst_overhead: int = 144
     max_free_dim: int = 2**14
+    sort_fixed_overhead: int = 8000
+    gather_latency_per_pass: int = 600
+    rotation_latency_per_tile: int = 400
+    rotation_tile_size: int = 512
+    insert_latency_per_element: int = 10
+    sync_latency_per_stage: int = 500
+    tile_overhead: int = 5000
+    gather_group_size: int = 512
 
 
 HW_PARAMS = TopkHardwareParams()
@@ -82,8 +101,8 @@ def reduce(op: str = 'mul', input_list: Optional[List] = None, initial_value=Non
         Reduced value after applying operation
     """
     supported_ops = ['mul', 'add', 'max', 'min']
-    kernel_assert(initial_value is not None, "initial_value must be set")
-    kernel_assert(input_list is not None, "input_list must be set")
+    kernel_assert(initial_value != None, "initial_value must be set")
+    kernel_assert(input_list != None, "input_list must be set")
     kernel_assert(op in supported_ops, f"only ops in {supported_ops} are supported, got {op}")
     for element in input_list:
         if op == 'mul':
@@ -438,33 +457,26 @@ class RotationalTopkConfig(nl.NKIObject):
         logger.info(msg)
 
 
-def _calculate_rotational_constants(
+_SMALL_K_THRESHOLD = 64
+
+
+def _calculate_rotational_constants_baseline(
     orig_k: int, vocab_size: int, pmax: int, BxS_tile: int
 ) -> Tuple[int, int, int, int, int]:
-    """
-    Calculate rotational algorithm constants for given tile size.
+    """Calculate rotational constants using the simple ideal-stages heuristic.
 
-    Args:
-        orig_k: Original number of top elements requested
-        vocab_size: Vocabulary dimension size
-        pmax: Maximum partition size
-        BxS_tile: Tile size for BxS dimension
-
-    Returns:
-        Tuple[int, int, int, int, int]: (local_top_k_per_stage, padded_k, n_stages, chunk_size, padded_vocab_size)
+    Used as fallback for small K (<= _SMALL_K_THRESHOLD) where the detailed
+    cost model over-estimates rotation/insert benefits.
     """
     MAX_FREE_DIM = 2**14
 
     max_n_stages = math.floor(pmax // BxS_tile)
     ideal_n_stages = div_ceil(min(orig_k, vocab_size), HW_PARAMS.topk_per_stage)
-
-    # Enforce HW constraint: vocab_size / n_stages <= 2^14
     min_n_stages_for_hw = div_ceil(vocab_size, MAX_FREE_DIM)
 
     n_stages = min(max_n_stages, ideal_n_stages)
     n_stages = max(n_stages, min_n_stages_for_hw)
 
-    # Verify we can satisfy HW constraint
     kernel_assert(
         n_stages <= max_n_stages,
         f"Cannot satisfy HW constraint: need {min_n_stages_for_hw} stages but only {max_n_stages} fit with BxS_tile={BxS_tile}",
@@ -476,7 +488,6 @@ def _calculate_rotational_constants(
     chunk_size = div_ceil(vocab_size, n_stages)
     padded_vocab_size = chunk_size * n_stages
 
-    # Verify HW constraints
     kernel_assert(
         chunk_size <= HW_PARAMS.max_free_dim,
         f"HW constraint violated: stage_free_size={chunk_size} > {HW_PARAMS.max_free_dim}",
@@ -490,65 +501,85 @@ def _calculate_rotational_constants(
     return local_top_k_per_stage, padded_k, n_stages, chunk_size, padded_vocab_size
 
 
-def _estimate_dve_cost(
-    orig_k: int, vocab_size: int, pmax: int, topk_sorted: bool, BxS_tile: int, n_stages: int
-) -> float:
+def _estimate_rotational_cost(orig_k: int, vocab_size: int, ns: int, sorted: bool = True) -> float:
+    """Estimate total DVE cycle cost for a given n_stages configuration.
+
+    Returns float('inf') if the configuration violates HW constraints.
     """
-    Estimate DVE clock cycles for given tile size and n_stages.
+    MAX_FREE_DIM = 2**14
+    lk = get_ceil_aligned_size(div_ceil(orig_k, ns), HW_PARAMS.topk_per_stage)
+    pk = lk * ns
+    sf = div_ceil(vocab_size, ns)
+    cf = sf + ns * lk
+    if sf > MAX_FREE_DIM or cf > MAX_FREE_DIM:
+        return float("inf")
+
+    topk_cost = 0
+    for stage_idx in range(ns):
+        topk_cost += div_ceil(lk, 8) * 2 * (sf + lk * stage_idx + HW_PARAMS.fixed_dve_inst_overhead)
+
+    sort_latency = 0
+    if sorted:
+        sort_passes = div_ceil(pk, 8)
+        sort_latency = sort_passes * 2 * (pk + HW_PARAMS.fixed_dve_inst_overhead) + HW_PARAMS.sort_fixed_overhead
+
+    gather_latency = ns * div_ceil(lk, 8) * HW_PARAMS.gather_latency_per_pass
+    rotation_latency = (ns - 1) * 2 * div_ceil(lk, HW_PARAMS.rotation_tile_size) * HW_PARAMS.rotation_latency_per_tile
+    insert_latency = (ns - 1) * lk * HW_PARAMS.insert_latency_per_element
+    sync_latency = ns * HW_PARAMS.sync_latency_per_stage
+    return topk_cost + sort_latency + gather_latency + rotation_latency + insert_latency + sync_latency
+
+
+def _calculate_rotational_constants(
+    orig_k: int, vocab_size: int, pmax: int, BxS_tile: int
+) -> Tuple[int, int, int, int, int]:
+    """Calculate rotational constants using detailed component-level DVE cost model.
+
+    Accounts for topk, sort, gather, rotation, insert, and sync costs separately
+    to select the optimal n_stages. Falls back to the baseline heuristic for
+    small K (<= 64) where the detailed model regresses.
 
     Args:
         orig_k: Original number of top elements requested
         vocab_size: Vocabulary dimension size
         pmax: Maximum partition size
-        topk_sorted: Whether the topk config requests sorted output
-        BxS_tile: Batch size per tile
-        n_stages: Number of rotational stages
+        BxS_tile: Tile size for BxS dimension
 
     Returns:
-        Estimated DVE clock cycles (inf if HW constraint violated)
+        Tuple[int, int, int, int, int]: (local_top_k_per_stage, padded_k, n_stages, chunk_size, padded_vocab_size)
     """
+    if orig_k <= _SMALL_K_THRESHOLD:
+        return _calculate_rotational_constants_baseline(orig_k, vocab_size, pmax, BxS_tile)
+
     MAX_FREE_DIM = 2**14
-    stage_free_size = div_ceil(vocab_size, n_stages)
+    max_n_stages = pmax // BxS_tile
+    min_n_stages_for_hw = div_ceil(vocab_size, MAX_FREE_DIM)
+    best_ns = None
+    best_cost = float("inf")
 
-    # HW constraint: stage_free_size must be <= 2^14
-    if stage_free_size > MAX_FREE_DIM:
-        return float('inf')
+    for ns in range(max(2, min_n_stages_for_hw), max_n_stages + 1):
+        cost = _estimate_rotational_cost(orig_k, vocab_size, ns)
+        if cost < best_cost:
+            best_cost = cost
+            best_ns = ns
 
-    k_per_stage = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
+    if best_ns == None:
+        return _calculate_rotational_constants_baseline(orig_k, vocab_size, pmax, BxS_tile)
 
-    # HW constraint: concatenated free dim must fit
-    if stage_free_size + n_stages * k_per_stage > MAX_FREE_DIM:
-        return float('inf')
-
-    padded_k = k_per_stage * n_stages
-
-    # Per-stage cost (repeated n_stages times)
-    per_stage_cost = div_ceil(k_per_stage, 8) * 2 * (stage_free_size + HW_PARAMS.fixed_dve_inst_overhead)
-    unsorted_cost = n_stages * per_stage_cost
-
-    # Final sort cost (if needed)
-    needs_sort = topk_sorted or padded_k != orig_k
-    if needs_sort:
-        base_sort_cost = div_ceil(padded_k, HW_PARAMS.dve_max_alus) * 2 * (padded_k + HW_PARAMS.fixed_dve_inst_overhead)
-        # Sort underutilization penalty: sort needs full 128 channels
-        sort_efficiency = BxS_tile / pmax
-        sorted_cost = base_sort_cost / sort_efficiency
-    else:
-        sorted_cost = 0
-
-    return unsorted_cost + sorted_cost
+    ns = best_ns
+    lk = get_ceil_aligned_size(div_ceil(orig_k, ns), HW_PARAMS.topk_per_stage)
+    pk = lk * ns
+    sf = div_ceil(vocab_size, ns)
+    kernel_assert(sf <= HW_PARAMS.max_free_dim, f"HW constraint: sf={sf}")
+    cf = sf + ns * lk
+    kernel_assert(cf <= HW_PARAMS.max_free_dim, f"HW constraint: cf={cf}")
+    return lk, pk, ns, sf, sf * ns
 
 
 def _find_optimal_tile_size(orig_k: int, vocab_size: int, per_lnc_BxS: int, pmax: int, topk_sorted: bool) -> int:
-    """
-    Find optimal tile size that minimizes total cost while respecting HW constraints.
+    """Find optimal tile size using detailed component-level DVE cost model.
 
-    Strategy:
-    - For large V, smaller tiles allow more n_stages, reducing stage_free_size
-    - CRITICAL HW constraints:
-        1. vocab_size/n_stages <= 2^14 (max8/match_replace8 limit)
-        2. Sort needs full 128 channels for efficiency
-    - Minimize: n_tiles x cost_per_tile
+    Falls back to the baseline heuristic for small K (<= 64).
 
     Args:
         orig_k: Original number of top elements requested
@@ -560,59 +591,90 @@ def _find_optimal_tile_size(orig_k: int, vocab_size: int, per_lnc_BxS: int, pmax
     Returns:
         Optimal tile size
     """
-    # Calculate minimum n_stages required by HW constraint
-    min_n_stages_for_hw = div_ceil(vocab_size, HW_PARAMS.max_free_dim)
+    if orig_k <= _SMALL_K_THRESHOLD:
+        return _find_optimal_tile_size_baseline(orig_k, vocab_size, per_lnc_BxS, pmax, topk_sorted)
 
-    # Try different tile sizes from 1 to PMAX
-    candidates = range(1, pmax + 1)
-
+    MAX_FREE_DIM = 2**14
     best_tile_size = None
-    best_cost = float('inf')
+    best_cost = float("inf")
 
-    for tile_size in candidates:
-        # Calculate n_stages for this tile size
+    for tile_size in range(1, pmax + 1):
+        n_tiles = div_ceil(per_lnc_BxS, tile_size)
+        max_n_stages = pmax // tile_size
+        best_ns_cost = float("inf")
+        min_ns_hw = div_ceil(vocab_size, MAX_FREE_DIM)
+
+        for ns in range(max(2, min_ns_hw), max_n_stages + 1):
+            cost = _estimate_rotational_cost(orig_k, vocab_size, ns)
+            if cost < best_ns_cost:
+                best_ns_cost = cost
+
+        if best_ns_cost == float("inf"):
+            continue
+
+        total_cost = n_tiles * (best_ns_cost + HW_PARAMS.tile_overhead)
+        if total_cost < best_cost:
+            best_cost = total_cost
+            best_tile_size = tile_size
+
+    if best_tile_size == None:
+        best_tile_size = max(16, div_ceil(pmax, div_ceil(vocab_size, MAX_FREE_DIM)))
+    return best_tile_size
+
+
+def _find_optimal_tile_size_baseline(
+    orig_k: int, vocab_size: int, per_lnc_BxS: int, pmax: int, topk_sorted: bool
+) -> int:
+    """Find optimal tile size using simple per-stage DVE cost estimate.
+
+    Used as fallback for small K where the detailed cost model regresses.
+    """
+    min_n_stages_for_hw = div_ceil(vocab_size, HW_PARAMS.max_free_dim)
+    best_tile_size = None
+    best_cost = float("inf")
+
+    for tile_size in range(1, pmax + 1):
         max_n_stages = math.floor(pmax // tile_size)
         ideal_n_stages = div_ceil(min(orig_k, vocab_size), HW_PARAMS.topk_per_stage)
         n_stages = min(max_n_stages, ideal_n_stages)
-        n_stages = max(n_stages, min_n_stages_for_hw)  # Enforce all constraints
+        n_stages = max(n_stages, min_n_stages_for_hw)
 
-        # Check if this configuration is feasible
         if n_stages > max_n_stages:
             continue
-
-        # Skip if only 1 stage (falls back to scanning anyway)
         if n_stages <= 1:
             continue
 
-        # Calculate cost per tile
-        cost_per_tile = _estimate_dve_cost(orig_k, vocab_size, pmax, topk_sorted, tile_size, n_stages)
-
-        # Skip if HW constraint violated
-        if cost_per_tile == float('inf'):
+        stage_free_size = div_ceil(vocab_size, n_stages)
+        if stage_free_size > HW_PARAMS.max_free_dim:
+            continue
+        k_per_stage = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
+        if stage_free_size + n_stages * k_per_stage > HW_PARAMS.max_free_dim:
             continue
 
-        # Calculate number of tiles needed
+        padded_k = k_per_stage * n_stages
+        per_stage_cost = div_ceil(k_per_stage, 8) * 2 * (stage_free_size + HW_PARAMS.fixed_dve_inst_overhead)
+        unsorted_cost = n_stages * per_stage_cost
+        needs_sort = topk_sorted or padded_k != orig_k
+        if needs_sort:
+            base_sort_cost = (
+                div_ceil(padded_k, HW_PARAMS.dve_max_alus) * 2 * (padded_k + HW_PARAMS.fixed_dve_inst_overhead)
+            )
+            sort_efficiency = tile_size / pmax
+            sorted_cost = base_sort_cost / sort_efficiency
+        else:
+            sorted_cost = 0
+        cost_per_tile = unsorted_cost + sorted_cost
+
         n_tiles = div_ceil(per_lnc_BxS, tile_size)
-
-        # Total cost
         total_cost = n_tiles * cost_per_tile
-
-        logger.debug(
-            f"Tile size {tile_size}: n_stages={n_stages}, n_tiles={n_tiles} cost_per_tile={int(cost_per_tile)}, total={int(total_cost)}"
-        )
 
         if total_cost < best_cost:
             best_cost = total_cost
             best_tile_size = tile_size
 
-    # If no valid tile size found, use smallest possible that satisfies HW constraint
-    if best_tile_size is None:
+    if best_tile_size == None:
         best_tile_size = max(16, div_ceil(pmax, min_n_stages_for_hw))
-        logger.warn(
-            f"No optimal tile size found, using {best_tile_size} to satisfy HW constraint, fallback to naive_scaning"
-        )
 
-    logger.info(f"Optimal tile size: {best_tile_size} (BxS={per_lnc_BxS}, V={vocab_size}, k={orig_k})")
     return best_tile_size
 
 
@@ -630,6 +692,22 @@ def _exceeds_concatenated_free_dim(orig_k: int, vocab_size: int, tile_size: int,
     chunk = div_ceil(vocab_size, n_stages)
     local_k = get_ceil_aligned_size(div_ceil(orig_k, n_stages), HW_PARAMS.topk_per_stage)
     return chunk + n_stages * local_k > HW_PARAMS.max_free_dim
+
+
+def _generate_stage_offsets_interleaved(n_stages, stage_free_size, BxS_size):
+    """Generate per-partition interleaved stage offset constant for on-chip index init."""
+    total_part = n_stages * BxS_size
+    offsets = np.zeros((total_part, 1), dtype=np.float32)
+    for partition_idx in range(total_part):
+        stage_idx = partition_idx % n_stages
+        offsets[partition_idx, 0] = stage_idx * stage_free_size
+
+    cache_key = f"offsets_interleaved_{n_stages}_{stage_free_size}_{BxS_size}"
+    if cache_key not in RotationalConstants._shared_const_cache:
+        with NamedTemporaryFile(suffix=".npy", delete=False) as temp_file:
+            np.save(temp_file, offsets)
+            RotationalConstants._shared_const_cache[cache_key] = temp_file.name
+    return cache_key
 
 
 def create_rotational_topk_config(
@@ -685,7 +763,7 @@ def create_rotational_topk_config(
     else:
         sorted_flag = topk_config.sorted
 
-    if shared_const_cache is None:
+    if shared_const_cache == None:
         shared_const_cache = {}
 
     return RotationalTopkConfig(
@@ -727,8 +805,8 @@ def rotate(dst: nl.ndarray, tensor: nl.ndarray, rotation_matrix: nl.ndarray) -> 
     f_max = nl.tile_size.gemm_moving_fmax
     free_size = tensor.shape[1]
     n_tiles = div_ceil(free_size, f_max)
-    for i in nl.affine_range(n_tiles):
-        tile_slice = nl.ds(i * f_max, min(f_max, free_size - i * f_max))
+    for tile_idx in nl.affine_range(n_tiles):
+        tile_slice = nl.ds(tile_idx * f_max, min(f_max, free_size - tile_idx * f_max))
         nisa.nc_matmul(dst[:, tile_slice], rotation_matrix, tensor[:, tile_slice])
 
 
@@ -883,11 +961,11 @@ def topk_core(data: nl.ndarray, k: int) -> Tuple[nl.ndarray, nl.ndarray]:
     return out_vals, out_inds
 
 
-def sort(data_sbuf: nl.ndarray, indices: Optional[nl.ndarray] = None) -> Tuple[nl.ndarray, nl.ndarray]:
+def sort(data_sbuf, indices, true_k):
     """
-    Sort data using top-k algorithm.
+    Sort data by extracting top true_k elements using repeated max8 passes and masking them..
 
-    Performs sorting by repeatedly finding top-8 elements and masking them.
+    Only runs ceil(true_k/8) DVE passes rather than sorting the entire buffer,
 
     Args:
         data_sbuf (nl.ndarray): [m, n], Unsorted data in SBUF
@@ -898,17 +976,15 @@ def sort(data_sbuf: nl.ndarray, indices: Optional[nl.ndarray] = None) -> Tuple[n
             - sorted_values: [m, n], Sorted values in SBUF
             - sorted_indices: [m, n], Global or local indices corresponding to sorted elements
     """
-    m, n = data_sbuf.shape
-    num_pass = div_ceil(n, HW_PARAMS.dve_max_alus)
-    kernel_assert(n % HW_PARAMS.dve_max_alus == 0, f"n {n} must be divisible by DVE_MAX_ALUS {HW_PARAMS.dve_max_alus}")
+    m, pk = data_sbuf.shape
+    num_pass = div_ceil(true_k, HW_PARAMS.dve_max_alus)
+    padded_k = num_pass * HW_PARAMS.dve_max_alus
 
-    topk_val_buf = nl.ndarray((m, n), dtype=data_sbuf.dtype, buffer=nl.sbuf)
-    topk_idx_buf = nl.ndarray((m, n), dtype=nl.uint32, buffer=nl.sbuf)
-    global_topk_idx_buf = nl.ndarray((m, n), dtype=nl.uint32, buffer=nl.sbuf)
+    topk_val_buf = nl.ndarray((m, padded_k), dtype=data_sbuf.dtype, buffer=nl.sbuf)
+    topk_idx_buf = nl.ndarray((m, padded_k), dtype=nl.uint32, buffer=nl.sbuf)
+    global_topk_idx_buf = nl.ndarray((m, padded_k), dtype=nl.uint32, buffer=nl.sbuf)
 
-    ix, iy = nl.ds(0, m), nl.ds(0, HW_PARAMS.dve_max_alus)
-
-    ix_data, iy_data = nl.ds(0, m), nl.ds(0, n)
+    ix_data, iy_data = nl.ds(0, m), nl.ds(0, pk)
 
     for pass_num in nl.sequential_range(num_pass):
         cur_slice = nl.ds(pass_num * HW_PARAMS.dve_max_alus, HW_PARAMS.dve_max_alus)
@@ -916,25 +992,23 @@ def sort(data_sbuf: nl.ndarray, indices: Optional[nl.ndarray] = None) -> Tuple[n
         if nisa.get_nc_version() <= nisa.nc_version.gen2:
             nisa.nc_find_index8(dst=topk_idx_buf[:, cur_slice], data=data_sbuf[...], vals=topk_val_buf[:, cur_slice])
             nisa.nc_match_replace8(
-                dst=data_sbuf[...], data=data_sbuf[...], vals=topk_val_buf[:, cur_slice], imm=float('-inf')
+                dst=data_sbuf[...], data=data_sbuf[...], vals=topk_val_buf[:, cur_slice], imm=float("-inf")
             )
         else:
             nisa.nc_match_replace8(
                 dst=data_sbuf,
                 data=data_sbuf,
                 vals=topk_val_buf[:, cur_slice],
-                imm=float('-inf'),
+                imm=float("-inf"),
                 dst_idx=topk_idx_buf[:, cur_slice],
             )
-        if indices is not None:
-            nisa.nc_n_gather(
-                dst=global_topk_idx_buf[ix, cur_slice],
-                data=indices[ix_data, iy_data],
-                indices=topk_idx_buf[ix, cur_slice],
-            )
-    if indices is not None:
-        return topk_val_buf, global_topk_idx_buf
-    return topk_val_buf, topk_idx_buf
+        nisa.nc_n_gather(
+            dst=global_topk_idx_buf[nl.ds(0, m), cur_slice],
+            data=indices[ix_data, iy_data],
+            indices=topk_idx_buf[nl.ds(0, m), cur_slice],
+        )
+
+    return topk_val_buf[:, :true_k], global_topk_idx_buf[:, :true_k]
 
 
 def reshape_with_dma(src, fold_factor, dtype):

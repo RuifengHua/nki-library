@@ -21,11 +21,10 @@ import pytest
 from botocore.exceptions import ClientError
 
 from ..utils.metrics_collector import MetricName, MetricsCollector
-from ..utils.metrics_emitter import RUN_TYPE_USER, SessionContext
+from ..utils.metrics_emitter import RUN_TYPE_USER, CoverageData, SessionContext
 from ..utils.sqs_emitter import SQSEmitter
 
 _SESSION = SessionContext(
-    run_id="test-run-123",
     target="trn2",
     trace_mode="compile_and_infer",
     nki_compilation_mode="parser",
@@ -90,12 +89,12 @@ class TestSQSEmitter:
         payload = message["payload"]
 
         # Session-level fields from emitter
-        assert payload["RunId"] == "test-run-123"
         assert payload["Target"] == "trn2"
         assert payload["TraceMode"] == "compile_and_infer"
         assert payload["NkiCompilationMode"] == "parser"
         assert "RunType" not in payload
         assert "Username" not in payload
+        assert "VersionSetEid" not in payload
         assert payload["IsRelease"] is False
         assert "Timestamp" in payload
 
@@ -115,7 +114,7 @@ class TestSQSEmitter:
 
     def test_emit_run_complete_message(self, mock_sqs):
         """Verify emit_run_complete() sends correctly formatted message."""
-        emitter = SQSEmitter(session=replace(_SESSION, run_id="test-run-456", kernel_name="attention_cte"))
+        emitter = SQSEmitter(session=replace(_SESSION, kernel_name="attention_cte"))
 
         emitter.emit_run_complete(
             tests_passed=95,
@@ -146,7 +145,7 @@ class TestSQSEmitter:
     def test_emit_with_custom_run_type_and_is_release(self, mock_sqs, collector_with_metrics):
         """Verify non-default run_type and is_release are included in payloads."""
         emitter = SQSEmitter(
-            session=replace(_SESSION, run_id="test-run-789", run_type="model", is_release=True),
+            session=replace(_SESSION, run_type="model", is_release=True),
         )
 
         # Verify test_result payload
@@ -157,7 +156,6 @@ class TestSQSEmitter:
 
         assert payload["RunType"] == "model"
         assert payload["IsRelease"] is True
-        assert payload["RunId"] == "test-run-789"
 
         # Verify run_complete payload
         mock_sqs.send_message.reset_mock()
@@ -176,7 +174,6 @@ class TestSQSEmitter:
         emitter = SQSEmitter(
             session=replace(
                 _SESSION,
-                run_id="2026-04-24T12:00:00.000000Z",
                 run_type=RUN_TYPE_USER,
                 username="alice",
                 kernel_name="rmsnorm",
@@ -187,13 +184,32 @@ class TestSQSEmitter:
         test_result_payload = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])["payload"]
         assert test_result_payload["RunType"] == "user"
         assert test_result_payload["Username"] == "alice"
-        assert test_result_payload["RunId"] == "2026-04-24T12:00:00.000000Z"
+        assert "VersionSetEid" not in test_result_payload
 
         mock_sqs.send_message.reset_mock()
         emitter.emit_run_complete(tests_passed=3, tests_total=3)
         run_complete_payload = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])["payload"]
         assert run_complete_payload["RunType"] == "user"
         assert run_complete_payload["Username"] == "alice"
+
+    def test_emit_with_version_set_eid(self, mock_sqs, collector_with_metrics):
+        """Pipeline runs include VersionSetEid as a keyword-typed identifier."""
+        emitter = SQSEmitter(
+            session=replace(
+                _SESSION,
+                version_set_eid="6446448844",
+                kernel_name="rmsnorm",
+            ),
+        )
+
+        emitter.emit(collector_with_metrics)
+        test_result_payload = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])["payload"]
+        assert test_result_payload["VersionSetEid"] == "6446448844"
+
+        mock_sqs.send_message.reset_mock()
+        emitter.emit_run_complete(tests_passed=5, tests_total=5)
+        run_complete_payload = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])["payload"]
+        assert run_complete_payload["VersionSetEid"] == "6446448844"
 
     def test_emit_with_no_queue_url_does_nothing(self, mock_sqs):
         """Verify emit() does nothing when queue_url is None."""
@@ -226,7 +242,7 @@ class TestSQSEmitter:
 
     def test_payload_structure_matches_opensearch_schema(self, mock_sqs, collector_with_metrics):
         """Verify payload structure matches expected OpenSearch document schema."""
-        emitter = SQSEmitter(session=replace(_SESSION, run_id="pipeline-event-6414929928"))
+        emitter = SQSEmitter(session=_SESSION)
 
         emitter.emit(collector_with_metrics)
 
@@ -235,7 +251,6 @@ class TestSQSEmitter:
 
         # Required fields per OpenSearch schema (all PascalCase)
         required_fields = [
-            "RunId",
             "TestName",
             "KernelName",
             "Timestamp",
@@ -251,7 +266,6 @@ class TestSQSEmitter:
             assert field in payload, f"Missing required field: {field}"
 
         # Verify types
-        assert isinstance(payload["RunId"], str)
         assert isinstance(payload["TestName"], str)
         assert isinstance(payload["KernelName"], str)
         assert isinstance(payload["Timestamp"], str)
@@ -281,3 +295,48 @@ class TestSQSEmitter:
         assert payload["KernelName"] == "mlp_tkg"
         assert payload["Target"] == "trn2"
         assert payload["Params"] == {"batch": 256, "hidden": 128}
+
+    def test_emit_run_complete_with_coverage_data(self, mock_sqs):
+        """Verify coverage_data fields are merged into the run_complete SQS payload."""
+        emitter = SQSEmitter(session=replace(_SESSION, kernel_name="attention_cte"))
+
+        coverage_data = CoverageData(
+            BranchRate=0.85,
+            LineRate=0.92,
+            CoveragePercent=89.12,
+            BranchesCovered=170,
+            BranchesValid=200,
+        )
+
+        emitter.emit_run_complete(
+            tests_passed=80,
+            tests_total=100,
+            tests_skipped=15,
+            tests_xfailed=5,
+            coverage_data=coverage_data,
+        )
+
+        mock_sqs.send_message.assert_called_once()
+        message = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])
+
+        assert message["type"] == "run_complete"
+        payload = message["payload"]
+
+        # Core run counts
+        assert payload["TestsPassed"] == 80
+        assert payload["TestsTotal"] == 100
+        assert payload["TestsSkipped"] == 15
+        assert payload["TestsXfailed"] == 5
+
+        # Coverage fields must be merged into the top-level payload
+        assert payload["BranchRate"] == pytest.approx(0.85)
+        assert payload["LineRate"] == pytest.approx(0.92)
+        assert payload["BranchesCovered"] == 170
+        assert payload["BranchesValid"] == 200
+        assert payload["CoveragePercent"] == pytest.approx(89.12)
+
+        # Session fields still present
+        assert payload["KernelName"] == "attention_cte"
+        assert payload["Target"] == "trn2"
+        assert payload["TraceMode"] == "compile_and_infer"
+        assert "Timestamp" in payload

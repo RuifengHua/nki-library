@@ -311,7 +311,6 @@ class TestQuantizeMatmulPipeline:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=lnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
 
         (
@@ -401,7 +400,6 @@ class TestQuantizeMatmulPipeline:
     # Case 2: RHS pre-quantized, LHS BF16 → quantize LHS → matmul
     #         (with and without scale packing)
     # ------------------------------------------------------------------
-    @pytest.mark.fast
     @pytest.mark.parametrize("M,K,N", _SMALL_SHAPES + _MEDIUM_SHAPES + _LARGE_SHAPES)
     @pytest.mark.parametrize("enable_scale_packing", [True, False], ids=["packed", "unpacked"])
     @pytest.mark.parametrize("spill_reload", [True, False])

@@ -22,7 +22,7 @@ import nki.language as nl
 from ..quantization.fp8_quantize import pre_combine_dequant_scales, static_quantization
 from ..utils.common_types import QuantizationType
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import get_program_sharding_info
+from ..utils.kernel_helpers import div_ceil, get_program_sharding_info
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ..utils.tensor_view import TensorView
 from ..utils.tiled_range import TiledRange
@@ -160,30 +160,85 @@ def _change_layout_and_fold_attention(attn_sb):
         name="attn_folded_sb",
     )
 
-    for head_idx in nl.static_range(N):
-        head_group_idx, head_offset = divmod(head_idx, FOLD_FACTOR)
+    if D_packed >= 32:
+        # Direct SBUF->SBUF fold (partition starts are 32-aligned when D_packed >= 32)
+        for head_idx in nl.static_range(N):
+            head_group_idx, head_offset = divmod(head_idx, FOLD_FACTOR)
+            nisa.tensor_copy(
+                src=attn_move_pack_sb.ap(
+                    pattern=[
+                        [B * N * S * _MX_PACK_FACTOR, D_packed],
+                        [N * S * _MX_PACK_FACTOR, B],
+                        [_MX_PACK_FACTOR, S],
+                        [1, _MX_PACK_FACTOR],
+                    ],
+                    offset=head_idx * S * _MX_PACK_FACTOR,
+                ),
+                dst=attn_folded_sb.reshape((D_packed_folded, N_folded * BxS, _MX_PACK_FACTOR)).ap(
+                    pattern=[
+                        [N_folded * BxS * _MX_PACK_FACTOR, D_packed],
+                        [S * _MX_PACK_FACTOR, B],
+                        [_MX_PACK_FACTOR, S],
+                        [1, _MX_PACK_FACTOR],
+                    ],
+                    offset=(
+                        head_offset * D_packed * N_folded * BxS * _MX_PACK_FACTOR
+                        + head_group_idx * BxS * _MX_PACK_FACTOR
+                    ),
+                ),
+            )
+    else:
+        ''''
+        D_packed < 32: tensor_copy dst requires 32-aligned partition starts.
+        As a temporary solution, do HBM -> HBM roundtrip to fold D_packed.
+
+        Few notes:
+         - quantize_mx instruction also requires 32 partion_size, so we must pad or fold.
+  
+        NOTE: This solution is not performant. It is a temprarary, functionally correct solution.
+        '''
+
+        # Step 2a: Swap B and N in SBUF: (D_packed, B, N, S, 4) -> (D_packed, N, B, S, 4)
+        attn_swapped_N_B_sb = nl.ndarray(
+            (D_packed, N, B, S, _MX_PACK_FACTOR),
+            dtype=data_dtype,
+            buffer=nl.sbuf,
+            name="attn_swapped_N_B_sb",
+        )
         nisa.tensor_copy(
-            src=attn_move_pack_sb.ap(
+            src=attn_move_pack_sb.reshape((D_packed, N, B, S, _MX_PACK_FACTOR)).ap(
                 pattern=[
-                    [B * N * S * _MX_PACK_FACTOR, D_packed],
+                    [N * B * S * _MX_PACK_FACTOR, D_packed],
+                    [S * _MX_PACK_FACTOR, N],
                     [N * S * _MX_PACK_FACTOR, B],
                     [_MX_PACK_FACTOR, S],
                     [1, _MX_PACK_FACTOR],
                 ],
-                offset=head_idx * S * _MX_PACK_FACTOR,
             ),
-            dst=attn_folded_sb.reshape((D_packed_folded, N_folded * BxS, _MX_PACK_FACTOR)).ap(
-                pattern=[
-                    [N_folded * BxS * _MX_PACK_FACTOR, D_packed],
-                    [S * _MX_PACK_FACTOR, B],
-                    [_MX_PACK_FACTOR, S],
-                    [1, _MX_PACK_FACTOR],
-                ],
-                offset=(
-                    head_offset * D_packed * N_folded * BxS * _MX_PACK_FACTOR + head_group_idx * BxS * _MX_PACK_FACTOR
-                ),
-            ),
+            dst=attn_swapped_N_B_sb[...],
         )
+
+        # Step 2b: DMA to HBM
+        attn_swapped_N_B_hbm = nl.ndarray(
+            (D_packed, N, BxS, _MX_PACK_FACTOR),
+            dtype=data_dtype,
+            buffer=nl.shared_hbm,
+            name="attn_swapped_hbm",
+        )
+        nisa.dma_copy(
+            dst=attn_swapped_N_B_hbm,
+            src=attn_swapped_N_B_sb.reshape((D_packed, N, BxS, _MX_PACK_FACTOR)),
+        )
+
+        # Step 2c: DMA back to SBUF with fold (N -> partition dim via FOLD_FACTOR)
+        # HBM layout: [D_packed, N, BxS, 4] — D_packed partitions, N in free dim
+        # Target SBUF: [D_packed_folded, N_folded, BxS, 4] — D_packed_folded partitions
+        for head_idx in nl.static_range(N):
+            head_group_idx, head_offset = divmod(head_idx, FOLD_FACTOR)
+            nisa.dma_copy(
+                dst=attn_folded_sb[nl.ds(head_offset * D_packed, D_packed), head_group_idx, :, :],
+                src=attn_swapped_N_B_hbm[:, head_idx, :, :],
+            )
 
     return attn_folded_sb
 
@@ -205,6 +260,14 @@ def _load_weights_folded(weights_qtz, D_packed_folded, N_folded, H_sharded, H_BL
     Returns:
         list: weights_qtz_sb — [num_h_blocks][N_folded] of [D_packed_folded][H_BLOCK_SIZE] tensors in SBUF.
     """
+    # HBM-side dtype may be the canonical ``nl.float8_e4m3fn_x4`` or a
+    # torch-compatible alt-dtype ``nl.uint32`` (vllm-neuron path; torch
+    # has no ``float8_e4m3fn_x4``). HWDGE requires src/dst memref element
+    # types to match, so SBUF allocation tracks the source dtype and we
+    # return a view-cast alias re-tagged to ``nl.float8_e4m3fn_x4`` for
+    # the downstream ``nc_matmul_mx`` consumer. Mirrors the QKV CTE fix
+    # in commit ``560a5f16`` (CR-277644685).
+    _hbm_weight_dtype = weights_qtz.dtype
     weights_qtz_sb = []
     for h_block in TiledRange(H_sharded, H_BLOCK_SIZE):
         weights_h_block_sb = []
@@ -212,7 +275,7 @@ def _load_weights_folded(weights_qtz, D_packed_folded, N_folded, H_sharded, H_BL
         for head_group_idx in nl.affine_range(N_folded):
             w_tensor = nl.ndarray(
                 (D_packed_folded, h_block.size),
-                dtype=nl.float8_e4m3fn_x4,
+                dtype=_hbm_weight_dtype,
                 buffer=nl.sbuf,
                 name=f"weight_qtz_{h_block.index}_{head_group_idx}",
             )
@@ -223,6 +286,10 @@ def _load_weights_folded(weights_qtz, D_packed_folded, N_folded, H_sharded, H_BL
                     nl.ds(h_offset_global, h_block.size),
                 ],
             )
+            # Matmul-side alias: same SBUF storage, relabeled to the MX
+            # matmul element type. No data movement.
+            if _hbm_weight_dtype != nl.float8_e4m3fn_x4:
+                w_tensor = w_tensor.view(nl.float8_e4m3fn_x4)
             weights_h_block_sb.append(w_tensor)
         weights_qtz_sb.append(weights_h_block_sb)
     return weights_qtz_sb
@@ -376,24 +443,37 @@ def _output_projection_tkg_mx_without_transpose_out(
     D_packed_folded, N_folded, _, _ = attn_for_quant_sb.shape
     # Current shape: [D_packed_folded, N_folded, BxS, 4]
 
+    # Pad BxS to next multiple of 4 for nc_matmul_mx even free-dim constraint.
+    T_padded = div_ceil(BxS, _MX_PACK_FACTOR) * _MX_PACK_FACTOR
+    if T_padded > BxS:
+        attn_padded = nl.ndarray(
+            (D_packed_folded, N_folded, T_padded, _MX_PACK_FACTOR),
+            dtype=attn_for_quant_sb.dtype,
+            buffer=nl.sbuf,
+            name="attn_for_quant_padded",
+        )
+        nisa.memset(dst=attn_padded, value=0)
+        nisa.tensor_copy(dst=attn_padded[:, :, :BxS, :], src=attn_for_quant_sb)
+        attn_for_quant_sb = attn_padded
+
     # Phase 3: Quantize attention
-    # [D_packed_folded, N_folded, BxS, 4]  -> [D_packed_folded, N_folded, BxS]
+    # [D_packed_folded, N_folded, T_padded, 4]  -> [D_packed_folded, N_folded, T_padded]
     if is_static_mx:
         # Reinterpret cast fp8 -> fp8_x4 + dummy MX scales
         attn_qtz_tv = TensorView(
-            attn_for_quant_sb.reshape((D_packed_folded, N_folded, BxS, _MX_PACK_FACTOR))
+            attn_for_quant_sb.reshape((D_packed_folded, N_folded, T_padded, _MX_PACK_FACTOR))
         ).reinterpret_cast(nl.float8_e4m3fn_x4)
-        attn_qtz_sb = attn_qtz_tv.reshape((D_packed_folded, N_folded, BxS)).get_view()
+        attn_qtz_sb = attn_qtz_tv.reshape((D_packed_folded, N_folded, T_padded)).get_view()
         attn_scale_sb = nl.ndarray(
-            (D_packed_folded, N_folded, BxS), dtype=nl.uint8, buffer=nl.sbuf, name='attn_scale_dummy'
+            (D_packed_folded, N_folded, T_padded), dtype=nl.uint8, buffer=nl.sbuf, name='attn_scale_dummy'
         )
         nisa.memset(dst=attn_scale_sb, value=127)
     else:
         attn_qtz_sb = nl.ndarray(
-            (D_packed_folded, N_folded, BxS), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf, name='attn_qtz_sb'
+            (D_packed_folded, N_folded, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf, name='attn_qtz_sb'
         )
         attn_scale_sb = nl.ndarray(
-            (D_packed_folded, N_folded, BxS), dtype=nl.uint8, buffer=nl.sbuf, name='attn_scale_sb'
+            (D_packed_folded, N_folded, T_padded), dtype=nl.uint8, buffer=nl.sbuf, name='attn_scale_sb'
         )
         nisa.quantize_mx(dst=attn_qtz_sb, src=attn_for_quant_sb, dst_scale=attn_scale_sb)
 
@@ -424,12 +504,12 @@ def _output_projection_tkg_mx_without_transpose_out(
         )
 
     # Phase 5: Matmul + output
-    output_sb = nl.ndarray((BxS, H_sharded), dtype=io_dtype, buffer=nl.sbuf)
+    output_sb = nl.ndarray((T_padded, H_sharded), dtype=io_dtype, buffer=nl.sbuf)
 
     for h_block in TiledRange(H_sharded, H_BLOCK_SIZE):
         for h_tile in TiledRange(h_block.size, F_MAX):
             mm_result_psum = nl.ndarray(
-                (BxS, h_tile.size),
+                (T_padded, h_tile.size),
                 dtype=nl.float32,
                 buffer=nl.psum,
             )
@@ -442,7 +522,7 @@ def _output_projection_tkg_mx_without_transpose_out(
                         :, nl.ds(h_tile.start_offset, h_tile.size)
                     ]
                 nisa.nc_matmul_mx(
-                    dst=mm_result_psum[:BxS, : h_tile.size],
+                    dst=mm_result_psum[:T_padded, : h_tile.size],
                     stationary=attn_qtz_sb[:, head_group_idx, :],
                     moving=weights_qtz_sb[h_block.index][head_group_idx][:, nl.ds(h_tile.start_offset, h_tile.size)],
                     stationary_scale=attn_scale_sb[:, head_group_idx, :],
@@ -453,32 +533,33 @@ def _output_projection_tkg_mx_without_transpose_out(
             if is_static_mx:
                 # Post-matmul dequant: copy from PSUM with combined scale
                 nisa.activation(
-                    dst=output_sb[:BxS, nl.ds(h_offset, h_tile.size)],
+                    dst=output_sb[:T_padded, nl.ds(h_offset, h_tile.size)],
                     op=nl.copy,
-                    data=mm_result_psum[:BxS, : h_tile.size],
-                    scale=combined_dequant_scale[:BxS, :],
+                    data=mm_result_psum[:T_padded, : h_tile.size],
+                    scale=combined_dequant_scale[:T_padded, :],
                 )
                 if bias != None:
                     nisa.tensor_tensor(
-                        dst=output_sb[:BxS, nl.ds(h_offset, h_tile.size)],
-                        data1=output_sb[:BxS, nl.ds(h_offset, h_tile.size)],
-                        data2=bias_sb[:BxS, nl.ds(h_offset, h_tile.size)],
+                        dst=output_sb[:T_padded, nl.ds(h_offset, h_tile.size)],
+                        data1=output_sb[:T_padded, nl.ds(h_offset, h_tile.size)],
+                        data2=bias_sb[:T_padded, nl.ds(h_offset, h_tile.size)],
                         op=nl.add,
                     )
             else:
                 if bias != None:
                     nisa.tensor_tensor(
-                        dst=output_sb[:BxS, nl.ds(h_offset, h_tile.size)],
-                        data1=mm_result_psum[:BxS, : h_tile.size],
-                        data2=bias_sb[:BxS, nl.ds(h_offset, h_tile.size)],
+                        dst=output_sb[:T_padded, nl.ds(h_offset, h_tile.size)],
+                        data1=mm_result_psum[:T_padded, : h_tile.size],
+                        data2=bias_sb[:T_padded, nl.ds(h_offset, h_tile.size)],
                         op=nl.add,
                     )
                 else:
                     nisa.tensor_copy(
-                        dst=output_sb[:BxS, nl.ds(h_offset, h_tile.size)],
-                        src=mm_result_psum[:BxS, : h_tile.size],
+                        dst=output_sb[:T_padded, nl.ds(h_offset, h_tile.size)],
+                        src=mm_result_psum[:T_padded, : h_tile.size],
                     )
 
+    # Store only physical BxS rows to HBM output
     nisa.dma_copy(
         dst=out_hbm_buffer[:BxS, nl.ds(prg_id * H_sharded, H_sharded)],
         src=output_sb[:BxS, :H_sharded],

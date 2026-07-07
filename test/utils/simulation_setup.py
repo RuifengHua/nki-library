@@ -19,6 +19,7 @@ This module is only imported when simulation mode is active.
 
 import logging
 import os
+import sys
 
 import numpy as np
 
@@ -48,14 +49,39 @@ def skip_slow_simulation_tests(items, skip_marker):
             item.add_marker(skip_marker)
 
 
+def _reset_kernel_global_state():
+    """Reset module-level globals that kernels use as singletons.
+
+    On hardware each kernel invocation starts with fresh state, but in the
+    simulator multiple tests run in the same process. This resets known globals
+    so subsequent simulations don't hit stale-state assertions.
+    """
+    for mod in sys.modules.values():
+        state = getattr(mod, "_state", None)
+        if isinstance(state, dict) and "sbm" in state:
+            state["sbm"] = None
+
+
 def simulate_kernel(kernel_func, kernel_input: dict, lnc_count: int) -> list:
     """Execute kernel using nki.simulator.simulate_kernel."""
-    from nki.simulator import simulate_kernel as _simulate_kernel
+    import nki
 
     # Strip ".must_alias_input" suffix from parameter names - this suffix is added
     # for the graph compiler but simulate_kernel expects original param names
     cleaned_input = {k.removesuffix(".must_alias_input"): v for k, v in kernel_input.items()}
-    result = _simulate_kernel(kernel_func, args=[], kwargs=cleaned_input, _lnc=lnc_count)
+    try:
+        result = nki.simulate(kernel_func)[lnc_count](**cleaned_input)
+    except AttributeError as e:
+        if "uint16" in str(e):
+            import pytest
+
+            pytest.skip(f"Simulator incompatible with current PyTorch version: {e} (NKI-2034)")
+        raise
+    finally:
+        # Reset module-level kernel state that persists across simulator invocations.
+        # On hardware each kernel runs in a fresh context, but in the simulator
+        # multiple tests may execute in the same Python process (pytest-xdist worker).
+        _reset_kernel_global_state()
 
     if result is None:
         return []

@@ -138,6 +138,51 @@ class TestCascadedMaxKernel:
             atol=1e-5,
         )
 
+    @staticmethod
+    def _bf16_top_of_vocab_input(vocab_size: int):
+        """Single-row bf16 input whose unique argmax sits at vocab_size-1.
+
+        vocab_size-1 (e.g. 383) is not representable in bf16: the mantissa is
+        exact only through 256, and the spacing in [256, 512) is 2, so 383
+        rounds UP to 384 == vocab_size, one past the last valid token. An index
+        path that runs in the bf16 logit dtype therefore returns an out-of-range
+        index; the fp32 index path is exact and returns 383.
+        """
+        x = np.full((1, 1, vocab_size), -1.0).astype(nl.bfloat16)
+        x[0, 0, vocab_size - 1] = 5.0
+        return {"input_tensor": x}
+
+    @pytest.mark.fast
+    def test_cascaded_max_bf16_index_not_rounded(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+    ):
+        """Argmax at a bf16-unrepresentable index must not round out of range.
+
+        Regression guard for the fp32 index-path fix: with a bf16 logit tensor
+        whose unique max is at index 383, a bf16 index path rounds the result up
+        to 384 (out of range). Fails without the fix, passes with it.
+        """
+        vocab_size = 384
+
+        def input_generator(test_config, input_tensor_def=None):
+            return self._bf16_top_of_vocab_input(vocab_size)
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=cascaded_max,
+            torch_ref=torch_ref_wrapper(cascaded_max_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=self.output_tensor_descriptor,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(logical_nc_config=1, platform_target=platform_target),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
     def filter_combinations(lnc_degree, batch, seqlen, vocab_size, dtype):
         if 128 < batch * seqlen < 1:
             return FilterResult.INVALID

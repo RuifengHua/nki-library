@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import json
 import typing
 from enum import Enum
@@ -231,3 +232,74 @@ def normalize_param_names(params: dict) -> dict:
     If two source keys map to the same canonical name, the last one wins.
     """
     return {CANONICAL_PARAM_NAMES.get(k, k): v for k, v in params.items()}
+
+
+def _stable_param_value(value):
+    """Serialize a parameter value for stable hashing.
+
+    Prioritizes stability over readability:
+    - Enums use .value (integer) rather than .name (string) since values are
+      part of the API contract and won't change if a member is renamed.
+    - Numpy scalars are converted to Python native types.
+    - Lists/tuples/dicts are recursively normalized.
+    - Objects with __dict__ are decomposed into sorted attribute dicts.
+    - Raises TypeError for unsupported types to force explicit handling.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, type):
+        return value.__name__
+    if isinstance(value, (list, tuple)):
+        return [_stable_param_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _stable_param_value(v) for k, v in sorted(value.items())}
+    # Handle sets by sorting for deterministic ordering
+    if isinstance(value, (set, frozenset)):
+        return sorted((_stable_param_value(v) for v in value), key=repr)
+    # Handle numpy scalars (int64, float32, etc.)
+    if hasattr(value, "item"):
+        return value.item()
+    # Decompose dataclasses and other objects into their attributes
+    if hasattr(value, "__dict__"):
+        return {k: _stable_param_value(v) for k, v in sorted(vars(value).items())}
+    raise TypeError(
+        f"Unsupported parameter type for hashing: {type(value).__name__}. Add explicit handling in _stable_param_value."
+    )
+
+
+def compute_params_hash(params: dict) -> str:
+    """Compute a stable hash from raw pytest callspec params.
+
+    Serializes all values (including None) in sorted key order to produce
+    a deterministic fingerprint. This is used as part of the permutation
+    identity key for regression tracking.
+
+    Unlike extract_pytest_params, this preserves None values to avoid
+    collisions between parametrizations that differ only by a None value.
+    Uses _stable_param_value which prefers enum .value over .name for
+    stability against member renames.
+    """
+    serialized = {}
+    for key in sorted(params.keys()):
+        serialized[key] = _stable_param_value(params[key])
+    canonical = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def derive_test_method_id(node) -> str:
+    """Derive a stable test method identifier from a pytest node.
+
+    Returns a string in the format module::class::method (or module::method
+    if the test is not inside a class). This identifies the test code being
+    executed, independent of parametrize values or pytest ID formatting.
+    """
+    module_name = node.module.__name__ if node.module else ""
+    class_name = node.cls.__name__ if node.cls else ""
+    method_name = node.originalname
+    if class_name:
+        return f"{module_name}::{class_name}::{method_name}"
+    return f"{module_name}::{method_name}"

@@ -1521,7 +1521,9 @@ def compute_block_output(
     """
     block_new_lst = []
     for _ in range(NUM_TILES):
-        block_new_lst.append(nl.ndarray((TILE_SIZE, H), dtype=output_dtype, buffer=nl.sbuf))
+        tmp = nl.ndarray((TILE_SIZE, H), dtype=output_dtype, buffer=nl.sbuf)
+        nisa.memset(tmp, value=0.0)
+        block_new_lst.append(tmp)
     gup_n_tile = div_ceil(I_TP, TILE_SIZE)
     h_i_upper = div_ceil(H, TOTAL_PSUM_SIZE)
     H_NUM_PSUM_TILES = div_ceil(H, PSUM_SIZE)
@@ -1820,6 +1822,7 @@ def load_and_broadcast_down_bias(inps: InputTensors, dims: DimensionSizes, cfg: 
         nl.ndarray: Broadcasted bias tensor with shape [128, H]
     """
     down_bias = nl.ndarray((1, dims.H), dtype=cfg.compute_dtype, buffer=nl.sbuf)
+    nisa.memset(down_bias, value=0.0)
 
     nisa.dma_copy(
         dst=down_bias[0:1, nl.ds(0, dims.H)],

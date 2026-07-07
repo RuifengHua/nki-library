@@ -176,7 +176,8 @@ def _output_projection_regular(attention, weight, bias, quantization_type, weigh
 
     # Preload all weights if they fit
     wgt_tile_dims = (0, 2) if use_double_row else None
-    if num_w_h_blocks == num_h_blocks:
+    all_weights_preloaded = num_w_h_blocks == num_h_blocks
+    if all_weights_preloaded:
         for h_i in affine_range(num_h_blocks):
             wgt_hbm_tile = wgt_hbm_grid.get_tile_at_index((h_i,))
             actual_h = wgt_hbm_tile.shape[-1]

@@ -92,4 +92,6 @@ def bwmm_shard_h_torch_ref(
 
         output[local_token_ids.long(), :] += down.to(hidden_states.dtype)
 
-    return {"output": output}
+    return (
+        {"output": output} if not checkpoint_activation else {"output": output, "gate_up_activations_T": gate_up_act_T}
+    )

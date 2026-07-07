@@ -97,6 +97,77 @@ class BlockShardStrategy(Enum):
     PING_PONG = 1
 
 
+class WeightQuantMode(Enum):
+    """Weight quantization mode for FP8 MoE kernels.
+
+    Scale shapes per mode (gate_up / down):
+        NONE:        No scales
+        PER_CHANNEL: [E, 1, 2*I_TP] / [E, 1, H]
+        PER_TENSOR:  [E, 2, 1] / [E, 1]
+        BLOCK_256:   [E, H//256, 2, I_TP//256, 128] / [E, I_TP//256, H//256, 128]
+    """
+
+    NONE = 0
+    PER_CHANNEL = 1
+    PER_TENSOR = 2
+    BLOCK_256 = 3
+
+
+class ActivationQuantMode(Enum):
+    """Activation (hidden/intermediate) quantization mode.
+
+    Scale shapes per mode (gate_up_hidden / down_hidden):
+        NONE:       No scales
+        PER_TOKEN:  [T+1, 1] / [T+1, 1]
+        PER_TENSOR: [E, 2, 1] / [E, 1]
+    """
+
+    NONE = 0
+    PER_TOKEN = 1
+    PER_TENSOR = 2
+
+
+class ScaleFormat(Enum):
+    """How scales are stored in HBM.
+
+    RAW:           Scalar values as-is
+    PRE_BROADCAST: Scalars pre-broadcasted to (TILE_SIZE, ...) on partition dim
+    """
+
+    RAW = 0
+    PRE_BROADCAST = 1
+
+
+class QuantConfig(NKIObject):
+    """Quantization configuration for MoE shard-on-I kernel.
+
+    Attributes:
+        weight_mode: Weight quantization granularity
+        activation_mode: Activation quantization granularity
+        scale_format: How scales are stored in HBM
+    """
+
+    weight_mode: WeightQuantMode = WeightQuantMode.NONE
+    activation_mode: ActivationQuantMode = ActivationQuantMode.NONE
+    scale_format: ScaleFormat = ScaleFormat.RAW
+
+    @property
+    def is_quant(self):
+        return self.weight_mode != WeightQuantMode.NONE
+
+    @property
+    def is_block_quant(self):
+        return self.weight_mode == WeightQuantMode.BLOCK_256
+
+    @property
+    def is_per_tensor(self):
+        return self.weight_mode == WeightQuantMode.PER_TENSOR
+
+    @property
+    def has_activation_scale(self):
+        return self.activation_mode != ActivationQuantMode.NONE
+
+
 class InputTensors(NKIObject):
     """
     Container for all input tensor references.
@@ -127,6 +198,11 @@ class InputTensors(NKIObject):
     expert_affinities_masked: Any
     gate_up_proj_scale: Any
     down_proj_scale: Any
+    gate_up_hidden_scale: Any = None
+    down_hidden_scale: Any = None
+    # Pre-reshaped tensors (populated at kernel entry point where direct params are available)
+    gate_up_proj_scale_flat: Any = None  # reshaped for block quant DMA
+    gate_up_proj_scale_E2I: Any = None  # reshaped for per-channel DMA
 
 
 class Configs(NKIObject):
@@ -193,6 +269,13 @@ class Configs(NKIObject):
     up_clamp_lower_limit: Optional[float]
     checkpoint_activation: bool = False
     expert_affinity_multiply_on_I: bool = False
+    # Accumulator/checkpoint precision; None = io_dtype (default). Set fp32 to reduce bf16 error.
+    accumulation_dtype: Any = None
+    # Flat quant fields. Kept flat (not on a nested QuantConfig) because the NKI
+    # parser frontend cannot read attributes off a nested NKIObject inside a kernel.
+    quant_activation_mode: ActivationQuantMode = ActivationQuantMode.NONE
+    quant_is_per_tensor: bool = False
+    is_block_quant: bool = False
 
 
 def div_ceil(n, d):
@@ -409,6 +492,8 @@ def compute_intermediate_states(
     expert_affinity_T_broadcasted=None,
     gup_scale=None,
     expert_affinity_multiply_on_I=False,
+    sbm: Optional[SbufManager] = None,
+    intermediate_states_lst: Optional[list] = None,
 ):
     """
     Compute intermediate states with activation and gating.
@@ -473,11 +558,22 @@ def compute_intermediate_states(
     N_PSUM_TILE = div_ceil(B, PSUM_SIZE)
     GUP_N_TILES = div_ceil(I_TP, TILE_SIZE)
 
-    intermediate_states_lst = []
+    if intermediate_states_lst is None:
+        intermediate_states_lst = []
+        for i_tile_idx in range(GUP_N_TILES):
+            if sbm is not None:
+                intermediate_states_lst.append(
+                    sbm.alloc_stack((TILE_SIZE, B), dtype=dtype, name=f"inter_state_i{i_tile_idx}")
+                )
+            else:
+                intermediate_states_lst.append(nl.ndarray((TILE_SIZE, B), dtype=dtype, buffer=nl.sbuf))
+
     tmp_lst = []
     for i_tile_idx in range(GUP_N_TILES):
-        intermediate_states_lst.append(nl.ndarray((TILE_SIZE, B), dtype=dtype, buffer=nl.sbuf))
-        tmp_lst.append(nl.ndarray((TILE_SIZE, B), dtype=dtype, buffer=nl.sbuf))
+        if sbm is not None:
+            tmp_lst.append(sbm.alloc_stack((TILE_SIZE, B), dtype=dtype, name=f"inter_tmp_i{i_tile_idx}"))
+        else:
+            tmp_lst.append(nl.ndarray((TILE_SIZE, B), dtype=dtype, buffer=nl.sbuf))
 
     free_size = gate_and_up_proj_states[0][0][0].shape[-1]
 
@@ -488,7 +584,7 @@ def compute_intermediate_states(
             end_idx = start_idx + free_size
 
             if expert_affinity_T_broadcasted != None and not expert_affinity_multiply_on_I:
-                for gate_or_up in nl.sequential_range(2):
+                for gate_or_up in range(2):
                     if gup_scale != None:
                         nisa.scalar_tensor_tensor(
                             data=gate_and_up_proj_states[gate_or_up][b_psum_idx][i_tile_idx][0:num_tile, 0:free_size],

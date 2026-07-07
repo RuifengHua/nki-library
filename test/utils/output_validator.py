@@ -21,6 +21,13 @@ from typing import Any, Union
 import numpy as np
 import numpy.typing as npt
 
+# Unpack functions for packed x4 MX dtypes → float32 numpy arrays for histogram visualization
+from nkilib_src.nkilib.core.utils.mx_torch_common import (
+    unpack_float4_x4,
+    unpack_float8_e4m3fn_x4,
+    unpack_float8_e5m2_x4,
+)
+
 from .common_dataclasses import (
     CustomValidatorWithOutputTensorData,
     KernelArgs,
@@ -31,20 +38,11 @@ from .comparators import get_largest_abs_diff, maxAllClose
 from .metrics_collector import IMetricsCollector, MetricName
 from .tensor_histogram import TensorHistogram
 
-
-def _get_x4_unpackers() -> dict:
-    """Lazy import of MX unpack functions to avoid pulling in neuron_dtypes at module load time."""
-    from nkilib_src.nkilib.core.utils.mx_torch_common import (
-        unpack_float4_x4,
-        unpack_float8_e4m3fn_x4,
-        unpack_float8_e5m2_x4,
-    )
-
-    return {
-        "float8_e4m3fn_x4": unpack_float8_e4m3fn_x4,
-        "float8_e5m2_x4": unpack_float8_e5m2_x4,
-        "float4_e2m1fn_x4": unpack_float4_x4,
-    }
+_X4_UNPACKERS = {
+    "float8_e4m3fn_x4": unpack_float8_e4m3fn_x4,
+    "float8_e5m2_x4": unpack_float8_e5m2_x4,
+    "float4_e2m1fn_x4": unpack_float4_x4,
+}
 
 
 def load_output_tensor_as_bytes(filepath: Union[str, pathlib.Path]) -> npt.NDArray[np.uint8]:
@@ -258,7 +256,7 @@ class OutputValidator:
                 except TypeError:
                     dtype_name = str(actual_outputs[output_key].dtype)
                     label = f"{rank_prefix}{output_key}"
-                    unpacker = _get_x4_unpackers().get(dtype_name)
+                    unpacker = _X4_UNPACKERS.get(dtype_name)
                     if unpacker is None:
                         if enable_histograms:
                             self.LOGGER.info(

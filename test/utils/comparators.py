@@ -14,14 +14,7 @@
 from typing import Optional, TextIO
 
 import numpy as np
-
-try:
-    from neuron_dtypes import is_float_type
-except ModuleNotFoundError:
-    # neuron_dtypes is only available at Hydra execution time (installed via setup_compiler_env.sh).
-    # Provide a fallback so the pytest plugin can load in build environments without it.
-    def is_float_type(dtype) -> bool:
-        return np.issubdtype(dtype, np.floating)
+from neuron_dtypes import is_float_type
 
 
 def maxAllClose(

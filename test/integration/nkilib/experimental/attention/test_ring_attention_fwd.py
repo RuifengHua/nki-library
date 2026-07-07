@@ -14,216 +14,96 @@
 """Tests for ring attention forward kernel."""
 
 import math
+from typing import List, Optional
 
+import ml_dtypes
 import numpy as np
 import pytest
 
 from nkilib_src.nkilib.experimental.attention.ring_attention_fwd import ring_attention_spmd_fwd
+from nkilib_src.nkilib.experimental.attention.ring_attention_fwd_torch import ring_attention_spmd_fwd_torch_ref
+from test.integration.nkilib.utils.sequence_packing_helpers import (
+    cu_seqlens_to_striped_bounds,
+)
 from test.utils.common_dataclasses import (
     CompilerArgs,
+    InferenceArgs,
     Platforms,
 )
-from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import CollectiveUnitTestFramework
+from test.utils.unit_test_collective_framework import CollectiveUnitTestFramework
 
 # ============================================================
 # NumPy reference: attention forward
 # ============================================================
 
 
-def ref_attention_fwd(q, k, v, scale, causal=False):
-    """
-    Reference attention forward pass.
-
-    Args:
-        q: (bs, seqlen_q, d)
-        k: (bs, seqlen_k, d)
-        v: (bs, seqlen_k, d)
-        scale: float, softmax scaling factor
-
-    Returns:
-        o: (bs, seqlen_q, d) — attention output
-        lse: (bs, seqlen_q) — log-sum-exp per row
-    """
-    scores = scale * (q @ k.transpose(0, 2, 1))  # (bs, seqlen_q, seqlen_k)
-    if causal:
-        sq, sk = scores.shape[1], scores.shape[2]
-        mask = np.triu(np.ones((sq, sk), dtype=bool), k=1)
-        scores[:, mask] = -float("inf")
-
-    row_max = scores.max(axis=-1, keepdims=True)
-    exp_scores = np.exp(scores - row_max)
-    row_sum = exp_scores.sum(axis=-1, keepdims=True)
-    softmax_weights = exp_scores / row_sum
-    o = softmax_weights @ v
-    lse = (row_max + np.log(row_sum)).squeeze(-1)  # (bs, seqlen_q)
-    return o, lse
-
-
-def ref_ring_attention_fwd(q_per_rank, k_per_rank, v_per_rank, scale, causal=False):
-    """
-    Reference ring attention forward: each rank's Q attends to ALL K/V.
-
-    Args:
-        q_per_rank: list of (bs, seqlen_per_rank, d) per rank
-        k_per_rank: list of (bs, seqlen_per_rank, d) per rank
-        v_per_rank: list of (bs, seqlen_per_rank, d) per rank
-        scale: float
-        causal: bool
-
-    Returns:
-        o_per_rank: list of (bs, seqlen_per_rank, d) per rank
-        lse_per_rank: list of (bs, seqlen_per_rank) per rank
-    """
-    k_full = np.concatenate(k_per_rank, axis=1)
-    v_full = np.concatenate(v_per_rank, axis=1)
-    q_full = np.concatenate(q_per_rank, axis=1)
-
-    o_full, lse_full = ref_attention_fwd(q_full, k_full, v_full, scale, causal)
-
-    num_ranks = len(q_per_rank)
-    seqlen_per_rank = q_per_rank[0].shape[1]
-    o_per_rank = [o_full[:, r * seqlen_per_rank : (r + 1) * seqlen_per_rank, :] for r in range(num_ranks)]
-    lse_per_rank = [lse_full[:, r * seqlen_per_rank : (r + 1) * seqlen_per_rank] for r in range(num_ranks)]
-
-    return o_per_rank, lse_per_rank
-
-
-def _make_ring_attention_torch_ref(per_rank_input_generator, collective_ranks):
-    """Build a torch_ref + input override pair for ring attention.
-
-    Ring attention golden requires all ranks' K/V, but the framework calls
-    torch_ref per-rank with only that rank's inputs. This factory returns a
-    closure that internally gathers all ranks' data from per_rank_input_generator.
-
-    The rank_id is communicated via a side-channel dict set by the
-    per_rank_torch_ref_input_override callback before each torch_ref call.
-
-    Returns:
-        (torch_ref, per_rank_torch_ref_input_override) tuple.
-    """
-    _state = {}  # side-channel: set by override, read by torch_ref
-
-    def _override(rank_id, raw_input):
-        _state["rank_id"] = rank_id
-        return raw_input
-
-    def _torch_ref(
-        q,
-        k,
-        v,
-        replica_groups=None,
-        num_workers=1,
-        softmax_scale=None,
-        use_causal_mask=False,
-        striped_input=False,
-        training=False,
-        lse_dtype=None,
-        tp_q=False,
-        tp_k=False,
-    ):
-        rank_id = _state["rank_id"]
-
-        # Find this rank's replica group and position within it
-        my_group = next(g for g in replica_groups if rank_id in g)
-        my_worker_idx = list(my_group).index(rank_id)
-
-        def _to_ref_3d(arr, transposed):
-            """Kernel 4-D layout -> ref (bs*h, spr, d)."""
-            if transposed:
-                # (bs, h, d, spr) -> (bs, h, spr, d)
-                arr = arr.transpose(0, 1, 3, 2)
-            bs, h, spr, d = arr.shape
-            return arr.reshape(bs * h, spr, d).astype(np.float32)
-
-        # Gather all workers' Q/K/V in this replica group in ref layout
-        q_workers, k_workers, v_workers = [], [], []
-        for worker_rank in my_group:
-            inp = per_rank_input_generator(worker_rank)
-            q_workers.append(_to_ref_3d(inp["q"], transposed=not inp.get("tp_q", False)))
-            k_workers.append(_to_ref_3d(inp["k"], transposed=not inp.get("tp_k", False)))
-            v_workers.append(_to_ref_3d(inp["v"], transposed=False))
-
-        # Undo pre-scaling on Q when causal (test pre-scales Q and passes scale=1.0)
-        actual_scale = softmax_scale
-        if use_causal_mask and softmax_scale == 1.0:
-            d = q_workers[0].shape[-1]
-            actual_scale = 1.0 / math.sqrt(d)
-            q_workers = [qw / actual_scale for qw in q_workers]
-
-        # Compute reference attention
-        if striped_input:
-            nw = len(my_group)
-            bs_h, spr, d = q_workers[0].shape
-            seqlen = spr * nw
-            q_global = np.empty((bs_h, seqlen, d), dtype=np.float32)
-            k_global = np.empty_like(q_global)
-            v_global = np.empty_like(q_global)
-            for w in range(nw):
-                q_global[:, w::nw, :] = q_workers[w]
-                k_global[:, w::nw, :] = k_workers[w]
-                v_global[:, w::nw, :] = v_workers[w]
-            o_global, lse_global = ref_attention_fwd(q_global, k_global, v_global, actual_scale, causal=True)
-            o_ref = o_global[:, my_worker_idx::nw, :]
-            lse_ref = lse_global[:, my_worker_idx::nw]
-        else:
-            o_all, lse_all = ref_ring_attention_fwd(
-                q_workers, k_workers, v_workers, actual_scale, causal=use_causal_mask
-            )
-            o_ref = o_all[my_worker_idx]
-            lse_ref = lse_all[my_worker_idx]
-
-        # Convert to kernel output layout
-        bs, h = q.shape[0], q.shape[1]
-        spr = o_ref.shape[1]
-        d = o_ref.shape[2]
-        out_o = o_ref.reshape(bs, h, spr, d).astype(np.float16)
-        lse_2d = lse_ref.reshape(bs, h, spr)
-        out_lse = lse_2d.reshape(bs, h, spr // 128, 128).transpose(0, 1, 3, 2).astype(np.float32)
-
-        return {"out_o": out_o, "out_lse": out_lse}
-
-    return _torch_ref, _override
-
-
-# ============================================================
-# Integration test: ring attention forward on hardware
-# ============================================================
-
-
-@pytest_test_metadata(
-    name="RingAttentionFwd",
-    pytest_marks=["collectives", "ring_attention"],
-)
 class TestRingAttentionFwd:
     """Integration tests for ring attention forward kernel."""
 
     @pytest.mark.parametrize(
-        "bs, nheads, nkv_heads, seqlen_per_rank, d, tp_degree, lnc, causal, striped",
+        "bs, nheads, nkv_heads, seqlen_per_rank, d, cp_degree, lnc, causal, striped, cu_seqlens_g",
+        # fmt: off
         [
             # ──── Non-causal, MHA ────
-            pytest.param(2, 2, 2, 4096, 128, 2, 1, False, False, id="nocausal_mha_seqsmall_tp2_lnc1"),
-            pytest.param(2, 2, 2, 4096, 128, 2, 2, False, False, id="nocausal_mha_seqsmall_tp2_lnc2_even"),
+            pytest.param(2, 2, 2, 4096, 128, 2, 1, False, False, None, id="nocausal_mha_seqsmall_cp2_lnc1"),
+            pytest.param(2, 2, 2, 4096, 128, 2, 2, False, False, None, id="nocausal_mha_seqsmall_cp2_lnc2_even"),
             # ──── Causal contiguous, MHA ────
-            pytest.param(2, 2, 2, 4096, 128, 2, 1, True, False, id="causal_contig_mha_seqsmall_tp2_lnc1"),
-            pytest.param(2, 2, 2, 4096, 128, 2, 2, True, False, id="causal_contig_mha_seqsmall_tp2_lnc2_even"),
+            pytest.param(2, 2, 2, 4096, 128, 2, 1, True, False, None, id="causal_contig_mha_seqsmall_cp2_lnc1"),
+            pytest.param(2, 2, 2, 4096, 128, 2, 2, True, False, None, id="causal_contig_mha_seqsmall_cp2_lnc2_even"),
             # ──── Causal striped, MHA ────
-            pytest.param(2, 2, 2, 4096, 128, 2, 1, True, True, id="causal_striped_mha_seqsmall_tp2_lnc1"),
-            pytest.param(2, 2, 2, 4096, 128, 2, 2, True, True, id="causal_striped_mha_seqsmall_tp2_lnc2_even"),
+            pytest.param(2, 2, 2, 4096, 128, 2, 1, True, True, None, id="causal_striped_mha_seqsmall_cp2_lnc1"),
+            pytest.param(2, 2, 2, 4096, 128, 2, 2, True, True, None, id="causal_striped_mha_seqsmall_cp2_lnc2_even"),
+            # ──── Tiny per-rank seqlen, cp=4 striped: probe whether lse drift requires large seqlen ────
+            pytest.param(1, 2, 2, 512, 128, 4, 2, True, True, None, id="causal_striped_mha_seqtiny_cp4_lnc2"),
             # ──── LNC=2 odd cases (bs * nheads is odd) ────
-            pytest.param(3, 1, 1, 4096, 128, 2, 2, False, False, id="nocausal_mha_seqsmall_tp2_lnc2_odd_bs3"),
-            pytest.param(1, 3, 3, 4096, 128, 2, 2, True, False, id="causal_contig_mha_seqlarge_tp2_lnc2_odd"),
+            pytest.param(3, 1, 1, 4096, 128, 2, 2, False, False, None, id="nocausal_mha_seqsmall_cp2_lnc2_odd_bs3"),
+            pytest.param(1, 3, 3, 4096, 128, 2, 2, True, False, None, id="causal_contig_mha_seqlarge_cp2_lnc2_odd"),
             # ──── Non-causal, MHA (large seqlen_per_rank, above 10k FA threshold) ────
-            pytest.param(1, 1, 1, 1024 * 10, 128, 4, 1, False, False, id="nocausal_mha_seqlarge_tp4_lnc1"),
-            pytest.param(1, 2, 2, 1024 * 10, 128, 4, 2, False, False, id="nocausal_mha_seqlarge_tp4_lnc2_even"),
+            pytest.param(1, 1, 1, 1024 * 10, 128, 4, 1, False, False, None, id="nocausal_mha_seqlarge_cp4_lnc1"),
+            pytest.param(1, 2, 2, 1024 * 10, 128, 4, 2, False, False, None, id="nocausal_mha_seqlarge_cp4_lnc2_even"),
             # ──── Causal contiguous, MHA (large seqlen_per_rank) ────
-            pytest.param(1, 1, 1, 1024 * 10, 128, 4, 1, True, False, id="causal_contig_mha_seqlarge_tp4_lnc1"),
-            pytest.param(1, 2, 2, 1024 * 10, 128, 4, 2, True, False, id="causal_contig_mha_seqlarge_tp4_lnc2_even"),
+            pytest.param(1, 1, 1, 1024 * 10, 128, 4, 1, True, False, None, id="causal_contig_mha_seqlarge_cp4_lnc1"),
+            pytest.param(
+                1, 2, 2, 1024 * 10, 128, 4, 2, True, False, None, id="causal_contig_mha_seqlarge_cp4_lnc2_even"
+            ),
             # ──── Causal striped, MHA (large seqlen_per_rank) ────
-            pytest.param(1, 1, 1, 1024 * 10, 128, 4, 1, True, True, id="causal_striped_mha_seqlarge_tp4_lnc1"),
-            pytest.param(1, 2, 2, 1024 * 10, 128, 4, 2, True, True, id="causal_striped_mha_seqlarge_tp4_lnc2_even"),
+            pytest.param(1, 1, 1, 1024 * 10, 128, 4, 1, True, True, None, id="causal_striped_mha_seqlarge_cp4_lnc1"),
+            pytest.param(
+                1, 2, 2, 1024 * 10, 128, 4, 2, True, True, None, id="causal_striped_mha_seqlarge_cp4_lnc2_even"
+            ),
+            # ──── 16K profiling configs (dense + sequence packing), bs=1 nh=2 cp=4 lnc=2 ────
+            pytest.param(1, 2, 2, 4096, 128, 4, 2, True, True, None, id="causal_striped_s16384_cp4_lnc2"),
+            pytest.param(
+                1,
+                2,
+                2,
+                4096,
+                128,
+                4,
+                2,
+                True,
+                True,
+                [0, 1024, 4096, 6144, 10240, 12288, 15360, 16384],
+                id="causal_striped_s16384_packed_cp4_lnc2",
+            ),
+            # ──── 32K profiling configs (dense + sequence packing), bs=1 nh=2 cp=4 lnc=2 ────
+            pytest.param(1, 2, 2, 8192, 128, 4, 2, True, True, None, id="causal_striped_s32768_cp4_lnc2"),
+            pytest.param(
+                1,
+                2,
+                2,
+                8192,
+                128,
+                4,
+                2,
+                True,
+                True,
+                [0, 2048, 8192, 12288, 20480, 24576, 30720, 32768],
+                id="causal_striped_s32768_packed_cp4_lnc2",
+            ),
         ],
+        # fmt: on
     )
     def test_ring_attention_spmd_fwd(
         self,
@@ -234,14 +114,28 @@ class TestRingAttentionFwd:
         nkv_heads: int,
         seqlen_per_rank: int,
         d: int,
-        tp_degree: int,
+        cp_degree: int,
         lnc: int,
         causal: bool,
         striped: bool,
+        cu_seqlens_g: Optional[List[int]],
     ):
-        """Test ring attention forward pass against reference."""
+        """Test ring attention forward pass against reference.
+
+        When ``cu_seqlens_g`` is provided (list of global document boundaries,
+        each a multiple of cp_degree), the kernel is invoked with sequence
+        packing bounds and the golden applies an additional same-document mask.
+        Packing requires causal=True and striped=True.
+        """
         np.random.seed(42)
         scale = 1.0 / math.sqrt(d)
+        is_packed = cu_seqlens_g is not None
+        if is_packed:
+            assert causal and striped, "sequence packing requires causal=True and striped=True"
+            # Large striped+packed configs trip an internal compiler scheduler error
+            # on trn2 (NCC_ISCH900). Validated on trn3_a0; skip on trn2.
+            if platform_target == Platforms.TRN2 and seqlen_per_rank * cp_degree >= 16384:
+                pytest.skip("large striped+packed CP configs hit NCC_ISCH900 on trn2; trn3_a0 validated")
 
         # The kernel expects q_h == k_h (pre-broadcasted for GQA).
         # We generate data at the KV-head granularity, then broadcast Q heads.
@@ -251,22 +145,40 @@ class TestRingAttentionFwd:
 
         if striped:
             # Generate global data in natural position order
-            seqlen = seqlen_per_rank * tp_degree
+            seqlen = seqlen_per_rank * cp_degree
             q_global = np.random.randn(bs_flat, seqlen, d).astype(np.float32)
             k_global = np.random.randn(bs_flat, seqlen, d).astype(np.float32)
             v_global = np.random.randn(bs_flat, seqlen, d).astype(np.float32)
 
-            # Stripe-slice: rank r gets positions [r, r+tp, r+2*tp, ...]
-            q_per_rank = [q_global[:, r::tp_degree, :] for r in range(tp_degree)]
-            k_per_rank = [k_global[:, r::tp_degree, :] for r in range(tp_degree)]
-            v_per_rank = [v_global[:, r::tp_degree, :] for r in range(tp_degree)]
+            # Stripe-slice: rank r gets positions [r, r+cp, r+2*cp, ...]
+            q_per_rank = [q_global[:, r::cp_degree, :] for r in range(cp_degree)]
+            k_per_rank = [k_global[:, r::cp_degree, :] for r in range(cp_degree)]
+            v_per_rank = [v_global[:, r::cp_degree, :] for r in range(cp_degree)]
         else:
             # Contiguous: generate per-rank data independently
-            q_per_rank = [np.random.randn(bs_flat, seqlen_per_rank, d).astype(np.float32) for _ in range(tp_degree)]
-            k_per_rank = [np.random.randn(bs_flat, seqlen_per_rank, d).astype(np.float32) for _ in range(tp_degree)]
-            v_per_rank = [np.random.randn(bs_flat, seqlen_per_rank, d).astype(np.float32) for _ in range(tp_degree)]
+            q_per_rank = [np.random.randn(bs_flat, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
+            k_per_rank = [np.random.randn(bs_flat, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
+            v_per_rank = [np.random.randn(bs_flat, seqlen_per_rank, d).astype(np.float32) for _ in range(cp_degree)]
 
-        replica_groups = (tuple(range(tp_degree)),)
+        replica_groups = (tuple(range(cp_degree)),)
+
+        # Sequence packing bounds: shape (bs_flat, seqlen_per_rank, 1) fp32, identical across ranks.
+        bmin_3d = None
+        bmax_3d = None
+        if is_packed:
+            bound_min_local, bound_max_local = cu_seqlens_to_striped_bounds(
+                np.asarray(cu_seqlens_g), seqlen_per_rank * cp_degree, cp_degree
+            )
+            bmin_3d = (
+                np.broadcast_to(bound_min_local.reshape(1, seqlen_per_rank, 1), (bs_flat, seqlen_per_rank, 1))
+                .astype(np.float32)
+                .copy()
+            )
+            bmax_3d = (
+                np.broadcast_to(bound_max_local.reshape(1, seqlen_per_rank, 1), (bs_flat, seqlen_per_rank, 1))
+                .astype(np.float32)
+                .copy()
+            )
 
         def _to_kernel_layout_q(rank_id):
             """(bs_flat, seqlen_per_rank, d) -> (bs, nheads, d, seqlen_per_rank).
@@ -302,41 +214,47 @@ class TestRingAttentionFwd:
             return arr_broadcast  # (bs, nheads, spr, d) — no transpose
 
         def create_inputs(rank_id: int):
-            q_input = _to_kernel_layout_q(rank_id).astype(np.float16)
+            q_input = _to_kernel_layout_q(rank_id).astype(ml_dtypes.bfloat16)
             kernel_scale = scale
 
             # When testing pre-scaled Q path: multiply Q by scale on the host
             # and pass softmax_scale=1.0 so the kernel skips its own pre-scaling.
             if causal:
-                q_input = (q_input.astype(np.float32) * scale).astype(np.float16)
+                q_input = (q_input.astype(np.float32) * scale).astype(ml_dtypes.bfloat16)
                 kernel_scale = 1.0
 
             inputs = {
                 "q": q_input,
-                "k": _to_kernel_layout_k(rank_id, k_per_rank).astype(np.float16),
-                "v": _to_kernel_layout_v(rank_id, v_per_rank).astype(np.float16),
+                "k": _to_kernel_layout_k(rank_id, k_per_rank).astype(ml_dtypes.bfloat16),
+                "v": _to_kernel_layout_v(rank_id, v_per_rank).astype(ml_dtypes.bfloat16),
                 "replica_groups": replica_groups,
-                "num_workers": tp_degree,
+                "num_workers": cp_degree,
                 "softmax_scale": kernel_scale,
                 "use_causal_mask": causal,
                 "striped_input": striped,
                 "training": True,
             }
+            if is_packed:
+                # bmin_3d / bmax_3d already shaped (bs_flat, spr, 1) — kernel flattens
+                # q, k, v to (bs_flat, ...) internally, so this shape matches.
+                inputs["bound_min"] = bmin_3d
+                inputs["bound_max"] = bmax_3d
             return inputs
 
-        torch_ref, ref_input_override = _make_ring_attention_torch_ref(create_inputs, tp_degree)
-
+        env_vars = {"NEURON_RT_ULTRASERVER_MODE": "4"} if (platform_target.is_trn3() and cp_degree > 1) else None
         framework = CollectiveUnitTestFramework(
             test_manager=test_manager,
             kernel_entry=ring_attention_spmd_fwd,
-            torch_ref=torch_ref,
+            torch_ref=ring_attention_spmd_fwd_torch_ref,
             per_rank_input_generator=create_inputs,
-            collective_ranks=tp_degree,
-            per_rank_torch_ref_input_override=ref_input_override,
+            collective_ranks=cp_degree,
         )
         framework.run_test(
             test_config=None,
             compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            inference_args=InferenceArgs(collective_ranks=cp_degree, env_vars=env_vars),
+            output_keys=["out_o", "out_lse"],
+            atol=1e-3,
         )
 
     @pytest.mark.parametrize(
@@ -427,15 +345,12 @@ class TestRingAttentionFwd:
                 "tp_k": True,
             }
 
-        torch_ref, ref_input_override = _make_ring_attention_torch_ref(create_inputs, total_ranks)
-
         framework = CollectiveUnitTestFramework(
             test_manager=test_manager,
             kernel_entry=ring_attention_spmd_fwd,
-            torch_ref=torch_ref,
+            torch_ref=ring_attention_spmd_fwd_torch_ref,
             per_rank_input_generator=create_inputs,
             collective_ranks=total_ranks,
-            per_rank_torch_ref_input_override=ref_input_override,
         )
         framework.run_test(
             test_config=None,
@@ -444,4 +359,5 @@ class TestRingAttentionFwd:
                 platform_target=platform_target,
                 additional_cmd_args=additional_cmd_args,
             ),
+            output_keys=["out_o", "out_lse"],
         )

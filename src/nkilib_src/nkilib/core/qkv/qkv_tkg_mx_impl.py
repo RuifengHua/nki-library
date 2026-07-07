@@ -26,6 +26,7 @@ from ..subkernels.rmsnorm_tkg import rmsnorm_tkg as _rmsnorm_tkg
 from ..utils.allocator import SbufManager, sizeinbytes
 from ..utils.common_types import NormType, QKVOutputLayout, QuantizationType
 from ..utils.kernel_assert import kernel_assert
+from ..utils.kernel_helpers import div_ceil
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ..utils.tensor_view import TensorView
 from ..utils.tiled_range import TiledRange
@@ -41,6 +42,9 @@ I_BLOCK_SIZE = 4096  # I_TILE_SIZE * 8 for 8 available PSUM banks
 I_TILE_SIZE = 512  # Maximum free dimension of a matmul instruction (one PSUM bank)
 WEIGHT_LOAD_BLOCK_SIZE = 2048  # Number of rows to load per weight block
 P_MAX = 128  # Partition dimension size (128)
+
+# MX packing: 4 elements packed into one float8_e4m3fn_x4 scalar
+_MX_PACK_FACTOR = 4
 
 
 def _qkv_tkg_mx_impl(
@@ -401,11 +405,12 @@ def _quantize_mx_input(
     transpose in "_layout_adapter_sb" function.
     """
     hidden_swizzled_sb = _layout_adapter_sb(src=hidden_sb, n_prgs=cfg.num_shards, prg_id=cfg.shard_id)
-    # Shape: [H0, H1_packed_shard, BxS, 4_H] - ready for quantize_mx
+    # _layout_adapter_sb pads BxS to next multiple of 4; Shape: [H0, H1_packed_shard, T_padded, 4_H]
+    T_padded = div_ceil(BxS, _MX_PACK_FACTOR) * _MX_PACK_FACTOR
 
     # Apply quantize_mx (_layout_adapter_sb returned sharded tensor)
-    hidden_qtz_sb = nl.ndarray((H0, H1_packed_shard, BxS), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
-    hidden_scales_sb = nl.ndarray((H0, H1_packed_shard, BxS), dtype=nl.uint8, buffer=nl.sbuf)
+    hidden_qtz_sb = nl.ndarray((H0, H1_packed_shard, T_padded), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+    hidden_scales_sb = nl.ndarray((H0, H1_packed_shard, T_padded), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.quantize_mx(dst=hidden_qtz_sb, src=hidden_swizzled_sb, dst_scale=hidden_scales_sb)
 
     return hidden_qtz_sb, hidden_scales_sb
@@ -455,15 +460,16 @@ def _quantize_static_mx_input(
     # _layout_adapter_sb assumes H1 = 4_H * H1_packed (4H at front), which requires pre-shuffled input.
     quantized_sb = quantized_flat.reshape((H0, BxS, H1))
     hidden_swizzled_sb = _layout_adapter_sb(src=quantized_sb, n_prgs=cfg.num_shards, prg_id=cfg.shard_id)
-    # Shape: [H0, H1_packed_shard, BxS, 4_H]
+    # _layout_adapter_sb does padding for BxS; Shape: [H0, H1_packed_shard, T_padded, 4_H]
+    T_padded = div_ceil(BxS, 4) * 4
 
     # Reinterpret cast fp8 -> fp8_x4 (pack 4 consecutive fp8 bytes)
     inp_tv = TensorView(hidden_swizzled_sb)
     hidden_qtz_tv = inp_tv.reinterpret_cast(nl.float8_e4m3fn_x4)
-    hidden_qtz_sb = hidden_qtz_tv.reshape((H0, H1_packed_shard, BxS)).get_view()
+    hidden_qtz_sb = hidden_qtz_tv.reshape((H0, H1_packed_shard, T_padded)).get_view()
 
     # Dummy MX scales (127 = identity in UE8M0) — minimal free dim, reused at index 0
-    hidden_scales_sb = nl.ndarray((H0, 1, BxS), dtype=nl.uint8, buffer=nl.sbuf)
+    hidden_scales_sb = nl.ndarray((H0, 1, T_padded), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.memset(dst=hidden_scales_sb, value=127)
 
     return hidden_qtz_sb, hidden_scales_sb, input_scale
@@ -503,15 +509,16 @@ def _quantize_row_mx_input(
     # Note: is_h_dim_4h_transposed=True is enforced by _validate_user_inputs.
     # _layout_adapter_sb assumes H1 = 4_H * H1_packed (4H at front), which requires pre-shuffled input.
     hidden_swizzled_sb = _layout_adapter_sb(src=quantized_sb, n_prgs=cfg.num_shards, prg_id=cfg.shard_id)
-    # Shape: [H0, H1_packed_shard, BxS, 4_H]
+    # _layout_adapter_sb pads BxS to next multiple of 4; Shape: [H0, H1_packed_shard, T_padded, 4_H]
+    T_padded = div_ceil(BxS, 4) * 4
 
     # Reinterpret cast fp8 -> fp8_x4 (pack 4 consecutive fp8 bytes)
     inp_tv = TensorView(hidden_swizzled_sb)
     hidden_qtz_tv = inp_tv.reinterpret_cast(nl.float8_e4m3fn_x4)
-    hidden_qtz_sb = hidden_qtz_tv.reshape((H0, H1_packed_shard, BxS)).get_view()
+    hidden_qtz_sb = hidden_qtz_tv.reshape((H0, H1_packed_shard, T_padded)).get_view()
 
     # Dummy MX scales (127 = identity in UE8M0) — minimal free dim, reused at index 0
-    hidden_scales_sb = nl.ndarray((H0, 1, BxS), dtype=nl.uint8, buffer=nl.sbuf)
+    hidden_scales_sb = nl.ndarray((H0, 1, T_padded), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.memset(dst=hidden_scales_sb, value=127)
 
     return hidden_qtz_sb, hidden_scales_sb, input_dequant_scale
@@ -579,7 +586,9 @@ def _qkv_tkg_projection_mxfp(
     hidden_orig_dtype = cfg.hidden_orig_dtype
 
     # We are deriving dimensions directly from already quantized tensors, hence shapes are 4x smaller already.
-    H0, H1_packed_shard, BxS = hidden_qtz_sb.shape
+    # T_padded from tensor shape is padded to next multiple of 4; BxS is the original token count.
+    H0, H1_packed_shard, T_padded = hidden_qtz_sb.shape
+    BxS = cfg.B * cfg.S
     H_packed_shard = H0 * H1_packed_shard
     H_packed, I = weights_qtz_hbm.shape
     # hidden_qtz comes in LNC2 sharded, weights do not. We shard weights at load time with shard_id.
@@ -604,7 +613,7 @@ def _qkv_tkg_projection_mxfp(
     NUM_128_TILES_PER_WEIGHT_LOAD_BLOCK = math.ceil(WEIGHT_LOAD_BLOCK_SIZE / P_MAX)
     NUM_I_BLOCKS = math.ceil(I / I_BLOCK_SIZE)
 
-    # Allocate output in HBM
+    # Allocate output in HBM with physical (unpadded) BxS
     output_hbm = nl.ndarray((BxS, I), dtype=hidden_orig_dtype, buffer=nl.shared_hbm)
 
     if cfg.add_bias:
@@ -615,14 +624,14 @@ def _qkv_tkg_projection_mxfp(
     # weight_scales_hbm: [1, 3] per-Q/K/V, input_scale: [P_MAX, 1] scalar
     # combined: [BxS, 3] — only BxS partitions needed for post-matmul dequant
     if cfg.is_static_quant:
-        w_scale_sb = nl.ndarray((BxS, 3), dtype=nl.float32, buffer=nl.sbuf)
+        w_scale_sb = nl.ndarray((T_padded, 3), dtype=nl.float32, buffer=nl.sbuf)
         if weight_scales_hbm.shape[0] == 1:
             nisa.dma_copy(dst=w_scale_sb[0:1, 0:3], src=weight_scales_hbm[0:1, 0:3])
             stream_shuffle_broadcast(w_scale_sb, w_scale_sb)
         else:
             nisa.dma_copy(dst=w_scale_sb, src=weight_scales_hbm[:BxS, 0:3])
         # combined_dequant_scale[P, i] = w_scale[P, i] * input_scale[P, 0]
-        nisa.activation(dst=w_scale_sb, op=nl.copy, data=w_scale_sb, scale=input_scale[:BxS, 0:1])
+        nisa.activation(dst=w_scale_sb, op=nl.copy, data=w_scale_sb, scale=input_scale[:T_padded, 0:1])
         combined_dequant_scale = w_scale_sb  # [BxS, 3]
 
     # For ROW_MX: transpose input_dequant_scale from [H0, BxS] to [BxS, 1] for output layout.
@@ -636,13 +645,15 @@ def _qkv_tkg_projection_mxfp(
         input_scale_2d = input_scale.reshape((H0, BxS))
         row_input_dequant_psum = nl.ndarray((BxS, 1), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=row_input_dequant_psum, data=input_scale_2d[0:1, 0:BxS])
-        row_input_dequant_sb = nl.ndarray((BxS, 1), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=row_input_dequant_sb, src=row_input_dequant_psum)
+        row_input_dequant_sb = nl.ndarray((T_padded, 1), dtype=nl.float32, buffer=nl.sbuf)
+        if BxS != T_padded:
+            nisa.memset(dst=row_input_dequant_sb, value=0)
+        nisa.tensor_copy(dst=row_input_dequant_sb[:BxS, :], src=row_input_dequant_psum)
 
     # QKV Projection loop - process each I_BLOCK_SIZE=4096 block (independent columns accumulated separately)
     for i_block in TiledRange(I, I_BLOCK_SIZE):
         # Allocate qkv_out_sb to store results of current I_BLOCK chunk
-        qkv_out_sb = nl.ndarray((BxS, i_block.size), dtype=hidden_orig_dtype, buffer=nl.sbuf)
+        qkv_out_sb = nl.ndarray((T_padded, i_block.size), dtype=hidden_orig_dtype, buffer=nl.sbuf)
 
         """
         SBUF can run out-of-space in unallocated kernels. Add "list block" dimensions here,
@@ -664,10 +675,25 @@ def _qkv_tkg_projection_mxfp(
         We use fixed block size, but since H in weights is packed, we process fewer H_BLOCKS
         than in non-quant version.
         """
+        # HBM-side dtype may be the canonical ``nl.float8_e4m3fn_x4`` or a
+        # torch-compatible alt-dtype ``nl.uint32`` (vllm-neuron path; torch
+        # has no ``float8_e4m3fn_x4``). HWDGE requires src/dst memref
+        # element types to match, so we allocate SBUF with the source
+        # dtype and expose a view-cast alias to ``nl.float8_e4m3fn_x4``
+        # for downstream ``nc_matmul_mx`` consumers. Keeping the storage
+        # tile's dtype stable across loop iterations avoids re-flipping
+        # the SBUF metadata between DMA writes. Mirrors the QKV CTE fix
+        # in commit ``560a5f16`` (CR-277644685).
+        _hbm_weight_dtype = weights_qtz_hbm.dtype
         weights_qtz_sb = nl.ndarray(
             (H0, NUM_W_BUFFERS, NUM_128_TILES_PER_WEIGHT_LOAD_BLOCK, i_block.size),
-            dtype=nl.float8_e4m3fn_x4,
+            dtype=_hbm_weight_dtype,
             buffer=nl.sbuf,
+        )
+        # Matmul-side alias: same SBUF storage, relabeled to the MX
+        # matmul element type. No data movement.
+        weights_qtz_sb_mx = (
+            weights_qtz_sb if _hbm_weight_dtype == nl.float8_e4m3fn_x4 else weights_qtz_sb.view(nl.float8_e4m3fn_x4)
         )
 
         if cfg.is_static_quant or cfg.is_row_quant:
@@ -785,10 +811,10 @@ def _qkv_tkg_projection_mxfp(
                 for i_tile in TiledRange(i_block.size, I_TILE_SIZE):
                     # STATIC_MX / ROW_MX: scales are minimal, always index at 0 in free dims
                     if cfg.is_static_quant or cfg.is_row_quant:
-                        stat_scale = hidden_scales_sb[0:H0, 0, 0:BxS]
+                        stat_scale = hidden_scales_sb[0:H0, 0, 0:T_padded]
                         mov_scale = weight_scales_sb[0:H0, 0, 0, 0 : i_tile.size]
                     else:
-                        stat_scale = hidden_scales_sb[0:H0, h_tile_idx_in_h, 0:BxS]
+                        stat_scale = hidden_scales_sb[0:H0, h_tile_idx_in_h, 0:T_padded]
                         mov_scale = weight_scales_sb[
                             0:H0,
                             weight_buffer_idx,
@@ -796,9 +822,13 @@ def _qkv_tkg_projection_mxfp(
                             i_tile.start_offset : i_tile.start_offset + i_tile.size,
                         ]
                     nisa.nc_matmul_mx(
-                        dst=mm_result_psum[i_tile.index][0:BxS, 0 : i_tile.size],
-                        stationary=hidden_qtz_sb[0:H0, h_tile_idx_in_h, 0:BxS],
-                        moving=weights_qtz_sb[
+                        dst=mm_result_psum[i_tile.index][0:T_padded, 0 : i_tile.size],
+                        stationary=hidden_qtz_sb[0:H0, h_tile_idx_in_h, 0:T_padded],
+                        # Read from the matmul-side alias (relabeled to
+                        # ``nl.float8_e4m3fn_x4``); DMA writes target the
+                        # storage tile ``weights_qtz_sb`` typed to the HBM
+                        # source dtype to keep HWDGE happy.
+                        moving=weights_qtz_sb_mx[
                             0:H0,
                             weight_buffer_idx,
                             h_tile_in_block.index,
@@ -813,16 +843,16 @@ def _qkv_tkg_projection_mxfp(
             if cfg.is_row_quant:
                 # ROW_MX: copy PSUM to SBUF with per-token input dequant scale
                 nisa.activation(
-                    dst=qkv_out_sb[:BxS, i_tile.start_offset : i_tile.start_offset + i_tile.size],
+                    dst=qkv_out_sb[:T_padded, i_tile.start_offset : i_tile.start_offset + i_tile.size],
                     op=nl.copy,
-                    data=mm_result_psum[i_tile.index][:BxS, 0 : i_tile.size],
+                    data=mm_result_psum[i_tile.index][:T_padded, 0 : i_tile.size],
                     scale=row_input_dequant_sb,
                 )
             elif cfg.is_static_quant:
                 # STATIC_MX: fuse PSUM→SBUF copy with per-Q/K/V dequant scale multiply
                 _static_mx_dequantize_from_psum(
-                    dst_sb=qkv_out_sb[:BxS, i_tile.start_offset : i_tile.start_offset + i_tile.size],
-                    src_psum=mm_result_psum[i_tile.index][:BxS, 0 : i_tile.size],
+                    dst_sb=qkv_out_sb[:T_padded, i_tile.start_offset : i_tile.start_offset + i_tile.size],
+                    src_psum=mm_result_psum[i_tile.index][:T_padded, 0 : i_tile.size],
                     dequant_scale_sb=combined_dequant_scale,
                     cfg=cfg,
                     I_start=i_block.start_offset + i_tile.start_offset,
@@ -833,10 +863,10 @@ def _qkv_tkg_projection_mxfp(
                 # So we don't double-add bias.
                 if cfg.add_bias and cfg.shard_id == 0:
                     nisa.tensor_tensor(
-                        dst=qkv_out_sb[:BxS, i_tile.start_offset : i_tile.start_offset + i_tile.size],
-                        data1=mm_result_psum[i_tile.index][:BxS, 0 : i_tile.size],
+                        dst=qkv_out_sb[:T_padded, i_tile.start_offset : i_tile.start_offset + i_tile.size],
+                        data1=mm_result_psum[i_tile.index][:T_padded, 0 : i_tile.size],
                         data2=bias_sb[
-                            :BxS,
+                            :T_padded,
                             i_block.start_offset + i_tile.start_offset : i_block.start_offset
                             + i_tile.start_offset
                             + i_tile.size,
@@ -845,46 +875,46 @@ def _qkv_tkg_projection_mxfp(
                     )
                 else:
                     nisa.tensor_copy(
-                        dst=qkv_out_sb[:BxS, i_tile.start_offset : i_tile.start_offset + i_tile.size],
-                        src=mm_result_psum[i_tile.index][:BxS, 0 : i_tile.size],
+                        dst=qkv_out_sb[:T_padded, i_tile.start_offset : i_tile.start_offset + i_tile.size],
+                        src=mm_result_psum[i_tile.index][:T_padded, 0 : i_tile.size],
                     )
 
         # STATIC_MX: bias after dequant (dequant already fused into PSUM copy above)
         if cfg.is_static_quant and cfg.add_bias and cfg.shard_id == 0:
             nisa.tensor_tensor(
-                dst=qkv_out_sb[:BxS, 0 : i_block.size],
-                data1=qkv_out_sb[:BxS, 0 : i_block.size],
-                data2=bias_sb[:BxS, i_block.start_offset : i_block.start_offset + i_block.size],
+                dst=qkv_out_sb[:T_padded, 0 : i_block.size],
+                data1=qkv_out_sb[:T_padded, 0 : i_block.size],
+                data2=bias_sb[:T_padded, i_block.start_offset : i_block.start_offset + i_block.size],
                 op=nl.add,
             )
 
         # ROW_MX: apply per-column weight dequant scale, then bias
         if cfg.is_row_quant:
-            # Load w_scale [1, i_block.size] and broadcast to [BxS, i_block.size]
-            row_w_scale_sb = nl.ndarray((BxS, i_block.size), dtype=nl.float32, buffer=nl.sbuf)
+            # Load w_scale [1, i_block.size] and broadcast to [T_padded, i_block.size]
+            row_w_scale_sb = nl.ndarray((T_padded, i_block.size), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(
                 dst=row_w_scale_sb[0:1, 0 : i_block.size],
                 src=weight_scales_hbm[0:1, i_block.start_offset : i_block.start_offset + i_block.size],
             )
             stream_shuffle_broadcast(row_w_scale_sb, row_w_scale_sb)
             nisa.tensor_tensor(
-                dst=qkv_out_sb[:BxS, 0 : i_block.size],
-                data1=qkv_out_sb[:BxS, 0 : i_block.size],
-                data2=row_w_scale_sb[:BxS, 0 : i_block.size],
+                dst=qkv_out_sb[:T_padded, 0 : i_block.size],
+                data1=qkv_out_sb[:T_padded, 0 : i_block.size],
+                data2=row_w_scale_sb[:T_padded, 0 : i_block.size],
                 op=nl.multiply,
             )
             if cfg.add_bias and cfg.shard_id == 0:
                 nisa.tensor_tensor(
-                    dst=qkv_out_sb[:BxS, 0 : i_block.size],
-                    data1=qkv_out_sb[:BxS, 0 : i_block.size],
-                    data2=bias_sb[:BxS, i_block.start_offset : i_block.start_offset + i_block.size],
+                    dst=qkv_out_sb[:T_padded, 0 : i_block.size],
+                    data1=qkv_out_sb[:T_padded, 0 : i_block.size],
+                    data2=bias_sb[:T_padded, i_block.start_offset : i_block.start_offset + i_block.size],
                     op=nl.add,
                 )
 
         # Cross-core reduction via sendrecv when LNC > 1
         # Each core has partial sum from its H shard, need to sum across cores
         if num_shards > 1:
-            qkv_recv_sb = nl.ndarray((BxS, i_block.size), dtype=hidden_orig_dtype, buffer=nl.sbuf)
+            qkv_recv_sb = nl.ndarray((T_padded, i_block.size), dtype=hidden_orig_dtype, buffer=nl.sbuf)
             other_core = 1 - shard_id
             nisa.sendrecv(
                 src=qkv_out_sb,
@@ -895,7 +925,7 @@ def _qkv_tkg_projection_mxfp(
             )
             nisa.tensor_tensor(dst=qkv_out_sb, data1=qkv_out_sb, data2=qkv_recv_sb, op=nl.add)
 
-        # Store to HBM
+        # Store to HBM (only physical BxS rows, discarding padding)
         nisa.dma_copy(
             dst=output_hbm[:BxS, i_block.start_offset : i_block.start_offset + i_block.size],
             src=qkv_out_sb[:BxS, 0 : i_block.size],

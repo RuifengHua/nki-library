@@ -126,6 +126,11 @@ class TiledTensor(nl.NKIObject):
         """Return the tile size for each source dimension."""
         return self._tile_size
 
+    @property
+    def tile_size(self):
+        """Return the tile size for each source dimension."""
+        return self._tile_size
+
     def _get_ndim(self):
         return len(self._grid_shape)
 
@@ -193,14 +198,31 @@ class TiledTensor(nl.NKIObject):
             flat_idx = flat_idx % stride
         return tuple(coords)
 
-    def _get_single_tile_view(self, flat_tile_idx):
-        """Get the TensorView for a single tile given its flat index in the original grid."""
+    def _get_single_tile_view(self, flat_tile_idx, keep_dim=True):
+        """Get the TensorView for a single tile given its flat index in the original grid.
+
+        Args:
+            flat_tile_idx: Flat index into the full grid.
+            keep_dim: If True (default), all dims are kept (sliced to size 1).
+                      If False, size-1 tile dims are removed via select.
+        """
         coords = self._unravel(flat_tile_idx, self._full_grid_shape)
         view = TensorView(self._source_view)
-        for d in range(len(self._source_shape)):
-            start = coords[d] * self._tile_size[d]
-            end = min(start + self._tile_size[d], self._source_shape[d])
-            view = view.slice(d, start, end)
+        if keep_dim:
+            for d in range(len(self._source_shape)):
+                start = coords[d] * self._tile_size[d]
+                end = min(start + self._tile_size[d], self._source_shape[d])
+                view = view.slice(d, start, end)
+        else:
+            squeezed = 0
+            for d in range(len(self._source_shape)):
+                start = coords[d] * self._tile_size[d]
+                end = min(start + self._tile_size[d], self._source_shape[d])
+                if self._tile_size[d] == 1 and d - squeezed > 0:
+                    view = view.select(d - squeezed, start)
+                    squeezed = squeezed + 1
+                else:
+                    view = view.slice(d - squeezed, start, end)
         return view
 
     def select(self, dim, index):
@@ -255,11 +277,13 @@ class TiledTensor(nl.NKIObject):
         new_shape[dim] = end - start
         return self._make_copy(grid_shape=tuple(new_shape), grid_offset=new_offset)
 
-    def get_tile(self, indices):
+    def get_tile(self, indices, keep_dim=True):
         """Access a single tile by its grid coordinates.
 
         Args:
             indices: Tuple of indices, one per grid dimension.
+            keep_dim: If False (default), size-1 tile dims are removed.
+                      If True, all dims are kept.
 
         Returns:
             TensorView for the specified tile.
@@ -277,7 +301,7 @@ class TiledTensor(nl.NKIObject):
                 f"Index {indices[i]} out of range for grid dimension {i} with size {self._grid_shape[i]}",
             )
             flat_idx = flat_idx + indices[i] * self._grid_strides[i]
-        return self._get_single_tile_view(flat_idx)
+        return self._get_single_tile_view(flat_idx, keep_dim=keep_dim)
 
     def reshape_dim(self, dim, shape):
         """Split a grid dimension into multiple dimensions.
@@ -750,3 +774,244 @@ class TiledTensor(nl.NKIObject):
                 groups.append([sd, [i]])
                 prev_src_dim = sd
         return groups
+
+    # ─── Allocation and list-of-tiles support ────────────────────────────
+
+    # When _tiles is set, this TiledTensor is backed by a list of individual
+    # tensors rather than a single contiguous source.
+    _tiles = None
+    _num_banks = None
+
+    def __getitem__(self, idx):
+        """Access a tile by (i, j) index. Returns the raw tensor or TensorView.
+
+        For contiguous-source TiledTensors, delegates to get_tile().get_view().
+        For list-backed TiledTensors, returns the tile directly with rotation/bank logic.
+        """
+        if isinstance(idx, tuple):
+            indices = idx
+        else:
+            indices = (idx,)
+
+        if self._tiles is not None:
+            ndim = len(self._grid_shape)
+            if self._num_banks is not None:
+                flat = 0
+                stride = 1
+                for d in range(ndim - 1, -1, -1):
+                    flat = flat + indices[d] * stride
+                    stride = stride * self._grid_shape[d]
+                return self._tiles[flat % self._num_banks]
+            # Rotation support
+            phys_indices = list(indices)
+            if self._rotate_dim is not None:
+                phys_indices[self._rotate_dim] = indices[self._rotate_dim] % self._rotate_count
+            # Compute flat index into physical tiles
+            flat = 0
+            stride = 1
+            for d in range(ndim - 1, -1, -1):
+                flat = flat + phys_indices[d] * stride
+                if self._rotate_dim is not None and self._rotate_dim == d:
+                    stride = stride * self._rotate_count
+                else:
+                    stride = stride * self._grid_shape[d]
+            return self._tiles[flat]
+
+        return self.get_tile(indices).get_view()
+
+    def permute(self, perm):
+        """Permute dimensions within each tile. Returns a new TiledTensor."""
+        new_ts = []
+        for p in perm:
+            new_ts.append(self._tile_size[p])
+        new_tile_size = tuple(new_ts)
+        if self._tiles is not None:
+            new_tiles = []
+            for t in self._tiles:
+                new_tiles.append(TensorView(t).permute(perm).get_view())
+            result = TiledTensor._make_tile_list(
+                new_tiles,
+                self._grid_shape,
+                new_tile_size,
+                num_banks=self._num_banks,
+                rotate_dim=self._rotate_dim if self._rotate_dim is not None else None,
+                rotate_count=self._rotate_count if self._rotate_count is not None else None,
+            )
+            return result
+        # View-backed: permute the source and adjust tile_size
+        new_source = TensorView(self._source_view).permute(perm)
+        return TiledTensor(new_source, new_tile_size)
+
+    def broadcast(self, dim, size):
+        """Broadcast a dimension within each tile. Returns a new TiledTensor."""
+        if self._tiles is not None:
+            new_tiles = []
+            for t in self._tiles:
+                new_tiles.append(TensorView(t).broadcast(dim=dim, size=size).get_view())
+            new_tile_size = list(self._tile_size)
+            new_tile_size[dim] = size
+            return TiledTensor._make_tile_list(
+                new_tiles,
+                self._grid_shape,
+                tuple(new_tile_size),
+                num_banks=self._num_banks,
+                rotate_dim=self._rotate_dim if self._rotate_dim is not None else None,
+                rotate_count=self._rotate_count if self._rotate_count is not None else None,
+            )
+        new_source = TensorView(self._source_view).broadcast(dim=dim, size=size * self._grid_shape[dim])
+        new_tile_size = list(self._tile_size)
+        new_tile_size[dim] = size
+        return TiledTensor(new_source, tuple(new_tile_size))
+
+    def alloc(
+        grid, tile_size, dtype, buffer=nl.sbuf, sbm=None, align=None, heap=False, rotate=None, num_banks=None, name=None
+    ):
+        """Allocate a TiledTensor grid of independent tiles.
+
+        Args:
+            grid: Tuple of logical tile counts per dimension.
+            tile_size: Size of each physical tile.
+            dtype: Data type for allocation.
+            buffer: nl.sbuf or nl.psum.
+            sbm: BufferManager. If set, uses sbm.alloc_stack per tile.
+            align: Alignment for sbm.alloc_stack.
+            rotate: (dim, count) — only allocate count physical tiles on that dim,
+                    logical indices wrap modulo count.
+            num_banks: Allocate this many physical tiles as a flat pool,
+                      indices wrap modulo num_banks.
+            name: Prefix for tensor names.
+
+        Returns:
+            TiledTensor backed by individually allocated tiles.
+        """
+        if num_banks is not None:
+            tiles = []
+            for b in range(num_banks):
+                tile_name = name + "_bank" + str(b) if name is not None else None
+                if sbm is not None:
+                    tiles.append(
+                        (sbm.alloc_heap if heap else sbm.alloc_stack)(
+                            tile_size, dtype=dtype, buffer=buffer, name=tile_name, align=align
+                        )
+                    )
+                else:
+                    tiles.append(nl.ndarray(tile_size, dtype=dtype, buffer=buffer))
+            return TiledTensor._make_tile_list(tiles, grid, tile_size, num_banks=num_banks)
+
+        # Determine physical grid
+        rotate_dim = None
+        rotate_count = None
+        phys_grid = list(grid)
+        if rotate is not None:
+            rotate_dim = rotate[0]
+            rotate_count = rotate[1]
+            phys_grid[rotate_dim] = rotate_count
+
+        # Allocate tiles in row-major order of physical grid
+        tiles = []
+        total_phys = 1
+        for d in range(len(phys_grid)):
+            total_phys = total_phys * phys_grid[d]
+        for i in range(total_phys):
+            tile_name = name + "_" + str(i) if name is not None else None
+            if sbm is not None:
+                tiles.append(
+                    (sbm.alloc_heap if heap else sbm.alloc_stack)(
+                        tile_size, dtype=dtype, buffer=buffer, name=tile_name, align=align
+                    )
+                )
+            else:
+                tiles.append(nl.ndarray(tile_size, dtype=dtype, buffer=buffer))
+
+        return TiledTensor._make_tile_list(tiles, grid, tile_size, rotate_dim=rotate_dim, rotate_count=rotate_count)
+
+    def _make_tile_list(tiles, grid, tile_size, num_banks=None, rotate_dim=None, rotate_count=None):
+        """Create a list-backed TiledTensor.
+
+        Uses a dummy source to satisfy the base constructor, then overrides
+        internals for list-based access.
+        """
+        # Create a minimal instance — use first tile as dummy source
+        obj = TiledTensor(tiles[0], tile_size)
+        obj._tiles = tiles
+        obj._grid_shape = tuple(grid)
+        obj._num_banks = num_banks
+        obj._rotate_dim = rotate_dim
+        obj._rotate_count = rotate_count
+        # tile_size for matmul_loop_nest compatibility
+        obj._tile_size = tuple(tile_size)
+        return obj
+
+    def sub_tile(self, dim, size, actual_size=None):
+        """Sub-divide tiles along a dimension, expanding the grid.
+
+        Each tile's dimension `dim` is split into chunks of `size`.
+        The grid expands on that axis.
+
+        Args:
+            dim: Source dimension to sub-tile (0-indexed within tile_size).
+                 Use -1 for last dimension.
+            size: Sub-tile size along that dimension.
+            actual_size: If set, only produce ceil(actual_size/size) sub-tiles
+                        instead of using the full tile extent.
+
+        Returns:
+            New TiledTensor with expanded grid.
+        """
+        if dim < 0:
+            dim = len(self._tile_size) + dim
+
+        src_dim_size = actual_size if actual_size is not None else self._tile_size[dim]
+        num_sub = (src_dim_size + size - 1) // size
+
+        if self._tiles is None:
+            # Source-backed: construct new TiledTensor with smaller tile_size,
+            # then reshape to separate the head and sub-tile axes.
+            new_tile_size = list(self._tile_size)
+            new_tile_size[dim] = size
+            new_tt = TiledTensor(self._source_view, tuple(new_tile_size))
+            # The new grid's dim `dim` has ceil(source_shape[dim] / size) tiles.
+            # We need to reshape it into (original_grid[dim], num_sub).
+            # This only works if original tiles are evenly sub-divided.
+            # If not, fall through to list-based expansion.
+            orig_count = self._grid_shape[dim]
+            new_count = new_tt._grid_shape[dim]
+            if orig_count * num_sub == new_count:
+                return new_tt.reshape_dim(dim, (orig_count, num_sub))
+            # Fall through to list-based for non-even case
+
+        # List-backed (or non-even source-backed): expand each tile into sub-tiles
+        new_tiles = []
+        num_orig_tiles = 1
+        for d in range(len(self._grid_shape)):
+            num_orig_tiles = num_orig_tiles * self._grid_shape[d]
+
+        for t_idx in range(num_orig_tiles):
+            tile = (
+                self._tiles[t_idx]
+                if self._tiles is not None
+                else self._get_single_tile_view(self._grid_offset + t_idx).get_view()
+            )
+            for s in range(num_sub):
+                start = s * size
+                end = min(start + size, src_dim_size)
+                if dim == 0:
+                    new_tiles.append(tile[start:end])
+                elif dim == 1 or (dim == -1 and len(self._tile_size) == 2):
+                    new_tiles.append(tile[:, start:end])
+                else:
+                    new_tiles.append(tile[:, :, start:end])
+
+        # Expand grid: insert num_sub on the sub-tiled axis
+        new_grid = list(self._grid_shape)
+        if len(new_grid) == 2 and new_grid[1] == 1 and dim == len(self._tile_size) - 1:
+            new_grid[1] = num_sub
+        elif dim < len(new_grid) and new_grid[dim] == 1:
+            new_grid[dim] = num_sub
+        else:
+            # Multiply the last grid dim
+            new_grid[-1] = new_grid[-1] * num_sub
+
+        new_tile_size = list(self._tile_size)
+        new_tile_size[dim] = size
+        return TiledTensor._make_tile_list(new_tiles, tuple(new_grid), tuple(new_tile_size))

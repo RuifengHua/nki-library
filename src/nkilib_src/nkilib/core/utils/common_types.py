@@ -75,6 +75,20 @@ class QuantizationType(Enum):
         return self in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX)
 
 
+class DtypeMode(Enum):
+    """FP8 E4M3 dtype variant selection for quantized kernels.
+
+    NON_OCP: nl.float8_e4m3 (max=240, with NaN). Default.
+    OCP:     nl.float8_e4m3fn (max=448, no NaN). OCP finite variant.
+    AUTO:    Resolve by hardware at kernel trace time via resolve_dtype_to_nki.
+             OCP when supported, NON_OCP otherwise.
+    """
+
+    NON_OCP = "non_ocp"
+    OCP = "ocp"
+    AUTO = "auto"
+
+
 class ComputationMode(Enum):
     AUTO = 0
     PREFILL = 1
@@ -91,18 +105,19 @@ class QKVWeightLayout(Enum):
     CONTIGUOUS (non-MX):
         Use the checkpoint weights as-is in [H, I] layout.
 
-    MX_CONTIGUOUS (MX without DMA transpose):
-        Pack every 4 consecutive H rows into float8_e4m3fn_x4:
-            w.reshape(H//4, 4, I).transpose(0, 2, 1).reshape(H//4, I*4)
-        then cast to float8_e4m3fn_x4. Result shape: [H//4, I] in x4 dtype.
+    MX_CONTIGUOUS (MX/ROW_MX):
+        Group every 4 consecutive H rows as the innermost dimension:
+            w.reshape(H//4, 4, I).transpose(0, 2, 1)
+        Result shape: [H//4, I, 4] in fp8 dtype.
 
     MX_INTERLEAVED (MX with DMA transpose — FP8 or BF16+static-dequant input):
-        Starting from MX_CONTIGUOUS packed weights, unpack back to [H, I],
-        then reorder rows so that the x4 quads match the interleaved layout
-        produced by DMA transpose on the input:
+        Starting from [H, I] fp8 weights, reorder rows so that the quads
+        match the interleaved layout produced by DMA transpose on the input:
             h_idx = np.arange(H).reshape(2, H//4, 2).transpose(1, 0, 2).reshape(H)
-            w_reordered = w_unpacked[h_idx, :]
-        then re-pack to float8_e4m3fn_x4. Result shape: [H//4, I] in x4 dtype.
+            w_reordered = w[h_idx, :]
+        then group into quads:
+            w_reordered.reshape(H//4, 4, I).transpose(0, 2, 1)
+        Result shape: [H//4, I, 4] in fp8 dtype.
     """
 
     CONTIGUOUS = 0
@@ -113,6 +128,51 @@ class QKVWeightLayout(Enum):
 class GateUpDim(Enum):
     GATE = 0
     UP = 1
+
+
+class MLPGateUpWeightLayout(Enum):
+    """Layout of gate and up projection weights passed to the kernel.
+
+    The kernel requires different weight layouts depending on whether or not
+    MX quantization is enabled. If it is enabled, it provides two alternative
+    functional layouts.
+
+    CONTIGUOUS:
+        Use the checkpoint weights as-is in [H, I] layout. This layout should be
+        used for non-MX flows.
+
+    H_X4_INNERMOST:
+        This layout should be used for MX quantized flows with fp8 weights. It is
+        most optimal when the hidden tensor is pre-quantized before it is passed
+        to the MLP kernel.
+
+        Starting from MLPGateUpWeightLayout.CONTIGUOUS, perform this transformation:
+            w.reshape(
+                H/512, 128, 4, I/512, 128, 4
+            ).transpose(
+                1, 0, 3, 5, 4, 2
+            )
+        Both H and I will need to be padded up to the nearest 512.
+        The final shape will be [128, H/512, I/512, 4, 128, 4]
+
+    H_X4_MIDDLE:
+        This layout should be used for MX quantized flows with fp8 weights. It is
+        most optimal when the hidden tensor is not quantized when it is passed to the
+        kernel. The quantization step will be fused to the start of the kernel.
+
+        Starting from MLPGateUpWeightLayout.CONTIGUOUS, perform this transformation:
+            w.reshape(
+                H/512, 4, 128, I/512, 128, 4
+            ).transpose(
+                2, 0, 3, 5, 4, 1
+            )
+        Both H and I will need to be padded up to the nearest 512.
+        The final shape will be [128, H/512, I/512, 4, 128, 4]
+    """
+
+    CONTIGUOUS = 0
+    H_X4_INNERMOST = 1
+    H_X4_MIDDLE = 2
 
 
 class HiddenLayout(Enum):
@@ -139,7 +199,7 @@ class MoELNCShardingStrategy(Enum):
     NO_SHARD = 0  # No sharding: each NC computes full result independently
     SHARD_I = 1  # Shard on I (intermediate) dimension - default for most workloads
     SHARD_T = 2  # Shard on T (token) dimension - useful when T is large
-    # SHARD_E = 3  # Future: Shard on E (expert) dimension
+    SHARD_E = 3  # Future: Shard on E (expert) dimension
 
 
 class MoEAllToAllVStrategy(Enum):
@@ -150,9 +210,8 @@ class MoEAllToAllVStrategy(Enum):
     """
 
     DISABLED = 0  # A2A-v not used
-    PERMUTED_OUTPUT = 1  # A2A-v used; input is permuted, output retains permuted row ordering from input
-    # TODO[perf]: implement fused unpermute
-    # UNPERMUTED_OUTPUT = 2  # A2A-v used; input is permuted, kernel unpermutes output to global token order
+    PRESERVE_ROW_ORDER = 1  # A2A-v used; output row ordering matches input row ordering.
+    PACK_OUTPUT_ROWS = 2  # A2A-v used; output rows are packed, with routed tokens placed in the first N rows, where N is the number of routed tokens.
 
 
 class MoEBlockIOLayout(Enum):

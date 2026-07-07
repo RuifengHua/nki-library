@@ -22,7 +22,7 @@ import nki.language as nl
 
 from ...core.mlp.mlp import mlp
 from ...core.utils.allocator import BufferManager
-from ...core.utils.common_types import ActFnType, NormType, QuantizationType
+from ...core.utils.common_types import ActFnType, DtypeMode, NormType, QuantizationType
 from ...core.utils.kernel_helpers import get_verified_program_sharding_info
 from ...core.utils.logging import get_logger
 from ...core.utils.tensor_view import TensorView
@@ -114,6 +114,7 @@ def transformer_tkg(
     W_gate_scales: Optional[List[nl.ndarray]] = None,
     W_up_scales: Optional[List[nl.ndarray]] = None,
     W_down_scales: Optional[List[nl.ndarray]] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ):
     """
     Transformer token generation forward pass megakernel.
@@ -153,6 +154,13 @@ def transformer_tkg(
         W_gate_scales (Optional[List[nl.ndarray]]): Per-layer FP8 gate weight scales
         W_up_scales (Optional[List[nl.ndarray]]): Per-layer FP8 up weight scales
         W_down_scales (Optional[List[nl.ndarray]]): Per-layer FP8 down weight scales
+        dtype_mode (DtypeMode): Quantization dtype policy forwarded to every
+            attention block and MLP call. Compiler enforces a single E4M3
+            variant per traced module (``EOCP001``); pick one variant for the
+            whole call graph.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
 
     Returns:
         output (nl.ndarray): [B, S_tkg, H], Final hidden states after all transformer layers
@@ -265,6 +273,7 @@ def transformer_tkg(
                 transposed_out=True,
                 out_in_sb=True,
                 sbm=sbm,
+                dtype_mode=dtype_mode,
             )
             attn_kernel_out_sb = attn_result[0]
 
@@ -303,6 +312,7 @@ def transformer_tkg(
                 store_output_in_sbuf=True,
                 use_tkg_down_proj_column_tiling=False,
                 sbm=sbm,
+                dtype_mode=dtype_mode,
             )
             mlp_result = mlp_outputs[0]
 
@@ -363,6 +373,7 @@ def transformer_tkg(
                 transposed_out=False,
                 out_in_sb=False,
                 sbm=sbm,
+                dtype_mode=dtype_mode,
             )
             attn_out = attn_result[0]
 
@@ -413,6 +424,7 @@ def transformer_tkg(
                 quant_clipping_bound=clamp_bound,
                 use_tkg_down_proj_column_tiling=False,
                 sbm=sbm,
+                dtype_mode=dtype_mode,
             )
             mlp_out = mlp_outputs[0]
 

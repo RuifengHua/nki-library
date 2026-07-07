@@ -22,15 +22,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ...mlp.mlp_tkg.mlp_proj_mx_torch import (
-    down_proj_mx_torch_ref,
-    gate_up_proj_mx_torch_ref,
-)
-from ...utils.common_types import ActFnType, MoEAllToAllVStrategy
+from ...utils.common_types import ActFnType, DtypeMode, MoEAllToAllVStrategy
+from ...utils.kernel_helpers import get_max_positive_value_for_dtype
 from ...utils.mx_torch_common import (
     quantize_to_mx,
     unpack_float4_x4,
     unpack_float8_e4m3fn_x4,
+)
+from .mlp_proj_mx_torch import (
+    down_proj_mx_torch_ref,
+    gate_up_proj_mx_torch_ref,
 )
 
 _TORCH_NP_FP8_DTYPE_MAP = {
@@ -75,7 +76,9 @@ def moe_tkg_torch_ref(
     block_size: int = None,
     input_dequant_scale: torch.Tensor = None,
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
-    outp_layout=None,
+    output_layout=None,
+    output: torch.Tensor = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> dict:
     """
     PyTorch reference implementation of Mixture of Experts Token Generation (MoE TKG).
@@ -83,12 +86,13 @@ def moe_tkg_torch_ref(
     Signature matches moe_tkg kernel.
 
     Args:
-        hidden_input: [T, H] or [T, H_concat] input tensor. When is_all_to_all_v=True, [T, H_concat]
-            layout is expected, wehre H_concat = H + H/4 + E_L * 2 + 4.
+        hidden_input: [T, H] or [T, H_concat] input tensor.
+            When all_to_all_v_strategy != DISABLED, [T, H_concat] layout is expected with fp8 dtype,
+            where H_concat = H + H/4 + E_L * 2 + 4 (hidden_quant | hidden_scale | expert_affinities | token_indices).
         expert_gate_up_weights: [E, 2, ...] gate/up projection weights
         expert_down_weights: [E, ...] down projection weights
-        expert_affinities: [T, E] expert affinity scores
-        expert_index: [T, K] selected expert indices (selective mode)
+        expert_affinities: [T, E] expert affinity scores (None when all_to_all_v_strategy != DISABLED)
+        expert_index: [T, K] selected expert indices (None when all_to_all_v_strategy != DISABLED)
         is_all_expert: if True, all experts process all tokens; else top-k selective
         rank_id: [T, 1] rank IDs for all-expert affinity scaling
         expert_gate_up_bias: [E, 2, I] optional gate/up bias
@@ -102,7 +106,13 @@ def moe_tkg_torch_ref(
         gate_clamp_lower_limit: lower clamp for gate projection output
         up_clamp_upper_limit: upper clamp for up projection output
         up_clamp_lower_limit: lower clamp for up projection output
-        is_all_to_all_v: Whether MoE layer uses all_to_all_v collective, which provides sparse input and requires shuffled output.
+        all_to_all_v_strategy (MoEAllToAllVStrategy): Input/output permutation strategy when all_to_all_v (A2A-v) is used.
+            Currently only supported on Trn3 with MX weights.
+            - DISABLED: Default; A2A-v is not used.
+            - PRESERVE_ROW_ORDER: Output row ordering matches input row ordering. Token indices are appended as trailing 2 columns of output.
+            - PACK_OUTPUT_ROWS: Output rows are packed, with routed tokens placed in the first N rows, where N is the number of routed tokens.
+                Final T-N rows are padded with 0s. Token indices are appended as trailing 2 columns of output.
+                When this strategy is used, the final 4 elements of hidden_input must be 0 for all padded rows.
 
     Unused params (signature compatibility with kernel):
         hidden_input_scale, mask_unselected_experts, expert_affinities_eager,
@@ -111,6 +121,18 @@ def moe_tkg_torch_ref(
     Returns:
         dict with "out" key containing output tensor [T, H]
     """
+    # OCP → 448, NON_OCP → 240. Callers pre-resolve AUTO (see
+    # ``resolve_dtype_mode_for_torch_ref``); the torch ref runs on CPU and can't
+    # query hardware directly. The clip must match the kernel's FP8 range so
+    # goldens align with the subkernel output.
+    assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
+        "moe_tkg_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+    )
+    if dtype_mode == DtypeMode.OCP:
+        _fp8_max = get_max_positive_value_for_dtype(nl.float8_e4m3fn)
+    else:
+        _fp8_max = get_max_positive_value_for_dtype(nl.float8_e4m3)
+
     # Convert activation_fn enum to string
     act_fn = "silu"
     if activation_fn is not None:
@@ -167,7 +189,7 @@ def moe_tkg_torch_ref(
         hidden_input_scale = None
         token_indices = None
     else:
-        _EXPECTED_A2AV_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2]
+        _EXPECTED_A2AV_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2, torch.bfloat16, torch.float16, torch.float32]
         assert (  # noqa: S101
             hidden_input.dtype in _EXPECTED_A2AV_DTYPES
         ), f"Expected hidden_input.dtype in {_EXPECTED_A2AV_DTYPES}, got {hidden_input.dtype=}"
@@ -178,42 +200,53 @@ def moe_tkg_torch_ref(
         _q_height = 8
         n_H512 = H_actual // _pmax // _q_width
         hidden_input_concat = hidden_input.clone()
-        affinities_offset = H_actual + H_actual // 4
 
-        # Slice first H columns of hidden_input_concat, convert to np, perform [T, H/512 * 128_H * 4_H]f8 -> reshape/bitcast [T, H/512, 128_H]f8x4 -> transpose [128_H, H/512, T]f8x4
-        hidden_input = (
-            hidden_input_concat[:, :H_actual]
-            .view(torch.uint8)
-            .numpy()
-            .view(_TORCH_NP_FP8_DTYPE_MAP[hidden_input_concat.dtype])
-        )
-        hidden_input = hidden_input.view(nl.float8_e4m3fn_x4)
-        hidden_input = hidden_input.reshape(T, n_H512, _pmax).transpose(2, 1, 0)
+        # Non-MX A2AV: bf16/fp16 concatenated input [T, H + E_L + 2]
+        is_non_mx_a2av = hidden_input.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        if is_non_mx_a2av:
+            E_L = expert_gate_up_weights.shape[0]
+            hidden_input = hidden_input_concat[:, :H_actual]
+            hidden_input_scale = None
+            expert_affinities = hidden_input_concat[:, H_actual : H_actual + E_L].to(torch.float32)
+            token_indices = hidden_input_concat[:, H_actual + E_L : H_actual + E_L + 2].clone().view(torch.int32)
+            H = H_actual
+        else:
+            affinities_offset = H_actual + H_actual // 4
 
-        # Slice cols H : H + H/4, perform [T, H/512 * 128_H]f8 -> transpose [128_H, H/512, T]u8 -> unstride [16_H, H/512, T]u8
-        _n_q_blocks_per_col = _pmax // _q_height
-        hidden_input_scale = torch.zeros(_pmax // _n_q_blocks_per_col, n_H512, T, dtype=torch.uint8)
-        hidden_input_scale_strided = (
-            hidden_input_concat[:, H_actual : H_actual + H_actual // 4]
-            .view(torch.uint8)
-            .reshape(T, n_H512, _pmax)
-            .permute(2, 1, 0)
-        )
-        unstride_indices = (torch.arange(4) + torch.arange(4).unsqueeze(1) * 32).flatten()
-        hidden_input_scale = hidden_input_scale_strided[unstride_indices, :, :]
+            # Slice first H columns of hidden_input_concat, convert to np, perform [T, H/512 * 128_H * 4_H]f8 -> reshape/bitcast [T, H/512, 128_H]f8x4 -> transpose [128_H, H/512, T]f8x4
+            hidden_input = (
+                hidden_input_concat[:, :H_actual]
+                .view(torch.uint8)
+                .numpy()
+                .view(_TORCH_NP_FP8_DTYPE_MAP[hidden_input_concat.dtype])
+            )
+            hidden_input = hidden_input.view(nl.float8_e4m3fn_x4)
+            hidden_input = hidden_input.reshape(T, n_H512, _pmax).transpose(2, 1, 0)
 
-        # View affinities as bf16, upcast to fp32, convert to numpy.
-        # NOTE: right now, affinities are hardcoded to be bf16.
-        expert_affinities = (
-            hidden_input_concat[:, affinities_offset : affinities_offset + 2 * E]
-            .clone()
-            .view(torch.bfloat16)
-            .to(torch.float32)
-            .numpy()
-        )
+            # Slice cols H : H + H/4, perform [T, H/512 * 128_H]f8 -> transpose [128_H, H/512, T]u8 -> unstride [16_H, H/512, T]u8
+            _n_q_blocks_per_col = _pmax // _q_height
+            hidden_input_scale = torch.zeros(_pmax // _n_q_blocks_per_col, n_H512, T, dtype=torch.uint8)
+            hidden_input_scale_strided = (
+                hidden_input_concat[:, H_actual : H_actual + H_actual // 4]
+                .view(torch.uint8)
+                .reshape(T, n_H512, _pmax)
+                .permute(2, 1, 0)
+            )
+            unstride_indices = (torch.arange(4) + torch.arange(4).unsqueeze(1) * 32).flatten()
+            hidden_input_scale = hidden_input_scale_strided[unstride_indices, :, :]
 
-        # FIXME: no magic numbers
-        token_indices = hidden_input_concat[:, -4:].clone().view(torch.int32)
+            # View affinities as bf16, upcast to fp32, convert to numpy.
+            # NOTE: right now, affinities are hardcoded to be bf16.
+            expert_affinities = (
+                hidden_input_concat[:, affinities_offset : affinities_offset + 2 * E]
+                .clone()
+                .view(torch.bfloat16)
+                .to(torch.float32)
+                .numpy()
+            )
+
+            # FIXME: no magic numbers
+            token_indices = hidden_input_concat[:, -4:].clone().view(torch.int32)
 
     if is_row_quant:
         return _moe_tkg_row_mx_ref(
@@ -308,6 +341,7 @@ def moe_tkg_torch_ref(
                 up_clamp_lower_limit,
                 gate_up_scale,
                 down_scale,
+                fp8_max=_fp8_max,
             )
 
             # Apply affinity scaling (POST_SCALE mode = 1)
@@ -339,6 +373,7 @@ def moe_tkg_torch_ref(
                     up_clamp_lower_limit,
                     gate_up_scale,
                     down_scale,
+                    fp8_max=_fp8_max,
                 )
 
                 # Apply affinity scaling (POST_SCALE mode = 1)
@@ -346,6 +381,20 @@ def moe_tkg_torch_ref(
                     expert_out = affinity * expert_out
 
                 output[t] = output[t] + expert_out.squeeze(0)
+
+    # For A2AV, handle output packing and token index concatenation
+    if all_to_all_v_strategy == MoEAllToAllVStrategy.PACK_OUTPUT_ROWS and token_indices is not None:
+        # Pack: move routed tokens (nonzero affinity) to first N rows
+        routed_mask = expert_affinities.sum(dim=1) != 0
+        count = int(routed_mask.sum().item())
+        packed_output = torch.zeros_like(output)
+        packed_output[:count] = output[routed_mask]
+        # Token indices: pack routed ones to first N rows
+        packed_token_indices = torch.zeros_like(token_indices)
+        packed_token_indices[:count] = token_indices[routed_mask]
+        output = torch.cat([packed_output, packed_token_indices.view(output.dtype)], dim=1)
+    elif all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED and token_indices is not None:
+        output = torch.cat([output, token_indices.view(output.dtype)], dim=1)
 
     return {"out": output}
 
@@ -388,6 +437,7 @@ def _compute_expert_mlp(
     down_scale=None,
     gate_up_in_scale=None,
     down_in_scale=None,
+    fp8_max: float = 240.0,
 ):
     """Compute MLP for a single expert.
 
@@ -401,7 +451,7 @@ def _compute_expert_mlp(
     - gate_up_in_scale: [1] - per-tensor input scale for gate/up projection
     - down_in_scale: [1] - per-tensor input scale for down projection
     """
-    FP8_E4M3_MAX = 240.0
+    FP8_E4M3_MAX = fp8_max
     gate_weight = gate_up_weight[:, 0, :]  # [H, I]
     up_weight = gate_up_weight[:, 1, :]  # [H, I]
 
@@ -637,7 +687,18 @@ def _moe_tkg_mx_ref(
 
     # When using a2av, token indices are appended to the end of the output, bitcast to output dtype
     output = result.astype(dtype)
-    if all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED:
+    if all_to_all_v_strategy == MoEAllToAllVStrategy.PACK_OUTPUT_ROWS:
+        # Unpermute: routed tokens (token_idx != 0) first, then zeros
+        token_idx_int32 = token_indices.numpy().view(np.int32).flatten()
+        routed_mask = token_idx_int32 != 0
+        count = int(routed_mask.sum())
+        PACK_OUTPUT_ROWS = np.zeros_like(output)
+        PACK_OUTPUT_ROWS[:count] = output[routed_mask]
+        # Trailing columns: token indices in unpermuted order
+        unpermuted_token_indices = np.zeros((T, token_indices.shape[1]), dtype=token_indices.numpy().dtype)
+        unpermuted_token_indices[:count] = token_indices.numpy()[routed_mask]
+        output = np.concatenate([PACK_OUTPUT_ROWS, unpermuted_token_indices.view(dtype)], axis=1)
+    elif all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED:
         output = np.concatenate([output, token_indices.numpy().view(dtype)], axis=1)
 
     return {"out": output}

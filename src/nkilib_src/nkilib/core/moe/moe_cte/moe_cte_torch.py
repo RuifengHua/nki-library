@@ -38,6 +38,10 @@ def moe_cte_torch_ref(
     down_proj_bias: Optional[torch.Tensor] = None,
     gate_up_proj_scale: Optional[torch.Tensor] = None,
     down_proj_scale: Optional[torch.Tensor] = None,
+    gate_up_hidden_scale: Optional[torch.Tensor] = None,
+    down_hidden_scale: Optional[torch.Tensor] = None,
+    is_block_quant: bool = False,
+    is_per_tensor: bool = False,
     activation_function: ActFnType = ActFnType.SiLU,
     skip_dma: SkipMode = SkipMode(False, False),
     compute_dtype=None,
@@ -55,6 +59,8 @@ def moe_cte_torch_ref(
     gate_up_activations_T: Optional[torch.Tensor] = None,
     down_activations: Optional[torch.Tensor] = None,
     top_k: int = 1,
+    down_bias_tp_degree: Optional[int] = None,
+    down_bias_tp_rank: Optional[int] = None,
 ) -> dict:
     """
     PyTorch reference implementation of blockwise MoE matrix multiplication.
@@ -73,20 +79,27 @@ def moe_cte_torch_ref(
         bwmm_func: BWMMFunc enum indicating kernel variant
         lnc_degree: LNC degree
         top_k: Number of top experts per token
+        down_bias_tp_degree: TP degree for down projection bias sharding
+        down_bias_tp_rank: TP rank for down projection bias sharding
 
     Returns:
         dict with 'output' and optionally 'gate_up_activations_T', 'down_activations'
     """
-    from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import BWMMFunc
+    from .bwmm_func import BWMMFunc
+
+    # is_per_tensor is part of the kernel signature; the torch ref dispatches per-tensor
+    # vs per-token activation rescale via the gate_up_hidden_scale shape, so this flag is
+    # informational here. Kept in the signature to mirror the kernel exactly.
+    _ = is_per_tensor
 
     E = gate_up_proj_weight.shape[0]
     H = hidden_states.shape[-1]
     I_TP = gate_up_proj_weight.shape[-1]
     B = block_size
 
-    is_block_parallel = bwmm_func == BWMMFunc.SHARD_ON_BLOCK
+    is_block_parallel = bwmm_func in (BWMMFunc.SHARD_ON_BLOCK, BWMMFunc.SHARD_ON_BLOCK_V2, BWMMFunc.SHARD_ON_BLOCK_HW)
     is_dropping = bwmm_func == BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING
-    is_shard_block = bwmm_func == BWMMFunc.SHARD_ON_BLOCK
+    is_shard_block = bwmm_func in (BWMMFunc.SHARD_ON_BLOCK, BWMMFunc.SHARD_ON_BLOCK_V2, BWMMFunc.SHARD_ON_BLOCK_HW)
     do_checkpoint = checkpoint_activation or is_dropping
 
     has_quantize = gate_up_proj_scale is not None and gate_up_proj_scale.numel() > 0
@@ -101,9 +114,14 @@ def moe_cte_torch_ref(
     # When skip_token=True: hidden_states is [T, H], so T = shape[0]
     T = hidden_states.shape[0] - 1 if not skip_dma.skip_token else hidden_states.shape[0]
 
+    is_v2_shard_block = bwmm_func in (BWMMFunc.SHARD_ON_BLOCK_V2, BWMMFunc.SHARD_ON_BLOCK_HW)
+
     # Output shape matches numpy golden: always [T+1, ...]
     if is_shard_block:
-        output_shape = [T + 1, lnc_degree, H] if separate_outputs else [T + 1, H]
+        if is_v2_shard_block:
+            output_shape = [T + 1, H] if separate_outputs else [T + 1, H]
+        else:
+            output_shape = [T + 1, lnc_degree, H] if separate_outputs else [T + 1, H]
     else:
         output_shape = [lnc_degree, T + 1, H] if separate_outputs else [T + 1, H]
 
@@ -137,8 +155,7 @@ def moe_cte_torch_ref(
     gup_scale = gate_up_proj_scale.float() if has_quantize and gate_up_proj_scale is not None else None
 
     for b_idx in range(N):
-        if conditions is not None and conditions[b_idx].item() == 0:
-            break
+        # Padded blocks are skipped via expert_idx >= E check below
 
         local_ids = token_pos_2d[b_idx]
         expert_idx = block_to_expert_flat[b_idx].item()
@@ -171,12 +188,56 @@ def moe_cte_torch_ref(
 
         # Apply quantization scales
         if has_quantize and gup_scale is not None:
-            if gup_scale.shape[0] == 1:
+            if is_block_quant:
+                # Block quant: scale shape [E, H//256, 2, I_TP//256, TILE_SIZE] — take first element
+                bq_scale = gup_scale[expert_idx, :, :, :, 0].float()  # [H//256, 2, I_TP//256]
+                BQ = 256
+                H_blocks = H // BQ
+                I_blocks = I_TP // BQ
+                gate_act_bq = torch.zeros_like(gate_act)
+                up_act_bq = torch.zeros_like(up_act)
+                for h_b in range(H_blocks):
+                    h_s, h_e = h_b * BQ, (h_b + 1) * BQ
+                    for i_b in range(I_blocks):
+                        i_s, i_e = i_b * BQ, (i_b + 1) * BQ
+                        gate_act_bq[:, i_s:i_e] += (
+                            local_hidden[:, h_s:h_e]
+                            @ gate_up_w[expert_idx, h_s:h_e, :I_TP][:, i_s:i_e]
+                            * bq_scale[h_b, 0, i_b]
+                        )
+                        up_act_bq[:, i_s:i_e] += (
+                            local_hidden[:, h_s:h_e]
+                            @ gate_up_w[expert_idx, h_s:h_e, I_TP:][:, i_s:i_e]
+                            * bq_scale[h_b, 1, i_b]
+                        )
+                gate_act = gate_act_bq
+                up_act = up_act_bq
+            elif gup_scale.shape[0] == 1:
                 gate_act *= gup_scale.squeeze()[:I_TP]
                 up_act *= gup_scale.squeeze()[I_TP:]
+            elif gup_scale.dim() == 3 and gup_scale.shape[1] == 2 and gup_scale.shape[2] == 1:
+                # Per-tensor: [E, 2, 1]
+                gate_act *= gup_scale[expert_idx, 0, 0].float()
+                up_act *= gup_scale[expert_idx, 1, 0].float()
             elif gup_scale.shape[0] == E:
                 gate_act *= gup_scale[expert_idx, 0, :I_TP]
                 up_act *= gup_scale[expert_idx, 0, I_TP:]
+
+        # Apply per-token hidden scale for static quantization (post-dequant)
+        if has_quantize and gate_up_hidden_scale is not None:
+            if (
+                gate_up_hidden_scale.dim() == 3
+                and gate_up_hidden_scale.shape[1] == 2
+                and gate_up_hidden_scale.shape[2] == 1
+            ):
+                # Per-tensor activation: [E, 2, 1]
+                gate_act *= gate_up_hidden_scale[expert_idx, 0, 0].float()
+                up_act *= gate_up_hidden_scale[expert_idx, 1, 0].float()
+            else:
+                # Per-token activation: [T+1, 1]
+                local_gup_hs = gate_up_hidden_scale[local_ids].float()  # [B, 1]
+                gate_act *= local_gup_hs
+                up_act *= local_gup_hs
 
         # Apply bias
         if gate_and_up_proj_bias is not None:
@@ -204,18 +265,55 @@ def moe_cte_torch_ref(
 
         # Apply down quantization scale
         if has_quantize and down_scale_work is not None:
-            if down_scale_work.shape[0] == 1:
+            if is_block_quant:
+                # Block quant: scale shape [E, I_TP//256, H//256, TILE_SIZE] — take first element
+                ds = down_scale_work[expert_idx, :, :, 0].float()  # [I_TP//256, H//256]
+                BQ = 256
+                I_blocks = intermediate.shape[1] // BQ
+                H_blocks = H // BQ
+                down_act_bq = torch.zeros(B, H, dtype=torch.float32)
+                for i_b in range(I_blocks):
+                    i_s, i_e = i_b * BQ, (i_b + 1) * BQ
+                    for h_b in range(H_blocks):
+                        h_s, h_e = h_b * BQ, (h_b + 1) * BQ
+                        down_act_bq[:, h_s:h_e] += (
+                            intermediate[:, i_s:i_e] @ down_w[expert_idx, i_s:i_e, h_s:h_e] * ds[i_b, h_b]
+                        )
+                down_act = down_act_bq
+            elif down_scale_work.shape[0] == 1:
                 down_act = down_act * down_scale_work.squeeze()
+            elif down_scale_work.dim() == 2 and down_scale_work.shape[1] == 1 and down_scale_work.shape[0] == E:
+                # Per-tensor: [E, 1]
+                down_act = down_act * down_scale_work[expert_idx, 0].float()
             elif down_scale_work.shape[0] == E:
                 down_act = down_act * down_scale_work[expert_idx, 0, :]
 
+        # Apply per-token intermediate scale for static quantization (post-dequant)
+        if has_quantize and down_hidden_scale is not None:
+            if down_hidden_scale.dim() == 2 and down_hidden_scale.shape[1] == 1 and down_hidden_scale.shape[0] == E:
+                # Per-tensor activation: [E, 1]
+                down_act = down_act * down_hidden_scale[expert_idx, 0].float()
+            else:
+                # Per-token activation: [T+1, 1]
+                local_down_hs = down_hidden_scale[local_ids].float()
+                down_act = down_act * local_down_hs
+
         # Apply down bias
         if down_proj_bias is not None:
-            if expert_affinity_multiply_on_I:
-                # When affinity is applied on I, bias must also be scaled by affinity
-                down_act += down_proj_bias[expert_idx] * local_affinities
+            if down_bias_tp_degree is not None:
+                # TP-sharded bias: apply only to the H slice for this TP rank
+                _h_per_tp = H // down_bias_tp_degree
+                _h_start = down_bias_tp_rank * _h_per_tp
+                _h_end = _h_start + _h_per_tp
+                if expert_affinity_multiply_on_I:
+                    down_act[:, _h_start:_h_end] += down_proj_bias[expert_idx] * local_affinities
+                else:
+                    down_act[:, _h_start:_h_end] += down_proj_bias[expert_idx]
             else:
-                down_act += down_proj_bias[expert_idx]
+                if expert_affinity_multiply_on_I:
+                    down_act += down_proj_bias[expert_idx] * local_affinities
+                else:
+                    down_act += down_proj_bias[expert_idx]
 
         if do_checkpoint:
             ckpt_down[b_idx] = down_act
@@ -229,7 +327,9 @@ def moe_cte_torch_ref(
         # Accumulate output (cast to bfloat16 then back, matching numpy golden .astype(dtype))
         scaled_bf16 = scaled.to(torch.bfloat16).to(torch.float32)
         if separate_outputs:
-            if is_shard_block:
+            if is_v2_shard_block:
+                output[local_ids, :] += scaled_bf16
+            elif is_shard_block:
                 output[local_ids, 0, :] += scaled_bf16
             else:
                 output[0, local_ids, :] += scaled_bf16
@@ -239,7 +339,9 @@ def moe_cte_torch_ref(
     # Slice for skip_token (matching numpy golden)
     if skip_dma.skip_token:
         if separate_outputs:
-            if is_shard_block:
+            if is_v2_shard_block:
+                output = output[:T, :]
+            elif is_shard_block:
                 output = output[:T, :, :]
             else:
                 output = output[:, :T, :]
@@ -280,6 +382,8 @@ def moe_cte_unified_torch_ref(
     gate_clamp_lower_limit=None,
     up_clamp_upper_limit=None,
     up_clamp_lower_limit=None,
+    gate_up_in_scale=None,
+    down_in_scale=None,
 ) -> dict:
     """
     PyTorch reference for the unified moe_cte() entry point.
@@ -295,8 +399,7 @@ def moe_cte_unified_torch_ref(
     Returns:
         dict with 'output' and optionally 'gate_up_activations_T', 'down_activations'
     """
-    from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import BWMMFunc
-
+    from .bwmm_func import BWMMFunc
     from .moe_cte import MoECTEImplementation
 
     # Map MoECTEImplementation -> BWMMFunc
@@ -337,7 +440,7 @@ def moe_cte_unified_torch_ref(
     ):
         import numpy as np
 
-        from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import _mx_internal_data
+        from .bwmm_func import _mx_internal_data
 
         internal = _mx_internal_data.get(id(spec))
         if internal is None:

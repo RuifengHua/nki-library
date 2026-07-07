@@ -32,6 +32,7 @@ from nkilib_src.nkilib.core.moe.moe_cte.moe_cte_utils import SkipMode
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
     ExpertAffinityScaleMode,
+    QuantizationType,
 )
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
@@ -45,6 +46,146 @@ from test.integration.nkilib.utils.tensor_generators import generate_stabilized_
 _q_width = 4  # quantization width
 _q_height = 8  # quantization height
 _pmax = 128  # sbuf max partition dim (128)
+
+# --- Scale packing constants -----------------------------------------------
+# Each MX scale tile occupies a 4-partition stripe in each 32-partition
+# quadrant. The top half of a quadrant (16 partitions) can hold up to 4 such
+# stripes, so a single packed buffer carries up to 4 tiles' scales. With more
+# tiles, we use multiple packed buffers; the last one may be partially filled.
+QUADRANT_SIZE = 32
+N_QUADRANTS = _pmax // QUADRANT_SIZE  # 4
+P_SCALE = _pmax // _q_height  # 16 source rows per scale tile
+ROWS_PER_SLOT = P_SCALE // N_QUADRANTS  # 4 partitions per slot
+SLOTS_PER_PACKED_BUFFER = (QUADRANT_SIZE // 2) // ROWS_PER_SLOT  # 4 tiles per packed buffer
+
+
+def n_packed_buffers_for(n_tiles: int) -> int:
+    """Number of packed buffers needed to hold n_tiles scale tiles."""
+    return (n_tiles + SLOTS_PER_PACKED_BUFFER - 1) // SLOTS_PER_PACKED_BUFFER
+
+
+def _scatter_to_packed_gate_up(scale_std: np.ndarray) -> np.ndarray:
+    """Pack gate/up weight scale from standard to packed HBM layout.
+
+    Args:
+        scale_std: uint8[E, P_SCALE=16, 2, n_H512_tile, I]
+    Returns:
+        uint8[E, _pmax=128, n_packed_buffers, 2, I]
+
+    Layout: H/512 tile `tile_idx` lives in packed buffer
+        packed_buffer_idx = tile_idx // SLOTS_PER_PACKED_BUFFER
+    at within-quadrant partition offset
+        slot_idx = tile_idx %  SLOTS_PER_PACKED_BUFFER
+    occupying partitions [quadrant_idx*32 + slot_idx*4 : +4] for each of the
+    4 quadrants. Bottom half of each quadrant (and unused slots in the last
+    packed buffer) stays zero.
+    """
+    E, p_scale, two, n_H512_tile, I = scale_std.shape
+    assert p_scale == P_SCALE and two == 2, f"unexpected shape {scale_std.shape}"
+    n_packed = n_packed_buffers_for(n_H512_tile)
+    packed = np.zeros((E, _pmax, n_packed, 2, I), dtype=np.uint8)
+    for tile_idx in range(n_H512_tile):
+        packed_buffer_idx = tile_idx // SLOTS_PER_PACKED_BUFFER
+        slot_idx = tile_idx % SLOTS_PER_PACKED_BUFFER
+        for quadrant_idx in range(N_QUADRANTS):
+            dst_partition_start = quadrant_idx * QUADRANT_SIZE + slot_idx * ROWS_PER_SLOT
+            src_partition_start = quadrant_idx * ROWS_PER_SLOT
+            packed[:, dst_partition_start : dst_partition_start + ROWS_PER_SLOT, packed_buffer_idx, :, :] = scale_std[
+                :, src_partition_start : src_partition_start + ROWS_PER_SLOT, :, tile_idx, :
+            ]
+    return packed
+
+
+def gather_from_packed_gate_up(scale_packed: np.ndarray, n_H512_tile: int) -> np.ndarray:
+    """Inverse of _scatter_to_packed_gate_up. Reads only the populated stripes;
+    zero-pad regions of the packed buffer are not consulted.
+
+    Args:
+        scale_packed: uint8[E, _pmax=128, n_packed_buffers, 2, I]
+        n_H512_tile:  number of real H/512 tiles in the source (the last
+                      packed buffer may have unused slots beyond this count)
+    Returns:
+        uint8[E, P_SCALE=16, 2, n_H512_tile, I]
+    """
+    E, p, n_packed, two, I = scale_packed.shape
+    assert p == _pmax and two == 2, f"unexpected packed shape {scale_packed.shape}"
+    out = np.zeros((E, P_SCALE, 2, n_H512_tile, I), dtype=np.uint8)
+    for tile_idx in range(n_H512_tile):
+        packed_buffer_idx = tile_idx // SLOTS_PER_PACKED_BUFFER
+        slot_idx = tile_idx % SLOTS_PER_PACKED_BUFFER
+        for quadrant_idx in range(N_QUADRANTS):
+            src_partition_start = quadrant_idx * QUADRANT_SIZE + slot_idx * ROWS_PER_SLOT
+            dst_partition_start = quadrant_idx * ROWS_PER_SLOT
+            out[:, dst_partition_start : dst_partition_start + ROWS_PER_SLOT, :, tile_idx, :] = scale_packed[
+                :, src_partition_start : src_partition_start + ROWS_PER_SLOT, packed_buffer_idx, :, :
+            ]
+    return out
+
+
+def gather_from_packed_down(scale_packed: np.ndarray, n_I512_tile: int, p_scale: int = P_SCALE) -> np.ndarray:
+    """Inverse of _scatter_to_packed_down.
+
+    Args:
+        scale_packed: uint8[E, _pmax=128, n_packed_buffers, H]
+        n_I512_tile:  number of real I/512 tiles in the source
+        p_scale:      number of source partition rows in the standard layout
+                      (= I_TP_par_dim // _q_height; ≤ P_SCALE=16)
+    Returns:
+        uint8[E, p_scale, n_I512_tile, H]
+    """
+    E, p, n_packed, H_ = scale_packed.shape
+    assert p == _pmax, f"unexpected packed shape {scale_packed.shape}"
+    n_quadrants_filled = p_scale // ROWS_PER_SLOT
+    out = np.zeros((E, p_scale, n_I512_tile, H_), dtype=np.uint8)
+    for tile_idx in range(n_I512_tile):
+        packed_buffer_idx = tile_idx // SLOTS_PER_PACKED_BUFFER
+        slot_idx = tile_idx % SLOTS_PER_PACKED_BUFFER
+        for quadrant_idx in range(n_quadrants_filled):
+            src_partition_start = quadrant_idx * QUADRANT_SIZE + slot_idx * ROWS_PER_SLOT
+            dst_partition_start = quadrant_idx * ROWS_PER_SLOT
+            out[:, dst_partition_start : dst_partition_start + ROWS_PER_SLOT, tile_idx, :] = scale_packed[
+                :, src_partition_start : src_partition_start + ROWS_PER_SLOT, packed_buffer_idx, :
+            ]
+    return out
+
+
+def _scatter_to_packed_down(scale_std: np.ndarray) -> np.ndarray:
+    """Pack down weight scale from standard to packed HBM layout.
+
+    Args:
+        scale_std: uint8[E, p_scale, n_total_I512_tile, H]
+            Down-projection scale; no gate/up axis. ``p_scale`` is
+            ``I_TP_par_dim // _q_height`` and may be ≤ P_SCALE=16 when
+            ``I_TP_par_dim < _pmax``. Quadrants beyond what fits in the
+            available source rows are zero-padded (the matmul OOB-skips them).
+    Returns:
+        uint8[E, _pmax=128, n_packed_buffers, H]
+
+    Layout: I/512 tile `tile_idx` lives in packed buffer
+        packed_buffer_idx = tile_idx // SLOTS_PER_PACKED_BUFFER
+    at within-quadrant partition offset
+        slot_idx = tile_idx %  SLOTS_PER_PACKED_BUFFER
+    same as the gate/up packing.
+    """
+    E, p_scale, n_I512_tile, H_ = scale_std.shape
+    n_quadrants_filled = p_scale // ROWS_PER_SLOT
+    assert n_quadrants_filled * ROWS_PER_SLOT == p_scale, (
+        f"down scale packing requires p_scale to be a multiple of ROWS_PER_SLOT={ROWS_PER_SLOT}, got {p_scale}"
+    )
+    n_packed = n_packed_buffers_for(n_I512_tile)
+    packed = np.zeros((E, _pmax, n_packed, H_), dtype=np.uint8)
+    for tile_idx in range(n_I512_tile):
+        packed_buffer_idx = tile_idx // SLOTS_PER_PACKED_BUFFER
+        slot_idx = tile_idx % SLOTS_PER_PACKED_BUFFER
+        # Only fill the quadrants that have source data; the rest stay zero.
+        for quadrant_idx in range(n_quadrants_filled):
+            dst_partition_start = quadrant_idx * QUADRANT_SIZE + slot_idx * ROWS_PER_SLOT
+            src_partition_start = quadrant_idx * ROWS_PER_SLOT
+            packed[:, dst_partition_start : dst_partition_start + ROWS_PER_SLOT, packed_buffer_idx, :] = scale_std[
+                :, src_partition_start : src_partition_start + ROWS_PER_SLOT, tile_idx, :
+            ]
+    return packed
+
 
 # Explicit parameter ordering per kernel variant, matching kernel function signatures.
 # From bwmm_shard_on_block_mx.py::bwmm_shard_on_block_mx
@@ -75,6 +216,10 @@ _SHARD_ON_BLOCK_MX_ORDER = [
     'gate_clamp_lower_limit',
     'up_clamp_lower_limit',
     'up_clamp_upper_limit',
+    'use_packed_scales',
+    'quantization_type',
+    'gate_up_in_scale',
+    'down_in_scale',
 ]
 
 # From bwmm_shard_on_I_mx.py::blockwise_mm_shard_intermediate_mx
@@ -273,6 +418,8 @@ def build_moe_bwmm_mx_cte_from_model_test_config(
     up_clamp_lower_limit: Optional[float] = None,
     alpha: Optional[float] = None,
     is_shard_on_I: bool = False,
+    use_packed_scales: bool = False,
+    quantization_type: QuantizationType = QuantizationType.MX,
 ) -> dict:
     """Build input tensors for MoE BWMM MX CTE model test configs using skewness-based routing.
 
@@ -397,6 +544,8 @@ def build_moe_bwmm_mx_cte_from_model_test_config(
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
+        use_packed_scales=use_packed_scales,
+        quantization_type=quantization_type,
     )
 
 
@@ -424,6 +573,8 @@ def build_moe_bwmm_mx_cte(
     use_cache: bool = False,
     is_shard_on_I: bool = False,
     n_static_blocks: Optional[int] = None,
+    use_packed_scales: bool = False,
+    quantization_type: QuantizationType = QuantizationType.MX,
 ) -> dict:
     """
     Build input tensors for MoE BWMM MXFP4/MXFP8 CTE kernel testing.
@@ -532,6 +683,8 @@ def build_moe_bwmm_mx_cte(
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
+        use_packed_scales=use_packed_scales,
+        quantization_type=quantization_type,
     )
 
     # Cache the generated inputs for future reuse
@@ -574,26 +727,38 @@ def _build_kernel_input_from_routing(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
+    use_packed_scales: bool = False,
+    quantization_type: QuantizationType = QuantizationType.MX,
 ) -> dict:
     """Build kernel input tensors and dict from pre-computed routing assignments.
 
     This is the shared implementation used by both build_moe_bwmm_mx_cte (TOPK routing)
     and build_moe_bwmm_mx_cte_from_model_test_config (skewness routing).
+
+    When ``use_packed_scales=True``, gate_up_proj_scale and down_proj_scale are
+    handed to the kernel in packed HBM layouts:
+        gate_up_proj_scale: uint8[E, _pmax=128, n_packed_gup, 2, I]
+        down_proj_scale:    uint8[E, _pmax=128, n_packed_down, H]
+    The kernel detects the packed layout from the partition dim (128 vs 16)
+    and dispatches to the packed sub-kernel variants. The torch reference
+    receives the standard (unpacked) scale arrays via ``_internal`` so it
+    keeps using the existing reference path.
     """
     # Calculate MXFP4 tensor dimensions
     kernel_assert(H % (_pmax * _q_width) == 0, f"H must be divisible by {_pmax * _q_width}, got {H}")
     n_H512_tile = H // (_pmax * _q_width)
 
     kernel_assert(
-        I_TP % (_pmax * _q_width) == 0 or (I_TP < (_pmax * _q_width) and I_TP % (_q_height * _q_width) == 0),
-        f"I_TP must be divisible by {_pmax * _q_width} or (I_TP < {_pmax * _q_width} and I_TP divisible by {_q_height * _q_width}), got {I_TP}",
+        I_TP % (_q_height * _q_width) == 0,
+        f"I_TP must be divisible by {_q_height * _q_width}, got {I_TP}",
     )
     n_I512_tile, r_I512_tile = divmod(I_TP, _pmax * _q_width)
-    I_TP_par_dim = _pmax
-    if r_I512_tile > 0:
-        kernel_assert(n_I512_tile == 0, f"Expected n_I512_tile == 0 when remainder exists, got {n_I512_tile}")
-        n_I512_tile = 1
-        I_TP_par_dim = r_I512_tile // _q_width
+    n_total_I512_tile = n_I512_tile + (1 if r_I512_tile > 0 else 0)
+    # Match kernel's p_I logic (moe_cte_mx_utils.BWMMMXDimensionSizes.p_I):
+    #   p_I = _pmax if I > 512 else I // _q_width
+    # Previously used r_I512_tile which is 0 when I_TP is an exact multiple of 512,
+    # producing a 0-sized partition dim that fails NkiTensor shape validation.
+    I_TP_par_dim = _pmax if I_TP > _pmax * _q_width else I_TP // _q_width
 
     # Generate hidden states with MXFP4-compatible layout
     # When skip_token is True, we use T tokens; otherwise T+1 (with padding token)
@@ -638,10 +803,26 @@ def _build_kernel_input_from_routing(
     # Generate MXFP4 down projection weights
     down_proj_weights_fp32, down_proj_weights, down_proj_scale = generate_stabilized_mx_data(
         mx_dtype=weight_dtype,
-        shape=(E * I_TP_par_dim, n_I512_tile * H * _q_width),
+        shape=(E * I_TP_par_dim, n_total_I512_tile * H * _q_width),
     )
-    down_proj_weights = down_proj_weights.reshape(E, I_TP_par_dim, n_I512_tile, H)
-    down_proj_scale = down_proj_scale.reshape(E, I_TP_par_dim // _q_height, n_I512_tile, H)
+    down_proj_weights = down_proj_weights.reshape(E, I_TP_par_dim, n_total_I512_tile, H)
+    down_proj_scale = down_proj_scale.reshape(E, I_TP_par_dim // _q_height, n_total_I512_tile, H)
+
+    # Zero-pad unused partitions of the remainder tile.
+    # The kernel expects the HBM weight to be pre-zeroed when p_I == _pmax
+    # (it only memsets when p_I < _pmax). For the remainder tile, only
+    # n_par_r_I512_tile partitions carry real data.
+    if r_I512_tile > 0 and I_TP_par_dim == _pmax:
+        n_par_r = r_I512_tile // _q_width
+        down_proj_weights_fp32_reshaped = down_proj_weights_fp32.reshape(
+            E, I_TP_par_dim, n_total_I512_tile, H * _q_width
+        )
+        down_proj_weights_fp32_reshaped[:, n_par_r:, -1, :] = 0
+        down_proj_weights_fp32 = down_proj_weights_fp32_reshaped.reshape(
+            E * I_TP_par_dim, n_total_I512_tile * H * _q_width
+        )
+        down_proj_weights[:, n_par_r:, -1, :] = 0
+        down_proj_scale[:, n_par_r // _q_height :, -1, :] = 0
 
     # Build kernel input dictionary in exact KLIR test order
     # Order must match build_blockwise_mm input_list:
@@ -694,7 +875,7 @@ def _build_kernel_input_from_routing(
     # Add bias tensors (matches build_blockwise_mm order: gate_and_up_proj_bias, down_proj_bias)
     if bias:
         gate_and_up_proj_bias = np.random.uniform(
-            -2.0625, 0.52, size=(E, I_TP_par_dim, 2, n_I512_tile, _q_width)
+            -2.0625, 0.52, size=(E, I_TP_par_dim, 2, n_total_I512_tile, _q_width)
         ).astype(dtype)
         down_proj_bias = np.random.uniform(-1.632, 1.4375, size=[E, H]).astype(dtype)
         kernel_input['gate_and_up_proj_bias'] = gate_and_up_proj_bias
@@ -703,9 +884,62 @@ def _build_kernel_input_from_routing(
         kernel_input['gate_and_up_proj_bias'] = None
         kernel_input['down_proj_bias'] = None
 
-    # Add scale tensors AFTER bias (matches build_blockwise_mm order)
-    kernel_input['gate_up_proj_scale'] = gate_up_proj_scale
-    kernel_input['down_proj_scale'] = down_proj_scale
+    # Add scale tensors AFTER bias (matches build_blockwise_mm order).
+    # If packing is requested, hand the kernel the packed copies. The torch
+    # reference inverts the packing via gather_from_packed_* in the wrapper.
+    if use_packed_scales:
+        # Both gate/up (always P_SCALE=16 source rows) and down (p_scale =
+        # I_TP_par_dim // _q_height, may be ≤ 16) are supported. For down,
+        # quadrants beyond what the source covers stay zero-padded.
+        kernel_input['gate_up_proj_scale'] = _scatter_to_packed_gate_up(gate_up_proj_scale)
+        kernel_input['down_proj_scale'] = _scatter_to_packed_down(down_proj_scale)
+    else:
+        kernel_input['gate_up_proj_scale'] = gate_up_proj_scale
+        kernel_input['down_proj_scale'] = down_proj_scale
+
+    # Forward the packed-scale flag to the kernel — only emit when packing is
+    # requested so kernel variants that don't accept the kwarg (e.g. shard-on-I)
+    # aren't broken by an unrecognized key.
+    if use_packed_scales:
+        kernel_input['use_packed_scales'] = True
+
+    # ── STATIC_MX support ──
+    # STATIC_MX reuses the existing weight-scale tensors instead of adding new params:
+    #   gate_up_proj_scale carries the per-expert gate/up weight scales as [E, 2, 1]
+    #     (idx 0 = gate, idx 1 = up); down_proj_scale carries down weight scale as [E, 1].
+    #   gate_up_in_scale: [E, 1], down_in_scale: [E, 1] — per-tensor input scales (HF
+    #     checkpoints emit one input_scale per (expert, proj_type)).
+    # Flat scale args at the kernel signature (matches MLP / MoE TKG conventions for @nki.jit tracing).
+    kernel_input['quantization_type'] = quantization_type
+    kernel_input['gate_up_in_scale'] = None
+    kernel_input['down_in_scale'] = None
+    if quantization_type == QuantizationType.STATIC_MX:
+        # Two scales serve different purposes — calibrate them independently:
+        #   - in_scale: framework's static fp8 quant scale for hidden states. Must match
+        #     the hidden's range so `hidden / in_scale` lands within ±fp8_max (no clipping).
+        #     CTE generates bf16 hidden with val_range=5, so in_scale ≈ 5/448 ≈ 0.011.
+        #     (TKG generates fp8-byte hidden directly, so it can use 1/512 here — that
+        #     would over-clip our bf16 hidden.)
+        #   - w_scale: framework's static fp8 quant scale for weights. Stored fp8 bytes
+        #     are ±fp8_max; w_scale dequantizes them to the network's "real" weight
+        #     magnitude. Use TKG's convention: 1/(2 × fp8_max).
+        _W_SCALE_MAP = {
+            nl.float8_e4m3fn_x4: 1.0 / 512.0,  # 1/(2×448)
+            nl.float8_e5m2_x4: 1.0 / 65536.0,  # 1/(2×57344) rounded
+        }
+        _w_scale_max = _W_SCALE_MAP.get(weight_dtype, 1.0 / 512.0)
+        _IN_SCALE_TARGET = 5.0 / 448.0  # val_range=5 / fp8_e4m3fn max
+        # Reuse gate_up_proj_scale / down_proj_scale to carry the per-expert weight scales.
+        kernel_input['gate_up_proj_scale'] = np.random.random_sample(size=(E, 2, 1)).astype(np.float32) * _w_scale_max
+        kernel_input['down_proj_scale'] = np.random.random_sample(size=(E, 1)).astype(np.float32) * _w_scale_max
+        # Per-expert input scales: each expert gets a slightly different in_scale to exercise
+        # the kernel's per-expert lookup path.
+        kernel_input['gate_up_in_scale'] = (_IN_SCALE_TARGET * np.random.uniform(0.8, 1.25, size=(E, 1))).astype(
+            np.float32
+        )
+        kernel_input['down_in_scale'] = (_IN_SCALE_TARGET * np.random.uniform(0.8, 1.25, size=(E, 1))).astype(
+            np.float32
+        )
 
     # Store additional data needed for golden computation
     kernel_input['_internal'] = {
@@ -715,7 +949,10 @@ def _build_kernel_input_from_routing(
         'N': N,
         'n_H512_tile': n_H512_tile,
         'n_I512_tile': n_I512_tile,
+        'n_total_I512_tile': n_total_I512_tile,
         'I_TP_par_dim': I_TP_par_dim,
+        'use_packed_scales': use_packed_scales,
+        'quantization_type': quantization_type,
     }
 
     return kernel_input

@@ -39,7 +39,7 @@ try:
 except ImportError:
     attention_tkg_model_configs = []
 
-from typing import Any, final
+from typing import Any, Optional, final
 
 import neuron_dtypes as dt
 import nki.isa as nisa
@@ -65,7 +65,7 @@ from nkilib_src.nkilib.core.attention.attention_tkg_utils import (
     uses_batch_tiling,
 )
 from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
-from nkilib_src.nkilib.core.utils.allocator import SbufManager
+from nkilib_src.nkilib.core.utils.allocator import SbufManager, create_auto_alloc_manager, sizeinbytes
 from nkilib_src.nkilib.core.utils.logging import Logger
 from test.integration.nkilib.utils.tensor_generators import np_random_sample, np_random_sample_fp8
 from test.utils.common_dataclasses import (
@@ -111,7 +111,9 @@ def attn_tkg_wrapper(
     cfg: AttnTKGConfig,
     dtype,
     lnc,
+    use_auto_alloc,
     DBG,
+    max_context_len=None,
 ):
     # Dummy validation step so that invalid configurations are verified early in test
     _compute_tile_params(
@@ -119,14 +121,17 @@ def attn_tkg_wrapper(
     )
 
     is_block_kv = cfg.block_len > 0
-    # Leave some room for compiler allocated usage
-    sbm = SbufManager(
-        0,
-        nl.tile_size.total_available_sbuf_size - 16 * 1024,
-        Logger(
-            "SBM",
-        ),
-    )  # LogLevel.DEBUG))
+    if not use_auto_alloc:
+        # Leave some room for compiler allocated usage
+        sbm = SbufManager(
+            0,
+            nl.tile_size.total_available_sbuf_size - 16 * 1024,
+            Logger(
+                "SBM",
+            ),
+        )  # LogLevel.DEBUG))
+    else:
+        sbm = create_auto_alloc_manager(logger=Logger("SBM"))
     sbm.open_scope()
 
     # Create output tensors
@@ -176,6 +181,7 @@ def attn_tkg_wrapper(
                 cfg.s_active,
                 full_sprior=cfg.full_sprior,
                 enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+                fuse_rope=cfg.fuse_rope,
             )
             DBG_ACTIVE_TABLE = nl.ndarray(
                 (TC.p_max, active_blocks_table.shape[1] * resize_factor // TC.p_max, cfg.bs),
@@ -201,6 +207,7 @@ def attn_tkg_wrapper(
         active_blocks_table,
         k_out,
         DBG_TENSORS=DBG_TENSORS,
+        max_context_len=max_context_len,
     )
 
     # Handle output if needed
@@ -238,6 +245,7 @@ def run_attention_tkg_test(
     sliding_window: int,
     is_negative_test_case: bool = False,
     DBG: bool = False,
+    max_context_len_value: Optional[int] = None,
 ):
     np.random.seed(42)
 
@@ -259,7 +267,11 @@ def run_attention_tkg_test(
     resize_factor = None
     if is_block_kv:
         assumed_num_cache_blocks = cfg.bs * cfg.curr_sprior // cfg.block_len
-        k_prior_shape = v_prior_shape = (assumed_num_cache_blocks, cfg.block_len, cfg.d_head)
+        if cfg.fp8_packed:
+            k_prior_shape = (assumed_num_cache_blocks, cfg.block_len // 2, cfg.d_head, 2)
+        else:
+            k_prior_shape = (assumed_num_cache_blocks, cfg.block_len, cfg.d_head)
+        v_prior_shape = (assumed_num_cache_blocks, cfg.block_len, cfg.d_head)
     else:
         k_prior_shape = (
             (cfg.bs, 1, cfg.full_sprior, cfg.d_head) if cfg.tp_k_prior else (cfg.bs, 1, cfg.d_head, cfg.full_sprior)
@@ -275,6 +287,13 @@ def run_attention_tkg_test(
 
     # Generate pos_id outside of tensor_gen so it stays the same for all inputs
     pos_id = generate_cache_lens(cfg.bs, cfg.curr_sprior, cfg.s_active, mode="normal")
+    if max_context_len_value is not None:
+        max_pos = cfg.curr_sprior - cfg.s_active
+        pos_id = generate_cache_lens(
+            cfg.bs, cfg.curr_sprior, cfg.s_active, mean_frac=max_context_len_value / (2 * max_pos)
+        )
+        pos_id = np.clip(pos_id, 0, max_context_len_value - cfg.s_active)
+        pos_id[0] = max_context_len_value - cfg.s_active  # ensure at least one batch hits the max
 
     def input_generator(test_config):
         random_gen = np_random_sample()
@@ -314,6 +333,7 @@ def run_attention_tkg_test(
                     include_active_mask=True,
                     transposed=True,
                     enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+                    fuse_rope=cfg.fuse_rope,
                 )
                 .numpy()
                 .astype(np.bool_)
@@ -363,7 +383,11 @@ def run_attention_tkg_test(
             "cfg": cfg,
             "dtype": dtype,
             "lnc": lnc,
+            "use_auto_alloc": False,
             "DBG": DBG,
+            "max_context_len": np.array([max_context_len_value], dtype=np.int32)
+            if max_context_len_value is not None
+            else None,
         }
 
     def attn_tkg_torch_wrapper(
@@ -383,7 +407,9 @@ def run_attention_tkg_test(
         cfg: AttnTKGConfig,
         dtype,
         lnc,
+        use_auto_alloc,
         DBG,
+        max_context_len=None,
     ):
         out = torch.zeros(attn_out_shape, dtype=torch.float32)
         k_out = torch.zeros(k_out_shape, dtype=torch.float32) if cfg.fuse_rope else None
@@ -409,6 +435,7 @@ def run_attention_tkg_test(
                     cfg.s_active,
                     full_sprior=cfg.full_sprior,
                     enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+                    fuse_rope=cfg.fuse_rope,
                 )
                 DBG_ACTIVE_TABLE = torch.zeros(
                     (P_MAX, active_blocks_table.shape[1] * resize_factor // P_MAX, cfg.bs),
@@ -433,6 +460,7 @@ def run_attention_tkg_test(
             active_blocks_table=active_blocks_table,
             k_out=k_out,
             DBG_TENSORS=DBG_TENSORS,
+            max_context_len=max_context_len,
         )
 
         # These tensors are padded and have "don't care" values that are removed by this custom comparator
@@ -496,13 +524,21 @@ def run_attention_tkg_test(
             DBG_EXP_SUM_NP = DBG_EXP_SUM.numpy()
 
             # Determine if FA and batch tiling are used (affects which debug tensors are valid)
-            s_prior_n_prgs = lnc if is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX) else 1
-            bs_n_prgs = lnc if is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX) else 1
+            s_prior_n_prgs = (
+                lnc
+                if is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope)
+                else 1
+            )
+            bs_n_prgs = (
+                lnc if is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope) else 1
+            )
             s_prior_per_prg = cfg.curr_sprior // s_prior_n_prgs
             bs_per_nc = cfg.bs // bs_n_prgs
             use_fa, fa_tile_size = uses_flash_attention(cfg.enable_fa_s_prior_tiling, s_prior_per_prg)
             fa_tile_s_prior = fa_tile_size if use_fa else s_prior_per_prg
-            use_bt, _ = uses_batch_tiling(bs_per_nc, cfg.q_head, cfg.s_active, fa_tile_s_prior)
+            use_bt, _ = uses_batch_tiling(
+                bs_per_nc, cfg.q_head, cfg.s_active, fa_tile_s_prior, use_auto_alloc, dtype_size=sizeinbytes(dtype)
+            )
 
             # DBG_QK is skipped when strided_mm1 + FA (complex K column remapping)
             # or strided_mm1 + batch tiling (batch and sprior tiles interleaved in QK buffer)
@@ -511,16 +547,19 @@ def run_attention_tkg_test(
             else:
                 golds['DBG_QK'] = dt.static_cast(DBG_QK_NP, DBG_QK_NP.dtype)
 
-            # DBG_QK_MAX is skipped when FA (running quantities) or batch tiling
+            # DBG_QK_MAX is skipped when batch tiling
             # (BSQ tile layout differs between full-batch and per-tile)
-            if use_fa or use_bt:
+            if use_bt:
                 golds['DBG_QK_MAX'] = skip_comparator('DBG_QK_MAX', DBG_QK_MAX_NP.shape, DBG_QK_MAX_NP.dtype)
             else:
                 golds['DBG_QK_MAX'] = custom_debug_tensor_comparator(DBG_QK_MAX_NP, 'DBG_QK_MAX')
 
-            # DBG_QK_EXP is skipped when FA (running quantities)
-            # or strided_mm1 + batch tiling (same interleaving issue as DBG_QK)
-            if use_fa or (cfg.strided_mm1 and use_bt):
+            # DBG_QK_EXP is skipped when the kernel takes the online-softmax path (use_fa OR
+            # sharded), because qk_io_type is computed against a per-tile/local max rather than
+            # the global max; also skipped when strided_mm1 + batch tiling (same interleaving
+            # issue as DBG_QK).
+            online_softmax_enabled = use_fa or s_prior_n_prgs > 1
+            if online_softmax_enabled or (cfg.strided_mm1 and use_bt):
                 golds['DBG_QK_EXP'] = skip_comparator('DBG_QK_EXP', DBG_QK_EXP_NP.shape, DBG_QK_EXP_NP.dtype)
             else:
                 golds['DBG_QK_EXP'] = dt.static_cast(DBG_QK_EXP_NP, dtype)
@@ -560,6 +599,7 @@ def run_attention_tkg_test(
                     cfg.s_active,
                     full_sprior=cfg.full_sprior,
                     enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+                    fuse_rope=cfg.fuse_rope,
                 )
                 golden_output['DBG_ACTIVE_TABLE'] = np.zeros(
                     (P_MAX, cfg.bs * cfg.curr_sprior * resize_factor // cfg.block_len // P_MAX),
@@ -602,6 +642,7 @@ def filter_invalid_tests(
     dtype: str = None,
     sink: bool = None,
     fp8_kv: bool = None,
+    fp8_packed: bool = None,
     sliding_window: int = None,
     lnc: int = None,
 ) -> FilterResult:
@@ -641,6 +682,13 @@ def filter_invalid_tests(
         if qk_in_sb is not None and not qk_in_sb:
             return FilterResult.INVALID
 
+    # fp8_packed constraints
+    if fp8_packed is not None and fp8_packed:
+        if fp8_kv is not None and not fp8_kv:
+            return FilterResult.INVALID
+        if block_len is not None and block_len == 0:
+            return FilterResult.INVALID
+
     # Partial combination, allow further exploration
     if lnc is None:
         return FilterResult.VALID
@@ -663,7 +711,9 @@ def filter_invalid_tests(
         strided_mm1=strided_mm1,
     )
 
-    s_prior_n_prgs = lnc if is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX) else 1
+    s_prior_n_prgs = (
+        lnc if is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope) else 1
+    )
     if (s_prior // s_prior_n_prgs) % P_MAX != 0:
         return FilterResult.INVALID
 
@@ -693,7 +743,11 @@ def filter_invalid_tests(
                     q_head=cfg.q_head,
                     s_active=cfg.s_active,
                     enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+                    fuse_rope=cfg.fuse_rope,
                 )
+
+        if fp8_packed and block_len < 2:
+            return FilterResult.INVALID
 
     return FilterResult.VALID
 
@@ -750,7 +804,7 @@ attention_tkg_fast_configs = [
     [AttnTKGConfig(4, 2, 7, 16384, 16384, 128, 0, use_pos_id=True, fuse_rope=True), AttnTKGTestParams()],
     # NKI Smaller bucket sizes/prior sequence length
     [AttnTKGConfig(4, 2, 7, 256, 16384, 128, 0, use_pos_id=True, fuse_rope=True), AttnTKGTestParams()],
-    [AttnTKGConfig(4, 2, 7, 512, 16384, 128, 0, use_pos_id=True, fuse_rope=True), AttnTKGTestParams()],
+    pytest.param(AttnTKGConfig(4, 2, 7, 512, 16384, 128, 0, use_pos_id=True, fuse_rope=True), AttnTKGTestParams(), marks=pytest.mark.fast),
     [AttnTKGConfig(4, 2, 7, 1024, 16384, 128, 0, use_pos_id=True, fuse_rope=True), AttnTKGTestParams()],
     [AttnTKGConfig(4, 2, 7, 2048, 16384, 128, 0, use_pos_id=True, fuse_rope=True), AttnTKGTestParams()],
     [AttnTKGConfig(4, 2, 7, 4096, 16384, 128, 0, use_pos_id=True, fuse_rope=True), AttnTKGTestParams()],
@@ -765,7 +819,7 @@ attention_tkg_fast_configs = [
     [AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 0, use_pos_id=True, fuse_rope=True, qk_in_sb=True), AttnTKGTestParams()],
     [AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 0, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
     [AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 0, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
-    [AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 0, fuse_rope=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
+    pytest.param(AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 0, fuse_rope=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(), marks=pytest.mark.fast),
 
     #################### Sink ####################
     [AttnTKGConfig(8, 8, 1, 1024, 10240, 64, 0, tp_k_prior=True, use_pos_id=True, fuse_rope=True), AttnTKGTestParams(test_sink=True)],
@@ -774,14 +828,14 @@ attention_tkg_fast_configs = [
     # Sink with fp32
     [AttnTKGConfig(8, 8, 1, 1024, 10240, 64, 0, tp_k_prior=True, use_pos_id=True, fuse_rope=True), AttnTKGTestParams(dtype=nl.float32, test_sink=True)],
     [AttnTKGConfig(128, 1, 1, 1024, 10240, 64, 0, tp_k_prior=True, use_pos_id=True, fuse_rope=True), AttnTKGTestParams(dtype=nl.float32, test_sink=True)],
-    [AttnTKGConfig(4, 4, 5, 1024, 10240, 64, 0, tp_k_prior=True, use_pos_id=True, fuse_rope=True), AttnTKGTestParams(dtype=nl.float32, test_sink=True)],
+    pytest.param(AttnTKGConfig(4, 4, 5, 1024, 10240, 64, 0, tp_k_prior=True, use_pos_id=True, fuse_rope=True), AttnTKGTestParams(dtype=nl.float32, test_sink=True), marks=pytest.mark.fast),
 
     #################### LNC-shard on batch ####################
     # for s_prior < 256
     [AttnTKGConfig(8, 4, 4, 128, 256, 64, 0, tp_k_prior=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
     [AttnTKGConfig(32, 8, 1, 128, 256, 64, 0, tp_k_prior=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
     [AttnTKGConfig(128, 1, 1, 128, 256, 64, 0, qk_in_sb=True), AttnTKGTestParams(test_sink=True)],
-    [AttnTKGConfig(1, 1, 1, 128, 256, 64, 0, tp_k_prior=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
+    pytest.param(AttnTKGConfig(1, 1, 1, 128, 256, 64, 0, tp_k_prior=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(), marks=pytest.mark.fast),
     [AttnTKGConfig(16, 8, 1, 8192, 8192, 64, 0, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
     # large batch (b*n*s>128)
     [AttnTKGConfig(4, 8, 7, 3072, 10240, 64, 0, tp_k_prior=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
@@ -789,7 +843,7 @@ attention_tkg_fast_configs = [
     [AttnTKGConfig(64, 8, 1, 2048, 2048, 128, 0, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams()],
 
     #################### Block KV Tests ####################
-    [AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
+    pytest.param(AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True), marks=pytest.mark.fast),
     [AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
     [AttnTKGConfig(4, 8, 7, 4096, 10240, 64, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
     [AttnTKGConfig(4, 8, 7, 3072, 10240, 64, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
@@ -797,7 +851,7 @@ attention_tkg_fast_configs = [
 
     # Block KV regression: n_sprior_tile=96 exercises n_sprior_tile-major HBM layout fix.
     # S shard, n_sprior_tile=96
-    [AttnTKGConfig(4, 1, 5, 12288, 12288, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
+    pytest.param(AttnTKGConfig(4, 1, 5, 12288, 12288, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True), marks=pytest.mark.fast),
     # S shard, n_sprior_tile=96 + SWA
     [AttnTKGConfig(4, 1, 5, 12288, 12288, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True, sliding_window=128)],
     # B shard, n_sprior_tile=96
@@ -808,7 +862,7 @@ attention_tkg_fast_configs = [
     [AttnTKGConfig(4, 1, 5, 1024, 10240, 128, 0, strided_mm1=False, qk_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
     [AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 0, strided_mm1=False, qk_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
     [AttnTKGConfig(4, 2, 7, 4096, 16384, 128, 0, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
-    [AttnTKGConfig(4, 1, 5, 1024, 10240, 128, 0, tp_k_prior=True, strided_mm1=False, qk_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
+    pytest.param(AttnTKGConfig(4, 1, 5, 1024, 10240, 128, 0, tp_k_prior=True, strided_mm1=False, qk_in_sb=True), AttnTKGTestParams(fp8_kv=True), marks=pytest.mark.fast),
     [AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 0, tp_k_prior=True, strided_mm1=False, qk_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
     [AttnTKGConfig(4, 2, 7, 4096, 16384, 128, 0, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
     # FP8 KV with Block KV
@@ -817,6 +871,10 @@ attention_tkg_fast_configs = [
     [AttnTKGConfig(1, 2, 5, 26624, 36896, 128, 32, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, enable_fa_s_prior_tiling=False), AttnTKGTestParams(fp8_kv=True)],
     # FP8 KV with Block KV large batch
     [AttnTKGConfig(128, 1, 1, 2048, 2048, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
+    # FP8 KV with Block KV fp8_packed
+    [AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True)],
+    [AttnTKGConfig(8, 8, 5, 4096, 4096, 64, 32, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True)],
+    pytest.param(AttnTKGConfig(2, 8, 5, 256, 256, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True, sliding_window=128), marks=pytest.mark.fast),
     # Block KV Tests with gen_mask_tkg mask generation (use_pos_id=True)
     [AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
     [AttnTKGConfig(4, 1, 5, 10240, 10240, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(test_sink=True)],
@@ -947,6 +1005,7 @@ _ABBREVS = {
     "out_in_sb": "osb",
     "k_out_in_sb": "kosb",
     "qk_in_sb": "qksb",
+    "fp8_packed": "fp8pk",
     "sliding_window": "swin",
 }
 
@@ -955,7 +1014,6 @@ _ABBREVS = {
 @pytest_marks(["attention", "tkg"])
 @final
 class TestAttentionTkgKernel:
-    @pytest.mark.fast
     @pytest.mark.parametrize("lnc", [1, 2])
     @pytest.mark.parametrize("attn_cfg, test_cfg", attention_tkg_fast_configs, ids=cfg_repr)
     def test_attn_tkg_fast(
@@ -969,7 +1027,6 @@ class TestAttentionTkgKernel:
         compiler_args = CompilerArgs(logical_nc_config=lnc, platform_target=platform_target)
         run_attention_tkg_test(test_manager=test_manager, compiler_args=compiler_args, cfg=attn_cfg, **asdict(test_cfg))
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(
         "attn_cfg, test_cfg",
         [
@@ -1036,6 +1093,7 @@ class TestAttentionTkgKernel:
         dtype=[nl.bfloat16, nl.float32],
         sink=[True, False],
         fp8_kv=[True, False],
+        fp8_packed=[True, False],
         sliding_window=BoundedRange([0, 128, 256], boundary_values=[]),
         lnc=BoundedRange([1, 2], boundary_values=[]),
         coverage="pairs",
@@ -1065,6 +1123,7 @@ class TestAttentionTkgKernel:
         dtype: str,
         sink: bool,
         fp8_kv: bool,
+        fp8_packed: bool,
         sliding_window: int,
         lnc: int,
         is_negative_test_case: bool,
@@ -1084,6 +1143,7 @@ class TestAttentionTkgKernel:
             out_in_sb=out_in_sb,
             k_out_in_sb=k_out_in_sb,
             qk_in_sb=qk_in_sb,
+            fp8_packed=fp8_packed,
         )
 
         compiler_args = CompilerArgs(logical_nc_config=lnc, platform_target=platform_target)
@@ -1105,3 +1165,56 @@ class TestAttentionTkgKernel:
                 f"Failed test, manual test vector: {print_test_config(cfg, AttnTKGTestParams(dtype=dtype, test_sink=sink, fp8_kv=fp8_kv, sliding_window=sliding_window))}"
             )
             raise
+
+
+# fmt: off
+attention_tkg_dynamic_fa_configs = [
+    # Dynamic FA early exit tests: [AttnTKGConfig, max_context_len]
+    # 1 tile (dynamic loop runs 0 iterations, only static last tile)
+    pytest.param(AttnTKGConfig(1, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 4096, marks=pytest.mark.fast),
+    # Full (no skip, exercises dynamic loop with all tiles)
+    [AttnTKGConfig(1, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 131072],
+    # Partial (between 16k and 32k)
+    [AttnTKGConfig(1, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 24576],
+    # 64K (skips ~half the tiles)
+    [AttnTKGConfig(1, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 65536],
+    # Odd values (not tile-aligned, tests ceil behavior)
+    [AttnTKGConfig(1, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 16385],
+    pytest.param(AttnTKGConfig(1, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 30000, marks=pytest.mark.fast),
+    # bs=2 variants
+    [AttnTKGConfig(2, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 4096],
+    [AttnTKGConfig(2, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 24576],
+    [AttnTKGConfig(2, 8, 1, 131072, 131072, 128, 32, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, out_in_sb=True), 131072],
+]
+# fmt: on
+
+
+def _dynamic_fa_cfg_repr(val):
+    """Generate test ID for dynamic FA config parameter."""
+    if isinstance(val, AttnTKGConfig):
+        return cfg_repr(val)
+    return f"mcl_{val}"
+
+
+class TestAttentionTkgDynamicFA:
+    @pytest.mark.parametrize("lnc", [1, 2])
+    @pytest.mark.parametrize("attn_cfg, max_context_len", attention_tkg_dynamic_fa_configs, ids=_dynamic_fa_cfg_repr)
+    def test_attn_tkg_dynamic_fa(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        attn_cfg: AttnTKGConfig,
+        max_context_len: int,
+        lnc: int,
+    ):
+        compiler_args = CompilerArgs(logical_nc_config=lnc, platform_target=platform_target)
+        run_attention_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            cfg=attn_cfg,
+            dtype=nl.bfloat16,
+            test_sink=False,
+            fp8_kv=True,
+            sliding_window=0,
+            max_context_len_value=max_context_len,
+        )

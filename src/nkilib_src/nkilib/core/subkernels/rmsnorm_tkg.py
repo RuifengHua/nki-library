@@ -203,7 +203,7 @@ def _rmsnorm_tkg_shard_on_bxs(
         output_sb_view = output_view
     else:
         alloc_tensor = sbm.alloc_heap if use_heap_memory else sbm.alloc_stack
-        output_sb = alloc_tensor((H0, BxS, H1), dtype=input_view.dtype, buffer=nl.sbuf, name="rmsnorm_output_sb")
+        output_sb = alloc_tensor((H0, BxS, H1), dtype=input_view.dtype, buffer=nl.sbuf)
         output_sb_view = TensorView(output_sb)
 
     _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
@@ -297,7 +297,7 @@ def _rmsnorm_tkg_shard_on_h(
         output_sb_view = output_view
     else:
         alloc_tensor = sbm.alloc_heap if use_heap_memory else sbm.alloc_stack
-        output_sb = alloc_tensor((H0, BxS, shard_H1), dtype=input_view.dtype, buffer=nl.sbuf, name="rmsnorm_output_sb")
+        output_sb = alloc_tensor((H0, BxS, shard_H1), dtype=input_view.dtype, buffer=nl.sbuf)
         output_sb_view = TensorView(output_sb)
 
     _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
@@ -380,9 +380,7 @@ def _process_rmsnorm_tile(
     H0, BxS, H1 = input_sb_view.shape
 
     # Compute x^2 for RMS calculation
-    rmsnorm_square = alloc_tensor(
-        shape=(H0, BxS, H1), dtype=inter_dtype, buffer=nl.sbuf, name=f"rmsnorm_square_{bxs_tile.index}"
-    )
+    rmsnorm_square = alloc_tensor(shape=(H0, BxS, H1), dtype=inter_dtype, buffer=nl.sbuf)
     num_allocated_tensor += 1
     nisa.activation(rmsnorm_square[...], op=nl.square, data=input_sb_view.get_view())
 
@@ -391,7 +389,6 @@ def _process_rmsnorm_tile(
         shape=(H0, BxS),
         dtype=inter_dtype,
         buffer=nl.sbuf,
-        name=f"rmsnorm_reduced_square_{bxs_tile.index}",
     )
     num_allocated_tensor += 1
     nisa.tensor_reduce(rmsnorm_reduced_square[...], nl.add, rmsnorm_square[...], axis=2)
@@ -403,7 +400,6 @@ def _process_rmsnorm_tile(
             shape=(H0, BxS),
             dtype=inter_dtype,
             buffer=nl.sbuf,
-            name=f"rmsnorm_remote_reduced_square_{bxs_tile.index}",
         )
         num_allocated_tensor += 1
         nisa.sendrecv(
@@ -423,9 +419,7 @@ def _process_rmsnorm_tile(
         )
 
     # Apply gamma scaling: input * gamma
-    gamma_mult = alloc_tensor(
-        shape=(H0, BxS, H1), dtype=inter_dtype, buffer=nl.sbuf, name=f"rmsnorm_gamma_mult_{bxs_tile.index}"
-    )
+    gamma_mult = alloc_tensor(shape=(H0, BxS, H1), dtype=inter_dtype, buffer=nl.sbuf)
     num_allocated_tensor += 1
     gamma_mult_view = TensorView(gamma_mult)
     nisa.tensor_tensor(
@@ -480,6 +474,7 @@ def rmsnorm_tkg_th(
     hidden_actual: int,
     eps: float,
     sbm: SbufManager = None,
+    use_contiguous_x4: bool = False,
 ):
     """
     RMSNorm with contiguous DMA load and does rmsnorm in [T,H] layout.
@@ -487,22 +482,38 @@ def rmsnorm_tkg_th(
     Computation is done entirely in [T, H] layout (T on partition dim, H on free dim).
     Only the final result is transposed to [H0, H1_shard, T] for downstream matmul.
 
+    When use_contiguous_x4=True, the output layout is [H0, n_H512*4, T] instead of
+    [H0, H2, T]. This produces contiguous-4 H packing
+    where partition p' at free position (h512*4+q, t) holds H = 512*h512 + 4*p' + q.
+    The layout change is done on-chip via tensor_copy permute + pe_transpose,
+    avoiding the expensive HBM spill+reload that would otherwise be needed in the
+    downstream MLP kernel. The caller permutes [H0, n_H512*4, T] → [H0, T, n_H512*4]
+    to get [P0=128, BxS=T, F0=n_H512*4] for row_quantization.
+
     Args:
         input_hbm: [BxS, H] TensorView in HBM (already T-sliced by caller)
         gamma: [1, H] nl.ndarray in HBM
-        output: [H0, H1_shard, T] TensorView in SBUF for gate/up projection
+        output: [H0, H1_shard, T] TensorView in SBUF for gate/up projection,
+                or [H0, n_H512*4, T] when use_contiguous_x4=True
         num_H_shards: number of H-shards (LNC count)
         hidden_actual: full H for mean calculation
         eps: epsilon
         sbm: SBUF memory manager
+        use_contiguous_x4: if True, produce contiguous-4 H packing in output
     """
     T, H = input_hbm.shape
     T0 = nl.tile_size.pmax
     H0 = nl.tile_size.pmax
+    _pmax = H0
     H1 = H // H0
     H2 = H1 // num_H_shards  # H1 tiles per shard
     H_per_shard = H0 * H2
     inter_dtype = nl.float32
+    _q_width = 4  # x4 packing width
+
+    if use_contiguous_x4:
+        kernel_assert(H_per_shard % 512 == 0, "H_per_shard must be divisible by 512 for contiguous x4")
+        n_H512 = H_per_shard // 512  # = H2 // _q_width
 
     _, lnc, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
     # When num_H_shards=1, both cores process full H — no H-shard slicing needed
@@ -512,33 +523,58 @@ def rmsnorm_tkg_th(
     alloc_tensor = sbm.alloc_heap
 
     # Pre-allocate tensors at H0 size (reused across T-tiles)
-    gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, buffer=nl.sbuf, name="rmsnorm_th_gamma")
+    gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, buffer=nl.sbuf)
     sbuf_buffer = alloc_tensor(
         (T0, H),  # [128, H]
         dtype=input_hbm.dtype,
         buffer=nl.sbuf,
-        name="rmsnorm_th_buf",
     )
-    reduced_sq = alloc_tensor(
-        shape=(T0, 1), dtype=inter_dtype, buffer=nl.sbuf, name="rmsnorm_th_reduced_sq"
-    )  # [128, 1]
-    square_sb = alloc_tensor(shape=(H0, H), dtype=inter_dtype, buffer=nl.sbuf, name="rmsnorm_th_square")  # [128, H]
+    reduced_sq = alloc_tensor(shape=(T0, 1), dtype=inter_dtype, buffer=nl.sbuf)  # [128, 1]
+    square_sb = alloc_tensor(shape=(H0, H), dtype=inter_dtype, buffer=nl.sbuf)  # [128, H]
 
-    # Load gamma once, reused across all T-tiles
-    gamma_hbm_view = (
-        TensorView(gamma)
-        .flatten_dims(start_dim=0, end_dim=1)
-        .reshape_dim(dim=0, shape=[num_H_shards, H0, H2])
-        .permute(dims=[1, 0, 2])
-    )
-    gamma_sb_view = TensorView(gamma_sb).reshape_dim(dim=1, shape=[num_H_shards, H2])
-    nisa.dma_copy(dst=gamma_sb_view.get_view(), src=gamma_hbm_view.get_view(), dge_mode=_DGE_MODE_NONE)
-    gamma_shard_view = (
-        TensorView(gamma_sb)
-        .reshape_dim(dim=1, shape=[num_H_shards, H2])
-        .slice(dim=1, start=shard_id, end=shard_id + 1)
-        .squeeze_dim(dim=1)
-    )
+    if not use_contiguous_x4:
+        # Standard path: gamma in [H0, H2] layout for post-transpose application
+        gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, buffer=nl.sbuf, name="rmsnorm_th_gamma")
+
+        gamma_hbm_view = (
+            TensorView(gamma)
+            .flatten_dims(start_dim=0, end_dim=1)
+            .reshape_dim(dim=0, shape=[num_H_shards, H0, H2])
+            .permute(dims=[1, 0, 2])
+        )
+        gamma_sb_view = TensorView(gamma_sb).reshape_dim(dim=1, shape=[num_H_shards, H2])
+        nisa.dma_copy(dst=gamma_sb_view.get_view(), src=gamma_hbm_view.get_view(), dge_mode=_DGE_MODE_NONE)
+        gamma_shard_view = (
+            TensorView(gamma_sb)
+            .reshape_dim(dim=1, shape=[num_H_shards, H2])
+            .slice(dim=1, start=shard_id, end=shard_id + 1)
+            .squeeze_dim(dim=1)
+        )
+    else:
+        # Contiguous x4 path: gamma in [T0, H_per_shard] layout for pre-transpose application.
+        # Load gamma[shard_start : shard_start + H_per_shard] as flat vector, broadcast on P dim.
+        gamma_flat_sb = alloc_tensor(
+            shape=(T0, H_per_shard), dtype=gamma.dtype, buffer=nl.sbuf, name="rmsnorm_th_gamma_flat"
+        )
+        H_shard_start_gamma = shard_id * H_per_shard
+        gamma_hbm_flat = (
+            TensorView(gamma)
+            .flatten_dims(start_dim=0, end_dim=1)
+            .slice(dim=0, start=H_shard_start_gamma, end=H_shard_start_gamma + H_per_shard)
+        )
+        # Broadcast [1, H_per_shard] → [T0, H_per_shard]
+        gamma_hbm_broadcast = gamma_hbm_flat.expand_dim(dim=0).broadcast(dim=0, size=T0)
+        nisa.dma_copy(dst=gamma_flat_sb, src=gamma_hbm_broadcast.get_view(), dge_mode=_DGE_MODE_NONE)
+
+        # Temp buffer for tensor_copy permute before pe_transpose
+        cx4_perm_buf = alloc_tensor(
+            shape=(T0, H_per_shard), dtype=input_hbm.dtype, buffer=nl.sbuf, name="rmsnorm_th_cx4_perm"
+        )
+
+        # Temp buffer for pe_transpose output (reused across T-tiles)
+        xpose_out_buf = alloc_tensor(
+            shape=(_pmax, T0, n_H512 * _q_width), dtype=input_hbm.dtype, buffer=nl.sbuf, name="rmsnorm_th_xpose_out"
+        )
 
     hidden_scale = 1.0 / hidden_actual
     H_shard_start = shard_id * H_per_shard
@@ -577,7 +613,7 @@ def rmsnorm_tkg_th(
 
         # input * normalization_factor for this shard's H slice
         input_shard = tile_buf.slice(dim=1, start=H_shard_start, end=H_shard_start + H_per_shard)  # [T_tile, H_shard]
-        norm_result_shard = tile_buf.slice(dim=1, start=0, end=H_per_shard)  # [T, H_shard]
+        norm_result_shard = tile_buf.slice(dim=1, start=0, end=H_per_shard)  # [T_tile, H_shard]
         nisa.tensor_scalar(
             norm_result_shard.get_view(),
             input_shard.get_view(),
@@ -585,33 +621,86 @@ def rmsnorm_tkg_th(
             operand0=tile_red.get_view(),
         )
 
-        # --- Step 3: Transpose [tile_T, H_per_shard] → [H0, H2, tile_T] ---
-        # pe_transpose: [tile_T, H0, H2] → [H0, tile_T, H2]
-        src = norm_result_shard.reshape_dim(dim=1, shape=[H0, H2])  # [tile_T, H0, H2]
-        dst = output.slice(dim=2, start=t_tile.start_offset, end=t_tile.end_offset)  # [H0, H2, tile_T]
-        dst_permuted = dst.permute(dims=[0, 2, 1])  # [H0, H2, tile_T] → [H0, tile_T, H2]
-        pe_transpose(
-            src=src,
-            dst=dst_permuted,
-            tile_size=H0,
-            dtype=input_hbm.dtype,
-            sbm=sbm,
-            psum_bank_base=t_tile.index * _psum_banks_per_tile_rmsnorm,
-        )
+        if not use_contiguous_x4:
+            # --- Standard path ---
+            # Step 3: Transpose [tile_T, H_per_shard] → [H0, H2, tile_T]
+            src = norm_result_shard.reshape_dim(dim=1, shape=[H0, H2])  # [tile_T, H0, H2]
+            dst = output.slice(dim=2, start=t_tile.start_offset, end=t_tile.end_offset)  # [H0, H2, tile_T]
+            dst_permuted = dst.permute(dims=[0, 2, 1])  # → [H0, tile_T, H2]
+            pe_transpose(
+                src=src,
+                dst=dst_permuted,
+                tile_size=H0,
+                dtype=input_hbm.dtype,
+                sbm=sbm,
+                psum_bank_base=t_tile.index * _psum_banks_per_tile_rmsnorm,
+            )
 
-        # --- Step 4: Apply gamma in [H0, H2, tile_T] layout ---
-        gamma_broadcast = gamma_shard_view.expand_dim(dim=2).broadcast(dim=2, size=tile_T)
-        nisa.tensor_tensor(
-            dst.get_view(),
-            dst.get_view(),
-            gamma_broadcast.get_view(),
-            nl.multiply,
-        )
+            # Step 4: Apply gamma in [H0, H2, tile_T] layout
+            gamma_broadcast = gamma_shard_view.expand_dim(dim=2).broadcast(dim=2, size=tile_T)
+            nisa.tensor_tensor(
+                dst.get_view(),
+                dst.get_view(),
+                gamma_broadcast.get_view(),
+                nl.multiply,
+            )
+        else:
+            # --- Contiguous x4 path ---
+            # Produces output [H0, n_H512*4, T] where partition p' at free position
+            # (h512*4+q, t) holds H = 512*h512 + 4*p' + q.
 
+            # Step 3a: Apply gamma in [T, H_per_shard] layout (before transpose).
+            # gamma_flat_sb is [T0, H_per_shard] with gamma values broadcast on P dim.
+            gamma_tile = TensorView(gamma_flat_sb).slice(dim=0, start=0, end=tile_T)
+            nisa.tensor_tensor(
+                norm_result_shard.get_view(),
+                norm_result_shard.get_view(),
+                gamma_tile.get_view(),
+                nl.multiply,
+            )
+
+            # Step 3b: Reshape [T, n_H512, 128, 4] and permute dims 1↔2 → [T, 128, n_H512, 4]
+            # so 128 is at dim 1 for pe_transpose (tile_size=128).
+            src_4d = norm_result_shard.reshape_dim(dim=1, shape=[n_H512, _pmax, _q_width])
+            perm_tile = TensorView(cx4_perm_buf).slice(dim=0, start=0, end=tile_T)
+            perm_dst_4d = perm_tile.reshape_dim(dim=1, shape=[_pmax, n_H512, _q_width])
+            nisa.tensor_copy(
+                dst=perm_dst_4d.get_view(),
+                src=src_4d.permute(dims=[0, 2, 1, 3]).get_view(),
+            )
+
+            # Step 3c: pe_transpose [T, 128, n_H512*4] → [128(P), tile_T, n_H512*4]
+            # into a dedicated contiguous temp buffer, then tensor_copy permute
+            # to output [128, n_H512*4, tile_T].
+            perm_src_3d = perm_tile.reshape_dim(dim=1, shape=[_pmax, n_H512 * _q_width])
+            xpose_out_tile = TensorView(xpose_out_buf).slice(dim=1, start=0, end=tile_T)
+            pe_transpose(
+                src=perm_src_3d,
+                dst=xpose_out_tile,
+                tile_size=_pmax,
+                dtype=input_hbm.dtype,
+                sbm=sbm,
+                psum_bank_base=t_tile.index * _psum_banks_per_tile_rmsnorm,
+            )
+
+            # Copy transposed tile [128, tile_T, n_H512*4] → output [128, n_H512*4, tile_T]
+            # via tensor_copy with permute [0, 2, 1].
+            out_tile = output.slice(dim=2, start=t_tile.start_offset, end=t_tile.end_offset)
+            nisa.tensor_copy(
+                dst=out_tile.get_view(),
+                src=xpose_out_tile.permute(dims=[0, 2, 1]).get_view(),
+            )
+
+    # Cleanup (reverse allocation order)
+    if use_contiguous_x4:
+        sbm.pop_heap()  # deallocate xpose_out_buf
+        sbm.pop_heap()  # deallocate cx4_perm_buf
+        sbm.pop_heap()  # deallocate gamma_flat_sb
+    else:
+        sbm.pop_heap()  # deallocate gamma_sb
     sbm.pop_heap()  # deallocate square_sb
     sbm.pop_heap()  # deallocate reduced_sq
     sbm.pop_heap()  # deallocate sbuf_buffer
-    sbm.pop_heap()  # deallocate gamma
 
 
 def _rmsnorm_tkg_llama_impl(
@@ -684,7 +773,7 @@ def _rmsnorm_tkg_llama_impl(
     # Load gamma
     # if hidden_dim_tp is on, rmsnorm_gamma offset needs to be 32B aligned
     gamma_align = 32 if hidden_dim_tp else None
-    gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, name="rmsnorm_gamma", align=gamma_align)
+    gamma_sb = alloc_tensor(shape=(H0, H1), dtype=gamma.dtype, align=gamma_align)
     num_allocated_tensor += 1
     gamma_sb_view = load_gamma_to_sbuf(
         gamma_hbm=gamma,
@@ -695,14 +784,12 @@ def _rmsnorm_tkg_llama_impl(
     )
 
     # Load eps
-    eps_sb = alloc_tensor(shape=(H0, 1), dtype=inter_dtype, buffer=nl.sbuf, name="rmsnorm_eps")
+    eps_sb = alloc_tensor(shape=(H0, 1), dtype=inter_dtype, buffer=nl.sbuf)
     num_allocated_tensor += 1
     nisa.memset(eps_sb, value=eps)
 
     # Load matmul reduction const
-    matmul_reduction_const = alloc_tensor(
-        shape=(H0, H0), dtype=inter_dtype, buffer=nl.sbuf, name="rmsnorm_mm_reduced_const"
-    )
+    matmul_reduction_const = alloc_tensor(shape=(H0, H0), dtype=inter_dtype, buffer=nl.sbuf)
     num_allocated_tensor += 1
     nisa.memset(matmul_reduction_const, value=1.0)
 
@@ -805,12 +892,12 @@ def _rmsnorm_tkg_dloc(
     sb_shard_offset = shard_id * T_shard if sync_output else 0
 
     # Pre-allocate per-tile scratch buffers
-    tile_buf = sbm.alloc_heap((tile_size, H), dtype=input_hbm.dtype, buffer=nl.sbuf, name="dloc_tile_buf")
-    reduced_sq = sbm.alloc_heap((tile_size, 1), dtype=inter_dtype, buffer=nl.sbuf, name="dloc_reduced_sq")
-    square_sb = sbm.alloc_heap((tile_size, H), dtype=inter_dtype, buffer=nl.sbuf, name="dloc_square")
+    tile_buf = sbm.alloc_heap((tile_size, H), dtype=input_hbm.dtype, buffer=nl.sbuf)
+    reduced_sq = sbm.alloc_heap((tile_size, 1), dtype=inter_dtype, buffer=nl.sbuf)
+    square_sb = sbm.alloc_heap((tile_size, H), dtype=inter_dtype, buffer=nl.sbuf)
 
     # Load gamma [1, H] -> [tile_size, H] replicated across partition dim
-    gamma_sb = sbm.alloc_heap((tile_size, H), dtype=gamma.dtype, buffer=nl.sbuf, name="dloc_gamma")
+    gamma_sb = sbm.alloc_heap((tile_size, H), dtype=gamma.dtype, buffer=nl.sbuf)
     gamma_hbm_view = TensorView(gamma).broadcast(dim=0, size=tile_size)
     nisa.dma_copy(dst=gamma_sb, src=gamma_hbm_view.get_view(), dge_mode=_DGE_MODE_NONE)
 

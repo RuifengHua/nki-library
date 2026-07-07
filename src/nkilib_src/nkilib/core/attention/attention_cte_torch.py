@@ -46,6 +46,9 @@ def attention_cte_torch_ref(
     skip_output_normalization: bool = False,
     bound_min=None,
     bound_max=None,
+    position_bias=None,
+    bias_layout=None,
+    bias_band_params=None,
 ):
     """PyTorch reference implementation for attention_cte NKI kernel.
 
@@ -81,6 +84,17 @@ def attention_cte_torch_ref(
             sequence packing. Shape [bs, seqlen_q, 1]. Default: None
         bound_max (torch.tensor, optional): Per-query upper bound (exclusive) for
             sequence packing. Shape [bs, seqlen_q, 1]. Default: None
+        position_bias (torch.tensor, optional): Position bias added to QK scores
+            before scaling and masking. Shape ``(bs, seqlen_q, seqlen_kv)`` in the
+            kernel's padded KV layout. Semantics: ``mask(scale * (QK + bias))``.
+            Default: None
+        bias_layout (str, optional): Kernel-only knob; accepted for signature
+            compatibility with the kernel and ignored here. The reference always
+            consumes a dense ``(bs, seqlen_q, seqlen_kv)`` bias; callers that pass
+            ``"banded"`` to the kernel should pass the equivalent dense bias to this
+            reference. Default: None
+        bias_band_params (dict, optional): Kernel-only knob; accepted for signature
+            compatibility and ignored here. Default: None
 
     Returns:
         dict[str, torch.tensor]: Dictionary with key "out" for the attention output tensor.
@@ -161,8 +175,25 @@ def attention_cte_torch_ref(
     if sliding_window > 0:
         mask += torch.where(pos_diff <= -sliding_window, minus_inf_t, zero_t)
 
-    # Compute QK, apply mask
+    # Compute QK, apply position bias (before scale and mask), then scale and mask
     qk = q @ k  # [bs, seqlen_q, prior_used_len + seqlen_k]
+
+    # Add position bias before scaling and masking: final = mask(scale * (QK + bias))
+    if position_bias is not None:
+        position_bias = position_bias.to(torch.float32)
+        kv_len_ref = prior_used_len + seqlen_k  # torch ref KV dim
+        if position_bias.shape[2] != kv_len_ref:
+            # position_bias is in kernel's padded layout: [prior_padded | active]
+            # Extract [0:prior_used_len] from prior region + [prior_padded:prior_padded+seqlen_k] from active
+            _K_TILE_SZ_REF = 512
+            seqlen_prior_padded = (
+                ((k_prior.shape[2] + _K_TILE_SZ_REF - 1) // _K_TILE_SZ_REF) * _K_TILE_SZ_REF if is_prefix_caching else 0
+            )
+            prior_bias = position_bias[:, :, :prior_used_len]
+            active_bias = position_bias[:, :, seqlen_prior_padded : seqlen_prior_padded + seqlen_k]
+            position_bias = torch.cat([prior_bias, active_bias], dim=2)
+        qk += position_bias
+
     qk *= scale
     qk += mask[None, :, :]
 

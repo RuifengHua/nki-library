@@ -41,11 +41,11 @@ def sub_tensor_torch_ref(data1: torch.Tensor, data2: torch.Tensor, alpha: float 
     return data1 - alpha * data2
 
 
-def mul_tensor_torch_ref(data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
+def mul_tensor_torch_ref(data1: torch.Tensor, data2: torch.Tensor, numel: int = None) -> torch.Tensor:  # noqa: ARG001
     return data1 * data2
 
 
-def div_tensor_torch_ref(data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
+def div_tensor_torch_ref(data1: torch.Tensor, data2: torch.Tensor, numel: int = None) -> torch.Tensor:  # noqa: ARG001
     return data1 / data2
 
 

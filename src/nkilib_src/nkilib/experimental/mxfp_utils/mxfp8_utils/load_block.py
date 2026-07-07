@@ -21,6 +21,7 @@ import nki.language as nl
 
 from ....core.utils.kernel_assert import kernel_assert
 from ....core.utils.kernel_helpers import div_ceil
+from ...mlp_mxfp8.common_utils import TILE_M as TILE_128
 from . import quantize_mxfp8_utils
 from .common_dataclasses import BlockDescriptor, TensorDescriptor, TileLocation
 from .common_utils import get_active_sbm
@@ -61,13 +62,25 @@ def _load_single_tensor(
     if load_td == None:
         return
 
-    if load_td.is_unswizzled_bf16:
-        # Unswizzled BF16: use DGT path
+    if load_td.is_unswizzled_bf16 or load_td.load_with_PE_swizzle:
+        # Unswizzled BF16: use DGT or PE swizzle path (dispatched by load_tile)
         # Detect remainder: if remaining K from k_global is less than LOAD_TILE_K
-        if f_global + f_offset >= load_td.logical_shape[1]:
+        f_effective = load_td.effective_f_dim if load_td.effective_f_dim is not None else load_td.logical_shape[1]
+        if f_global + f_offset >= f_effective:
             return
 
-        remaining_k = load_td.data.shape[1] - k_global
+        if load_td.load_with_PE_swizzle and load_td.indirect_dma_vector_offset is not None:
+            indirect_start_col = (f_global + f_offset) // TILE_128
+            indirect_num_cols = LOAD_TILE_F // TILE_128
+            indirect_vector_offset = load_td.indirect_dma_vector_offset[
+                :, indirect_start_col : indirect_start_col + indirect_num_cols
+            ]
+        else:
+            indirect_vector_offset = None
+
+        # logical_shape[0] is the logical K dimension regardless of the physical layout
+        # (F-by-K [F, K] vs K-by-F [K, F]); TensorDescriptor encapsulates that mapping.
+        remaining_k = load_td.logical_shape[0] - k_global
         is_remainder = remaining_k < LOAD_TILE_K
         INTERLEAVE_FACTOR = quantize_mxfp8_utils.INTERLEAVE_FACTOR
 
@@ -79,6 +92,7 @@ def _load_single_tensor(
                 tile_f=LOAD_TILE_F,
                 k_offset=k_global,
                 f_offset=f_global + f_offset,
+                vector_offset=indirect_vector_offset,
             )
             data_store_loc = TileLocation(
                 tensor=store_td,
@@ -100,6 +114,7 @@ def _load_single_tensor(
                     tile_f=LOAD_TILE_F,
                     k_offset=k_offset,
                     f_offset=f_global + f_offset,
+                    vector_offset=indirect_vector_offset,
                 )
                 data_store_loc = TileLocation(
                     tensor=store_td,
@@ -120,6 +135,7 @@ def _load_single_tensor(
                     tile_f=LOAD_TILE_F,
                     k_offset=k_offset,
                     f_offset=f_global + f_offset,
+                    vector_offset=indirect_vector_offset,
                 )
                 # TODO: Remove if else, just call load_tile with p_offset, no need for extra tensor copy. Need compiler / ucode bug fix
                 if p_offset > 0:
@@ -188,13 +204,15 @@ def _load_single_tensor(
         Original input scales use Q_TILE_K (128) per group.
         Spill buffer scales use LOAD_TILE_K (physical tile K) per group.
         """
-        data_K = load_td.data.shape[0]
+        data_K = load_td.effective_f_dim if load_td.effective_f_dim is not None else load_td.data.shape[0]
         num_tiles = div_ceil(data_K, LOAD_TILE_K)
         num_groups = (
             num_tiles + quantize_mxfp8_utils.MAX_TILES_PER_SCALE_PACKING_GROUP - 1
         ) // quantize_mxfp8_utils.MAX_TILES_PER_SCALE_PACKING_GROUP
         expected_q_tile_k_size = num_groups * quantize_mxfp8_utils.Q_TILE_K
-        scales_K = load_td.scales.shape[0]
+        scales_K = (
+            load_td.effective_f_dim_scales if load_td.effective_f_dim_scales is not None else load_td.scales.shape[0]
+        )
         scale_group_stride = quantize_mxfp8_utils.Q_TILE_K if scales_K == expected_q_tile_k_size else LOAD_TILE_K
 
         # Handle packed scales: only load at scaling group boundaries
@@ -451,14 +469,23 @@ def load_lhs_and_rhs(
     LOAD_TILES_IN_N_RANGE = LOAD_TILES_IN_N if rhs_td != None else 1
     LOAD_TILES_IN_K_RANGE = LOAD_TILES_IN_K_LHS if lhs_td != None else LOAD_TILES_IN_K_RHS
 
-    # Compute masking locally: needed when physical dimensions aren't divisible by block sizes
+    # Compute masking locally: needed when physical dimensions aren't divisible by block sizes,
+    # or when effective_f_dim causes partial loading in stacked-expert tensors.
+    # For swizzled/quantized TDs: effective_f_dim is per-expert K → check vs BLOCK_K.
+    # For unswizzled BF16 TDs: effective_f_dim is per-expert F → check vs BLOCK_M/N.
+    # TODO: Simplify the below to reuse the effective shapes for F and K
+    lhs_eff = lhs_td.effective_f_dim if (lhs_td != None and lhs_td.effective_f_dim is not None) else None
+    rhs_eff = rhs_td.effective_f_dim if (rhs_td != None and rhs_td.effective_f_dim is not None) else None
     needs_masking = (
         (BLOCK_K_LHS > 0 and (lhs_td != None and lhs_td.physical_shape[0] % BLOCK_K_LHS != 0))
         or (BLOCK_K_RHS > 0 and (rhs_td != None and rhs_td.physical_shape[0] % BLOCK_K_RHS != 0))
         or (lhs_td != None and lhs_td.physical_shape[1] % BLOCK_M != 0)
         or (rhs_td != None and rhs_td.physical_shape[1] % BLOCK_N != 0)
+        or (lhs_eff is not None and lhs_td.is_swizzled and BLOCK_K_LHS > 0 and lhs_eff % BLOCK_K_LHS != 0)
+        or (rhs_eff is not None and rhs_td.is_swizzled and BLOCK_K_RHS > 0 and rhs_eff % BLOCK_K_RHS != 0)
+        or (lhs_eff is not None and not lhs_td.is_swizzled and BLOCK_M > 0 and lhs_eff % BLOCK_M != 0)
+        or (rhs_eff is not None and not rhs_td.is_swizzled and BLOCK_N > 0 and rhs_eff % BLOCK_N != 0)
     )
-
     if lhs_td != None:
         lhs_sbuf, lhs_data_sbuf, lhs_scales_sbuf = _allocate_sbuf(
             lhs_td,
@@ -469,7 +496,7 @@ def load_lhs_and_rhs(
         )
         _zero_sbuf(lhs_sbuf, lhs_data_sbuf, lhs_scales_sbuf, lhs_td.is_quantized, needs_masking)
 
-        if lhs_td.is_unswizzled_bf16:
+        if lhs_td.is_unswizzled_bf16 and not lhs_td.load_with_PE_swizzle:
             lhs_td.set_vector_offset_patterns(LHS_LOAD_TILE_K, LHS_LOAD_TILE_M)
 
         # Build SBUF TD for load destination
@@ -495,7 +522,7 @@ def load_lhs_and_rhs(
         )
         _zero_sbuf(rhs_sbuf, rhs_data_sbuf, rhs_scales_sbuf, rhs_td.is_quantized, needs_masking)
 
-        if rhs_td.is_unswizzled_bf16:
+        if rhs_td.is_unswizzled_bf16 and not rhs_td.load_with_PE_swizzle:
             rhs_td.set_vector_offset_patterns(RHS_LOAD_TILE_K, RHS_LOAD_TILE_N)
 
         # Build SBUF TD for load destination

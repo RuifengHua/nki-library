@@ -44,10 +44,11 @@ from ...core.attention.attention_tkg_utils import AttnTKGConfig
 from ...core.embeddings.rope_torch import _rope_single_head
 from ...core.output_projection.output_projection_tkg_torch import output_projection_tkg_torch_ref
 from ...core.qkv.qkv_tkg_torch import qkv_tkg_torch_ref
-from ...core.utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from ...core.utils.common_types import DtypeMode, NormType, QKVOutputLayout, QuantizationType
 from ...core.utils.kernel_assert import kernel_assert
 from ...core.utils.kernel_helpers import get_max_positive_value_for_dtype
 from ...core.utils.logging import get_logger
+from ..collectives.distributed_adapter import get_pg
 
 logger = get_logger("attention_block_tkg_torch")
 
@@ -131,11 +132,15 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         KVDP: int = 1,
         KVDP_replica_group: None = None,
         KVDP_collective_mode=None,
+        KVDP_rank: Optional[torch.Tensor] = None,
         enable_fa_s_prior_tiling: bool = True,
+        fp8_packed: bool = False,
         pos_ids: Optional[torch.Tensor] = None,
         swa_start_pos_ids: Optional[torch.Tensor] = None,
         S_ctx: Optional[int] = None,
         is_h_transposed_by_4: bool = False,
+        max_context_len=None,
+        dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     ) -> Dict[str, torch.Tensor]:
         """PyTorch reference for the fused attention block TKG kernel.
 
@@ -196,6 +201,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             V_cache: Value cache tensor.
             attention_mask: Attention mask. Shape: ``[S_ctx, B, N, S]`` when
                 pos_ids is None, ``[S, B, N, S]`` (active-only) when pos_ids is provided.
+                When KVDP > 1: ``[S_ctx, B_attn, q_heads_attn, S_tkg]``.
             sink: Optional attention sink tensor. Forwarded to attention ref.
             softmax_scale: Custom softmax scale. None uses ``1/√D``. When using FP8
                 KV cache with None, k_scale is automatically absorbed effectively setting
@@ -213,6 +219,8 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             is_h_transposed_by_4: Whether input X and RMSNorm gamma have been
                 pre-shuffled along the H dimension for MXFP quantization.
                 Forwarded to the QKV projection reference. Default: False.
+            max_context_len: Optional int32 array [1] for dynamic FA early exit.
+                Limits KV context processed to at most max_context_len positions.
 
             k_scale: FP8 quantization scale for K. Shape: ``[1, 1]`` or ``[P, 1]``.
                 None to disable FP8 KV quantization.
@@ -239,10 +247,14 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
 
             sbm: Accepted for signature compatibility (kernel-only, SBUF memory handle).
             X_in_sb: Accepted for signature compatibility (kernel-only, input SBUF flag).
-            KVDP: Must be 1. This ref computes a single-rank result; KVDP slicing
-                is handled by the test harness. Asserted to prevent misuse.
-            KVDP_replica_group: Accepted for signature compatibility (kernel-only).
+            KVDP: Number of KV data parallelism ranks. When > 1, the torch ref
+                performs KVDP collectives (Q all_to_all, K/V batch slice,
+                output all_to_all) to match the kernel's per-rank behavior.
+            KVDP_replica_group: Replica group for KVDP collectives. Used to
+                obtain the process group via ``get_pg()``.
             KVDP_collective_mode: Accepted for signature compatibility (kernel-only).
+            KVDP_rank: This rank's position within its KVDP replica group (0 to KVDP-1).
+                Used for K/V batch slicing. Shape: ``[1]``, dtype ``uint32``.
             enable_fa_s_prior_tiling: Accepted for signature compatibility
                  (kernel-only, whether to enable flash attention in kernel).
             Dict with keys:
@@ -252,17 +264,28 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                   ``update_cache`` is False).
                 - ``"V_cache_updated"`` / ``"V_tkg"``: Updated V cache (or raw V).
         """
-        kernel_assert(
-            KVDP == 1, f"Torch ref is single-rank only, got KVDP={KVDP}. Slice inputs per-rank before calling."
-        )
-
         X = X.float()
         if transposed_in:
             # Convert [H0, n_prgs, H1_shard, BxS] back to [B, S_tkg, H]
             H0, n_prgs, H1_shard, BxS = X.shape
             H = H0 * n_prgs * H1_shard
-            _, B_mask, _, S_tkg_mask = attention_mask.shape
-            X = X.permute(3, 1, 0, 2).reshape(B_mask, S_tkg_mask, H)
+            _, _, _, S_tkg_mask = attention_mask.shape
+            B_from_x = BxS // S_tkg_mask
+            X = X.permute(3, 1, 0, 2).reshape(B_from_x, S_tkg_mask, H)
+        # Accept block-KV cache with kv head dim at axis 1 by squeezing it.
+        # Mirrors __internal_squeeze_head_dim in the kernel.
+        # For fp8_packed, base K is 4D so head dim makes it 5D; for non-packed, base is 3D so head dim makes it 4D.
+        k_ndim_with_head = 5 if fp8_packed else 4
+        cache_has_kv_head_dim = (
+            active_blocks_table is not None and K_cache.dim() == k_ndim_with_head and K_cache.shape[1] == 1
+        )
+        if cache_has_kv_head_dim:
+            K_cache = K_cache.squeeze(1)
+            V_cache = V_cache.squeeze(1)
+        # fp8_packed: unpack [num_blocks, block_len//2, d_head, 2] -> [num_blocks, block_len, d_head]
+        if fp8_packed and active_blocks_table is not None and K_cache.dim() == 4:
+            num_blocks, half_bl, d_head_k, _ = K_cache.shape
+            K_cache = K_cache.permute(0, 1, 3, 2).reshape(num_blocks, half_bl * 2, d_head_k)
         B, S_tkg, H, d_head, q_heads, S_ctx, S_max_ctx, blk_len = self._extract_shapes(
             X,
             W_qkv,
@@ -275,6 +298,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         )
 
         # -- QKV projection (reuse qkv_tkg_torch_ref)
+
         qkv_result = qkv_tkg_torch_ref(
             hidden=X,
             qkv_w=W_qkv,
@@ -291,8 +315,11 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             qkv_bias=bias_qkv,
             hidden_actual=X_hidden_dim_actual,
             is_h_dim_4h_transposed=is_h_transposed_by_4,
+            dtype_mode=dtype_mode,
         )
         QKV = qkv_result['out'].float()  # [N+2, B, S, D]
+        # Free large intermediate to reduce peak memory in SimDistRunner sequential passes
+        del qkv_result
 
         # -- QK norm pre RoPE (in-place on QKV)
         QKV = self._qk_norm_pre_rope(
@@ -309,6 +336,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         cos_f = cos.float() if cos is not None else None
         sin_f = sin.float() if sin is not None else None
         Q, K = self._apply_rope_to_qk(QKV, cos_f, sin_f, q_heads, d_head, rope_contiguous_layout)
+        del cos_f, sin_f  # Free to reduce peak memory in SimDistRunner
 
         # -- QK norm post RoPE (Q stays [D, B, N, S], K stays [D, B, S])
         Q, K = self._qk_norm_post_rope(
@@ -321,7 +349,8 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             W_rmsnorm_K_post_rope,
         )
 
-        V = QKV[-1]  # [B, S, D]
+        V = QKV[-1].clone()  # [B, S, D] — clone to allow freeing QKV and reduce peak memory
+        del QKV
 
         # -- FP8 KV cache quantization (optional)
         kv_quant = k_scale is not None and v_scale is not None
@@ -330,11 +359,41 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         if kv_quant:
             K_new, V_new = self._quantize_kv_to_fp8(K_new, V_new, k_scale, v_scale)
 
+        # -- KVDP input collectives: redistribute Q heads across ranks, slice K/V batch
+        if KVDP > 1:
+            pg = get_pg(KVDP_replica_group)
+            kernel_assert(KVDP_rank is not None, "KVDP_rank tensor is required when KVDP > 1")
+            kvdp_rank_int = int(KVDP_rank.item())
+            Q, K_new, V_new, K_cache, V_cache = self._kvdp_input_collectives(
+                Q,
+                K_new,
+                V_new,
+                K_cache,
+                V_cache,
+                q_heads,
+                KVDP,
+                B,
+                S_tkg,
+                d_head,
+                pg,
+                kvdp_rank_int,
+            )
+            B_attn = B // KVDP
+            q_heads_attn = q_heads * KVDP
+            # Verify attention mask already has correct KVDP shape from test harness
+            kernel_assert(
+                attention_mask.shape[2] == q_heads_attn,
+                f"attention_mask head dim mismatch: expected {q_heads_attn}, got {attention_mask.shape[2]}",
+            )
+        else:
+            B_attn = B
+            q_heads_attn = q_heads
+
         # -- Attention (reuse attention_tkg_torch_ref)
         # Default output for the skip_attention + no output projection path.
-        output = Q.clone()  # [D,B,N,S]
+        output = Q.clone()  # [D,B_attn,N_attn,S]
         if skip_attention:
-            attn_out = Q.permute(1, 2, 0, 3)  # [D,B,N,S] -> [B,N,D,S]
+            attn_out = Q.permute(1, 2, 0, 3)  # [D,B_attn,N_attn,S] -> [B_attn,N_attn,D,S]
         else:
             attn_out = self._run_attention(
                 Q,
@@ -349,15 +408,23 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                 S_ctx,
                 S_max_ctx,
                 softmax_scale,
-                q_heads,
+                q_heads_attn,
                 sink=sink,
                 pos_ids=pos_ids,
                 swa_start_pos_ids=swa_start_pos_ids,
                 k_scale=k_scale,
-            )  # [B, N, D, S]
+                dtype_mode=dtype_mode,
+            )  # [B_attn, N_attn, D, S]
             output = attn_out.permute(2, 0, 1, 3) if out_in_sb else attn_out  # may be overridden
 
+        # -- KVDP output collectives: redistribute attention output back
+        if KVDP > 1:
+            attn_out = self._kvdp_output_collectives(attn_out, q_heads, KVDP, B_attn, S_tkg, pg)
+            output = attn_out.permute(2, 0, 1, 3) if out_in_sb else attn_out
+
         # -- KV cache update
+        # After KVDP input collectives, K_new is [D, B_attn, S] and V_new is [B_attn, S, D],
+        # matching the per-rank K/V cache. For KVDP=1, K_new/V_new have full batch B.
         K_out, V_out = self._update_kv_cache(
             K_new,
             V_new,
@@ -381,11 +448,21 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                 weight_scale=weight_dequant_scale_out,
                 input_scale=input_dequant_scale_out,
                 TRANSPOSE_OUT=transposed_out,
+                dtype_mode=dtype_mode,
             )
             output = out_result['out']
 
         # -- Build result dict
         if update_cache:
+            # fp8_packed: repack K_cache_updated [n, bl, d] -> [n, bl//2, d, 2]
+            if fp8_packed and active_blocks_table is not None:
+                num_blocks, block_len_full, d_head_k = K_out.shape
+                K_out = K_out.reshape(num_blocks, block_len_full // 2, 2, d_head_k).permute(0, 1, 3, 2)
+            # Restore axis-1 head dim if input had it, so output shapes
+            # match the kernel's in-place updated cache buffer.
+            if cache_has_kv_head_dim:
+                K_out = K_out.unsqueeze(1)
+                V_out = V_out.unsqueeze(1)
             return {"X_out": output, "K_cache_updated": K_out, "V_cache_updated": V_out}
         return {"X_out": output, "K_tkg": K_out, "V_tkg": V_out}
 
@@ -628,6 +705,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
         pos_ids: Optional[torch.Tensor] = None,
         swa_start_pos_ids: Optional[torch.Tensor] = None,
         k_scale: Optional[torch.Tensor] = None,
+        dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     ) -> torch.Tensor:
         """Run scaled dot-product attention via :func:`attention_tkg_torch_ref`.
 
@@ -710,6 +788,7 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
             start_pos_ids=swa_start_pos_ids.float() if swa_start_pos_ids is not None else None,
             sink=sink,
             active_blocks_table=abt if is_block_kv else None,
+            dtype_mode=dtype_mode,
         )
         return out
 
@@ -778,3 +857,71 @@ class AttentionBlockTkgTorchRef(torch.nn.Module):
                 K_cache[b, 0, start_pos : start_pos + S_tkg, :] = K_new[:, b, :].T
             V_cache[b, 0, start_pos : start_pos + S_tkg, :] = V_new[b, :, :]
         return K_cache, V_cache
+
+    def _kvdp_input_collectives(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        K_cache: torch.Tensor,
+        V_cache: torch.Tensor,
+        q_heads: int,
+        KVDP: int,
+        B: int,
+        S_tkg: int,
+        d_head: int,
+        pg,
+        KVDP_rank: int,
+    ):
+        """KVDP input collectives: Q all_to_all, K/V batch slice.
+
+        Before: each rank has Q [D, B, q_heads, S], K [D, B, S], V [B, S, D]
+        After:  each rank has Q [D, B_attn, q_heads*KVDP, S], K [D, B_attn, S], V [B_attn, S, D]
+
+        The Q all_to_all exchanges batch chunks for head chunks across ranks:
+        each rank sends its B/KVDP batch slice to each other rank and receives
+        q_heads from each other rank.
+        """
+        B_attn = B // KVDP
+
+        # Q all_to_all: [D, B, q_heads, S] -> split batch -> exchange -> cat heads -> [D, B_attn, q_heads*KVDP, S]
+        # Split Q along batch dim into KVDP chunks, each [D, B_attn, q_heads, S]
+        Q_send = list(Q.chunk(KVDP, dim=1))
+        Q_recv = [torch.empty_like(Q_send[0]) for _ in range(KVDP)]
+        pg.alltoall(Q_recv, Q_send)
+        # Each received chunk has q_heads from a different rank -> cat along head dim
+        Q = torch.cat(Q_recv, dim=2)  # [D, B_attn, q_heads*KVDP, S]
+
+        # K batch slice: [D, B, S] -> [D, B_attn, S]
+        K = K[:, KVDP_rank * B_attn : (KVDP_rank + 1) * B_attn, :]
+
+        # V batch slice: [B, S, D] -> [B_attn, S, D]
+        V = V[KVDP_rank * B_attn : (KVDP_rank + 1) * B_attn, :, :]
+
+        # K_cache/V_cache are already per-rank (B_attn) from the input generator
+        return Q, K, V, K_cache, V_cache
+
+    def _kvdp_output_collectives(
+        self,
+        attn_out: torch.Tensor,
+        q_heads: int,
+        KVDP: int,
+        B_attn: int,
+        S_tkg: int,
+        pg,
+    ) -> torch.Tensor:
+        """KVDP output collectives: attention output all_to_all.
+
+        Before: each rank has attn_out [B_attn, q_heads*KVDP, D, S]
+        After:  each rank has attn_out [B, q_heads, D, S]
+
+        The all_to_all exchanges head chunks for batch chunks: each rank sends
+        its q_heads slice to each other rank and receives B_attn batches from
+        each other rank.
+        """
+        # Split attn_out along head dim into KVDP chunks, each [B_attn, q_heads, D, S]
+        attn_send = list(attn_out.chunk(KVDP, dim=1))
+        attn_recv = [torch.empty_like(attn_send[0]) for _ in range(KVDP)]
+        pg.alltoall(attn_recv, attn_send)
+        # Each received chunk has B_attn batches from a different rank -> cat along batch dim
+        return torch.cat(attn_recv, dim=0)  # [B, q_heads, D, S]

@@ -262,7 +262,8 @@ def _generate_bwd_golden(
             block_down_weight_grad = first_dot_activation.T @ down_out_grad
 
         if down_bias_grad is not None:
-            block_down_bias_grad = np.sum(down_out_grad.astype(np.float32), axis=0)
+            bias_grad_src = block_grad * ea if is_affinity_i else down_out_grad
+            block_down_bias_grad = np.sum(bias_grad_src.astype(np.float32), axis=0)
             down_bias_grad[block_expert_idx] += block_down_bias_grad
 
         down_weight_grad[block_expert_idx] += block_down_weight_grad
@@ -471,6 +472,11 @@ def blockwise_mm_bwd_torch_ref(
     activation_type: ActFnType = ActFnType.SiLU,
     block_tile_size: int = None,
     blocking_params=None,
+    hidden_states_grad_out=None,
+    expert_affinities_masked_grad_out=None,
+    gate_up_proj_weight_grad_out=None,
+    down_proj_weight_grad_out=None,
+    accumulation_dtype=None,
 ) -> dict:
     """Torch reference for blockwise_mm_bwd. Converts to numpy, runs golden, returns dict of torch tensors."""
     if skip_dma is None:

@@ -19,7 +19,7 @@ import nki.language as nl
 
 from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
-from ...utils.kernel_helpers import div_ceil
+from ...utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
 from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import MLPParameters, mlpp_has_down_projection_bias
@@ -272,13 +272,15 @@ def process_down_projection(
     # ---------------- Allocate Weight Tiles ----------------
     tiles = MLPTKGConstants.calculate_down_tiles(params, dims, gate_tile_info, sbm)
 
+    _fp8_e4m3_tile_dtype = resolve_fp8_e4m3_dtype(params.dtype_mode)
+
     weight_tiles = []
     for w_tile_idx in range(tiles.num_allocated_w_tile):
         weight_tile = alloc_tensor_view(
             sbm,
             (dims.I0, tiles.HTile),
             name=f"down_w_tile_{w_tile_idx}",
-            dtype=nl.float8_e4m3 if str(down_w.dtype) == "float8e4" else down_w.dtype,
+            dtype=_fp8_e4m3_tile_dtype if str(down_w.dtype) == "float8e4" else down_w.dtype,
             buffer=nl.sbuf,
         )
         weight_tiles.append(weight_tile)

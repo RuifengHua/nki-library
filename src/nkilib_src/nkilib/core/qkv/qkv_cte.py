@@ -29,6 +29,7 @@ from ..utils.allocator import SbufManager, sizeinbytes
 
 # NKI Library
 from ..utils.common_types import (
+    DtypeMode,
     NormType,
     QKNormConfig,
     QKVOutputLayout,
@@ -40,6 +41,7 @@ from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
+from ..utils.tensor_view import TensorView
 
 # QKV CTE
 from .qkv_cte_utils import (
@@ -287,6 +289,7 @@ def qkv_cte(
     # --- Block KV Cache Related
     use_block_kv: bool = False,
     transpose_k_cache: bool = False,
+    fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.ndarray] = None,
     # -----------------------------------------
@@ -312,6 +315,7 @@ def qkv_cte(
     output_hbm: Optional[nl.ndarray] = None,
     # --- Strided Input
     strided_input_config: Optional[StridedInputConfig] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> nl.ndarray:
     """
     QKV (Query, Key, Value) projection kernel with multiple (optional) fused operations.
@@ -360,7 +364,7 @@ def qkv_cte(
     Args:
         input (nl.ndarray): [B, S, H], Input hidden states tensor where B=batch, S=sequence_length, H=hidden_dim.
             We name it 'input' and not 'hidden' to avoid ambiguity with the size of "hidden dimension".
-        fused_qkv_weights (nl.ndarray): [H, I],  or [H//4, I] for MX, Fused QKV weight matrix where I=fused_qkv_dim=(num_q_heads + 2*num_kv_heads)*d_head
+        fused_qkv_weights (nl.ndarray): [H, I] for non-MX, or [H//4, I, 4] fp8 for MX/ROW_MX. Fused QKV weight matrix where I=fused_qkv_dim=(num_q_heads + 2*num_kv_heads)*d_head
         output_layout (QKVOutputLayout): Output tensor layout: QKVOutputLayout.BSD=[B, S, I] or QKVOutputLayout.NBSd=[num_heads, B, S, d_head]. Default: QKVOutputLayout.BSD
         bias (Optional[nl.ndarray]): [1, I], Bias tensor to add to QKV projection output. Default: None
         fused_residual_add (Optional[bool]): Whether to perform residual addition: input = input + mlp_prev + attention_prev. Default: False
@@ -380,6 +384,11 @@ def qkv_cte(
         num_kv_heads (Optional[int]): Number of key/value heads (required for RoPE). Default: None
         transpose_k_cache (bool): Whether to store K in transposed layout [num_blocks*num_kv_heads, d_head, block_size] in the block KV cache
             or [B, kv_dim, max_seq_len] for flat KV cache. Default: False
+        fp8_packed (bool): Enable packed FP8 K cache layout for block KV. Packs 2 consecutive FP8 sequence
+            positions into one row: k_cache shape [num_blocks, block_size // 2, kv_dim, 2] fp8, where
+            dim 3 index 0 = even positions and index 1 = odd positions. Enables DMA transpose on decode.
+            Requires block KV, FP8 quantization, even block_size, and d_head <= 128.
+            Mutually exclusive with transpose_k_cache. Default: False
         store_output_in_sbuf (bool): Whether to store output in SBUF (currently unsupported, must be False). Default: False
         sbm (Optional[SbufManager]): Optional SBUF manager for memory allocation control, with pre-specified bounds for SBUF usage.
             If sbm is not provided, kernel will by default be allocated and use all of the available SBUF space. Default: None
@@ -397,6 +406,13 @@ def qkv_cte(
             [B, S, H//512, 128, 4] -> [B, S, 4, H//512, 128] and flattened to [B, S, H].
         weight_layout (QKVWeightLayout): Layout of fused_qkv_weights. See QKVWeightLayout
             docstring for packing instructions. Default: QKVWeightLayout.CONTIGUOUS
+        dtype_mode (DtypeMode): Quantization dtype policy for STATIC/ROW
+            weight tiles. Also used for the FP8 KV cache when ``kv_dtype`` is
+            the opaque ``"float8e4"`` sentinel; a concrete ``kv_dtype`` is
+            honored as-is.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
 
     Returns:
         output (nl.ndarray): QKV projection output tensor:
@@ -491,6 +507,7 @@ def qkv_cte(
         # Block KV Cache
         use_block_kv=use_block_kv,
         transpose_k_cache=transpose_k_cache,
+        fp8_packed=fp8_packed,
         block_size=block_size,
         slot_mapping=slot_mapping,
         # Performance
@@ -507,6 +524,7 @@ def qkv_cte(
         qk_norm_post_rope=qk_norm_post_rope,
         strided_input_config=strided_input_config,
         output_hbm=output_hbm,
+        dtype_mode=dtype_mode,
     )
 
     _validate_user_inputs(args=user_inputs)
@@ -535,13 +553,17 @@ def qkv_cte(
     # Output S dimension matches kernel's processing S (= num_local_tokens for strided, S_orig otherwise).
     if cfg.use_kv_cache:
         # Output Q tensor: S matches kernel's processing S (= num_local_tokens for strided).
-        q_S = cfg.strided_input_config.num_local_tokens if cfg.strided_input_config != None else dims.S_orig
-        q_tensor_hbm = nl.ndarray(
-            (dims.B_orig, q_S, dims.q_dim),
-            dtype=input.dtype,
-            buffer=nl.shared_hbm,
-            name=f"{_hbm_name_prefix}qkv_cte_output_hbm",
-        )
+        # When q_dim == 0 (KV-only projection), skip allocation — no Q output.
+        if dims.q_dim > 0:
+            q_S = cfg.strided_input_config.num_local_tokens if cfg.strided_input_config != None else dims.S_orig
+            q_tensor_hbm = nl.ndarray(
+                (dims.B_orig, q_S, dims.q_dim),
+                dtype=input.dtype,
+                buffer=nl.shared_hbm,
+                name=f"{_hbm_name_prefix}qkv_cte_output_hbm",
+            )
+        else:
+            q_tensor_hbm = None
         output_hbm = None
     elif output_hbm is not None:
         # Caller provided output tensor — skip allocation.
@@ -573,7 +595,8 @@ def qkv_cte(
             cos_cache = cos_cache.reshape((1, dims.BxS, dims.d_head))
             sin_cache = sin_cache.reshape((1, dims.BxS, dims.d_head))
         if cfg.use_kv_cache:
-            q_tensor_hbm = q_tensor_hbm.reshape((1, dims.BxS, dims.q_dim))
+            if q_tensor_hbm is not None:
+                q_tensor_hbm = q_tensor_hbm.reshape((1, dims.BxS, dims.q_dim))
             if not use_block_kv:
                 if transpose_k_cache:
                     # Cache layout: [B, kv_dim, max_seq_len] -> [1, kv_dim, max_seq_len]
@@ -591,7 +614,7 @@ def qkv_cte(
 
     # Pass values and directly, and keep 'cfg' and 'dims'
     # object separate for clarity.
-    if quantization_type in (QuantizationType.MX, QuantizationType.ROW_MX):
+    if quantization_type.is_mx():
         _qkv_cte_mx_impl(
             input_hbm=input,
             fused_qkv_weights_hbm=fused_qkv_weights,
@@ -648,7 +671,8 @@ def qkv_cte(
             cos_cache = cos_cache.reshape((dims.B_orig, dims.S_orig, dims.d_head))
             sin_cache = sin_cache.reshape((dims.B_orig, dims.S_orig, dims.d_head))
         if cfg.use_kv_cache:
-            q_tensor_hbm = q_tensor_hbm.reshape((dims.B_orig, dims.S_orig, dims.q_dim))
+            if q_tensor_hbm is not None:
+                q_tensor_hbm = q_tensor_hbm.reshape((dims.B_orig, dims.S_orig, dims.q_dim))
             if not use_block_kv:
                 if transpose_k_cache:
                     # Cache layout: [1, kv_dim, max_seq_len] -> [B, kv_dim, max_seq_len]
@@ -761,7 +785,7 @@ def _quantize_and_store_kv(
 
 def _quantize_and_store_k_transposed(
     output_sb: nl.ndarray,
-    scale_sb: Optional[nl.ndarray],
+    inv_scale_sb: Optional[nl.ndarray],
     cache_hbm: nl.ndarray,
     kv_offset: int,
     s_tile_sz: int,
@@ -810,66 +834,21 @@ def _quantize_and_store_k_transposed(
     d_head = dims.d_head
     num_kv_heads = dims.num_kv_heads
 
-    if scale_sb is not None:
-        # FP8 path: scale first, clamp after transpose
-        inv_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=scale_sb.dtype, buffer=nl.sbuf)
-        nisa.reciprocal(dst=inv_scale_sb[0:s_tile_sz, 0:1], data=scale_sb[0:s_tile_sz, 0:1])
-
-        scaled_sb = sbm.alloc_stack((nl.tile_size.pmax, kv_dim), dtype=output_sb.dtype, buffer=nl.sbuf)
-        nisa.tensor_scalar(
-            dst=scaled_sb[0:s_tile_sz, 0:kv_dim],
-            data=output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim],
-            op0=nl.multiply,
-            operand0=inv_scale_sb[0:s_tile_sz, 0:1],
-        )
-        transpose_src_sb = scaled_sb
-    else:
-        # bf16 path: transpose directly from output_sb (no scaling)
-        transpose_src_sb = output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim]
-
     transposed_sb = sbm.alloc_stack(
         (nl.tile_size.pmax, num_kv_heads * nl.tile_size.pmax),
         dtype=cfg.kv_dtype,
         buffer=nl.sbuf,
     )
-    NUM_TRANSPOSE_PSUM_BUFS = min(num_kv_heads, NUM_HW_PSUM_BANKS)
-    transpose_psum_bufs = []
-    for _ in nl.affine_range(NUM_TRANSPOSE_PSUM_BUFS):
-        transpose_psum_bufs.append(
-            nl.ndarray(
-                (nl.tile_size.pmax, nl.tile_size.pmax),
-                dtype=output_sb.dtype,
-                buffer=nl.psum,
-            )
-        )
-
-    num_chunks = math.ceil(num_kv_heads / NUM_TRANSPOSE_PSUM_BUFS)
-    for i_chunk in nl.affine_range(num_chunks):
-        chunk_start = i_chunk * NUM_TRANSPOSE_PSUM_BUFS
-        chunk_size = min(NUM_TRANSPOSE_PSUM_BUFS, num_kv_heads - chunk_start)
-        for j in nl.affine_range(chunk_size):
-            i_head = chunk_start + j
-            nisa.nc_transpose(
-                data=transpose_src_sb[0:s_tile_sz, nl.ds(i_head * d_head, d_head)],
-                dst=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
-            )
-
-            if scale_sb is not None:
-                # FP8 path: clamp during PSUM→SBUF eviction
-                nisa.tensor_scalar(
-                    dst=transposed_sb[0:d_head, nl.ds(i_head * nl.tile_size.pmax, s_tile_sz)],
-                    data=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
-                    op0=nl.maximum,
-                    operand0=cfg.fp8_min,
-                    op1=nl.minimum,
-                    operand1=cfg.fp8_max,
-                )
-            else:
-                # bf16 path: plain copy from PSUM→SBUF
-                nisa.tensor_copy(
-                    dst=transposed_sb[0:d_head, nl.ds(i_head * nl.tile_size.pmax, s_tile_sz)],
-                    src=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
-                )
+    _scale_and_transpose_per_head(
+        output_sb,
+        inv_scale_sb,
+        kv_offset,
+        s_tile_sz,
+        cfg,
+        dims,
+        sbm,
+        transposed_sb,
+    )
 
     if cfg.use_block_kv:
         block_size = cfg.block_size
@@ -1001,6 +980,240 @@ def _quantize_and_store_k_transposed(
         )
 
 
+def _quantize_and_store_k_fp8_packed(
+    output_sb_tiles: List[nl.ndarray],
+    inv_scale_sb: nl.ndarray,
+    cache_hbm: nl.ndarray,
+    kv_offset: int,
+    s_tile_sz: int,
+    cfg: QKV_CTE_Config,
+    dims: QKV_CTE_Dims,
+    sbm: SbufManager,
+    packed_slot_sb: nl.ndarray,
+):
+    """
+    Quantize K values to FP8, pack consecutive pairs, and store to packed block KV cache.
+
+    Processes 1 or 2 tiles at once. When 2 tiles are provided, each tile is transposed
+    (stage 1) into adjacent slots within a shared buffer so that per head, both tiles'
+    fp8 data is contiguous on the free dimension. After bf16 reinterpretation, this gives
+    a full [d_head, pmax] bf16 region per head — enabling a single full-partition
+    nc_transpose (stage 2) and scatter DMA (stage 3).
+
+    Two consecutive FP8 sequence positions are packed into one row:
+    position 2i at [:, :, :, 0] and position 2i+1 at [:, :, :, 1].
+
+    The packing requires two nc_transposes per head:
+    1. [s_tile_sz, d_head] bf16 → [d_head, s_tile_sz] fp8 (per tile, with FP8 clamp)
+       Tiles write into adjacent slots via _scale_and_transpose_per_head(tile_idx=...).
+    2. Reinterpret as bf16 → single nc_transpose [d_head, num_packed_rows] → [num_packed_rows, d_head]
+
+    Args:
+        output_sb_tiles: List of 1 or 2 output tiles, each [s_tile_sz, I] in SBUF.
+        inv_scale_sb: [pmax, 1], Pre-computed inverse quantization scale in SBUF.
+        cache_hbm: K cache in HBM, shape [num_blocks, block_size // 2, kv_dim, 2] fp8.
+        kv_offset: Column offset into output_sb where K values start.
+        s_tile_sz: Number of active sequence positions per tile. Must be even.
+        cfg: Kernel configuration.
+        dims: Tensor dimensions (kv_dim, d_head, num_kv_heads).
+        sbm: SBUF memory manager.
+        packed_slot_sb: [num_tiles * s_tile_sz // 2, 1], Pre-computed packed row indices.
+    """
+    kv_dim = dims.kv_dim
+    d_head = dims.d_head
+    num_kv_heads = dims.num_kv_heads
+    num_tiles = len(output_sb_tiles)
+    kernel_assert(num_tiles in (1, 2), f"Expected 1 or 2 tiles, got {num_tiles}")
+    packed_rows_per_tile = s_tile_sz // 2
+    num_packed_rows = num_tiles * packed_rows_per_tile
+
+    # Stage 1: scale + per-head transpose with FP8 clamp for each tile.
+    # Uses _scale_and_transpose_per_head (shared with _quantize_and_store_k_transposed).
+    # Layout: [pmax, num_kv_heads * num_tiles * pmax] fp8.
+    # Per head, tiles are adjacent: head i occupies [i * num_tiles * pmax : (i+1) * num_tiles * pmax],
+    # with tile t at sub-offset t * pmax. This adjacency enables a single transpose 2 per head.
+    combined_fp8_sb = sbm.alloc_stack(
+        (nl.tile_size.pmax, num_kv_heads * num_tiles * nl.tile_size.pmax),
+        dtype=cfg.kv_dtype,
+        buffer=nl.sbuf,
+    )
+
+    for t_idx in range(num_tiles):
+        _scale_and_transpose_per_head(
+            output_sb_tiles[t_idx],
+            inv_scale_sb,
+            kv_offset,
+            s_tile_sz,
+            cfg,
+            dims,
+            sbm,
+            transposed_sb=combined_fp8_sb,
+            num_tiles_per_head=num_tiles,
+            tile_idx=t_idx,
+        )
+
+    # Stage 2: Per-head second transpose (bf16 reinterpretation → store orientation).
+    # Reinterpret combined_fp8_sb [pmax, num_kv_heads * num_tiles * pmax] fp8
+    # as [pmax, num_kv_heads * num_tiles * pmax // 2] bf16 (zero-cost, same physical memory).
+    # For 2 tiles: each head has num_tiles * packed_rows_per_tile = pmax bf16 values → full 128-partition transpose.
+    # Output buffer for all heads: [num_packed_rows, kv_dim] bf16.
+    packed_sb = sbm.alloc_stack((num_packed_rows, kv_dim), dtype=nl.bfloat16, buffer=nl.sbuf)
+
+    NUM_TRANSPOSE_PSUM_BUFS = min(num_kv_heads, NUM_HW_PSUM_BANKS)
+    transpose_psum_bufs2 = []
+    for _ in nl.affine_range(NUM_TRANSPOSE_PSUM_BUFS):
+        transpose_psum_bufs2.append(
+            nl.ndarray((nl.tile_size.pmax, nl.tile_size.pmax), dtype=nl.bfloat16, buffer=nl.psum)
+        )
+
+    packed_bf16_view = TensorView(combined_fp8_sb).reinterpret_cast(nl.bfloat16)
+
+    num_chunks = math.ceil(num_kv_heads / NUM_TRANSPOSE_PSUM_BUFS)
+    for i_chunk in nl.affine_range(num_chunks):
+        chunk_start = i_chunk * NUM_TRANSPOSE_PSUM_BUFS
+        chunk_size = min(NUM_TRANSPOSE_PSUM_BUFS, num_kv_heads - chunk_start)
+        for j in nl.affine_range(chunk_size):
+            i_head = chunk_start + j
+
+            # Per head: bf16 data at offset i_head * num_tiles * pmax // 2, length num_packed_rows
+            head_bf16_offset = i_head * num_tiles * (nl.tile_size.pmax // 2)
+
+            # Transpose 2: [d_head, num_packed_rows] bf16 → PSUM [num_packed_rows, d_head] bf16
+            nisa.nc_transpose(
+                data=packed_bf16_view.slice(0, start=0, end=d_head)
+                .slice(1, start=head_bf16_offset, end=head_bf16_offset + num_packed_rows)
+                .get_view(),
+                dst=transpose_psum_bufs2[j][0:num_packed_rows, 0:d_head],
+            )
+
+            # Copy PSUM → packed_sb at the correct head offset
+            nisa.tensor_copy(
+                dst=packed_sb[0:num_packed_rows, nl.ds(i_head * d_head, d_head)],
+                src=transpose_psum_bufs2[j][0:num_packed_rows, 0:d_head],
+                engine=nisa.vector_engine if i_head % 2 == 0 else nisa.scalar_engine,
+            )
+
+    # Stage 3: Scatter DMA store to packed block KV cache.
+    # cache_hbm is [num_blocks, block_size // 2, kv_dim, 2] fp8.
+    # Flatten to [total_packed_rows, kv_dim * 2] fp8 for scatter addressing.
+    # Reinterpret SBUF src as fp8 to match element count (same bytes, 2x elements).
+    num_blocks = cache_hbm.shape[0]
+    block_size_half = cache_hbm.shape[1]
+    total_packed_rows = num_blocks * block_size_half
+    cache_2d = cache_hbm.reshape((total_packed_rows, kv_dim * 2))
+
+    packed_sb_fp8 = TensorView(packed_sb).reinterpret_cast(cfg.kv_dtype).get_view()
+
+    nisa.dma_copy(
+        dst=cache_2d.ap(
+            pattern=[[kv_dim * 2, num_packed_rows], [1, kv_dim * 2]],
+            offset=0,
+            vector_offset=packed_slot_sb.ap(pattern=[[1, num_packed_rows], [1, 1]], offset=0),
+            indirect_dim=0,
+        ),
+        src=packed_sb_fp8,
+        dge_mode=dge_mode.swdge,
+    )
+
+
+def _scale_and_transpose_per_head(
+    output_sb: nl.ndarray,
+    inv_scale_sb: Optional[nl.ndarray],
+    kv_offset: int,
+    s_tile_sz: int,
+    cfg: QKV_CTE_Config,
+    dims: QKV_CTE_Dims,
+    sbm: SbufManager,
+    transposed_sb: nl.ndarray,
+    num_tiles_per_head: int = 1,
+    tile_idx: int = 0,
+) -> nl.ndarray:
+    """Optionally scale K values, nc_transpose per head, clamp to FP8 on PSUM eviction (FP8 path).
+
+    Produces a per-head transposed SBUF buffer. Head `i_head` data (s_tile_sz elements)
+    is written at free-dim offset: i_head * num_tiles_per_head * pmax + tile_idx * pmax.
+
+    When num_tiles_per_head=1 (default): layout is [pmax, num_kv_heads * pmax], head i at i*pmax.
+    When num_tiles_per_head=2: layout is [pmax, num_kv_heads * 2 * pmax], with tiles adjacent
+    per head (enables a single full-partition transpose 2 across both tiles).
+
+    When inv_scale_sb is provided (FP8 path):
+      - K is multiplied by inv_scale (precomputed 1/scale) before transpose
+      - PSUM→SBUF eviction applies clamp to [fp8_min, fp8_max] and casts to cfg.kv_dtype (fp8)
+    When inv_scale_sb is None (bf16 path):
+      - K is transposed directly without scaling/clamping; output is bf16
+
+    Writes into transposed_sb (caller allocates the output buffer).
+
+    Used by both `_quantize_and_store_k_transposed` and
+    `_quantize_and_store_k_fp8_packed` to share the scale + transpose-1 path.
+    """
+    kv_dim = dims.kv_dim
+    d_head = dims.d_head
+    num_kv_heads = dims.num_kv_heads
+
+    if inv_scale_sb is not None:
+        # FP8 path: scale first, clamp after transpose
+        scaled_sb = sbm.alloc_stack((nl.tile_size.pmax, kv_dim), dtype=output_sb.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=scaled_sb[0:s_tile_sz, 0:kv_dim],
+            data=output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim],
+            op0=nl.multiply,
+            operand0=inv_scale_sb[0:s_tile_sz, 0:1],
+        )
+        transpose_src_sb = scaled_sb
+    else:
+        # bf16 path: transpose directly from output_sb (no scaling)
+        transpose_src_sb = output_sb[0:s_tile_sz, kv_offset : kv_offset + kv_dim]
+
+    NUM_TRANSPOSE_PSUM_BUFS = min(num_kv_heads, NUM_HW_PSUM_BANKS)
+    transpose_psum_bufs = []
+    for _ in nl.affine_range(NUM_TRANSPOSE_PSUM_BUFS):
+        transpose_psum_bufs.append(
+            nl.ndarray((nl.tile_size.pmax, nl.tile_size.pmax), dtype=output_sb.dtype, buffer=nl.psum)
+        )
+
+    num_chunks = math.ceil(num_kv_heads / NUM_TRANSPOSE_PSUM_BUFS)
+    for i_chunk in nl.affine_range(num_chunks):
+        chunk_start = i_chunk * NUM_TRANSPOSE_PSUM_BUFS
+        chunk_size = min(NUM_TRANSPOSE_PSUM_BUFS, num_kv_heads - chunk_start)
+        for j in nl.affine_range(chunk_size):
+            i_head = chunk_start + j
+            nisa.nc_transpose(
+                data=transpose_src_sb[0:s_tile_sz, nl.ds(i_head * d_head, d_head)],
+                dst=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
+            )
+            if inv_scale_sb is not None:
+                # FP8 path: clamp during PSUM→SBUF eviction
+                nisa.tensor_scalar(
+                    dst=transposed_sb[
+                        0:d_head,
+                        nl.ds(
+                            i_head * num_tiles_per_head * nl.tile_size.pmax + tile_idx * nl.tile_size.pmax, s_tile_sz
+                        ),
+                    ],
+                    data=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
+                    op0=nl.maximum,
+                    operand0=cfg.fp8_min,
+                    op1=nl.minimum,
+                    operand1=cfg.fp8_max,
+                )
+            else:
+                # bf16 path: plain copy from PSUM→SBUF
+                nisa.tensor_copy(
+                    dst=transposed_sb[
+                        0:d_head,
+                        nl.ds(
+                            i_head * num_tiles_per_head * nl.tile_size.pmax + tile_idx * nl.tile_size.pmax, s_tile_sz
+                        ),
+                    ],
+                    src=transpose_psum_bufs[j][0:d_head, 0:s_tile_sz],
+                    engine=nisa.vector_engine if (i_head + tile_idx) % 2 == 0 else nisa.scalar_engine,
+                )
+
+    return transposed_sb
+
+
 def _qkv_cte_impl(
     input_hbm,
     fused_qkv_weights_hbm,
@@ -1129,6 +1342,8 @@ def _qkv_cte_impl(
     # Load KV quantization scales if enabled (not needed for bf16 KV cache)
     k_scale_sb = None
     v_scale_sb = None
+    k_inv_scale_sb = None
+    v_inv_scale_sb = None
     if cfg.use_kv_quantization:
         k_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
         v_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -1142,6 +1357,11 @@ def _qkv_cte_impl(
             src=v_scale_hbm[0 : nl.tile_size.pmax, 0:1],
             dge_mode=dge_mode.swdge,
         )
+        # Precompute inverse scales (1/scale) once — avoids redundant reciprocal per tile.
+        k_inv_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+        v_inv_scale_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.reciprocal(dst=k_inv_scale_sb, data=k_scale_sb)
+        nisa.reciprocal(dst=v_inv_scale_sb, data=v_scale_sb)
 
     # Load quantization scales
     w_scale_tile, in_scale_tile = None, None
@@ -1637,9 +1857,13 @@ def _qkv_cte_impl(
                 # Load weights [weight_load_block_size_per_H=1024, I] at a time.
                 # Default weight constants are meant for non-prefetches case (they are over-written in case of prefetching)
                 # Note: Projection uses num_weight_buffers and weight_load_block_size_per_H for indexing regardless of use_weight_prefetch.
-                num_weight_buffers = dims.NUM_WEIGHT_BUFFERS_DEFAULT  # 4
                 weight_load_block_size_per_H = dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT  # 1024
                 num_weight_load_blocks_per_H = math.ceil(H / weight_load_block_size_per_H)
+                # Reduce weight buffers when SBUF budget is exceeded (mirrors lookahead in _multi_buffering_degree_for_seqlen)
+                if projected_sbuf_taken_space_after_multi_buffer > cfg.total_available_sbuf_space_to_this_kernel:
+                    num_weight_buffers = min(dims.NUM_WEIGHT_BUFFERS_DEFAULT, num_weight_load_blocks_per_H)
+                else:
+                    num_weight_buffers = dims.NUM_WEIGHT_BUFFERS_DEFAULT  # 4
                 max_num_128_H_subtiles_per_weight_block = math.ceil(
                     weight_load_block_size_per_H / 128
                 )  # e.g 1024 / 128 = 8.
@@ -2069,19 +2293,26 @@ def _qkv_cte_impl(
 
             if cfg.use_kv_cache and cfg.output_layout == QKVOutputLayout.BSD:
                 # KV cache mode: store Q separately, optionally quantize and store K/V to caches
+                fp8_pack_pending_tiles = []  # accumulator for fp8_packed tile pairing
+                fp8_pack_first_tile_offset = None
+                # Disable two-tile optimization if any tile in this block is partial (< pmax).
+                # This avoids mixing different s_tile_sz values in a single paired call.
+                fp8_packed_two_tile_opt = cfg.fp8_packed and (s_block_sz % nl.tile_size.pmax == 0)
                 for i_tile_S in range(num_S_tiles_in_block):
                     s_tile_local_offset = i_block_S * S_BLOCK_SIZE + i_tile_S * nl.tile_size.pmax
                     s_tile_sz = min(nl.tile_size.pmax, S_shard - s_tile_local_offset)
                     s_tile_global_offset = dims.S_shard_offset + s_tile_local_offset
 
-                    nisa.dma_copy(
-                        dst=q_tensor_hbm.ap(
-                            pattern=[[dims.q_dim, s_tile_sz], [1, dims.q_dim]],
-                            offset=i_batch * dims.S * dims.q_dim + s_tile_global_offset * dims.q_dim,
-                        ),
-                        src=output_sb[i_tile_S][0:s_tile_sz, 0 : dims.q_dim],
-                        dge_mode=dge_mode.swdge,
-                    )
+                    # Store Q output to HBM (skip when q_dim == 0, i.e. KV-only projection)
+                    if dims.q_dim > 0:
+                        nisa.dma_copy(
+                            dst=q_tensor_hbm.ap(
+                                pattern=[[dims.q_dim, s_tile_sz], [1, dims.q_dim]],
+                                offset=i_batch * dims.S * dims.q_dim + s_tile_global_offset * dims.q_dim,
+                            ),
+                            src=output_sb[i_tile_S][0:s_tile_sz, 0 : dims.q_dim],
+                            dge_mode=dge_mode.swdge,
+                        )
 
                     # Load slot_mapping for block KV cache
                     if cfg.use_block_kv:
@@ -2094,12 +2325,60 @@ def _qkv_cte_impl(
                                 pattern=[[1, s_tile_sz]],
                                 offset=i_batch * dims.S + s_tile_global_offset,
                             ),
-                            dge_mode=dge_mode.swdge,
+                            dge_mode=dge_mode.none,  # to remove gpsimd contention with the cache write
                         )
-                    if cfg.transpose_k_cache:
+                    if cfg.fp8_packed:
+                        # Accumulate tiles for paired processing (full 128-partition transpose+DMA).
+                        # Flush when we have 2 tiles, on the last tile, or when two-tile opt is disabled.
+                        fp8_pack_pending_tiles.append(output_sb[i_tile_S])
+                        if fp8_pack_first_tile_offset is None:
+                            fp8_pack_first_tile_offset = s_tile_global_offset
+                        if (
+                            len(fp8_pack_pending_tiles) == 2
+                            or i_tile_S == num_S_tiles_in_block - 1
+                            or not fp8_packed_two_tile_opt
+                        ):
+                            pair_count = len(fp8_pack_pending_tiles)
+
+                            # Load packed slot indices for all tiles in one DMA (stride 2 across
+                            # contiguous tiles). Both tiles' even-indexed slots are contiguous in HBM.
+                            num_packed_rows = pair_count * (s_tile_sz // 2)
+                            packed_slot_sb = sbm.alloc_stack((nl.tile_size.pmax, 1), dtype=nl.int32, buffer=nl.sbuf)
+                            nisa.dma_copy(
+                                dst=packed_slot_sb[0:num_packed_rows, 0:1],
+                                src=slot_mapping_hbm.ap(
+                                    pattern=[[2, num_packed_rows]],
+                                    offset=i_batch * dims.S + fp8_pack_first_tile_offset,
+                                ),
+                                dge_mode=dge_mode.none,  # to remove gpsimd contention with the cache write
+                            )
+                            # slot_mapping holds flat indices into [num_blocks * block_size].
+                            # Right-shift by 1 (= divide by 2) converts to packed row indices
+                            # into [num_blocks * block_size // 2], since each packed row holds
+                            # two consecutive sequence positions.
+                            nisa.tensor_scalar(
+                                dst=packed_slot_sb[0:num_packed_rows, 0:1],
+                                data=packed_slot_sb[0:num_packed_rows, 0:1],
+                                op0=nl.right_shift,
+                                operand0=1,
+                            )
+                            _quantize_and_store_k_fp8_packed(
+                                output_sb_tiles=fp8_pack_pending_tiles,
+                                inv_scale_sb=k_inv_scale_sb,
+                                cache_hbm=k_cache_hbm,
+                                kv_offset=dims.q_dim,
+                                s_tile_sz=s_tile_sz,
+                                cfg=cfg,
+                                dims=dims,
+                                sbm=sbm,
+                                packed_slot_sb=packed_slot_sb,
+                            )
+                            fp8_pack_pending_tiles = []
+                            fp8_pack_first_tile_offset = None
+                    elif cfg.transpose_k_cache:
                         _quantize_and_store_k_transposed(
                             output_sb=output_sb[i_tile_S],
-                            scale_sb=k_scale_sb,
+                            inv_scale_sb=k_inv_scale_sb,
                             cache_hbm=k_cache_hbm,
                             kv_offset=dims.q_dim,
                             s_tile_sz=s_tile_sz,
@@ -2225,7 +2504,7 @@ def _qkv_cte_mx_impl(
 
     Args:
         input_hbm (nl.ndarray): [B, S, H], Input hidden states tensor on HBM
-        fused_qkv_weights_hbm (nl.ndarray): [H//4, I], MX-quantized fused QKV weights on HBM
+        fused_qkv_weights_hbm (nl.ndarray): [H//4, I, 4] fp8, MX-quantized fused QKV weights on HBM
         output_hbm (nl.ndarray): Output tensor on HBM, shape depends on cfg.output_layout
         cfg (QKV_CTE_Config): Kernel configuration object
         dims (QKV_CTE_Dims): Tensor dimensions object
@@ -2326,7 +2605,7 @@ def _qkv_cte_mx_impl(
         input_view = input_hbm.reshape((dims.B, dims.S * H_pack, H_128_tiles, P_MAX))
 
     _is_fp8_input = input_hbm.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
-    _use_static_dequant = qkv_in_scale is not None
+    _use_static_dequant = cfg.quantization_config.has_mx_static_dequant_scales
     _is_bf16_with_static_quant = input_hbm.dtype == nl.bfloat16 and _use_static_dequant
     _is_row_mx = cfg.quantization_config.has_row_mx_dequant
     _use_dma_xpose_mx_path = (
@@ -2361,10 +2640,16 @@ def _qkv_cte_mx_impl(
         _xpose_seq_mult = 1
         _xpose_dtype = nl.float32
     elif _use_dma_xpose_mx_path:
-        _xpose_src = _dma_xpose_packed_2d
-        _xpose_row_stride = H_PACKED
-        _xpose_seq_mult = 2
-        _xpose_dtype = _dma_xpose_view_dtype
+        if cfg.weight_layout == QKVWeightLayout.MX_INTERLEAVED:
+            _xpose_src = _dma_xpose_packed_2d
+            _xpose_row_stride = H_PACKED
+            _xpose_seq_mult = 2
+            _xpose_dtype = _dma_xpose_view_dtype
+        elif cfg.weight_layout == QKVWeightLayout.MX_CONTIGUOUS:
+            _xpose_src = input_hbm
+            _xpose_row_stride = H_PACKED
+            _xpose_seq_mult = 1
+            _xpose_dtype = nl.float32
 
     if cfg.fused_norm_type == NormType.RMS_NORM or cfg.fused_norm_type == NormType.LAYER_NORM:
         gamma_norm_weights_sb = _load_norm_weights_mx(
@@ -2437,30 +2722,50 @@ def _qkv_cte_mx_impl(
                     )
             weight_scale_sb.append(mx_weight_scale_sb)
 
-        # Load MX weights
+        # Load MX weights from HBM [H//4, I, 4] fp8 into SBUF.
+        # Allocate SBUF in HBM fp8 dtype for HWDGE type matching, then
+        # view-cast to float8_e4m3fn_x4 for nc_matmul_mx.
+        _hbm_weight_dtype = fused_qkv_weights_hbm.dtype
         weights_sb = []
-        mx_weights_sb = sbm.alloc_stack((P_MAX, dims.num_512_tiles_per_H, I), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
+        mx_weights_sb = sbm.alloc_stack(
+            (P_MAX, dims.num_512_tiles_per_H, I * 4),
+            dtype=_hbm_weight_dtype,
+            align=4,
+            buffer=nl.sbuf,
+        )
         for h_tile_idx in nl.affine_range(H_128_tiles):
             h_tile_sz = min(P_MAX, H_PACKED - h_tile_idx * P_MAX)
             nisa.dma_copy(
-                dst=mx_weights_sb[0:h_tile_sz, h_tile_idx, 0:I],
+                dst=mx_weights_sb[0:h_tile_sz, h_tile_idx, 0 : I * 4],
                 src=fused_qkv_weights_hbm.ap(
-                    pattern=[[I, h_tile_sz], [1, I]], offset=h_tile_idx * P_MAX * I, dtype=nl.float8_e4m3fn_x4
+                    pattern=[[I * 4, h_tile_sz], [1, I * 4]],
+                    offset=h_tile_idx * P_MAX * I * 4,
+                    dtype=_hbm_weight_dtype,
                 ),
                 dge_mode=dge_mode.hwdge,
             )
+        mx_weights_sb = mx_weights_sb.view(nl.float8_e4m3fn_x4)
         weights_sb.append(mx_weights_sb)
     else:
-        # Chunked loading: allocate smaller buffers
+        # Chunked loading: allocate smaller buffers in HBM fp8 dtype for
+        # HWDGE type matching. View-cast to x4 after each DMA for matmul.
         num_weight_load_blocks_mx = H_128_tiles  # Load 1 H_128_tile at a time
         h_tiles_per_block = 1
 
+        _hbm_weight_dtype = fused_qkv_weights_hbm.dtype
         weight_scale_sb = []
         weights_sb = []
         for _ in range(NUM_MX_WEIGHT_BUFFERS):
             if qkv_w_scale is not None:
                 weight_scale_sb.append(sbm.alloc_stack((P_MAX, h_tiles_per_block, I), dtype=nl.uint8, buffer=nl.sbuf))
-            weights_sb.append(sbm.alloc_stack((P_MAX, h_tiles_per_block, I), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf))
+            weights_sb.append(
+                sbm.alloc_stack(
+                    (P_MAX, h_tiles_per_block, I * 4),
+                    dtype=_hbm_weight_dtype,
+                    align=4,
+                    buffer=nl.sbuf,
+                )
+            )
 
     # Load and pre-fuse MX static dequantization scales: combined = w_scale * in_scale
     mx_dequant_sb = None
@@ -2816,14 +3121,20 @@ def _qkv_cte_mx_impl(
                                 dge_mode=dge_mode.hwdge,
                             )
 
-                    # Load weights for this h_tile
+                    # Load weights for this h_tile from HBM [H//4, I, 4] fp8.
+                    # Buffer is allocated in fp8 for HWDGE matching; view-cast
+                    # to x4 after load for nc_matmul_mx.
+                    weights_sb_fp8 = weights_sb[buf_idx].view(_hbm_weight_dtype)
                     nisa.dma_copy(
-                        dst=weights_sb[buf_idx][0:h_tile_sz, 0, 0:I],
+                        dst=weights_sb_fp8[0:h_tile_sz, 0, 0 : I * 4],
                         src=fused_qkv_weights_hbm.ap(
-                            pattern=[[I, h_tile_sz], [1, I]], offset=h_tile_idx * P_MAX * I, dtype=nl.float8_e4m3fn_x4
+                            pattern=[[I * 4, h_tile_sz], [1, I * 4]],
+                            offset=h_tile_idx * P_MAX * I * 4,
+                            dtype=_hbm_weight_dtype,
                         ),
                         dge_mode=dge_mode.hwdge,
                     )
+                    weights_sb[buf_idx] = weights_sb_fp8.view(nl.float8_e4m3fn_x4)
 
                 # DMA transpose: load one H_128_tile for each S tile
                 for i_tile_S in nl.affine_range(num_output_s_tiles):
@@ -3702,12 +4013,26 @@ def _multi_buffering_degree_for_seqlen(
         NUM_512_BN_STATS_TILES_H = math.ceil(dims.H / BN_STATS_FMAX)
         sbuf_tile_space_non_buffered += 6 * NUM_512_BN_STATS_TILES_H * sizeinbytes(cfg.act_dtype)
 
-    weights_space_per_partition = (
-        dims.NUM_WEIGHT_BUFFERS_DEFAULT
-        * (dims.I * math.ceil(dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT / 128))
-        * sizeinbytes(cfg.compute_mm_dtype)
+    single_weight_buf_space = (dims.I * math.ceil(dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT / 128)) * sizeinbytes(
+        cfg.compute_mm_dtype
     )
+    weights_space_per_partition = dims.NUM_WEIGHT_BUFFERS_DEFAULT * single_weight_buf_space
     sbuf_tile_space_non_buffered += weights_space_per_partition
+
+    # If SBUF budget is exceeded, reduce weight buffers to the actual number of load iterations needed for H.
+    # With small H (e.g. H=1280, block=1024), only ceil(H/1024) loads are needed so extra buffers are unused.
+    if cfg.total_available_sbuf_space_to_this_kernel - sbuf_tile_space_non_buffered < 0:
+        num_weight_load_blocks = math.ceil(dims.H / dims.WEIGHT_LOAD_BLOCK_SIZE_PER_H_DEFAULT)
+        effective_num_weight_buffers = min(dims.NUM_WEIGHT_BUFFERS_DEFAULT, num_weight_load_blocks)
+        sbuf_tile_space_non_buffered -= (
+            dims.NUM_WEIGHT_BUFFERS_DEFAULT - effective_num_weight_buffers
+        ) * single_weight_buf_space
+        kernel_assert(
+            sbuf_tile_space_non_buffered < cfg.total_available_sbuf_space_to_this_kernel,
+            f"SBUF budget exceeded even after reducing weight buffers: "
+            f"sbuf_tile_space_non_buffered={sbuf_tile_space_non_buffered}, "
+            f"available={cfg.total_available_sbuf_space_to_this_kernel}",
+        )
 
     # QK-norm: gamma weights [pmax, d_head] broadcast + scratch [pmax, 1]
     _has_qk_norm = cfg.qk_norm_pre_rope is not None or cfg.qk_norm_post_rope is not None
@@ -3746,6 +4071,11 @@ def _multi_buffering_degree_for_seqlen(
     # Ensure NUM_512_TILES_PER_H * s_multi_buffer_degree <= 8
     MAX_PSUM_TILING_GROUPS = NUM_HW_PSUM_BANKS // dims.num_512_tiles_per_I
     s_multi_buffer_degree = min(s_multi_buffer_degree, MAX_PSUM_TILING_GROUPS)
+
+    # For fp8_packed, round down to even degree so tiles pair cleanly for the
+    # two-tile transpose optimization (full 128-partition transpose 2 and DMA).
+    if cfg.fp8_packed:
+        s_multi_buffer_degree = max(2 * (s_multi_buffer_degree // 2), 1)
 
     projected_sbuf_taken_space = s_multi_buffer_degree * sbuf_tile_space_pre_buffering + sbuf_tile_space_non_buffered
     return s_multi_buffer_degree, projected_sbuf_taken_space

@@ -47,7 +47,7 @@ from nki.isa.constants import matmul_perf_mode
 from nki.language import affine_range, static_range
 
 from ..utils.allocator import BufferManager, align_to, create_auto_alloc_manager, sizeinbytes
-from ..utils.common_types import QuantizationType
+from ..utils.common_types import DtypeMode, QuantizationType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, get_program_sharding_info
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
@@ -76,6 +76,7 @@ def output_projection_tkg(
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
     sbm: Optional[BufferManager] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> nl.ndarray:
     """
     Output Projection Kernel
@@ -104,8 +105,8 @@ def output_projection_tkg(
             Indexing: [n * D + d, h]
             Dtype:
                 - QuantizationType.NONE: nl.float32, nl.float16, or nl.bfloat16
-                - QuantizationType.STATIC: nl.float8_e4m3
-                - QuantizationType.ROW: nl.float8_e4m3
+                - QuantizationType.STATIC: nl.float8_e4m3 or nl.float8_e4m3fn
+                - QuantizationType.ROW: nl.float8_e4m3 or nl.float8_e4m3fn
                 - QuantizationType.MX: nl.float8_e4m3fn_x4
                 - QuantizationType.STATIC_MX: nl.float8_e4m3fn_x4
         bias (Optional[nl.ndarray]): Optional bias tensor in HBM
@@ -137,6 +138,11 @@ def output_projection_tkg(
             such that h = h_0 * H_1 * H_2 + h_1 * H_2 + h_2.
         OUT_IN_SB (bool): If True, output is in SBUF. Else, it is written out to HBM.
         sbm (BufferManager): Optional BufferManager for tensor allocation with consistent naming.
+        dtype_mode (DtypeMode): Quantization dtype policy. The kernel's FP8
+            allocations follow ``weight.dtype``; allocate ``weight`` as
+            ``nl.float8_e4m3fn`` (OCP) or ``nl.float8_e4m3`` (NON_OCP) so the
+            whole traced module agrees on a single E4M3 variant
+            (compiler enforces ``EOCP001``).
 
     Returns:
         out (nl.ndarray): Output tensor in HBM. Shape depends on `TRANSPOSE_OUT` parameter.
@@ -533,10 +539,6 @@ def _validate_and_create_config(
             f"MX quantization requires weight_scale shape [{n_d_not_packed // 32}, {h_size}], got {weight_scale.shape}",
         )
         kernel_assert(
-            (b_size * s_size) % 4 == 0,
-            f"MX quantization requires B*S ({b_size * s_size}) to be divisible by 4",
-        )
-        kernel_assert(
             h_size % 4 == 0,
             f"MX quantization requires H ({h_size}) to be divisible by 4",
         )
@@ -566,9 +568,15 @@ def _validate_and_create_config(
         # STATIC_MX-specific validation
 
         ################### Verify Dtypes #############
+        # HBM-side dtype may be the canonical ``nl.float8_e4m3fn_x4`` or a
+        # torch-compatible alt-dtype ``nl.uint32`` (vllm-neuron path;
+        # torch has no ``float8_e4m3fn_x4``). Both have a 4-byte element
+        # width; the kernel internals allocate SBUF with the source dtype
+        # and view-cast to ``nl.float8_e4m3fn_x4`` before the matmul.
+        # Mirrors the QKV CTE fix in commit ``560a5f16`` (CR-277644685).
         kernel_assert(
-            weight.dtype == nl.float8_e4m3fn_x4,
-            f"STATIC_MX quantization requires weight dtype float8_e4m3fn_x4, got {weight.dtype}",
+            weight.dtype in (nl.float8_e4m3fn_x4, nl.uint32),
+            f"STATIC_MX quantization requires weight dtype float8_e4m3fn_x4 or uint32, got {weight.dtype}",
         )
         kernel_assert(
             weight_scale != None,
@@ -601,10 +609,6 @@ def _validate_and_create_config(
         kernel_assert(
             input_scale.shape == (P_MAX, 1),
             f"STATIC_MX quantization requires input_scale shape ({P_MAX}, 1), got {input_scale.shape}",
-        )
-        kernel_assert(
-            (b_size * s_size) % 4 == 0,
-            f"STATIC_MX quantization requires B*S ({b_size * s_size}) to be divisible by 4",
         )
         kernel_assert(
             h_size % 4 == 0,

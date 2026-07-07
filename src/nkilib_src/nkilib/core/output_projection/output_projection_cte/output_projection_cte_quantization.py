@@ -34,6 +34,7 @@ from .output_projection_cte_tensor_io import (
     invert_static_quant_scales,
     load_bias,
     load_input_tensor_quantized,
+    load_mx_compact_weight_scales,
     load_mx_input_interleaved,
     load_mx_prequantized_input,
     load_mx_quantized_weights,
@@ -367,14 +368,15 @@ def _compute_matmul_dequantize(
                         weight_slice,
                     )
 
-            # Dequantize using weight scales
+            # Dequantize using weight scales - alternate between scalar and vector engines
             h_indices = h_subtile_idx * cfg.h_tile.subtile_dim_info.tile_size
-            nisa.activation(
+            engine = nisa.scalar_engine if (s_subtile_idx + h_subtile_idx) % 2 == 0 else nisa.vector_engine
+            nisa.tensor_scalar(
                 dst=result_sb[s_subtile_idx][:curr_s_subtile_size, nl.ds(h_indices, curr_h_subtile_size)],
-                op=nl.copy,
                 data=res_psum[:curr_s_subtile_size, :curr_h_subtile_size],
-                scale=weight_scale_sbuf[:curr_s_subtile_size, :1],
-                bias=get_zero_bias_vector_sbuf(P_MAX)[:curr_s_subtile_size, :1],
+                op0=nl.multiply,
+                operand0=weight_scale_sbuf[:curr_s_subtile_size, :1],
+                engine=engine,
             )
 
             if bias_sbuf != None:
@@ -980,10 +982,22 @@ def perform_mx_quantized_projection(
         curr_h_block_size = cfg.h_tile.get_tile_bound(h_block_idx)
         h_start = cfg.h_sharded_size * prg_id + h_block_idx * cfg.h_tile.tile_size
         weight_view = TensorView(weight_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
-        weight_scale_view = TensorView(weight_scale_hbm).slice(dim=1, start=h_start, end=h_start + curr_h_block_size)
 
         w_sbuf_list = load_mx_quantized_weights(weight_view, quant_config.quant_data_type, cfg, quant_config)
-        w_scale_sbuf_list = load_mx_weight_scales(weight_scale_view, cfg)
+        if quant_config.compact_weight_scales:
+            # block-128: load compact [D//128, H//128] and expand to
+            # the dense MX hardware layout per d_tile.
+            w_scale_sbuf_list = load_mx_compact_weight_scales(
+                weight_scale_hbm=weight_scale_hbm,
+                h_start=h_start,
+                curr_h_block_size=curr_h_block_size,
+                cfg=cfg,
+            )
+        else:
+            weight_scale_view = TensorView(weight_scale_hbm).slice(
+                dim=1, start=h_start, end=h_start + curr_h_block_size
+            )
+            w_scale_sbuf_list = load_mx_weight_scales(weight_scale_view, cfg)
 
         bias_sbuf = None
         if bias_hbm != None:

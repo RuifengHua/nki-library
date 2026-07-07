@@ -383,6 +383,108 @@ def load_mx_weight_scales(
     return w_scale_sbuf_list
 
 
+def load_mx_compact_weight_scales(
+    weight_scale_hbm: nl.ndarray,
+    h_start: int,
+    curr_h_block_size: int,
+    cfg: TilingConfig,
+) -> List[nl.ndarray]:
+    """Load block-128 compact MX weight scales and expand to hardware layout.
+
+    quantizes weights with one uint8 scale per 128x128 block, so the
+    HBM scale tensor is ``[K_unpacked // 128, H // 128]`` — far more compact than
+    the standard MX block-32 layout ``[K_unpacked // 8, H]``. The hardware
+    ``nc_matmul_mx`` op consumes the dense MX scale layout
+    ``[d_tile_size, h_tile_size]`` with sparse quadrant population (rows
+    ``0-3, 32-35, 64-67, 96-99`` carry valid scales).
+
+    Each d_tile of ``d_tile_size`` partitions covers ``d_tile_size * 4`` actual
+    K-elements (since the data is fp8x4 packed, 4 K-elements per partition byte).
+    Within a d_tile, the 4 hardware quadrants of 32 partitions each cover a
+    distinct 128-K-element region, so each quadrant maps to a different compact
+    scale row. Mirroring ``qkv_mla_cte_utils._load_mx_weights``:
+
+    1. DMA stage: per quadrant, copy that quadrant's compact row into the 4
+       valid partition rows. Stride-0 on the partition axis broadcasts within
+       a quadrant; stride 1 on the free dim reads ``out_n_blocks`` consecutive
+       compact columns. Free-dim broadcast at DMA time is NOT used — the DMA
+       engine doesn't support stride-0 on the free axis without falling back
+       to per-element copies.
+    2. Compute stage: vector-engine ``tensor_copy`` with stride-0 source
+       broadcast on the free axis expands each compact column to ``SCALE_BLOCK``
+       (128) hardware columns, producing the
+       ``[d_tile_size, n_blocks * SCALE_BLOCK]`` layout consumed by
+       ``nc_matmul_mx``.
+
+    Args:
+        weight_scale_hbm: ``[K_unpacked_full // 128, H_full // 128]`` uint8
+            compact block-128 scales on HBM.
+        h_start: Column offset (in H elements) of the current h_block. Must be
+            a multiple of 128.
+        curr_h_block_size: Width of the current h_block in H elements.
+        cfg: Tiling configuration. ``cfg.d_tile`` describes the D-tiling.
+
+    Returns:
+        List of dense MX scale tensors per d_tile, each
+        ``[d_tile_size, padded_h_block_size]`` uint8 in hardware layout.
+    """
+    SCALE_BLOCK = 128
+    SCALE_P_PER_QUAD = 4
+    H_PACK = 4
+
+    # Slice scale to current h_block. ceil(curr_h_block_size / 128) compact columns.
+    n_block_offset = h_start // SCALE_BLOCK
+    out_n_blocks = (curr_h_block_size + SCALE_BLOCK - 1) // SCALE_BLOCK
+    padded_h_block_size = out_n_blocks * SCALE_BLOCK
+    full_n_blocks = weight_scale_hbm.shape[1]
+
+    compact_rows_per_dtile = (cfg.d_tile.tile_info.tile_size * H_PACK) // SCALE_BLOCK
+
+    w_scale_sbuf_list = []
+    for d_tile_idx in range(cfg.d_tile.tile_info.tile_count):
+        padded_size, actual_size = cfg.d_tile.get_bounds(d_tile_idx)
+        if padded_size <= 0:
+            break
+
+        # Final destination: dense MX layout for nc_matmul_mx.
+        scale_sbuf = nl.ndarray((padded_size, padded_h_block_size), dtype=nl.uint8, buffer=nl.sbuf)
+
+        # 4 rows per quadrant carry the per-quadrant compact
+        # scale row, broadcast 4-wide on partition.
+        compact_sb = nl.ndarray((padded_size, out_n_blocks), dtype=nl.uint8, buffer=nl.sbuf)
+
+        compact_base_row = d_tile_idx * compact_rows_per_dtile
+
+        # Number of quadrants in this d_tile that map to valid (non-padding) compact rows.
+        valid_k_elements = actual_size * H_PACK
+        valid_quadrants = valid_k_elements // SCALE_BLOCK
+        num_quadrants = padded_size // _SBUF_QUADRANT_SIZE
+
+        # Stage 1: DMA per quadrant with stride-0 partition broadcast (4 rows).
+        # Each quadrant reads a distinct compact row covering its 128-K slice.
+        for quad_idx in range(min(num_quadrants, valid_quadrants)):
+            nisa.dma_copy(
+                dst=compact_sb[
+                    quad_idx * _SBUF_QUADRANT_SIZE : quad_idx * _SBUF_QUADRANT_SIZE + SCALE_P_PER_QUAD,
+                    :out_n_blocks,
+                ],
+                src=weight_scale_hbm.ap(
+                    pattern=[[0, SCALE_P_PER_QUAD], [1, out_n_blocks]],
+                    offset=(compact_base_row + quad_idx) * full_n_blocks + n_block_offset,
+                    dtype=nl.uint8,
+                ),
+            )
+
+        # Stage 2: vector-engine broadcast on free dim (stride-0 source on inner dim).
+        # Treat compact_sb as [P, n_blocks, 1] and broadcast inner dim by SCALE_BLOCK.
+        src_view = TensorView(compact_sb).expand_dim(dim=2).broadcast(dim=2, size=SCALE_BLOCK).get_view()
+        dst_view = TensorView(scale_sbuf).reshape_dim(dim=1, shape=(out_n_blocks, SCALE_BLOCK)).get_view()
+        nisa.tensor_copy(dst=dst_view, src=src_view)
+
+        w_scale_sbuf_list.append(scale_sbuf)
+    return w_scale_sbuf_list
+
+
 def load_mx_quantized_weights(
     weight_view: TensorView,
     weight_dtype,

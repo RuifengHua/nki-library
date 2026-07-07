@@ -31,30 +31,29 @@ from ...core.utils.tensor_view import TensorView
 _MAX_GRPS_PER_TILE = 128
 
 
-def _load_rank_sb(scalar_rank, qts):
+def _load_rank_sb(iota_nw, scalar_rank, qts):
     """
     Load a dynamic rank ID into a (qts, 1) float32 SBUF tensor.
 
-    Uses register_store to write the dynamic index-type rank ID into a (1,1)
-    int32 SBUF tensor, tensor_copy to cast int32 -> float32, then
-    stream_shuffle_broadcast to replicate across all partitions.
+    Uses indirect DMA with scalar_offset=scalar_rank to read iota_nw[scalar_rank]
+    directly into SBUF, then stream_shuffle_broadcast to replicate across all
+    partitions. This pattern (matching ring_attention_bwd) avoids register_store,
+    whose scheduling can be reordered across ring steps on trn3 cp=4 lnc=2
+    striped causal — see steering_private/trn3_ring_id_investigation.md.
 
     Args:
+        iota_nw (nl.ndarray): [1, num_workers] HBM iota table containing [0, 1, ..., num_workers-1].
         scalar_rank: Dynamic rank ID (index type from collective_permute).
         qts (int): Q sequence tile size (partition dimension).
 
     Returns:
         nl.ndarray: [qts, 1], Rank ID broadcast to all partitions in SBUF as float32.
     """
-    # Store dynamic rank into int32 SBUF (register_store requires matching dtypes)
-    rank_int = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.register_store(dst=rank_int, src=scalar_rank)
-
-    # Cast int32 -> float32 for downstream arithmetic
     sb = nl.ndarray((qts, 1), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=sb[0:1, 0:1], src=rank_int)
-
-    # Broadcast partition 0 to all partitions
+    nisa.dma_copy(
+        dst=sb[0, 0],
+        src=iota_nw.ap(pattern=[[1, 1], [1, 1]], offset=0, scalar_offset=scalar_rank, indirect_dim=1),
+    )
     stream_shuffle_broadcast(src=sb, dst=sb)
     return sb
 
@@ -685,6 +684,8 @@ def ring_attention_spmd_fwd(
     lse_dtype: nki.dtype = nl.float32,
     tp_q: bool = False,
     tp_k: bool = False,
+    bound_min: nl.ndarray = None,
+    bound_max: nl.ndarray = None,
 ):
     """
     Ring attention forward using attention_cte with HBM I/O.
@@ -733,6 +734,16 @@ def ring_attention_spmd_fwd(
             When False (default), k must be pre-transposed to (batch, d, seqlen).
             The ring transfer buffers match the input k layout, so collective permute
             transfers k in whichever layout the caller provides.
+        bound_min (nl.ndarray, optional): Sequence packing lower bound. Shape
+            (b*q_h, seqlen_per_rank, 1), fp32. Per-local-Q-token inclusive lower bound
+            on the local K index of the document this Q token belongs to. Must be
+            provided together with bound_max. Requires use_causal_mask=True and
+            striped_input=True. Under the invariant that each padded document length
+            is a multiple of num_workers, the local document layout is identical on
+            every rank, so the caller produces this tensor once and replicates it to
+            every rank. Use cu_seqlens_to_striped_bounds() to build it from cu_seqlens.
+        bound_max (nl.ndarray, optional): Sequence packing upper bound (exclusive).
+            Same shape/dtype/semantics as bound_min.
 
     Returns:
         o (nl.ndarray): [b, h, seqlen, d], Attention output.
@@ -772,7 +783,21 @@ def ring_attention_spmd_fwd(
     kernel_assert(d <= 128, f"head_dim must be <= 128, got {d}")
     kernel_assert(seqlen % _Q_GRP_SZ == 0, f"seqlen must be divisible by {_Q_GRP_SZ}, got {seqlen}")
 
-    if replica_groups == None:
+    # Sequence packing: bound_min and bound_max must be provided together. Both
+    # must reference LOCAL (per-rank) positions. Under striped input with each
+    # padded doc length a multiple of num_workers, the local document layout is
+    # identical across ranks, so the caller can produce the bounds once and
+    # replicate them to every rank.
+    is_sequence_packed = bound_min is not None
+    kernel_assert(
+        is_sequence_packed == (bound_max is not None),
+        "bound_min and bound_max must both be provided or both be None",
+    )
+    if is_sequence_packed:
+        kernel_assert(use_causal_mask, "bound_min/bound_max require use_causal_mask=True")
+        kernel_assert(striped_input, "bound_min/bound_max require striped_input=True")
+
+    if replica_groups is None:
         replica_groups = ()
 
     bs = b * q_h
@@ -867,11 +892,16 @@ def ring_attention_spmd_fwd(
     # cp_offset_hbm is a (1,1) shared HBM tensor that gets updated each ring step.
     cp_offset_hbm = None
     if use_causal_mask:
+        iota_nw_sb = nl.ndarray((1, num_workers), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(iota_nw_sb, [[1, num_workers]], offset=0)
+        iota_nw = nl.ndarray((1, num_workers), dtype=nl.float32, buffer=nl.shared_hbm, name="iota_nw")
+        nisa.dma_copy(dst=iota_nw, src=iota_nw_sb)
+
         rank_id = ncc.collective_permute_implicit_current_processing_rank_id(
             iteration_id=0,
             replica_group=replica_group,
         )
-        rank_id_sb = _load_rank_sb(rank_id, _Q_GRP_SZ)
+        rank_id_sb = _load_rank_sb(iota_nw, rank_id, _Q_GRP_SZ)
         cp_offset_hbm = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm)
 
     allocator = ModularAllocator(initial_address=0)
@@ -902,6 +932,8 @@ def ring_attention_spmd_fwd(
         global_cp_deg=num_workers if use_causal_mask else None,
         cp_striped_input=striped_input,
         skip_output_normalization=True,
+        bound_min=bound_min,
+        bound_max=bound_max,
     )
 
     # Initialize send KV buffers with local K/V.
@@ -946,7 +978,7 @@ def ring_attention_spmd_fwd(
                 iteration_id=ring_step,
                 replica_group=replica_group,
             )
-            recv_rank_sb = _load_rank_sb(recv_rank, _Q_GRP_SZ)
+            recv_rank_sb = _load_rank_sb(iota_nw, recv_rank, _Q_GRP_SZ)
             _compute_cp_offset(rank_id_sb, recv_rank_sb, cp_offset_hbm, seqlen, striped_input)
 
         # Run attention_cte with K/V in nxt buffers (collective already landed).
@@ -964,6 +996,8 @@ def ring_attention_spmd_fwd(
             global_cp_deg=num_workers if use_causal_mask else None,
             cp_striped_input=striped_input,
             skip_output_normalization=True,
+            bound_min=bound_min,
+            bound_max=bound_max,
         )
 
         # Swap buffer roles BEFORE launching the next collective.

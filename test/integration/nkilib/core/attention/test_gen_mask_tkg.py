@@ -255,6 +255,7 @@ def gen_mask_tkg_hbm_torch_ref_adapter_factory(lnc: int):
         block_len: int = 0,
         active_mask: torch.Tensor = None,
         enable_fa_s_prior_tiling: bool = True,
+        fuse_rope: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Torch ref adapter matching gen_mask_tkg_hbm kernel signature."""
         mask = gen_mask_tkg_hbm_torch_ref[lnc](
@@ -267,6 +268,7 @@ def gen_mask_tkg_hbm_torch_ref_adapter_factory(lnc: int):
             block_len=block_len,
             active_mask=active_mask,
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+            fuse_rope=fuse_rope,
         )
         return {"mask_out_hbm": mask}
 
@@ -525,7 +527,7 @@ class TestGenMaskTkg:
         (4, 1, 256, 1, 0, 0, 0, 1),   # Minimal s_ctx
         (4, 1, 512, 1, 0, 0, 0, 1),   # Small s_ctx
         (4, 1, 1024, 5, 0, 0, 0, 1),  # With multiple active tokens
-        (4, 2, 2048, 7, 0, 0, 0, 1),  # Multiple heads
+        pytest.param(4, 2, 2048, 7, 0, 0, 0, 1, marks=pytest.mark.fast),  # Multiple heads
         (4, 1, 4096, 5, 0, 0, 0, 1),  # Larger s_ctx
         # LNC=1 FA tile tests
         (4, 1, 1024, 5, 0, 0, 256, 1),    # First tile
@@ -540,7 +542,6 @@ class TestGenMaskTkg:
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest_parametrize(flat_kv_strided_test_params, flat_kv_strided_test_perms, abbrevs=_ABBREVS)
     def test_flat_kv_strided_mask_generation(
         self,
@@ -1085,20 +1086,19 @@ class TestGenMaskTkgHbm:
         (4, 2, 2048, 7, True, 1),
         (16, 4, 4096, 5, True, 1),
         # Non-strided MM1, LNC=1
-        (4, 1, 256, 1, False, 1),
+        pytest.param(4, 1, 256, 1, False, 1, marks=pytest.mark.fast),
         (4, 1, 1024, 5, False, 1),
         (8, 2, 4096, 7, False, 1),
         # LNC=2 s_prior-sharded (BQS <= 128)
-        (4, 1, 4096, 5, True, 2),      # BQS=20
+        pytest.param(4, 1, 4096, 5, True, 2, marks=pytest.mark.fast),      # BQS=20
         (4, 2, 16384, 7, True, 2),     # BQS=56
         (4, 1, 4096, 5, False, 2),     # Non-strided, s_prior-sharded
         # LNC=2 batch-sharded (BQS > 128)
-        (8, 8, 4096, 5, True, 2),      # BQS=320
+        pytest.param(8, 8, 4096, 5, True, 2, marks=pytest.mark.fast),      # BQS=320
         (8, 8, 4096, 5, False, 2),     # Non-strided, batch-sharded
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest_parametrize(flat_kv_test_params, flat_kv_test_perms, abbrevs=_ABBREVS)
     def test_flat_kv(
         self,

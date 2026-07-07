@@ -34,10 +34,17 @@ def attention_segmented_cte_torch_ref(
     sliding_window: Optional[int] = None,
     sink: Optional[torch.Tensor] = None,
     num_q_heads: int = 1,
-    kvp_offset: Optional[torch.Tensor] = None,
     k_pre_transposed: bool = False,
+    fp8_packed: bool = False,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
+    kvp_q_offset: Optional[torch.Tensor] = None,
+    kvp_rank_id: Optional[torch.Tensor] = None,
+    kvp_group_size: int = 0,
+    kvp_cp_offset_int: int = 0,
+    kvp_seg_block_offset_int: int = 0,
+    kvp_prior_load_blocks: int = 0,
+    kvp_prior_fully_visible: bool = False,
 ) -> torch.Tensor:
     """
     Torch reference for segmented attention with block-based KV cache.
@@ -62,6 +69,9 @@ def attention_segmented_cte_torch_ref(
             When provided, K cache values are multiplied by k_scale after loading.
         v_scale: Optional per-head-dim dequantization scale for V cache, shape (128, 1).
             When provided, V cache values are multiplied by v_scale after loading.
+        kvp_q_offset: Optional causal mask offset for KV-parallel mode (unused in reference).
+        kvp_rank_id: Optional rank index for interleaved KV distribution (unused in reference).
+        kvp_group_size: Number of ranks for round-robin KV distribution (unused in reference).
 
     Returns:
         Attention output, shape (bs_q, seqlen_q, head_dim) or (bs_q, head_dim, seqlen_q) depending on tp_out
@@ -71,7 +81,17 @@ def attention_segmented_cte_torch_ref(
     k_cache = k_cache.float()
     v_cache = v_cache.float()
 
-    if k_pre_transposed:
+    if fp8_packed:
+        # Unpack: (num_blocks, block_size//2, kv_dim, 2) -> (num_blocks, num_kv_heads, block_size, head_dim)
+        num_kv_heads = v_cache.shape[1]
+        head_dim_val = v_cache.shape[3]
+        n_blocks = k_cache.shape[0]
+        block_size_half = k_cache.shape[1]
+        kv_dim = num_kv_heads * head_dim_val
+        k_cache = k_cache.permute(0, 1, 3, 2).reshape(n_blocks, block_size_half * 2, kv_dim)
+        k_cache = k_cache.reshape(n_blocks, block_size_half * 2, num_kv_heads, head_dim_val)
+        k_cache = k_cache.permute(0, 2, 1, 3)  # -> (N, H, block_size, D)
+    elif k_pre_transposed:
         num_kv_heads = v_cache.shape[1]
         block_size_val = k_cache.shape[2]
         head_dim_val = k_cache.shape[1]

@@ -22,13 +22,32 @@ These utilities are designed to be reusable across different kernel types
 and provide consistent behavior for common operations.
 """
 
+import os as _os
 from typing import List, Optional, Tuple
 
 import nki.isa as nisa
 import nki.language as nl
 
-from .common_types import ActFnType, NormType
+from .common_types import ActFnType, DtypeMode, NormType
 from .kernel_assert import kernel_assert
+
+_NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE = _os.environ.get("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "").lower() == "true"
+
+
+# Temporary: will be replaced by nl.tile_size.psum_num_banks once the NKI API exposes it.
+def _psum_num_banks() -> int:
+    """Return the number of usable PSUM banks.
+
+    When NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=true the compiler lowers
+    dma_transpose to nc_transpose, which uses an identity matmul that
+    requires PSUM bank 7 as scratch space. In that mode, kernels must
+    restrict themselves to banks 0-6 (7 banks). Otherwise all 8 banks are
+    usable. The reservation applies to both gen3 and gen4 hardware.
+    """
+    if not _NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE:
+        return 8
+    return 7
+
 
 # TODO: Get this constant from the NKI API once it is available
 NUM_HW_PSUM_BANKS = 8
@@ -459,6 +478,36 @@ def reduce(op='mul', input: List = None, initial_value=None):
         elif op == 'max':
             initial_value = max(initial_value, value)
     return initial_value
+
+
+def resolve_fp8_e4m3_dtype(dtype_mode: DtypeMode):
+    """Resolve a ``DtypeMode`` to the concrete FP8 E4M3 nki dtype.
+
+    Shared across every kernel that allocates FP8 E4M3 tiles (MLP, MoE MLP,
+    rmsnorm_quant, QKV, attention_block, …). Keeps the 3-way resolution in
+    one place so the mapping stays consistent and callers don't repeat the
+    same conditional.
+
+    Args:
+        dtype_mode: FP8 E4M3 dtype variant selection.
+
+    Returns:
+        nki dtype:
+            - ``DtypeMode.OCP``     → ``nl.float8_e4m3fn`` (max=448).
+            - ``DtypeMode.AUTO``    → OCP on TRN3, NON_OCP elsewhere
+              (resolved at kernel trace time).
+            - ``DtypeMode.NON_OCP`` → ``nl.float8_e4m3`` (max=240).
+
+    Notes:
+        AUTO uses ``nisa.get_nc_version()`` which is only available during
+        kernel trace. Torch refs running on CPU must pre-resolve AUTO via
+        the test-side platform target.
+    """
+    if dtype_mode == DtypeMode.OCP:
+        return nl.float8_e4m3fn
+    if dtype_mode == DtypeMode.AUTO:
+        return resolve_dtype_to_nki(nl.float8_e4m3fn)
+    return nl.float8_e4m3
 
 
 def resolve_dtype_to_nki(dtype):

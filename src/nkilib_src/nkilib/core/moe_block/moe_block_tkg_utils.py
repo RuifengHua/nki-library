@@ -220,11 +220,8 @@ def validate_moe_block_inputs(
     # Basic parameter checks
     kernel_assert(dims.H % _pmax == 0, f"H={dims.H} must be divisible by {_pmax}")
 
-    # Token size constraints differ between selective and all-expert modes
-    if expert_config.is_all_expert:
-        if quant_config.is_moe_weight_mx:
-            kernel_assert(dims.T % 4 == 0, f"all_expert mode with MXFP requires T divisible by 4, got {dims.T}")
-    else:
+    # Token size constraints
+    if not expert_config.is_all_expert:
         kernel_assert(dims.T <= 128, f"selective_load mode currently supports T <= 128, got {dims.T}")
 
     kernel_assert(
@@ -275,3 +272,105 @@ def validate_moe_block_inputs(
         router_mm_dtype in (nl.bfloat16, nl.float16, nl.float32),
         f"moe_block_tkg expects router_mm_dtype to be one of (nl.bfloat16, nl.float16, nl.float32), got {router_mm_dtype}",
     )
+
+
+# Byte sizes for NKI dtypes used in SBUF estimation
+_DTYPE_SIZE = {
+    nl.bfloat16: 2,
+    nl.float16: 2,
+    nl.float32: 4,
+    nl.float8_e4m3: 1,
+    nl.float8_e4m3fn: 1,
+    nl.float4_e2m1fn_x4: 2,
+    nl.float8_e4m3fn_x4: 4,
+    nl.float8_e5m2_x4: 4,
+    nl.uint8: 1,
+}
+
+# SBUF usable bytes per partition by target (from trn_hw_info.md)
+_SBUF_USABLE_PER_PARTITION = {
+    "trn1": 180224,
+    "trn2": 212984,
+    "trn3": 245752,
+}
+
+
+def _dtype_size(dtype) -> int:
+    """Return size in bytes for a given NKI dtype."""
+    return _DTYPE_SIZE.get(dtype, 2)
+
+
+def _get_tile_size(
+    T: int,
+    H: int,
+    E_L: int,
+    I: int,
+    is_mx: bool,
+    input_dtype=nl.bfloat16,
+    weight_dtype=nl.bfloat16,
+) -> int:
+    """
+    Determine the tile size for T-dimension tiling based on estimated SBUF capacity.
+
+    Estimates peak SBUF usage per partition across two execution phases:
+    - Phase 1 (RMSNorm + Router): rmsnorm output + router intermediates
+    - Phase 2 (Expert MLP): weights + quantized input + affinities + output accumulator
+
+    The estimate is intentionally conservative. When tile_T == T, no tiling occurs.
+
+    Args:
+        T: Total number of tokens.
+        H: Hidden dimension size.
+        E_L: Number of local experts.
+        I: Intermediate dimension size.
+        is_mx: Whether using MX quantized weights.
+        input_dtype: Input/activation dtype (e.g., nl.bfloat16).
+        weight_dtype: Expert weight dtype (e.g., nl.float4_e2m1fn_x4).
+
+    Returns:
+        Tile size (multiple of _pmax) that fits within SBUF capacity.
+    """
+    input_bytes = _dtype_size(input_dtype)
+    # Use trn2 capacity as the conservative default (smallest modern target)
+    sbuf_capacity = _SBUF_USABLE_PER_PARTITION["trn2"]
+
+    H_free = H // _pmax
+
+    # Expert weight footprint per partition (constant, doesn't scale with T)
+    if is_mx:
+        n_I512 = div_ceil(I, 512)
+        n_I512_local = div_ceil(n_I512, 2)  # LNC-2 sharding
+        weight_bytes = _dtype_size(weight_dtype)
+        weight_per_part = n_I512_local * H * weight_bytes + n_I512_local * H  # weight + scale
+    else:
+        weight_per_part = I * H * _dtype_size(weight_dtype) // _pmax
+
+    tile_T = T
+    while tile_T > _pmax:
+        n_T128 = div_ceil(tile_T, _pmax)
+
+        # Phase 1: RMSNorm output lives through router computation
+        # rmsnorm_out: [_pmax, tile_T, H_free] in input_dtype
+        phase1 = tile_T * H_free * input_bytes
+
+        # Phase 2: Expert MLP
+        if is_mx:
+            num_H512_tiles = H // (_pmax * _q_width)
+            # Quantized input (fp8x4 = 1B) + scale (uint8 = 1B) per element
+            input_per_part = num_H512_tiles * tile_T * 2
+        else:
+            input_per_part = tile_T * H_free * input_bytes
+
+        affinities_per_part = n_T128 * E_L * 4  # float32 affinities
+        output_per_part = n_T128 * H * input_bytes  # output accumulator
+
+        phase2 = weight_per_part + input_per_part + affinities_per_part + output_per_part
+
+        if max(phase1, phase2) <= sbuf_capacity:
+            break
+        tile_T = tile_T // 2
+
+    # Ensure tile_T is at least _pmax and a multiple of _pmax
+    tile_T = max(tile_T, _pmax)
+    tile_T = (tile_T // _pmax) * _pmax
+    return tile_T

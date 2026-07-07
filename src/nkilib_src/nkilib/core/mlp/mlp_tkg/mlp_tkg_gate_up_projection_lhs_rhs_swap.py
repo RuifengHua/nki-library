@@ -20,7 +20,7 @@ import nki.language as nl
 from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil
+from ...utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
 from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import MLPParameters
@@ -321,12 +321,13 @@ def run_gate_up_projection_lhs_rhs_swap(
     weight_tiles = []
     HTile_h1 = div_ceil(tiles.HTile, dims.H0)
     weight_shape = (dims.H0, HTile_h1, dims.I) if use_old_sharding_shape else (dims.H0, HTile_h1, tiles.I_shard_size)
+    _fp8_e4m3_tile_dtype = resolve_fp8_e4m3_dtype(params.dtype_mode)
     for w_tile_idx in range(tiles.num_allocated_w_tile):
         weight_tile = alloc_tensor_view(
             sbm,
             weight_shape,
             name=f"gate_up_w_tile_{w_tile_idx}",
-            dtype=nl.float8_e4m3 if str(up_w.dtype) == "float8e4" else up_w.dtype,
+            dtype=_fp8_e4m3_tile_dtype if str(up_w.dtype) == "float8e4" else up_w.dtype,
         )
         weight_tiles.append(weight_tile)
 

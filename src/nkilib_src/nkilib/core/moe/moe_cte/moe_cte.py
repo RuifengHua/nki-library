@@ -21,7 +21,8 @@ from typing import Any, Optional
 import nki
 import nki.language as nl
 
-from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
+from ....experimental.moe.moe_cte.bwmm_shard_on_block_v2 import bwmm_shard_on_block as bwmm_shard_on_block_v2
+from ...utils.common_types import ActFnType, ExpertAffinityScaleMode, QuantizationType
 from .bwmm_shard_on_block import bwmm_shard_on_block
 from .bwmm_shard_on_block_mx import bwmm_shard_on_block_mx
 from .bwmm_shard_on_I import (
@@ -120,15 +121,56 @@ class ShardOnBlockConfig(nl.NKIObject):
             Used for hybrid static/dynamic loop optimization with padded sequences.
             Used by: shard_on_block_mx
             Default: 55
+
+        use_packed_scales (bool): When True, gate_up_proj_scale and down_proj_scale are
+            in packed HBM layout — packed as H_2k instead of H_512, so each 32-partition
+            quadrant holds 4 MX scale tiles stacked in a 4-partition stripe (totalling
+            up to 16 partitions of the quadrant), vs. one tile per quadrant in the
+            standard layout. Producers must emit both scales packed.
+            Used by: shard_on_block_mx
+            Default: False
+
+        weight_dtype (nki.dtype, optional): Target dtype for MX weight conversion when
+            weights are passed as uint/int/float carrier types. For MXFP4:
+            nl.float4_e2m1fn_x4. For MXFP8: nl.float8_e4m3fn_x4 or nl.float8_e5m2_x4.
+            If None, the kernel auto-detects.
+            Used by: shard_on_block_mx
+            Default: None
+
+        top_k (int): Top-K experts per token. Used together with ep_degree for the
+            kernel's auto-computed best-case static-block estimate when n_static_blocks
+            is unset and an over-range n_dynamic_blocks is given.
+            Used by: shard_on_block_mx
+            Default: 1
+
+        ep_degree (int): Expert-parallelism degree the routing is sharded across.
+            Used with top_k for the static-block estimate (see above).
+            Used by: shard_on_block_mx
+            Default: 1
+
+        quantization_type (QuantizationType): Selects the quantization path. When
+            STATIC_MX, the kernel takes the per-tensor MXFP (FP8/FP4 + identity
+            micro-scale) path. The per-expert weight scales reuse gate_up_proj_scale
+            ([E, 2, 1]) and down_proj_scale ([E, 1]); the per-tensor input scales are
+            passed via gate_up_in_scale / down_in_scale. MX (default) is the standard
+            microscaling path; any non-STATIC_MX value routes to it.
+            Used by: shard_on_block_mx
+            Default: QuantizationType.MX
     """
 
     # shard_on_block parameters
     n_block_per_iter: int = 1
     block_sharding_strategy: BlockShardStrategy = BlockShardStrategy.PING_PONG
+    non_overlapping_shards: bool = False
 
     # shard_on_block_mx parameters (MxFP4/MxFP8 quantization)
     n_static_blocks: int = -1
     n_dynamic_blocks: int = 55
+    use_packed_scales: bool = False
+    weight_dtype: Any = None
+    top_k: int = 1
+    ep_degree: int = 1
+    quantization_type: QuantizationType = QuantizationType.MX
 
 
 @dataclass
@@ -326,6 +368,10 @@ def moe_cte(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
+    # Per-expert STATIC_MX input scales. The per-expert weight scales reuse the existing
+    # gate_up_proj_scale / down_proj_scale tensors (gate/up packed [E, 2, 1], down [E, 1]).
+    gate_up_in_scale: Optional[nl.ndarray] = None,
+    down_in_scale: Optional[nl.ndarray] = None,
 ):
     """
     Unified entry point for MoE CTE blockwise matrix multiplication kernels.
@@ -356,9 +402,11 @@ def moe_cte(
         quantization_config (QuantizationConfig, optional): Quantization scales configuration
         gate_up_proj_scale (nl.ndarray, optional): Direct scale tensor for gate/up weights.
             Takes precedence over quantization_config. Use for MX quantization to avoid
-            wrapping tensors in dataclass (NKI tracer limitation).
+            wrapping tensors in dataclass (NKI tracer limitation). Under STATIC_MX this
+            instead carries the per-expert gate/up weight scales as [E, 2, 1].
         down_proj_scale (nl.ndarray, optional): Direct scale tensor for down weights.
-            Takes precedence over quantization_config.
+            Takes precedence over quantization_config. Under STATIC_MX this instead
+            carries the per-expert down weight scale as [E, 1].
         gate_up_activations_T (nl.ndarray, optional): Storage for gate/up activations
         down_activations (nl.ndarray, optional): Storage for down activations
         activation_function (ActFnType): Activation function type (default: SiLU)
@@ -370,6 +418,10 @@ def moe_cte(
         gate_clamp_lower_limit (float, optional): Lower clamp for gate projection
         up_clamp_upper_limit (float, optional): Upper clamp for up projection
         up_clamp_lower_limit (float, optional): Lower clamp for up projection
+        gate_up_in_scale, down_in_scale (nl.ndarray, optional): Per-expert STATIC_MX
+            input quant scales for the gate/up and down projections respectively.
+            Only used by shard_on_block_mx under STATIC_MX. (The matching weight
+            dequant scales reuse gate_up_proj_scale / down_proj_scale.)
 
     Returns:
         output (nl.ndarray): Expert-processed token representations in HBM
@@ -413,6 +465,33 @@ def moe_cte(
     if sharding_spec.implementation == MoECTEImplementation.shard_on_block:
         print(f"bwmm_shard_block_branch")
         cfg = sharding_spec.shard_on_block or ShardOnBlockConfig()
+        if cfg.non_overlapping_shards:
+            return bwmm_shard_on_block_v2(
+                hidden_states=hidden_states,
+                expert_affinities_masked=expert_affinities_masked,
+                gate_up_proj_weight=gate_up_proj_weight,
+                down_proj_weight=down_proj_weight,
+                block_size=block_size,
+                token_position_to_id=token_position_to_id,
+                block_to_expert=block_to_expert,
+                gate_and_up_proj_bias=gate_and_up_proj_bias,
+                down_proj_bias=down_proj_bias,
+                gate_up_proj_scale=gate_up_proj_scale,
+                down_proj_scale=down_proj_scale,
+                down_activations=down_activations,
+                activation_function=activation_function,
+                skip_dma=skip_dma,
+                compute_dtype=compute_dtype,
+                is_tensor_update_accumulating=is_tensor_update_accumulating,
+                expert_affinities_scaling_mode=expert_affinities_scaling_mode,
+                n_block_per_iter=cfg.n_block_per_iter,
+                gate_clamp_upper_limit=gate_clamp_upper_limit,
+                gate_clamp_lower_limit=gate_clamp_lower_limit,
+                up_clamp_upper_limit=up_clamp_upper_limit,
+                up_clamp_lower_limit=up_clamp_lower_limit,
+                block_sharding_strategy=cfg.block_sharding_strategy,
+                non_overlapping_shards=cfg.non_overlapping_shards,
+            )
         return bwmm_shard_on_block(
             hidden_states=hidden_states,
             expert_affinities_masked=expert_affinities_masked,
@@ -545,10 +624,17 @@ def moe_cte(
             activation_function=activation_function,
             skip_dma=skip_dma,
             compute_dtype=compute_dtype,
+            weight_dtype=cfg.weight_dtype,
             is_tensor_update_accumulating=is_tensor_update_accumulating,
             expert_affinities_scaling_mode=expert_affinities_scaling_mode,
             gate_clamp_upper_limit=gate_clamp_upper_limit,
             gate_clamp_lower_limit=gate_clamp_lower_limit,
             up_clamp_lower_limit=up_clamp_lower_limit,
             up_clamp_upper_limit=up_clamp_upper_limit,
+            use_packed_scales=cfg.use_packed_scales,
+            top_k=cfg.top_k,
+            ep_degree=cfg.ep_degree,
+            quantization_type=cfg.quantization_type,
+            gate_up_in_scale=gate_up_in_scale,
+            down_in_scale=down_in_scale,
         )

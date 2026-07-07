@@ -96,7 +96,7 @@ def find_nonzero_indices(
     """
     T_DIM, C_DIM = input_tensor.shape
     if col_start_id != None and n_cols != None:
-        col_start_id_sbuf = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf, name="col_start_id_sbuf")
+        col_start_id_sbuf = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(dst=col_start_id_sbuf, src=col_start_id[0:1])
         C = n_cols
     else:
@@ -121,15 +121,13 @@ def find_nonzero_indices(
     indices = nl.ndarray((C, T_DIM), dtype=index_dtype, buffer=nl.shared_hbm)
 
     if NUM_CHUNKS > 1:
-        sbuf_init = nl.ndarray(
-            (P_MAX, C_per_shard * T_DIM // P_MAX), dtype=index_dtype, buffer=nl.sbuf, name="sbuf_init"
-        )
+        sbuf_init = nl.ndarray((P_MAX, C_per_shard * T_DIM // P_MAX), dtype=index_dtype, buffer=nl.sbuf)
         nisa.memset(dst=sbuf_init, value=-1)
         reshaped_dst = indices.reshape((P_MAX * 2, C_per_shard * T_DIM // P_MAX))
         nisa.dma_copy(dst=reshaped_dst[P_MAX * shard_id : P_MAX * (shard_id + 1), :], src=sbuf_init)
 
     nonzero_counts = nl.ndarray((C,), dtype=nl.int32, buffer=nl.shared_hbm)
-    nonzero_counts_local = nl.ndarray((1, C_per_shard), dtype=nl.int32, buffer=nl.sbuf, name="nonzero_counts_local")
+    nonzero_counts_local = nl.ndarray((1, C_per_shard), dtype=nl.int32, buffer=nl.sbuf)
     nisa.memset(dst=nonzero_counts_local, value=0)
 
     n_column_rounds = div_ceil(C_per_shard, _NUM_GPSIMD_CORES)
@@ -143,9 +141,8 @@ def find_nonzero_indices(
         n_columns_this_round = min(_NUM_GPSIMD_CORES, C_per_shard - _NUM_GPSIMD_CORES * column_round_idx)
         column_start_offset = column_round_idx * _NUM_GPSIMD_CORES + C_offset
 
-        offsets = nl.ndarray(
-            (1, _NUM_GPSIMD_CORES), dtype=nl.int32, buffer=nl.sbuf, name=f"offsets_er-{column_round_idx}"
-        )
+        # Track cumulative offsets for writing indices
+        offsets = nl.ndarray((1, _NUM_GPSIMD_CORES), dtype=nl.int32, buffer=nl.sbuf)
         nisa.memset(dst=offsets, value=0)
 
         if NUM_CHUNKS == 1:

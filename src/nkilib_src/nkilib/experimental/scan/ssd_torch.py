@@ -17,7 +17,7 @@
 import torch
 
 
-def ssd_torch_ref(x, dt, A, B, C, chunk_size=128, D=None, initial_state=None):
+def ssd_torch_ref(x, dt, A, B, C, chunk_size=128, D=None, initial_state=None, causal_mask=None):
     """
     PyTorch reference implementation of SSD (State Space Duality) for Mamba-2.
 
@@ -37,6 +37,7 @@ def ssd_torch_ref(x, dt, A, B, C, chunk_size=128, D=None, initial_state=None):
         chunk_size (int): Chunk size Q.
         D (torch.Tensor, optional): Skip connection weights (nheads,).
         initial_state (torch.Tensor, optional): Initial state (batch, nheads, dstate, headdim).
+        causal_mask: Unused. Accepted for kernel signature parity.
 
     Returns:
         dict: {"y": torch.Tensor, "final_state": torch.Tensor}
@@ -57,25 +58,25 @@ def ssd_torch_ref(x, dt, A, B, C, chunk_size=128, D=None, initial_state=None):
 
     causal = torch.tril(torch.ones(Q, Q, dtype=torch.float32))
 
-    for b in range(batch):
-        for h in range(nheads):
-            A_h = A_f[h]
+    for batch_idx in range(batch):
+        for head_idx in range(nheads):
+            A_h = A_f[head_idx]
 
             # Initialize hidden state (dstate, headdim)
-            if initial_state is not None:
-                state = initial_state[b, h].float().clone()  # (dstate, headdim)
+            if initial_state != None:
+                state = initial_state[batch_idx, head_idx].float().clone()
             else:
                 state = torch.zeros((dstate, headdim), dtype=torch.float32)
 
-            for ic in range(num_chunks):
-                cs_start = ic * Q
+            for chunk_idx in range(num_chunks):
+                cs_start = chunk_idx * Q
                 cs_end = cs_start + Q
 
                 # Load chunk inputs
-                x_chunk = x_f[b, h, cs_start:cs_end, :]  # (Q, headdim)
-                dt_chunk = dt_f[b, h, cs_start:cs_end]  # (Q,)
-                B_chunk = B_f[b, cs_start:cs_end, :]  # (Q, dstate)
-                C_chunk = C_f[b, cs_start:cs_end, :]  # (Q, dstate)
+                x_chunk = x_f[batch_idx, head_idx, cs_start:cs_end, :]  # (Q, headdim)
+                dt_chunk = dt_f[batch_idx, head_idx, cs_start:cs_end]  # (Q,)
+                B_chunk = B_f[batch_idx, cs_start:cs_end, :]  # (Q, dstate)
+                C_chunk = C_f[batch_idx, cs_start:cs_end, :]  # (Q, dstate)
 
                 # Step 1: Cumulative decay
                 log_decay = dt_chunk * A_h  # (Q,)
@@ -85,19 +86,13 @@ def ssd_torch_ref(x, dt, A, B, C, chunk_size=128, D=None, initial_state=None):
                 exp_neg_cs = torch.exp(-cs)  # (Q,)
 
                 # dt * x: (Q, headdim)
-                dtx = dt_chunk.unsqueeze(-1) * x_chunk  # (Q, headdim)
+                dtx = dt_chunk.unsqueeze(-1) * x_chunk
 
                 # Step 2: Intra-chunk structured attention
-                # CB = C @ B^T: (Q, Q)
-                CB = C_chunk @ B_chunk.T
-
-                # Apply causal mask
+                # Y_intra = exp(cs) * ((CB * causal) @ (exp(-cs) * dt * x))
+                CB = C_chunk @ B_chunk.T  # (Q, Q)
                 CB_causal = CB * causal
-
-                # Scale input: X_scaled = dtx * exp(-cs)
                 X_scaled = dtx * exp_neg_cs.unsqueeze(-1)  # (Q, headdim)
-
-                # Y_intra = exp(cs) * (CB_causal @ X_scaled)
                 Y_intra = exp_cs.unsqueeze(-1) * (CB_causal @ X_scaled)  # (Q, headdim)
 
                 # Step 3: State-to-output
@@ -117,12 +112,12 @@ def ssd_torch_ref(x, dt, A, B, C, chunk_size=128, D=None, initial_state=None):
 
                 # Step 5: Combine output
                 y_chunk = Y_intra + Y_off
-                if D is not None:
-                    D_h = D[h].float()
+                if D != None:
+                    D_h = D[head_idx].float()
                     y_chunk = y_chunk + D_h * x_chunk
 
-                y[b, h, cs_start:cs_end, :] = y_chunk
+                y[batch_idx, head_idx, cs_start:cs_end, :] = y_chunk
 
-            final_state[b, h] = state
+            final_state[batch_idx, head_idx] = state
 
     return {"y": y, "final_state": final_state}

@@ -17,18 +17,6 @@
 import nki.isa as nisa
 import nki.language as nl
 
-from ...mlp.mlp_parameters import (
-    MLPBiasParameters,
-    MLPParameters,
-    MLPQuantizationParameters,
-)
-
-# MLP utils
-from ...mlp.mlp_tkg.mlp_tkg_constants import MLPTKGConstants
-from ...mlp.mlp_tkg.mlp_tkg_down_projection import process_down_projection
-from ...mlp.mlp_tkg.mlp_tkg_gate_up_projection import process_gate_up_projection
-from ...mlp.mlp_tkg.mlp_tkg_utils import input_norm_load, transpose_store
-
 # common utils
 from ...utils.allocator import SbufManager
 from ...utils.common_types import ExpertAffinityScaleMode, GateUpDim, QuantizationType
@@ -36,12 +24,23 @@ from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.logging import get_logger
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 from ...utils.tensor_view import TensorView
+from .mlp_parameters import (
+    MLPBiasParameters,
+    MLPParameters,
+    MLPQuantizationParameters,
+)
+
+# MLP utils
+from .mlp_tkg_constants import MLPTKGConstants
+from .mlp_tkg_down_projection import process_down_projection
+from .mlp_tkg_gate_up_projection import process_gate_up_projection
 from .moe_tkg_utils import (
     broadcast_token_affinity,
     gather_expert_affinities,
     reshape_scale_for_mlp,
     safe_tensor_view,
 )
+from .projection_utils import input_norm_load, transpose_store
 
 
 def _selective_expert_moe_tkg(
@@ -176,9 +175,7 @@ def _selective_expert_moe_tkg(
     # Allocate SBUF locations for down result
     down_output_list = []
     for expert_k_idx in range(dims.K):
-        down_sb = sbm.alloc_stack(
-            (dims.H0, dims.H1_shard), dtype=io_dtype, name=f"down_sbuf_{expert_k_idx}", buffer=nl.sbuf
-        )
+        down_sb = sbm.alloc_stack((dims.H0, dims.H1_shard), dtype=io_dtype, buffer=nl.sbuf)
         down_output_list.append(down_sb)
 
     # Reshape gate_up weights from [E, H, 2, I] to [E, H, 2 * I]
@@ -380,7 +377,8 @@ def _selective_expert_moe_tkg(
     dims.T = T_per_shard
 
     # Store output
-    if output.buffer == nl.sbuf:
+    output_is_sbuf = output.is_sbuf() if isinstance(output, TensorView) else output.buffer == nl.sbuf
+    if output_is_sbuf:
         # Transpose output_temp [H0, H1_shard, T_per_shard] -> [H0, T, H1_shard] for SBUF output
         for h1_idx in range(dims.H1_shard):
             nisa.tensor_copy(dst=output[:, T_offset : T_offset + T_per_shard, h1_idx], src=output_temp[:, h1_idx, :])

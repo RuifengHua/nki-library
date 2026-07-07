@@ -88,6 +88,13 @@ class TestConfig:
         rhs_is_swizzled: bool = True,
         enable_scale_packing: Optional[bool] = None,
         lnc_2_shard_rhs: Optional[bool] = None,
+        load_with_PE_swizzle: bool = False,
+        fast_subset: Optional[set] = None,
+        # Both default to F-by-K ([F, K]) to match the kernel default and avoid the K-by-F
+        # F%512 constraint on M/N for the common case. Set either to False per-operand to
+        # exercise the K-by-F ([K, F]) layout.
+        lhs_is_f_by_k: bool = True,
+        rhs_is_f_by_k: bool = True,
     ) -> None:
         # Create kernel config with kernel-level params
         self.kernel_config = MatmulMxfp8KernelConfig(
@@ -140,15 +147,13 @@ class TestConfig:
         self.dists = dists
         self.params = params
         self.stride = stride if stride != None else DEFAULT_STRIDE
-
-        # Validate DGT tile size requirements for unswizzled inputs
-        if not lhs_is_swizzled:
-            assert tile_m == 128, f"Unswizzled LHS requires tile_m=128, got {tile_m}"
-            assert tile_k == 512, f"Unswizzled LHS requires tile_k=512, got {tile_k}"
-            assert TILES_IN_LOAD_M == 4, f"Unswizzled LHS requires TILES_IN_LOAD_M=4, got {TILES_IN_LOAD_M}"
-        if not rhs_is_swizzled:
-            assert tile_k == 512, f"Unswizzled RHS requires tile_k=512, got {tile_k}"
-            assert TILES_IN_LOAD_N == 1, f"Unswizzled RHS requires TILES_IN_LOAD_N=1, got {TILES_IN_LOAD_N}"
+        self.load_with_PE_swizzle = load_with_PE_swizzle
+        # Sub-indices (within this entry's autoGenerateRandomSubset output)
+        # to mark pytest.mark.fast. Stable to grid reordering and additions;
+        # sensitive to seed and TESTS_PER_SETUP changes. Consumed by populate_tests().
+        self.fast_subset = frozenset(fast_subset) if fast_subset is not None else frozenset()
+        self.lhs_is_f_by_k = lhs_is_f_by_k
+        self.rhs_is_f_by_k = rhs_is_f_by_k
 
     # ------------------------------------------------------------------
     # Property accessors delegating to kernel_config for backward compat
@@ -278,6 +283,7 @@ class TestConfig:
             "lnc_2_shard_rhs": self.lnc_2_shard_rhs,
             "seed": self.seed,
             "stride": self.stride,
+            "conf": str(self),
         }
 
         baseline = self.get_bf16_baseline()
@@ -305,7 +311,7 @@ class TestConfig:
             self.kernel_config,
             lhs_dtype=self.lhs_dtype or 'mxfp8_x4',
             rhs_dtype=self.rhs_dtype or 'mxfp8_x4',
-            output_dtype_str=self.output_dtype or 'fp32',
+            output_dtype_str=self.output_dtype or 'bfloat16',
         )
 
     def calc_sbuf_free_dim_size(self) -> int:
@@ -314,7 +320,7 @@ class TestConfig:
             self.kernel_config,
             lhs_dtype=self.lhs_dtype or 'mxfp8_x4',
             rhs_dtype=self.rhs_dtype or 'mxfp8_x4',
-            output_dtype_str=self.output_dtype or 'fp32',
+            output_dtype_str=self.output_dtype or 'bfloat16',
         )
 
     def fits_in_sbuf(self) -> bool:
@@ -323,7 +329,7 @@ class TestConfig:
             self.kernel_config,
             lhs_dtype=self.lhs_dtype or 'mxfp8_x4',
             rhs_dtype=self.rhs_dtype or 'mxfp8_x4',
-            output_dtype_str=self.output_dtype or 'fp32',
+            output_dtype_str=self.output_dtype or 'bfloat16',
         )
 
     @staticmethod
@@ -362,7 +368,7 @@ class TestConfig:
         # Resolve test-level defaults
         lhs_dtype = self.lhs_dtype if self.lhs_dtype != None else MatrixPrecision.MXFP8_X4
         rhs_dtype = self.rhs_dtype if self.rhs_dtype != None else MatrixPrecision.MXFP8_X4
-        output_dtype = self.output_dtype if self.output_dtype != None else MatrixPrecision.FP32
+        output_dtype = self.output_dtype if self.output_dtype != None else MatrixPrecision.BFLOAT16
 
         dists = self._generate_random_dists(1)
         lhs_dist = random.choice(dists["lhs"])
@@ -435,6 +441,8 @@ class TestConfig:
             spill_reload=kc.spill_reload if self._orig_spill_reload != None else None,
             lhs_is_swizzled=kc.lhs_is_swizzled,
             rhs_is_swizzled=kc.rhs_is_swizzled,
+            lhs_is_f_by_k=self.lhs_is_f_by_k,
+            rhs_is_f_by_k=self.rhs_is_f_by_k,
             enable_scale_packing=kc.enable_scale_packing if self._orig_enable_scale_packing != None else None,
             lnc_2_shard_rhs=lnc_2_shard_rhs_val
             if self._orig_lnc_2_shard_rhs != None or not lnc_2_shard_rhs_val
@@ -570,6 +578,8 @@ class TestConfig:
                 # Swizzled flags
                 lhs_is_swizzled=self.lhs_is_swizzled,
                 rhs_is_swizzled=self.rhs_is_swizzled,
+                lhs_is_f_by_k=self.lhs_is_f_by_k,
+                rhs_is_f_by_k=self.rhs_is_f_by_k,
                 lnc_2_shard_rhs=lnc_2_shard_rhs,
             )
 
@@ -615,7 +625,7 @@ class TestConfig:
         if self.output_dtype != None:
             params['output_dtype'] = [self.output_dtype]
         else:
-            params['output_dtype'] = [MatrixPrecision.FP32]
+            params['output_dtype'] = [MatrixPrecision.BFLOAT16]
 
         return params
 
@@ -712,6 +722,15 @@ class TestConfig:
             lines.append(f"  SBUF Usage: {sbuf_mb:.2f} MB / {SBUF_LIMIT_BYTES / (1024 * 1024):.0f} MB {fits}")
         except (AssertionError, TypeError):
             pass
+
+        baseline = self.get_bf16_baseline()
+        if baseline:
+            lines.append(
+                f"  BF16 Baseline: InferenceTime={baseline.get('inference_time', -1.0)}, "
+                f"ActiveInferenceTime={baseline.get('active_inference_time', -1.0)}, "
+                f"MFU={baseline.get('mfu_percent', -1.0)}, "
+                f"MBU={baseline.get('mbu_percent', -1.0)}"
+            )
 
         if self.xfail != "pass":
             lines.append(f"  Expected Result: {self.xfail}")

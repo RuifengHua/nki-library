@@ -15,7 +15,7 @@
 import torch
 
 
-def rope_torch_ref(
+def RoPE_torch_ref(
     x_in: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,

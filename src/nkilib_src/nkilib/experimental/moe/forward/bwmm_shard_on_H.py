@@ -548,7 +548,7 @@ def blockwise_mm_baseline_shard_hidden(
     compute_dtype: nki.dtype = nl.bfloat16,
     is_tensor_update_accumulating: bool = True,
     expert_affinities_scaling_mode: ExpertAffinityScaleMode = ExpertAffinityScaleMode.POST_SCALE,
-) -> nl.ndarray:
+) -> tuple:
     """
     Blockwise matrix multiplication kernel with hidden dimension sharding for MoE.
 
@@ -580,7 +580,10 @@ def blockwise_mm_baseline_shard_hidden(
         expert_affinities_scaling_mode (ExpertAffinityScaleMode): Scaling mode (default: POST_SCALE).
 
     Returns:
-        output (nl.ndarray): [T+1, H], Output hidden states.
+        tuple:
+            - output (nl.ndarray): [T+1, H], Output hidden states.
+            - gate_up_activations_T (nl.ndarray or None): [N, 2, I_TP, B], Checkpointed gate/up
+              activations if gate_up_activations_T was provided, otherwise None.
 
     Notes:
         - Hidden dimension H must be divisible by NUM_SHARDS (2 for LNC2)
@@ -650,6 +653,11 @@ def blockwise_mm_baseline_shard_hidden(
     output_initialization_shard(output, dims, shard_id)
 
     for block_idx in nl.sequential_range(N):  # sequential_range for sequential HBM block access
+        if dims.NUM_SHARDS == 2:
+            nisa.core_barrier(output, (0, 1))
+        else:
+            nisa.core_barrier(output, (0,))
+
         token_indices = load_token_indices(token_position_to_id, block_idx, B, dims.NUM_TILES)
         block_expert = load_block_expert(block_to_expert, block_idx)
 
@@ -699,9 +707,4 @@ def blockwise_mm_baseline_shard_hidden(
 
         store_block_output_shard(output, block_new, token_indices, dims, shard_id, skip_dma)
 
-        if dims.NUM_SHARDS == 2:
-            nisa.core_barrier(output, (0, 1))
-        else:
-            nisa.core_barrier(output, (0,))
-
-    return output
+    return output, gate_up_activations_T

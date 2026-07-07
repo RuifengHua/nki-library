@@ -169,7 +169,10 @@ class TestQuantizeToMxHardware:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(platform_target=platform_target),
+            compiler_args=CompilerArgs(
+                platform_target=platform_target,
+                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+            ),
             rtol=2e-2,
             atol=1e-5,
         )

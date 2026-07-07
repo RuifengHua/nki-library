@@ -249,9 +249,9 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
     Vectorized approach — eliminates the BxS serial loop:
       Scale computation (NO per-token loop):
         1. tensor_scalar(abs) on full [P0, BxS, F0]
-        2. tensor_reduce(max, axis=[2]) on [P0, BxS, F0] → [P0, BxS]
+        2. tensor_reduce(maximum, axis=[2]) on [P0, BxS, F0] → [P0, BxS]
            Per-partition per-token absmax in ONE instruction instead of BxS iterations.
-        3. tensor_partition_reduce(max) on [P0, BxS] → [P0, BxS] (p0 only)
+        3. tensor_partition_reduce(maximum) on [P0, BxS] → [P0, BxS] (p0 only)
         4. tensor_scalar(multiply 1/MAXVAL, maximum MINVAL) on [P0, BxS]
         5. stream_shuffle_broadcast on [P0, BxS] — broadcast p0 → all partitions
         6. reciprocal on [P0, BxS] → quant_scale
@@ -290,7 +290,7 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
     partial_max_all = _alloc((P0, BxS), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(
         dst=partial_max_all,
-        op=nl.max,
+        op=nl.maximum,
         data=abs_3d,
         axis=[2],
     )

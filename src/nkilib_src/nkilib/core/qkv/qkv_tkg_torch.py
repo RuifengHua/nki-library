@@ -14,21 +14,15 @@
 
 """PyTorch reference implementation for qkv_tkg kernel."""
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import nki.language as nl
 import numpy as np
 import torch
 
-from test.integration.nkilib.utils.test_kernel_common import norm_name2func_torch
-
-from ..utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from ..subkernels.norm_torch_dispatch import norm_name2func_torch
+from ..utils.common_types import DtypeMode, NormType, QKVOutputLayout, QuantizationType
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
-
-# FP8 clipping constant for STATIC quantization (float8_e4m3 max representable value)
-FP8_E4M3_CLIP_VALUE = get_max_positive_value_for_dtype(nl.float8_e4m3)
-# FP8 clipping constant for STATIC_MX quantization (float8_e4m3fn max representable value)
-FP8_E4M3FN_CLIP_VALUE = get_max_positive_value_for_dtype(nl.float8_e4m3fn)
 
 P_MAX = 128
 _Q_WIDTH = 4
@@ -55,7 +49,9 @@ def qkv_tkg_torch_ref(
     qkv_bias: Optional[torch.Tensor] = None,
     norm_bias: Optional[torch.Tensor] = None,
     hidden_actual: Optional[int] = None,
+    sbm: Any = None,  # noqa: ARG001 — SbufManager is hardware-only; accepted for signature parity with kernel
     transposed_in: bool = False,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> Dict[str, torch.Tensor]:
     """
     PyTorch reference implementation for qkv_tkg kernel.
@@ -219,12 +215,20 @@ def qkv_tkg_torch_ref(
             raise ValueError("num_q_heads required for STATIC/STATIC_MX quantization")
         if num_kv_heads is None:
             raise ValueError("num_kv_heads required for STATIC/STATIC_MX quantization")
-        clip_value = FP8_E4M3FN_CLIP_VALUE if is_static_mx else FP8_E4M3_CLIP_VALUE
+        # STATIC_MX is always OCP. STATIC follows dtype_mode (caller pre-resolves AUTO).
+        assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
+            "qkv_tkg_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+        )
+        if is_static_mx or dtype_mode == DtypeMode.OCP:
+            _fp8_e4m3_dtype = nl.float8_e4m3fn
+        else:
+            _fp8_e4m3_dtype = nl.float8_e4m3
+        clip_value = get_max_positive_value_for_dtype(_fp8_e4m3_dtype)
         hidden = (hidden / qkv_in_scale).clamp(-clip_value, clip_value)
 
     if is_row_mx:
-        # Per-row dynamic quantization: absmax per token, scale = absmax / fp8_max
-        clip_value = FP8_E4M3FN_CLIP_VALUE
+        # ROW_MX is TRN3-only, always OCP.
+        clip_value = get_max_positive_value_for_dtype(nl.float8_e4m3fn)
         absmax = hidden.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
         row_dequant_scale = absmax / clip_value
         hidden = (hidden / row_dequant_scale).clamp(-clip_value, clip_value)

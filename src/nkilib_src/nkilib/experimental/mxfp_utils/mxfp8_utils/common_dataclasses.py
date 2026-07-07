@@ -21,11 +21,13 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ....core.utils.kernel_assert import kernel_assert
+from ...moe.bwd.moe_bwd_parameters import SkipMode
+from .common_utils import get_active_sbm
 
 P_MAX = 128  # Hardware partition dimension size
 TRANSPOSE_CHUNK_SIZE = 32  # Element count per nc_transpose chunk
 NUM_TRANSPOSE_CHUNKS = 4  # Number of chunks in one partition (P_MAX // TRANSPOSE_CHUNK_SIZE)
-from .quantize_mxfp8_utils import INTERLEAVE_FACTOR, are_scales_packed
+from .quantize_mxfp8_utils import INTERLEAVE_FACTOR, L_TILE_K, are_scales_packed
 
 
 @dataclass
@@ -43,12 +45,27 @@ class TensorDescriptor(nl.NKIObject):
 
     Args:
         data (Optional[nl.ndarray]): Primary tensor data, None if not specified.
-        scales (Optional[nl.ndarray]): Quantization scale factors, None if unquantized
-        is_swizzled (bool): True if tensor is in [P/4, F*4] swizzled format
-        is_f_by_k (bool): True if tensor is in the [F, P] ([F, K]) orientation
-        is_x4 (bool): True if data is in _x4 packed format
-        scales_are_packed (bool): True if scales are packed
-        is_col_parallel_sharded (bool): True if tensor is sharded across 2 cores (LNC2)
+        scales (Optional[nl.ndarray]): Quantization scale factors, None if unquantized.
+        is_swizzled (bool): True if tensor is in [P/4, F*4] swizzled format.
+        is_f_by_k (bool): True if tensor is in the [F, P] ([F, K]) orientation.
+        is_x4 (bool): True if data is in _x4 packed format.
+        scales_are_packed (bool): True if scales are packed.
+        is_col_parallel_sharded (bool): True if tensor is sharded across 2 cores (LNC2).
+        load_with_PE_swizzle (bool): When True, use PE transpose
+            (load_tile_bf16_PE_transpose) instead of DGT for loading unswizzled bf16.
+            Supports both direct (contiguous) and indirect (scattered) DMA modes;
+            indirect mode is activated when indirect_dma_vector_offset is set.
+        indirect_dma_vector_offset (Optional[nl.ndarray]): SBUF
+            int32 tensor of shape (P_MAX, NUM_SUB_TILES) holding global F-row indices
+            for indirect DMA gather when load_with_PE_swizzle=True.
+        scalar_offset (Optional[nl.ndarray]): Currently unsupported. Runtime scalar
+            offset added to every DGT vector_offset entry for per-expert weight slicing.
+            Must be float32 dtype, pre-scaled into vector_size units.
+        effective_f_dim (Optional[int]): Currently unsupported. Per-expert logical F
+            dimension for stacked-expert tensors to clamp DGT tile_f at expert boundaries.
+        skip_dma (Optional[SkipMode]): Currently unsupported. Controls OOB handling for
+            DMA operations. When skip_dma.skip_token is True, out-of-bounds indices are
+            skipped via oob_mode.skip.
 
     Notes:
         - Layout flags track cumulative transformations
@@ -59,7 +76,7 @@ class TensorDescriptor(nl.NKIObject):
     data: Optional[nl.ndarray] = None
     scales: Optional[nl.ndarray] = None
     is_swizzled: bool = False
-    is_f_by_k: bool = False
+    is_f_by_k: Optional[bool] = None
     is_x4: bool = False
     scales_are_packed: bool = False
     is_col_parallel_sharded: bool = False
@@ -73,6 +90,40 @@ class TensorDescriptor(nl.NKIObject):
     vector_offset_pattern_256: Optional[nl.ndarray] = None
     vector_offset_pattern_128: Optional[nl.ndarray] = None
 
+    # When True, use PE swizzle (load_tile_bf16_PE_transpose) instead of DGT
+    # for loading unswizzled bf16 tensors. Supports both:
+    #   - Direct DMA (contiguous rows): when indirect_dma_vector_offset is None
+    #   - Indirect DMA (scattered token gather): when indirect_dma_vector_offset
+    #     is set to an SBUF int32 tensor of shape (P_MAX, NUM_SUB_TILES) holding
+    #     global F-row indices.
+    # Whether indirect or direct is determined by the presence of vector_offset
+    # on the TileLocation at load time.
+    load_with_PE_swizzle: bool = False
+    indirect_dma_vector_offset: Optional[nl.ndarray] = None
+
+    # Runtime scalar offset added uniformly to every DGT vector_offset entry
+    # at TileLocation construction time. Used to select per-expert weight
+    # slices when the data tensor is a 2D reshape view of a stacked-experts
+    # tensor (e.g. [E*I_TP, H] view of a [E, I_TP, H] tensor). The caller is
+    # responsible for pre-scaling the runtime expert index into vector_size
+    # units (vector_size = tile_k // INTERLEAVE_FACTOR), since vector_offset
+    # values index the flattened (F*K/vector_size, ..., vector_size) DGT view.
+    scalar_offset: Optional[nl.ndarray] = None
+    scalar_offset_scales: Optional[nl.ndarray] = None
+    effective_f_dim_scales: Optional[int] = None
+    # Per-expert logical F dimension for stacked-expert tensors. When a tensor
+    # is reshaped from [E, F_per_expert, K] to [E*F_per_expert, K] and scalar_offset
+    # is used to index experts, the DGT access pattern must clamp tile_f to the
+    # per-expert F boundary (not the full tensor F). Without this, the last F-tile
+    # within an expert overflows into the next expert's rows (or past the tensor end).
+    effective_f_dim: Optional[int] = None
+
+    # OOB mode for indirect DMA loads. When set to oob_mode.skip, out-of-bounds
+    # indices (e.g., -1 padding slots in MoE skip_token mode) are skipped by the
+    # DMA engine instead of triggering a runtime error. The destination SBUF is
+    # pre-zeroed before the DMA so skipped partitions read as zero.
+    skip_dma: SkipMode = None
+
     def _get_physical_shape(self, data, is_quantized, is_x4, is_swizzled):
         """Compute physical (K, second_dim) shape from raw tensor data and layout flags."""
         if is_quantized:
@@ -81,7 +132,9 @@ class TensorDescriptor(nl.NKIObject):
             else:
                 return (data.shape[0], data.shape[1] // INTERLEAVE_FACTOR)
         else:
-            if is_swizzled:
+            # Swizzled is stored (K, F), and K-by-F is already (K, F); both are in
+            # (K, second_dim) order, so return as-is. Only F-by-K ([F, K]) needs the swap.
+            if is_swizzled or not self.is_f_by_k:
                 return (data.shape[0], data.shape[1])
             else:
                 F, K = data.shape
@@ -106,8 +159,20 @@ class TensorDescriptor(nl.NKIObject):
             if self.data != None and not self.scales_are_packed and len(self.data.shape) == 2:
                 self.scales_are_packed = are_scales_packed(self.data.shape, self.scales.shape)
         self.is_unswizzled_bf16 = not self.is_quantized and not self.is_swizzled
-        if self.is_unswizzled_bf16:
+        # Resolve is_f_by_k (it may be None = "unset/auto" here):
+        #   - unswizzled BF16 + explicit K-by-F (is_f_by_k == False) -> load via PE swizzle
+        #   - unswizzled BF16 + unset(None)/F-by-K               -> F-by-K (set True below)
+        #   - swizzled/quantized (layout irrelevant) + unset      -> coerced to False at the end
+        # (None == False is False, so None never takes the K-by-F branch.)
+        if self.is_unswizzled_bf16 and self.is_f_by_k == False:
+            # K-by-F unswizzled input: must use PE swizzle (DGT requires F-by-K)
+            self.load_with_PE_swizzle = True
+        elif self.is_unswizzled_bf16:
+            # Default (None) or explicit True: F-by-K layout
             self.is_f_by_k = True
+        # For non-unswizzled-bf16 tensors (quantized/swizzled), ensure is_f_by_k is a concrete bool
+        if self.is_f_by_k is None:
+            self.is_f_by_k = False
 
         # Compute shapes
         if self.data != None and len(self.data.shape) == 2:
@@ -180,8 +245,15 @@ class TensorDescriptor(nl.NKIObject):
         COUNT_F_PER_PARTITION = P_MAX // COUNT_K
         CHANNEL_MULTIPLIER = SKIP_K * COUNT_F_PER_PARTITION
 
-        vector_offsets_sbuf = nl.ndarray((P_MAX, NUM_PARTITIONS), dtype=nl.uint32, buffer=nl.sbuf)
-        vector_offsets_tmp = nl.ndarray((NUM_PARTITIONS, P_MAX), dtype=nl.uint32, buffer=nl.sbuf)
+        kernel_assert(
+            NUM_PARTITIONS <= TRANSPOSE_CHUNK_SIZE,
+            f"_generate_vector_offset_pattern: nc_transpose requires NUM_PARTITIONS <= {TRANSPOSE_CHUNK_SIZE}, "
+            f"got NUM_PARTITIONS={NUM_PARTITIONS} (tile_k={tile_k}, tile_f={tile_f})",
+        )
+
+        sbm = get_active_sbm()
+        vector_offsets_sbuf = sbm.alloc_stack((P_MAX, NUM_PARTITIONS), dtype=nl.uint32, buffer=nl.sbuf)
+        vector_offsets_tmp = sbm.alloc_stack((NUM_PARTITIONS, P_MAX), dtype=nl.uint32, buffer=nl.sbuf)
 
         nisa.iota(
             dst=vector_offsets_tmp,
@@ -347,7 +419,15 @@ class TileLocation(nl.NKIObject):
     vector_offset: Optional[nl.ndarray] = None
 
     def __post_init__(self):
-        """Auto-generate vector_offset and access_pattern for unswizzled F-by-K tensors."""
+        """Auto-generate vector_offset and access_pattern for unswizzled F-by-K tensors.
+
+        Skipped when load_with_PE_swizzle=True, since PE transpose uses either
+        user-provided row indices (indirect) or contiguous DMA (direct), and
+        does not need DGT vector offsets.
+        """
+        if self.tensor.load_with_PE_swizzle:
+            return
+
         if not self.tensor.is_swizzled and self.tensor.is_f_by_k:
             self.set_vector_offset()
             self.generate_ap()
@@ -374,15 +454,52 @@ class TileLocation(nl.NKIObject):
         if self.tensor.vector_offset_pattern_512 == None:
             self.tensor.set_vector_offset_patterns(self.tile_k, self.tile_f)
 
+        sbm = get_active_sbm()
         pattern = self.tensor.get_vector_offset_pattern(self.tile_k)
         F, K = self.tensor.data.shape
 
         vector_size = self.tile_k // INTERLEAVE_FACTOR
         SKIP_K = K // vector_size
         base_offset = self.k_offset // vector_size + self.f_offset * SKIP_K
-        vector_offsets_k = nl.ndarray(pattern.shape, dtype=nl.uint32, buffer=nl.sbuf)
+        vector_offsets_k = sbm.alloc_stack(pattern.shape, dtype=nl.uint32, buffer=nl.sbuf)
 
         nisa.tensor_scalar(dst=vector_offsets_k, data=pattern, op0=nl.add, operand0=base_offset)
+
+        # Runtime expert offset (in vector_size units) for stacked-experts views.
+        # The caller computes scalar_offset assuming vector_size = L_TILE_K // INTERLEAVE_FACTOR
+        # (the full-tile vector_size). For remainder tiles (tile_k < L_TILE_K),
+        # vector_size is smaller, so each index unit covers fewer elements.
+        # We must scale the scalar_offset by (L_TILE_K / tile_k) to convert from
+        # full-tile vector_size units to the current tile's vector_size units.
+        if self.tensor.scalar_offset is not None:
+            scalar_offset_to_add = self.tensor.scalar_offset
+            if self.tile_k < L_TILE_K:
+                scale_factor = L_TILE_K // self.tile_k
+                scaled_offset = sbm.alloc_stack(
+                    self.tensor.scalar_offset.shape,
+                    dtype=nl.float32,
+                    buffer=nl.sbuf,
+                )
+                nisa.tensor_scalar(
+                    dst=scaled_offset,
+                    data=self.tensor.scalar_offset,
+                    op0=nl.multiply,
+                    operand0=scale_factor,
+                )
+                scalar_offset_to_add = scaled_offset
+
+            vector_offsets_with_expert = sbm.alloc_stack(
+                pattern.shape,
+                dtype=nl.uint32,
+                buffer=nl.sbuf,
+            )
+            nisa.tensor_scalar(
+                dst=vector_offsets_with_expert,
+                data=vector_offsets_k,
+                op0=nl.add,
+                operand0=scalar_offset_to_add,
+            )
+            vector_offsets_k = vector_offsets_with_expert
 
         self.vector_offset = vector_offsets_k
 
@@ -401,13 +518,16 @@ class TileLocation(nl.NKIObject):
             Access pattern format: [[P_MAX, flattened_rows], [1, 1], [1, 1], [1, P_MAX]]
 
             Where flattened_rows = min(tile_f, F - f_offset) * tile_k // P_MAX
+            When effective_f_dim is set (e.g. stacked-expert tensors), F_effective is the
+            per-expert F range. Otherwise F_effective is the full tensor F dimension.
         """
         if self.access_pattern != None:
             return
 
         F, _ = self.tensor.data.shape
+        F_effective = self.tensor.effective_f_dim if self.tensor.effective_f_dim is not None else F
         vector_size = self.tile_k // INTERLEAVE_FACTOR
-        flattened_rows = min(self.tile_f, F - self.f_offset) * self.tile_k // vector_size
+        flattened_rows = min(self.tile_f, F_effective - self.f_offset) * self.tile_k // vector_size
         access_pattern = [[vector_size, flattened_rows], [1, 1], [1, 1], [1, vector_size]]
 
         self.access_pattern = access_pattern

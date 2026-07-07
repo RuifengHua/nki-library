@@ -257,6 +257,11 @@ def blockwise_mm_shard_intermediate_mx(
 
     activation_bias = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(activation_bias, value=0)
+
+    # Hoist [0, 1, 2, 3] H-fold offset vector once for all blocks. Used by compute_hidden_index_vector.
+    arange_4H = nl.ndarray((1, _q_width), dtype=nl.float32, buffer=nl.sbuf, name="arange_4H")
+    nisa.iota(arange_4H, [[1, _q_width]], offset=0)
+
     # Create input tensor container
     inps = InputTensors(
         hidden_states=hidden_states.reshape((T, _q_width, prj_cfg.n_H512_tile, _pmax)),
@@ -273,6 +278,7 @@ def blockwise_mm_shard_intermediate_mx(
         p_down_idx_vector=p_down_idx_vector,
         gup_scales_sb=gup_scales_sb,
         activation_bias=activation_bias,
+        arange_4H=arange_4H,
     )
 
     # Create configuration
@@ -569,6 +575,10 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
     activation_bias = nl.ndarray((_pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(activation_bias, value=0)
 
+    # Hoist [0, 1, 2, 3] H-fold offset vector once for all blocks. Used by compute_hidden_index_vector.
+    arange_4H = nl.ndarray((1, _q_width), dtype=nl.float32, buffer=nl.sbuf, name="arange_4H")
+    nisa.iota(arange_4H, [[1, _q_width]], offset=0)
+
     # Create input tensor container
     inps = InputTensors(
         hidden_states=hidden_states.reshape((T, _q_width, prj_cfg.n_H512_tile, _pmax)),
@@ -585,6 +595,7 @@ def blockwise_mm_shard_intermediate_mx_hybrid(
         p_down_idx_vector=p_down_idx_vector,
         gup_scales_sb=gup_scales_sb,
         activation_bias=activation_bias,
+        arange_4H=arange_4H,
     )
 
     # Create configuration - initially for static blocks
@@ -862,7 +873,7 @@ def compute_one_block_mx(
     if is_dynamic:
         # For dynamic blocks, load hidden states fresh each iteration to avoid
         # cross-iteration SBUF dependency issues with the compiler's while-loop handling.
-        # FIXME: We should reenable pre-load once this ticket is resolved: https://aws-neuron.atlassian.net/browse/NKI-1582
+        # FIXME: We should reenable pre-load once this ticket is resolved: NKI-1582
         load_and_quantize_hidden_states(
             inps,
             block_idx,
@@ -987,7 +998,7 @@ def compute_one_block_mx(
     if next_block_idx is not None and not is_dynamic:
         """
         LOAD, TRANSPOSE HIDDEN STATES (static loops only)
-        FIXME: We should re-enable pre-load for dynamic loops as well once this ticket is resolved: https://aws-neuron.atlassian.net/browse/NKI-1582
+        FIXME: We should re-enable pre-load for dynamic loops as well once this ticket is resolved: NKI-1582
         """
         if USE_DMA_TRANSPOSE:
             load_hidden_states_mx(

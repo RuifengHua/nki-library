@@ -195,15 +195,24 @@ def _wrap_sqrt_ref():
 class TestForeachElementwise:
     """Integration tests for foreach elementwise NKI kernels."""
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize("shape", TEST_SHAPES)
     @pytest.mark.parametrize(
-        "kernel,ref",
+        "kernel,ref,shape",
         [
-            (add_scalar_kernel, add_scalar_torch_ref),
-            (sub_scalar_kernel, sub_scalar_torch_ref),
-            (mul_scalar_kernel, mul_scalar_torch_ref),
-            (div_scalar_kernel, div_scalar_torch_ref),
+            pytest.param(k, r, s, marks=pytest.mark.fast)
+            if (k, s)
+            in {
+                (div_scalar_kernel, (256,)),
+                (sub_scalar_kernel, (256,)),
+                (add_scalar_kernel, (1024,)),
+            }
+            else pytest.param(k, r, s)
+            for k, r in [
+                (add_scalar_kernel, add_scalar_torch_ref),
+                (sub_scalar_kernel, sub_scalar_torch_ref),
+                (mul_scalar_kernel, mul_scalar_torch_ref),
+                (div_scalar_kernel, div_scalar_torch_ref),
+            ]
+            for s in TEST_SHAPES
         ],
     )
     def test_scalar_ops(self, test_manager: Orchestrator, platform_target: Platforms, shape, kernel, ref):
@@ -218,15 +227,26 @@ class TestForeachElementwise:
             test_config=None, compiler_args=CompilerArgs(platform_target=platform_target), rtol=1e-2, atol=1e-2
         )
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize("shape", TEST_SHAPES)
     @pytest.mark.parametrize(
-        "kernel,ref,uses_alpha",
+        "kernel,ref,uses_alpha,shape",
         [
-            (add_tensor_kernel, add_tensor_torch_ref, True),
-            (sub_tensor_kernel, sub_tensor_torch_ref, True),
-            (mul_tensor_kernel, mul_tensor_torch_ref, False),
-            (div_tensor_kernel, div_tensor_torch_ref, False),
+            pytest.param(k, r, ua, s, marks=pytest.mark.fast)
+            if (k, s)
+            in {
+                (div_tensor_kernel, (1024,)),
+                (mul_tensor_kernel, (4, 8, 32)),
+                (sub_tensor_kernel, (4, 8, 32)),
+                (div_tensor_kernel, (128,)),
+                (mul_tensor_kernel, (128,)),
+            }
+            else pytest.param(k, r, ua, s)
+            for k, r, ua in [
+                (add_tensor_kernel, add_tensor_torch_ref, True),
+                (sub_tensor_kernel, sub_tensor_torch_ref, True),
+                (mul_tensor_kernel, mul_tensor_torch_ref, False),
+                (div_tensor_kernel, div_tensor_torch_ref, False),
+            ]
+            for s in TEST_SHAPES
         ],
     )
     def test_tensor_ops(self, test_manager: Orchestrator, platform_target: Platforms, shape, kernel, ref, uses_alpha):
@@ -247,8 +267,10 @@ class TestForeachElementwise:
             test_config=None, compiler_args=CompilerArgs(platform_target=platform_target), rtol=1e-2, atol=1e-2
         )
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize("shape", BOUNDARY_SHAPES)
+    @pytest.mark.parametrize(
+        "shape",
+        [pytest.param(s, marks=pytest.mark.fast) if s == (257,) else pytest.param(s) for s in BOUNDARY_SHAPES],
+    )
     def test_scalar_boundary(self, test_manager: Orchestrator, platform_target: Platforms, shape):
         """Boundary sizes: non-multiples of P_MAX to exercise tail path."""
         framework = UnitTestFramework(
@@ -262,8 +284,10 @@ class TestForeachElementwise:
             test_config=None, compiler_args=CompilerArgs(platform_target=platform_target), rtol=1e-2, atol=1e-2
         )
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize("shape", BOUNDARY_SHAPES)
+    @pytest.mark.parametrize(
+        "shape",
+        [pytest.param(s, marks=pytest.mark.fast) if s == (255,) else pytest.param(s) for s in BOUNDARY_SHAPES],
+    )
     def test_tensor_boundary(self, test_manager: Orchestrator, platform_target: Platforms, shape):
         """Boundary sizes: non-multiples of P_MAX to exercise tail path for tensor ops."""
         framework = UnitTestFramework(
@@ -277,13 +301,23 @@ class TestForeachElementwise:
             test_config=None, compiler_args=CompilerArgs(platform_target=platform_target), rtol=1e-2, atol=1e-2
         )
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize("shape", TEST_SHAPES)
     @pytest.mark.parametrize(
-        "kernel,ref_wrapper",
+        "kernel,ref_wrapper,shape",
         [
-            (addcdiv_kernel, _wrap_addcdiv_ref()),
-            (addcmul_kernel, _wrap_addcmul_ref()),
+            pytest.param(k, rw, s, marks=pytest.mark.fast)
+            if (k, s)
+            in {
+                (addcdiv_kernel, (256,)),
+                (addcmul_kernel, (256,)),
+                (addcdiv_kernel, (128,)),
+                (addcmul_kernel, (128,)),
+            }
+            else pytest.param(k, rw, s)
+            for k, rw in [
+                (addcdiv_kernel, _wrap_addcdiv_ref()),
+                (addcmul_kernel, _wrap_addcmul_ref()),
+            ]
+            for s in TEST_SHAPES
         ],
     )
     def test_addcd_ops(self, test_manager: Orchestrator, platform_target: Platforms, shape, kernel, ref_wrapper):
@@ -298,8 +332,10 @@ class TestForeachElementwise:
             test_config=None, compiler_args=CompilerArgs(platform_target=platform_target), rtol=1e-2, atol=1e-2
         )
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize("shape", TEST_SHAPES)
+    @pytest.mark.parametrize(
+        "shape",
+        [pytest.param(s, marks=pytest.mark.fast) if s in {(32, 32), (128,)} else pytest.param(s) for s in TEST_SHAPES],
+    )
     def test_lerp(self, test_manager: Orchestrator, platform_target: Platforms, shape):
         framework = UnitTestFramework(
             test_manager=test_manager,
@@ -312,8 +348,10 @@ class TestForeachElementwise:
             test_config=None, compiler_args=CompilerArgs(platform_target=platform_target), rtol=1e-2, atol=1e-2
         )
 
-    @pytest.mark.fast
-    @pytest.mark.parametrize("shape", TEST_SHAPES)
+    @pytest.mark.parametrize(
+        "shape",
+        [pytest.param(s, marks=pytest.mark.fast) if s in {(1024,), (128,)} else pytest.param(s) for s in TEST_SHAPES],
+    )
     def test_sqrt(self, test_manager: Orchestrator, platform_target: Platforms, shape):
         framework = UnitTestFramework(
             test_manager=test_manager,

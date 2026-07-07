@@ -54,6 +54,11 @@ def blockwise_mm_bwd(
     activation_type: ActFnType = ActFnType.SiLU,
     block_tile_size: int = None,
     blocking_params: MOEBwdDroplessBlockingParams = None,
+    hidden_states_grad_out: nl.ndarray = None,
+    expert_affinities_masked_grad_out: nl.ndarray = None,
+    gate_up_proj_weight_grad_out: nl.ndarray = None,
+    down_proj_weight_grad_out: nl.ndarray = None,
+    accumulation_dtype: nki.dtype = None,
 ) -> tuple:
     """
     Compute backward pass for blockwise MoE layer.
@@ -99,6 +104,17 @@ def blockwise_mm_bwd(
             for any dimension increases the amount of data loaded into SBUF before the matmul begins execution. This allows
             more compute per load but also increases SBUF memory consumption. If None, uses defaults. It is highly recommended
             to tune this parameter to maximize kernel performance.
+        hidden_states_grad_out (nl.ndarray, optional): Pre-allocated [T, H] output tensor for hidden states
+            gradient. If None, allocated internally.
+        expert_affinities_masked_grad_out (nl.ndarray, optional): Pre-allocated [T*E, 1] output tensor for
+            expert affinity gradient. If None, allocated internally.
+        gate_up_proj_weight_grad_out (nl.ndarray, optional): Pre-allocated [E, H, 2, I_TP] output tensor for
+            gate/up projection weight gradient. If None, allocated internally.
+        down_proj_weight_grad_out (nl.ndarray, optional): Pre-allocated [E, I_TP, H] output tensor for down
+            projection weight gradient. If None, allocated internally.
+        accumulation_dtype (nki.dtype, optional): Opt-in high-precision dtype for the bias-gradient
+            accumulators. Default None = compute_dtype (baseline, unchanged). Set to nl.float32 to
+            accumulate bias gradients in fp32 (reduces bf16 accumulation error; e.g. for fp32 grad buffers).
 
     Returns:
         tuple: Gradient tensors:
@@ -122,17 +138,30 @@ def blockwise_mm_bwd(
     if clamp_limits == None:
         clamp_limits = ClampLimits()
 
-    hidden_states_grad = nl.ndarray(hidden_states.shape, dtype=hidden_states.dtype, buffer=nl.shared_hbm)
+    # If a *_grad_out tensor is provided, use it instead of allocating internally.
+    if hidden_states_grad_out != None:
+        hidden_states_grad = hidden_states_grad_out
+    else:
+        hidden_states_grad = nl.ndarray(hidden_states.shape, dtype=hidden_states.dtype, buffer=nl.shared_hbm)
 
-    expert_affinities_masked_grad = nl.ndarray(
-        expert_affinities_masked.shape, dtype=expert_affinities_masked.dtype, buffer=nl.shared_hbm
-    )
+    if expert_affinities_masked_grad_out != None:
+        expert_affinities_masked_grad = expert_affinities_masked_grad_out
+    else:
+        expert_affinities_masked_grad = nl.ndarray(
+            expert_affinities_masked.shape, dtype=expert_affinities_masked.dtype, buffer=nl.shared_hbm
+        )
 
-    gate_up_proj_weight_grad = nl.ndarray(
-        gate_up_proj_weight.shape, dtype=gate_up_proj_weight.dtype, buffer=nl.shared_hbm
-    )
+    if gate_up_proj_weight_grad_out != None:
+        gate_up_proj_weight_grad = gate_up_proj_weight_grad_out
+    else:
+        gate_up_proj_weight_grad = nl.ndarray(
+            gate_up_proj_weight.shape, dtype=gate_up_proj_weight.dtype, buffer=nl.shared_hbm
+        )
 
-    down_proj_weight_grad = nl.ndarray(down_proj_weight.shape, dtype=down_proj_weight.dtype, buffer=nl.shared_hbm)
+    if down_proj_weight_grad_out != None:
+        down_proj_weight_grad = down_proj_weight_grad_out
+    else:
+        down_proj_weight_grad = nl.ndarray(down_proj_weight.shape, dtype=down_proj_weight.dtype, buffer=nl.shared_hbm)
 
     gate_and_up_proj_bias_grad = None
     down_proj_bias_grad = None
@@ -169,6 +198,7 @@ def blockwise_mm_bwd(
         affinity_option=affinity_option,
         blocking_params=blocking_params,
         shard_option=shard_option,
+        accumulation_dtype=accumulation_dtype,
     )
 
     params.validate()

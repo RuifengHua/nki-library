@@ -68,6 +68,7 @@ def gen_mask_tkg(
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
     n_sprior_tile_total: int = 0,
+    dynamic_s_prior_offset: Optional[nl.ndarray] = None,
 ) -> nl.ndarray:
     """
     Generate attention mask for TKG kernel.
@@ -209,11 +210,16 @@ def gen_mask_tkg(
         n_sprior_tile=n_sprior_tile,
         s_prior_per_shard=s_prior_per_shard,
         sprior_prg_id=sprior_prg_id,
-        s_prior_offset=s_prior_offset,
+        s_prior_offset=0 if dynamic_s_prior_offset is not None else s_prior_offset,
         block_len=block_len,
         strided_mm1=strided_mm1,
         n_sprior_tile_total=n_sprior_tile_total,
     )
+
+    # For dynamic FA tiling, add the runtime s_prior_offset to the iota.
+    # dynamic_s_prior_offset is (P_MAX, 1) float32 SBUF tensor, pre-broadcast on partition dim.
+    if dynamic_s_prior_offset is not None:
+        nisa.activation(dst=tmp_iota, op=nl.copy, data=tmp_iota, bias=dynamic_s_prior_offset, scale=1.0)
 
     # Step 2: Create prior masks by per-batch comparison
     # Trace-time routing: SWA path when start_pos is provided, standard path otherwise
@@ -881,6 +887,7 @@ def gen_mask_tkg_hbm(
     block_len: int = 0,
     active_mask: Optional[nl.ndarray] = None,
     enable_fa_s_prior_tiling: bool = True,
+    fuse_rope: bool = False,
 ) -> nl.ndarray:
     """HBM wrapper for gen_mask_tkg.
 
@@ -902,6 +909,7 @@ def gen_mask_tkg_hbm(
         active_mask: Optional [s_active, bs, q_head, s_active] active mask in HBM.
         enable_fa_s_prior_tiling: Whether flash attention tiling is enabled. Must match
             the value passed to attention_tkg / attention_block_tkg. Default: True.
+        fuse_rope: Whether RoPE is fused (impacts LNC sharding decision).
 
     Returns:
         mask_out_hbm: [s_prior, bs, q_head, s_active] generated mask in HBM.
@@ -913,13 +921,13 @@ def gen_mask_tkg_hbm(
     # LNC sharding
     _, lnc, nc_id = get_verified_program_sharding_info("gen_mask_tkg_hbm", (0, 1))
 
-    cfg = AttnTKGConfig(bs=bs, q_head=q_head, s_active=s_active, curr_sprior=s_prior)
+    cfg = AttnTKGConfig(bs=bs, q_head=q_head, s_active=s_active, curr_sprior=s_prior, fuse_rope=fuse_rope)
 
-    if lnc == 2 and is_s_prior_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+    if lnc == 2 and is_s_prior_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope):
         sprior_sharded = True
         batch_sharded = False
         s_prior_per_shard = s_prior // lnc
-    elif lnc == 2 and is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+    elif lnc == 2 and is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope):
         sprior_sharded = False
         batch_sharded = True
         s_prior_per_shard = s_prior
@@ -941,6 +949,7 @@ def gen_mask_tkg_hbm(
             q_head,
             s_active,
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+            fuse_rope=fuse_rope,
         )
 
     n_sprior_tile_total = s_prior // P_MAX

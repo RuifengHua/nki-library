@@ -17,7 +17,10 @@
 import nki.isa as nisa
 import nki.language as nl
 
+from ...core.utils.kernel_assert import kernel_assert
+from ...core.utils.kernel_helpers import div_ceil
 from ..mxfp_utils.mxfp8_utils.common_dataclasses import BlockDescriptor, TensorDescriptor
+from ..mxfp_utils.mxfp8_utils.common_utils import get_active_sbm
 from ..mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
     INTERLEAVE_FACTOR,
     get_fp8_dtype_x4,
@@ -218,4 +221,157 @@ def _store_unswizzled_sbuf_block_to_hbm(
                     pattern=[[sbuf_step_p, actual_m], [1, actual_n]],
                     offset=sbuf_offset,
                 ),
+            )
+
+
+def apply_gradient_clamp(gradient, activation, upper_limit, lower_limit, dtype):
+    """Zero out gradient elements where the forward activation is outside [lower, upper].
+
+    No-op if both limits are None. Operates entirely in SBUF.
+    Follows the same pattern as the MOE kernel (bwmm_bwd_dropless.py).
+
+    Args:
+        gradient: SBUF tensor to clamp in-place (e.g. d_gate or d_up).
+        activation: SBUF tensor to check against limits (forward checkpoint).
+        upper_limit: float or None — zero gradient where activation >= upper.
+        lower_limit: float or None — zero gradient where activation <= lower.
+        dtype: compute dtype (e.g. nl.bfloat16).
+    """
+    if upper_limit is None and lower_limit is None:
+        return
+
+    sbm = get_active_sbm()
+    shape = gradient.shape
+
+    mask1 = sbm.alloc_stack(shape=shape, dtype=dtype, buffer=nl.sbuf)
+    mask2 = sbm.alloc_stack(shape=shape, dtype=dtype, buffer=nl.sbuf)
+    nisa.memset(mask1, value=1.0)
+    nisa.memset(mask2, value=1.0)
+
+    if upper_limit is not None:
+        nisa.tensor_scalar(dst=mask1, data=activation, op0=nl.less, operand0=upper_limit)
+
+    if lower_limit is not None:
+        nisa.tensor_scalar(dst=mask2, data=activation, op0=nl.greater, operand0=lower_limit)
+
+    nisa.tensor_tensor(dst=mask1, data1=mask1, data2=mask2, op=nl.logical_and)
+    nisa.tensor_tensor(dst=gradient, op=nl.multiply, data1=gradient, data2=mask1)
+
+
+def apply_activation_clamp(tensor, upper_limit, lower_limit):
+    """Clamp activation values in-place using tensor_scalar min/max.
+
+    Mirrors the MoE forward kernel (bwmm_shard_on_I.py) clamping pattern.
+    No-op if both limits are None.
+
+    Args:
+        tensor: SBUF tensor to clamp in-place.
+        upper_limit: float or None — clamp values above this.
+        lower_limit: float or None — clamp values below this.
+    """
+    if upper_limit is None and lower_limit is None:
+        return
+
+    if upper_limit is not None and lower_limit is not None:
+        nisa.tensor_scalar(
+            data=tensor, op0=nl.minimum, operand0=upper_limit, op1=nl.maximum, operand1=lower_limit, dst=tensor
+        )
+    elif upper_limit is not None:
+        nisa.tensor_scalar(data=tensor, op0=nl.minimum, operand0=upper_limit, dst=tensor)
+    else:
+        nisa.tensor_scalar(data=tensor, op0=nl.maximum, operand0=lower_limit, dst=tensor)
+
+
+# DMA transpose tile dimensions: load (FREE_DIM, PAR_DIM) from HBM, produce (PAR_DIM, FREE_DIM) in SBUF
+_TRANSPOSE_PAR_DIM = 128
+_TRANSPOSE_FREE_DIM = 512
+
+
+def hbm_dma_transpose(
+    src_hbm, dst_hbm, M=None, N=None, src_row_offset=0, src_col_offset=0, dst_row_offset=0, dst_col_offset=0
+):
+    """Transpose a sub-region of src_hbm into a sub-region of dst_hbm.
+
+    Reads src_hbm[src_row_offset : src_row_offset+M, src_col_offset : src_col_offset+N]
+    and writes the transpose to
+    dst_hbm[dst_row_offset : dst_row_offset+N, dst_col_offset : dst_col_offset+M].
+
+    Tiles into (_TRANSPOSE_FREE_DIM, _TRANSPOSE_PAR_DIM) = (512, 128) chunks,
+    transposes each via nisa.dma_transpose into SBUF, then copies out.
+
+    TODO: Currently, the function doesn't assume src_hbm and dst_hbm are logical
+    transposes of each other i.e. src_hbm.shape = dst_hbm.T.shape. Assess whether
+    this is necessary.
+
+    Args:
+        src_hbm: Source HBM tensor (full, unsliced).
+        dst_hbm: Destination HBM tensor (full, unsliced).
+        M: Number of rows to transpose from src. Defaults to src rows - src_row_offset.
+        N: Number of cols to transpose from src. Defaults to src cols - src_col_offset.
+        src_row_offset: Starting row in src.
+        src_col_offset: Starting col in src.
+        dst_row_offset: Starting row in dst for output.
+        dst_col_offset: Starting col in dst for output.
+    """
+    src_full_rows, src_full_cols = src_hbm.shape
+    dst_full_rows, dst_full_cols = dst_hbm.shape
+    sbm = get_active_sbm()
+
+    if M is None:
+        M = src_full_rows - src_row_offset
+    if N is None:
+        N = src_full_cols - src_col_offset
+
+    kernel_assert(M > 0, f"M ({M}) must be positive")
+    kernel_assert(N > 0, f"N ({N}) must be positive")
+    kernel_assert(
+        src_row_offset + M <= src_full_rows,
+        f"src_row_offset ({src_row_offset}) + M ({M}) exceeds src rows ({src_full_rows})",
+    )
+    kernel_assert(
+        src_col_offset + N <= src_full_cols,
+        f"src_col_offset ({src_col_offset}) + N ({N}) exceeds src cols ({src_full_cols})",
+    )
+    kernel_assert(
+        dst_row_offset + N <= dst_full_rows,
+        f"dst_row_offset ({dst_row_offset}) + N ({N}) exceeds dst rows ({dst_full_rows})",
+    )
+    kernel_assert(
+        dst_col_offset + M <= dst_full_cols,
+        f"dst_col_offset ({dst_col_offset}) + M ({M}) exceeds dst cols ({dst_full_cols})",
+    )
+
+    num_row_tiles = div_ceil(M, _TRANSPOSE_FREE_DIM)
+    num_col_tiles = div_ceil(N, _TRANSPOSE_PAR_DIM)
+
+    for row_idx in nl.affine_range(num_row_tiles):
+        row_start = row_idx * _TRANSPOSE_FREE_DIM
+        row_size = min(_TRANSPOSE_FREE_DIM, M - row_start)
+
+        for col_idx in nl.affine_range(num_col_tiles):
+            col_start = col_idx * _TRANSPOSE_PAR_DIM
+            col_size = min(_TRANSPOSE_PAR_DIM, N - col_start)
+
+            sbuf_tile = sbm.alloc_stack(shape=(col_size, row_size), dtype=src_hbm.dtype, buffer=nl.sbuf)
+
+            src_r = src_row_offset + row_start
+            src_c = src_col_offset + col_start
+            src_ap_offset = src_r * src_full_cols + src_c
+            nisa.dma_transpose(
+                dst=sbuf_tile,
+                src=src_hbm.ap(
+                    pattern=[[src_full_cols, row_size], [1, col_size]],
+                    offset=src_ap_offset,
+                ),
+            )
+
+            dst_r = dst_row_offset + col_start
+            dst_c = dst_col_offset + row_start
+            dst_ap_offset = dst_r * dst_full_cols + dst_c
+            nisa.dma_copy(
+                dst=dst_hbm.ap(
+                    pattern=[[dst_full_cols, col_size], [1, row_size]],
+                    offset=dst_ap_offset,
+                ),
+                src=sbuf_tile,
             )

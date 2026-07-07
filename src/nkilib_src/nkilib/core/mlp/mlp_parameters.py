@@ -25,7 +25,9 @@ from nki.language import NKIObject
 from ..utils.common_types import (
     ActFnType,
     ComputationMode,
+    DtypeMode,
     ExpertAffinityScaleMode,
+    MLPGateUpWeightLayout,
     MoEAllToAllVStrategy,
     NormType,
     QuantizationType,
@@ -41,9 +43,11 @@ SUPPORTED_DTYPES = [
     nl.float8_e4m3,
     'float8e4',
     nl.float8_e4m3fn,
+    # TODO: Remove x4 dtypes from SUPPORTED_DTYPES. These should be internal.
     nl.float4_e2m1fn_x4,
     nl.float8_e4m3fn_x4,
     nl.float8_e5m2_x4,
+    nl.uint32,
 ]
 SUPPORTED_QUANT_TYPES = [
     QuantizationType.NONE,
@@ -461,6 +465,7 @@ class MLPParameters(NKIObject):
     use_tkg_gate_up_proj_column_tiling: bool
     use_tkg_down_proj_column_tiling: bool
     use_tkg_down_proj_optimized_layout: bool
+    use_contiguous_x4_gate_up: bool
     shard_on_h_disabled: bool
     gate_clamp_lower_limit: Optional[float]
     gate_clamp_upper_limit: Optional[float]
@@ -468,6 +473,12 @@ class MLPParameters(NKIObject):
     up_clamp_upper_limit: Optional[float]
     transposed_in: bool
     transposed_out: bool
+    # Explicit FP8 E4M3 dtype selection for TKG STATIC/ROW weight tiles.
+    #   NON_OCP (default) → nl.float8_e4m3 (max=240)
+    #   OCP               → nl.float8_e4m3fn (max=448)
+    #   AUTO              → resolve_dtype_to_nki('float8_e4m3fn'), OCP when supported
+    dtype_mode: DtypeMode
+    gate_up_w_layout: MLPGateUpWeightLayout
 
     def __init__(
         self,
@@ -498,6 +509,7 @@ class MLPParameters(NKIObject):
         use_tkg_gate_up_proj_column_tiling: bool = False,
         use_tkg_down_proj_column_tiling: bool = False,
         use_tkg_down_proj_optimized_layout: bool = False,
+        use_contiguous_x4_gate_up: bool = False,
         shard_on_h_disabled: bool = False,
         gate_clamp_lower_limit: Optional[float] = None,
         gate_clamp_upper_limit: Optional[float] = None,
@@ -511,9 +523,12 @@ class MLPParameters(NKIObject):
         mode: ComputationMode = ComputationMode.AUTO,
         transposed_in: bool = False,
         transposed_out: bool = False,
+        dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+        gate_up_w_layout: MLPGateUpWeightLayout = MLPGateUpWeightLayout.CONTIGUOUS,
     ):
         self.transposed_in = transposed_in
         self.transposed_out = transposed_out
+        self.dtype_mode = dtype_mode
         self.input_in_sbuf = hidden_tensor.buffer == nl.sbuf
         self.hidden_input_scale = hidden_input_scale
         self.input_dequant_scale = input_dequant_scale
@@ -524,7 +539,6 @@ class MLPParameters(NKIObject):
             )
             self.batch_size = 1
             self.sequence_len = hidden_tensor.shape[3]
-            self.hidden_size = down_proj_weights_tensor.shape[-1]
         elif self.input_in_sbuf:
             # SBUF input shape: [H0, T, H1] or [H0, H/512, T] for MXFP all-expert quantized input
             kernel_assert(len(hidden_tensor.shape) == 3, "SBUF input must have 3D shape")
@@ -537,14 +551,17 @@ class MLPParameters(NKIObject):
                 T = hidden_tensor.shape[1]
             self.batch_size = 1
             self.sequence_len = T
-            self.hidden_size = down_proj_weights_tensor.shape[-1]
         elif len(hidden_tensor.shape) == 3:  # B, S, H
             self.batch_size = hidden_tensor.shape[0]
             self.sequence_len = hidden_tensor.shape[1]
-            self.hidden_size = down_proj_weights_tensor.shape[-1]
         else:  # T, H
             self.batch_size = 1
             self.sequence_len = hidden_tensor.shape[0]
+
+        if quantization_type in [QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX]:
+            # down_proj_weights_tensor is either fp8x4[128_I, I/512, H] or fp8[128_I, I/128, H, 4_I]
+            self.hidden_size = down_proj_weights_tensor.shape[2]
+        else:
             self.hidden_size = down_proj_weights_tensor.shape[-1]
 
         self.hidden_tensor = hidden_tensor
@@ -558,6 +575,7 @@ class MLPParameters(NKIObject):
         self.use_tkg_gate_up_proj_column_tiling = use_tkg_gate_up_proj_column_tiling
         self.use_tkg_down_proj_column_tiling = use_tkg_down_proj_column_tiling
         self.use_tkg_down_proj_optimized_layout = use_tkg_down_proj_optimized_layout
+        self.use_contiguous_x4_gate_up = use_contiguous_x4_gate_up
         self.shard_on_h_disabled = shard_on_h_disabled
         self.gate_clamp_lower_limit = gate_clamp_lower_limit
         self.gate_clamp_upper_limit = gate_clamp_upper_limit
@@ -565,6 +583,7 @@ class MLPParameters(NKIObject):
         self.up_clamp_upper_limit = up_clamp_upper_limit
         self.force_cte_mode = force_cte_mode
         self.mode = mode
+        self.gate_up_w_layout = gate_up_w_layout
 
         if output_dtype == None:
             self.output_dtype = resolve_dtype_to_nki(hidden_tensor.dtype)
@@ -589,31 +608,31 @@ class MLPParameters(NKIObject):
             mx_dummy_scale_hbm=mx_dummy_scale_hbm,
         )
 
-        if (
-            self.quant_params.is_quant_mx()
-            or (self.quant_params.is_quant_static_mx() and len(gate_proj_weights_tensor.shape) == 3)
-            or self.quant_params.is_quant_row_mx()
-        ):
-            # MX or STATIC_MX with x4-packed 3D weights (TKG path)
-            # gate_proj_weights_tensor[p_max, H_512, I]
-            self.intermediate_size = gate_proj_weights_tensor.shape[-1]
-            # down_proj_weights_tensor[p_max, I_512, H]
+        if gate_up_w_layout == MLPGateUpWeightLayout.CONTIGUOUS:
+            # gate_proj_weights_tensor is [H, I]
             kernel_assert(
-                down_proj_weights_tensor.shape[-1] == self.hidden_size,
-                f"unexpected down project weight shape {down_proj_weights_tensor.shape}",
+                len(up_proj_weights_tensor.shape) == 2,
+                f"MLPGateUpWeightLayout.CONTIGUOUS expects up weight to have two dimensions. "
+                f"Got {len(up_proj_weights_tensor.shape)}",
             )
-        elif len(down_proj_weights_tensor.shape) == 3:  # E, I, H
-            self.intermediate_size = down_proj_weights_tensor.shape[1]
-            kernel_assert(
-                down_proj_weights_tensor.shape[2] == self.hidden_size,
-                f"unexpected down project weight shape {down_proj_weights_tensor.shape}",
-            )
-        elif len(down_proj_weights_tensor.shape) == 2:  # I, H
-            self.intermediate_size = down_proj_weights_tensor.shape[0]
-            kernel_assert(
-                down_proj_weights_tensor.shape[1] == self.hidden_size,
-                f"unexpected down project weight shape {down_proj_weights_tensor.shape}",
-            )
+            self.intermediate_size = up_proj_weights_tensor.shape[1]
+        else:  # gate_up_w_layout in [H_X4_INNERMOST, H_X4_MIDDLE]
+            if len(gate_proj_weights_tensor.shape) == 3:
+                # gate_proj_weights_tensor is fp8x4[128, H/512, I]
+                # TODO: remove this case once TKG support MLPGateUpWeightLayout style weights
+                self.intermediate_size = gate_proj_weights_tensor.shape[-1]
+            else:
+                # gate_proj_weights_tensor is fp8[128, H/512, I/512, 4, 128, 4]
+                kernel_assert(
+                    len(up_proj_weights_tensor.shape) == 6,
+                    f"{gate_up_w_layout} expects up weight to have six dimensions. "
+                    f"Got {len(up_proj_weights_tensor.shape)}",
+                )
+                self.intermediate_size = (
+                    up_proj_weights_tensor.shape[2]  # I/512
+                    * up_proj_weights_tensor.shape[3]  # 4
+                    * up_proj_weights_tensor.shape[4]  # 128
+                )
 
 
 def is_mlp_tkg(params: MLPParameters) -> bool:
@@ -691,7 +710,11 @@ def mlpp_has_normalization_bias(params: MLPParameters) -> bool:
 
 
 def mlpp_has_dma_xpose(params: MLPParameters) -> bool:
-    return params.quant_params.is_quant_static_mx() and mlpp_has_quantized_input(params)
+    return (
+        params.quant_params.is_dtype_mx()
+        and mlpp_has_quantized_input(params)
+        and params.gate_up_w_layout == MLPGateUpWeightLayout.H_X4_INNERMOST
+    )
 
 
 def override_seq_len(mlp_params: MLPParameters, seq_len: int) -> MLPParameters:
@@ -712,6 +735,43 @@ def override_inter_size(mlp_params: MLPParameters, inter_sz: int) -> MLPParamete
     return mlp_params
 
 
+def _validate_mlp_gate_up_weight_layout(params: MLPParameters):
+    H = params.hidden_size
+    I = params.intermediate_size
+    shape = list(params.up_proj_weights_tensor.shape)
+
+    if params.gate_up_w_layout == MLPGateUpWeightLayout.CONTIGUOUS:
+        kernel_assert(
+            shape == [H, I], f"MLPGateUpWeightLayout.CONTIGUOUS expects up proj weight to have shape [H, I].Got {shape}"
+        )
+    elif params.gate_up_w_layout in [MLPGateUpWeightLayout.H_X4_INNERMOST, MLPGateUpWeightLayout.H_X4_MIDDLE]:
+        expected_shape = [min(H // 4, 128), H // 512, I // 512, 4, min(I // 4, 128), 4]
+        kernel_assert(
+            shape == expected_shape,
+            "MLPGateUpWeightLayout.H_X4_MIDDLE expects up proj weight to have shape "
+            f"{expected_shape} when H = {H} and I = {I}. Got {shape}.",
+        )
+
+
+def _validate_mlp_down_weight_layout(params: MLPParameters):
+    H = params.hidden_size
+    I = params.intermediate_size
+    shape = list(params.down_proj_weights_tensor.shape)
+
+    if not params.quant_params.is_dtype_mx():
+        kernel_assert(
+            shape[-2:] == [I, H],
+            f"{params.quant_params.quantization_type} expects down proj weight to have shape [I, H]",
+        )
+    else:  # quantization_type in [MX, ROW_MX, STATIC_MX]
+        expected_shape = [min(I // 4, 128), I // 512, H, 4]
+        kernel_assert(
+            shape == expected_shape,
+            f"{params.quant_params.quantization_type} expects down proj weight to have shape "
+            f"{expected_shape} when H = {H} and I = {I}. Got {shape}.",
+        )
+
+
 def _validate_mlp_required_arguments(params: MLPParameters):
     kernel_assert(params.hidden_tensor != None, "Hidden tensor is a required argument")
     kernel_assert(
@@ -730,7 +790,6 @@ def _validate_mlp_required_arguments(params: MLPParameters):
 
 def _validate_mlp_arguments_shapes(params: MLPParameters):
     # Get tensor dimensions
-    hidden_rank = len(params.hidden_tensor.shape)
     BxS = params.batch_size * params.sequence_len
     H = params.hidden_size
     I = params.intermediate_size
@@ -738,10 +797,11 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
     n_I512_tile = math.ceil(I / (128 * _q_width))
     i_p = I // 4 if I <= 512 else 128
 
-    # Determine if we are in token-generation (TKG) mode
-    is_tkg = is_mlp_tkg(params)
-
     if params.quant_params.is_dtype_mx():
+        kernel_assert(
+            params.gate_up_w_layout in [MLPGateUpWeightLayout.H_X4_INNERMOST, MLPGateUpWeightLayout.H_X4_MIDDLE],
+            "MX quantization (mxfp) requires gate_up_w_layout to be one of H_X4_INNERMOST or H_X4_MIDDLE",
+        )
         kernel_assert(
             H % 512 == 0,
             f"MX quantization (mxfp) requires H to be divisible by 512, got H={H}. "
@@ -759,15 +819,13 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
     kernel_assert(H > 0, f'Unsupported hidden dimension {H}; expected H to be positive.')
     kernel_assert(I > 0, f'Unsupported intermediate dimension {I}; expected I to be positive.')
 
-    # For bias shape validation, STATIC_MX uses MX-style 3D bias only when weights are 3D (TKG path)
-    _is_mx_layout = (
-        params.quant_params.is_quant_mx()
-        or (params.quant_params.is_quant_static_mx() and len(params.gate_proj_weights_tensor.shape) == 3)
-        or params.quant_params.is_quant_row_mx()
-    )
+    # TODO: Remove this condition once TKG uses non-x4 fp8 weights
+    if not is_mlp_tkg(params):
+        _validate_mlp_gate_up_weight_layout(params)
+        _validate_mlp_down_weight_layout(params)
 
     if mlpp_has_gate_projection_bias(params):
-        expected = (i_p, n_I512_tile, _q_width) if _is_mx_layout else (1, I)
+        expected = (i_p, n_I512_tile, _q_width) if params.quant_params.is_dtype_mx() else (1, I)
         actual = params.bias_params.gate_proj_bias_tensor.shape
         kernel_assert(
             actual == expected,
@@ -775,7 +833,7 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
         )
 
     if mlpp_has_up_projection_bias(params):
-        expected = (i_p, n_I512_tile, _q_width) if _is_mx_layout else (1, I)
+        expected = (i_p, n_I512_tile, _q_width) if params.quant_params.is_dtype_mx() else (1, I)
         actual = params.bias_params.up_proj_bias_tensor.shape
         kernel_assert(
             actual == expected,
@@ -788,6 +846,14 @@ def _validate_mlp_arguments_shapes(params: MLPParameters):
         kernel_assert(
             actual == expected,
             f"Down projection bias shape mismatch: expected {expected}, got {actual}.",
+        )
+
+    if not params.skip_gate_proj:
+        kernel_assert(
+            params.gate_proj_weights_tensor.shape == params.up_proj_weights_tensor.shape,
+            f"Gate and up projection weight shapes do not match. "
+            f"Got gate shape {params.gate_proj_weights_tensor.shape} "
+            f"and up shape {params.up_proj_weights_tensor.shape}",
         )
 
     params.quant_params._validate_shapes(params)

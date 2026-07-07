@@ -19,14 +19,14 @@ if _os.environ.get("SKIP_MODEL_TESTS"):
 """
 MLP CTE model configuration data
 
-Config format: [vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum, rtol, norm_type, quant_type,
+Config format: [vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum, rtol, norm_type, quant_type, gate_up_w_layout,
                 fused_add, store_add, skip_gate, act_fn_type, gate_bias, up_bias, down_bias, norm_bias]
 """
 
 import math
 
 from test.utils.common_dataclasses import ModelTestType
-from nkilib_src.nkilib.core.utils.common_types import ActFnType, NormType, QuantizationType
+from nkilib_src.nkilib.core.utils.common_types import ActFnType, MLPGateUpWeightLayout, NormType, QuantizationType
 
 # Only dense (non-MoE) models
 MODELS = {
@@ -72,6 +72,7 @@ def get_mlp_config(model_name, tp, cp, seqlen, quant_type):
     if m is None:
         return None
     qt = quant_type if hasattr(quant_type, 'name') else QuantizationType[quant_type]
+    gu_l = MLPGateUpWeightLayout.H_X4_INNERMOST if QuantizationType.is_mx(qt) else MLPGateUpWeightLayout.CONTIGUOUS
     intermediate_tp = _align_intermediate(m["intermediate"] // tp, qt)
     hidden_padded = math.ceil(m["hidden"] / 512) * 512
     qt_name = qt.name if hasattr(qt, 'name') else qt
@@ -80,6 +81,7 @@ def get_mlp_config(model_name, tp, cp, seqlen, quant_type):
         "vnc_degree": 2, "batch": 1, "seqlen": seqlen // cp,
         "hidden": hidden_padded, "intermediate": intermediate_tp,
         "norm_type": "NO_NORM", "quant_type": qt_name,
+        "gate_up_w_layout": gu_l,
         "fused_add": False, "store_add": False, "skip_gate": False,
         "act_fn_type": af_name,
         "gate_bias": m["bias"], "up_bias": m["bias"],
@@ -99,7 +101,7 @@ def generate_mlp_configs(configs=None):
                     d = get_mlp_config(model_name, tp, cp, orig_seqlen, quant_type)
                     result.append((
                         d["vnc_degree"], d["batch"], d["seqlen"], d["hidden"], d["intermediate"],
-                        None, 3.6e-2, NormType.NO_NORM, quant_type,
+                        None, 3.6e-2, NormType.NO_NORM, quant_type, d["gate_up_w_layout"],
                         d["fused_add"], d["store_add"], d["skip_gate"], m["act_fn"],
                         d["gate_bias"], d["up_bias"], d["down_bias"], d["norm_bias"],
                     ))

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import math
+import multiprocessing
 import os
 import pathlib
 import pickle
@@ -48,8 +50,77 @@ from .metrics_collector import IMetricsCollector, MetricName
 from .negative_test_helpers import is_in_negative_test_context
 from .output_validator import OutputValidator
 from .param_extractor import normalize_params_with_type_hints
-from .perf_analysis_private import analyze_trace
-from .profiler_utils import NEURON_RT_ENABLE_DGE_NOTIFICATIONS, ProfilerCommands, extract_and_filter_output_files
+from .profiler_utils import (
+    NEURON_RT_ENABLE_DGE_NOTIFICATIONS,
+    ProfilerCommands,
+    extract_and_filter_output_files,
+)
+
+
+def _resolve_neuronx_cc_jobs(config) -> int | None:
+    """Return --jobs N to pass to neuronx-cc, or None to leave it unset.
+
+    'auto' divides available CPUs by the number of xdist workers so concurrent
+    compilations share cores without thrashing.  '0' disables the flag entirely.
+    """
+    raw = feature_flag_helper.get_feature_flag(config, "neuronx_cc_jobs", "auto")
+    if raw == "0":
+        return None
+    if raw != "auto":
+        return int(raw)
+    cpu_count = multiprocessing.cpu_count()
+    workerinput = getattr(config, "workerinput", None)
+    if workerinput:
+        num_workers = workerinput.get("workercount", 1)
+    else:
+        num_workers = getattr(config.option, "numprocesses", None) or 1
+        if num_workers == "auto":
+            num_workers = cpu_count
+    jobs = max(1, math.ceil(cpu_count / int(num_workers)))
+    logging.debug("neuronx-cc jobs: cpu_count=%d num_workers=%s -> --jobs=%d", cpu_count, num_workers, jobs)
+    return jobs
+
+
+_BIRSIM_BOOL_FLAG_RE = re.compile(
+    r"--enable-birsim(?:-after-all|-at-begin|-at-end|-with-kernel-inline|-sync-only)?"
+    r"(?:\s*=\s*(\S+))?(?=\s|$)",
+    re.IGNORECASE,
+)
+_BIRSIM_CHECKER_FLAG_RE = re.compile(r"--enable-checker-after(?=[=\s]|$)", re.IGNORECASE)
+_BIRSIM_BOOL_TRUE_VALUES = {"true", "1"}
+_BIRSIM_BOOL_FALSE_VALUES = {"false", "0"}
+
+
+def _has_user_birsim_flag(additional_cmd_args: list[str]) -> bool:
+    """Return True if the user-supplied compiler args contain an affirmative birsim opt-in.
+
+    Recognized forms:
+      - --enable-birsim is the master switch; --enable-birsim-{after-all,at-begin,
+        at-end,sync-only,with-kernel-inline} are timing variants. All are
+        cl::opt<bool>, so LLVM accepts the bare flag (=true) or =true/=1/=false/=0
+        (case-insensitive).
+      - --enable-checker-after=<passes> is a cl::list<std::string>; with the master
+        flag also enabled, the named passes run birsim/birverifier. Treat any presence
+        of the flag as opt-in: the compiler asserts if a checker variant is set
+        without the master, so a user who passes only --enable-checker-after almost
+        certainly intends birsim to run too.
+    """
+    for arg in additional_cmd_args:
+        for match in _BIRSIM_BOOL_FLAG_RE.finditer(arg):
+            value = match.group(1)
+            if value is None:
+                # bare flag, equivalent to =true under cl::opt<bool>
+                return True
+            value_lower = value.lower()
+            if value_lower in _BIRSIM_BOOL_TRUE_VALUES:
+                return True
+            if value_lower not in _BIRSIM_BOOL_FALSE_VALUES:
+                # cl::opt<bool> rejects unrecognized values at parse time, but be
+                # conservative here so the dump is created if the compiler accepts.
+                return True
+        if _BIRSIM_CHECKER_FLAG_RE.search(arg):
+            return True
+    return False
 
 
 @dataclass
@@ -82,17 +153,21 @@ def run_separated_perf_analysis(test_dir: str, target_instance_family: str, prof
     artifacts_dir = test_dir / "artifacts"
     trace_configs = [
         # vnc_2 (LNC2): one trace per NeuronCore (files directly in artifacts/)
-        ("perf_sim_at_end_trace.nc00_sg00.sg0000.bb.json", "sg00", "analysis_nc00.log"),
-        ("perf_sim_at_end_trace.nc01_sg00.sg0000.bb.json", "sg01", "analysis_nc01.log"),
+        # BB name varies by compiler version (e.g. "bb", "Block1"), so use glob.
+        ("perf_sim_at_end_trace.nc00_sg00.sg0000.*.json", "sg00", "analysis_nc00.log"),
+        ("perf_sim_at_end_trace.nc01_sg00.sg0000.*.json", "sg01", "analysis_nc01.log"),
         # vnc_1 (LNC1): single module-level trace (file in artifacts/sg00/)
-        ("sg00/perf_sim_at_end_trace.module.sg0000.bb.json", "sg00", "analysis_nc00.log"),
+        ("sg00/perf_sim_at_end_trace.module.sg0000.*.json", "sg00", "analysis_nc00.log"),
     ]
-    for trace_filename, subgraph, output_filename in trace_configs:
-        input_file = artifacts_dir / trace_filename
-        if not input_file.exists():
-            logging.error(f"Perf analysis trace file not found: {input_file}")
+    for trace_pattern, subgraph, output_filename in trace_configs:
+        matches = sorted(artifacts_dir.glob(trace_pattern))
+        if not matches:
+            logging.debug(f"Perf analysis trace file not found: {artifacts_dir / trace_pattern}")
             continue
+        input_file = matches[0]
         try:
+            from .perf_analysis_private import analyze_trace
+
             analyze_trace(
                 input_file=input_file,
                 profiled_file=test_dir / INF_ARTIFACT_DIR_NAME / profiled_file,
@@ -114,8 +189,16 @@ class Orchestrator:
         collector: IMetricsCollector,
         nki_compilation_mode: NKICompilationMode,
         perf_analysis_enabled: bool = False,
+        hw_profile_enabled: bool = True,
         kernel_name: str = None,
     ):
+        # Perf analysis reads NTFF artifacts, so it requires HW profiling enabled.
+        if perf_analysis_enabled and not hw_profile_enabled:
+            raise ValueError(
+                "--enable-perf-analysis requires --enable-hw-profile=True; perf analysis "
+                "reads NTFF artifacts produced by neuron-profile capture."
+            )
+
         self.fs_config: FilesystemArgs = FilesystemArgs(
             base_output_directory_path=feature_flag_helper.resolve_base_output_directory(config),
             host_manager=host_manager,
@@ -126,6 +209,7 @@ class Orchestrator:
         self.collector = collector
         self.kernel_under_test: Optional[KernelArgs] = None
         self.perf_analysis_enabled: bool = perf_analysis_enabled
+        self.hw_profile_enabled: bool = hw_profile_enabled
         self.kernel_name: str = kernel_name
 
         self.profiler_binary_path: str = self.__get_neuron_binary_path_for__(config, "neuron-profile")
@@ -140,11 +224,20 @@ class Orchestrator:
         self.debugger_interactive: bool = feature_flag_helper.get_feature_flag(config, "debugger_interactive", False)
         self.debugger_core_id: int = feature_flag_helper.get_feature_flag(config, "debugger_core_id", 0)
         self.debugger_replay: bool = feature_flag_helper.get_feature_flag(config, "debugger_replay", False)
+        self.neuronx_cc_jobs: int | None = _resolve_neuronx_cc_jobs(config)
+        self.neuronx_cc_cache_path: str | None = feature_flag_helper.get_feature_flag(
+            config, "s3_neuronx_cc_cache_path"
+        )
         self.upload_profile_to_explorer: Optional[UploadProfileMode] = (
             UploadProfileMode.from_str(val)
             if (val := feature_flag_helper.get_feature_flag(config, "upload_profile_to_explorer", None))
             else None
         )
+        if self.upload_profile_to_explorer and not hw_profile_enabled:
+            raise ValueError(
+                "--upload-profile-to-explorer requires --enable-hw-profile=True; "
+                "explorer upload bundles the NTFF trace from neuron-profile capture."
+            )
 
     def execute(self, kernel_under_test: KernelArgs):
         kernel_under_test.compiler_input.enable_debugging = self.enable_kernel_debugging
@@ -164,6 +257,13 @@ class Orchestrator:
             perf_sim_flag = "--internal-backend-options=--enable-perf-sim"
             if perf_sim_flag not in kernel_under_test.compiler_input.additional_cmd_args:
                 kernel_under_test.compiler_input.additional_cmd_args.append(perf_sim_flag)
+
+        # Cap neuronx-cc thread count so xdist workers share CPUs without thrashing
+        if self.neuronx_cc_jobs is not None:
+            jobs_flag = f"--jobs={self.neuronx_cc_jobs}"
+            if not any(a.startswith("--jobs") for a in kernel_under_test.compiler_input.additional_cmd_args):
+                kernel_under_test.compiler_input.additional_cmd_args.append(jobs_flag)
+                logging.info("neuronx-cc jobs capped to %d", self.neuronx_cc_jobs)
 
         self.__prepare_output_directory()
         assert self.fs_config.artifacts_output_directory_path
@@ -347,7 +447,10 @@ class Orchestrator:
             self.collector.add_dimension({MetricName.EXPLORER_PROFILE_URL: profile_url})
 
     def _run_compilation(
-        self, collector: IMetricsCollector, kernel_under_test: KernelArgs, output_names: list[str] | None
+        self,
+        collector: IMetricsCollector,
+        kernel_under_test: KernelArgs,
+        output_names: list[str] | None,
     ) -> None:
         """Run kernel compilation phase."""
         # Skip compilation for simulator mode
@@ -361,8 +464,10 @@ class Orchestrator:
         logging.info(f"Running compilation for {self.fs_config.artifacts_output_directory_path=}")
         try:
             with collector.timer(MetricName.COMPILATION_TIME):
-                if kernel_under_test.compiler_input.enable_birsim:
-                    # Dump inputs and golden outputs early for debugging in birsim format
+                # Dump birsim inputs/goldens when the user opts in via the framework flag or
+                # via raw compiler args. See _has_user_birsim_flag for the set of accepted forms.
+                additional_cmd_args = kernel_under_test.compiler_input.additional_cmd_args or []
+                if kernel_under_test.compiler_input.enable_birsim or _has_user_birsim_flag(additional_cmd_args):
                     self._dump_birsim_artifacts(kernel_under_test)
 
                 self._compiled_kernel = trace_kernel(
@@ -371,6 +476,8 @@ class Orchestrator:
                     output_directory=self.fs_config.artifacts_output_directory_path,
                     output_names=output_names,
                     frontendMode=self.nki_compilation_mode,
+                    neuronx_cc_cache_path=self.neuronx_cc_cache_path,
+                    collector=collector,
                 )
 
             # Record MLIR→BIR and BIR→NEFF sub-phase timings from the compiled kernel
@@ -393,7 +500,7 @@ class Orchestrator:
             logging.error(error_msg)
             raise CompilationException(error_msg) from e
 
-    def _run_inference(self, kernel_under_test: KernelArgs, input_file_paths: dict[str, str]) -> Optional[str]:
+    def _run_inference(self, kernel_under_test: KernelArgs, input_file_paths: dict[str, str]) -> str | None:
         """Run compiled kernel on hardware using neuron-profile."""
         assert self.fs_config.artifacts_output_directory_path
 
@@ -418,6 +525,24 @@ class Orchestrator:
                                     kernel_under_test.compiler_input.platform_target,
                                 )
 
+                            # Soft-join the core-allocation FIFO queue before
+                            # uploading artifacts so upload latency does not cost
+                            # this attempt its FIFO position. The
+                            # later get_core_allocation reuses the same cached
+                            # manager/entry_id to commit; if the slot is
+                            # pruned/bumped during a long upload, the first
+                            # ready=True poll transparently re-enqueues (poll
+                            # verb), so no resume code is needed. The poll itself
+                            # is best-effort (genuine failures are swallowed), but
+                            # if the joined slot's queue ETA already exceeds
+                            # patience it raises to rotate to another host before
+                            # this attempt pays the upload cost.
+                            execution_host.soft_join_queue(
+                                collector=self.collector,
+                                collective_ranks=kernel_under_test.inference_args.collective_ranks,
+                                lnc_config=kernel_under_test.compiler_input.logical_nc_config,
+                            )
+
                             with execution_host.prepare_host(
                                 target_directory=self.fs_config.artifacts_output_directory_path,
                                 skip_remote_cleanup=self.fs_config.skip_remote_cleanup,
@@ -425,7 +550,10 @@ class Orchestrator:
                                 force_local_cleanup=self.fs_config.force_local_cleanup,
                             ):
                                 return self.__run_profiler_on_host__(
-                                    execution_host, kernel_under_test, input_file_paths, self.collector
+                                    execution_host,
+                                    kernel_under_test,
+                                    input_file_paths,
+                                    self.collector,
                                 )
         except Exception as e:
             if isinstance(e, InferenceException):
@@ -434,11 +562,11 @@ class Orchestrator:
 
     def __run_profiler_on_host__(
         self,
-        execution_host,
+        execution_host: Host,
         kernel_under_test: KernelArgs,
         input_file_paths: dict[str, str],
         collector,
-    ) -> str:
+    ) -> str | None:
         """Run neuron-profile on the prepared host."""
         kernel_input_args = self.__format_profiler_kernel_input_args__(kernel_under_test, input_file_paths)
 
@@ -485,6 +613,7 @@ class Orchestrator:
             profile_all_ranks=kernel_under_test.inference_args.profile_all_ranks,
             env_vars=env_vars,
             perf_analysis_enabled=self.perf_analysis_enabled,
+            hw_profile_enabled=self.hw_profile_enabled,
             save_all_outputs=save_all_outputs,
             force_clean_input_writes=force_clean_input_writes,
             separation_pass_enabled=separation_pass_enabled,
@@ -508,6 +637,8 @@ class Orchestrator:
         hardware_cmd = profiler_cmds.get_hardware_command()
         post_lock_cmd = profiler_cmds.get_post_lock_command()
 
+        assert self.fs_config.artifacts_output_directory_path
+
         return execution_host.execute_command(
             command=f"( {hardware_cmd} ) 2>&1 | tee log-infer.txt",
             target_directory=self.fs_config.artifacts_output_directory_path,
@@ -516,7 +647,7 @@ class Orchestrator:
             do_copy_artifacts=True,
             get_list_of_files_to_copy=get_list_of_files_to_copy,
             collector=collector,
-            post_lock_command=f"( {post_lock_cmd} ) 2>&1 | tee -a log-infer.txt" if post_lock_cmd else None,
+            post_lock_command=(f"( {post_lock_cmd} ) 2>&1 | tee -a log-infer.txt" if post_lock_cmd else None),
         )
 
     def _dump_output_tensors(self, output_tensors: dict[str, np.ndarray]) -> str:
@@ -588,7 +719,7 @@ class Orchestrator:
         the NEFF uses generic names like output_0 but the validator expects
         the Python-level names (e.g. 'y'). This renames the files to match.
         """
-        if not getattr(self, '_compiled_kernel', None) or not output_names:
+        if not getattr(self, "_compiled_kernel", None) or not output_names:
             # The simulation mode does not compile kernel, thus the field _compiled_kernel won't be set.
             return
 
@@ -630,7 +761,7 @@ class Orchestrator:
                 for file_name in output_path.iterdir():
                     if file_name.is_file():
                         abs_out_file_paths.append(file_name.absolute().as_posix())
-                    elif file_name.is_dir() and file_name.name.startswith('output_worker_'):
+                    elif file_name.is_dir() and file_name.name.startswith("output_worker_"):
                         # Include files from per-rank output directories
                         for rank_file in file_name.iterdir():
                             if rank_file.is_file():
@@ -639,7 +770,7 @@ class Orchestrator:
                 validation_log_filepath = os.path.join(
                     self.fs_config.artifacts_output_directory_path,
                     INF_ARTIFACT_DIR_NAME,
-                    'log-validate.txt',
+                    "log-validate.txt",
                 )
 
                 # Run determinism check if enabled and not simulating
@@ -650,7 +781,10 @@ class Orchestrator:
                         # Build list of paths to check (per-rank for collectives, single path otherwise)
                         if kernel_under_test.inference_args.collective_ranks > 1:
                             check_paths = [
-                                (rank, os.path.join(local_artifact_download_path, f"output_worker_{rank}"))
+                                (
+                                    rank,
+                                    os.path.join(local_artifact_download_path, f"output_worker_{rank}"),
+                                )
                                 for rank in range(kernel_under_test.inference_args.collective_ranks)
                             ]
                         else:
@@ -670,7 +804,10 @@ class Orchestrator:
                 OutputValidator(
                     kernel_under_test,
                     abs_out_file_paths,
-                ).validate(logfile_path=validation_log_filepath, enable_histograms=self.enable_validation_histograms)
+                ).validate(
+                    logfile_path=validation_log_filepath,
+                    enable_histograms=self.enable_validation_histograms,
+                )
 
             except Exception as e:
                 raise ValidationException(str(e)) from e
@@ -703,7 +840,13 @@ class Orchestrator:
         # TODO: Make host architecture validation more robust by adding the ability to query the host type from the host
         attached_neuron_devices: list[NeuronDeviceInfo] = host.get_neuron_device_info()
 
-        if platform_target in (Platforms.TRN2, Platforms.TRN3, Platforms.TRN3_A0):
+        if platform_target in (
+            Platforms.TRN2,
+            Platforms.TRN3,
+            Platforms.TRN3_A0,
+            Platforms.TRN3_PDS,
+            Platforms.TRN3_PDS_A0,
+        ):
             assert sum(neuron_info.nc_count for neuron_info in attached_neuron_devices) in [
                 4,
                 8,
@@ -755,7 +898,7 @@ class Orchestrator:
                     # Save as raw binary for neuron-profile
                     file_name = name_fn(name) + ".bin"
                     file_path = os.path.join(target_directory, file_name)
-                    with open(file_path, 'wb') as f:
+                    with open(file_path, "wb") as f:
                         f.write(value.tobytes())
 
                 dumped_files[name] = file_path
@@ -771,9 +914,10 @@ class Orchestrator:
         """Dump kernel inputs and golden outputs in birsim format for debugging."""
         assert self.fs_config.artifacts_output_directory_path
         logical_nc_config = kernel_under_test.compiler_input.logical_nc_config
+        artifacts_root = os.path.join(self.fs_config.artifacts_output_directory_path, "artifacts")
         for nc_idx in range(logical_nc_config):
             nc_dir = f"nc{nc_idx:02d}"
-            birsim_dir = os.path.join(self.fs_config.artifacts_output_directory_path, nc_dir, "sg00")
+            birsim_dir = os.path.join(artifacts_root, nc_dir, "sg00")
             # Birsim requires naming convention: value_{name}.npy
             if kernel_under_test.kernel_input:
                 _ = self.__dump_tensors__(
@@ -785,14 +929,17 @@ class Orchestrator:
                     and kernel_under_test.validation_args.golden_output.golden is not None
                 ):
                     output_golden = kernel_under_test.validation_args.golden_output.golden
+                    # Drop CustomValidatorWithOutputTensorData entries: birsim has no golden to
+                    # compare against, but input dumps still feed sanitizer/race/barrier checks.
+                    output_golden = {k: v for k, v in output_golden.items() if isinstance(v, np.ndarray)}
+                    if output_golden:
+                        # birsim is looking for files with specific naming pattern. moreover, they
+                        # have to be numpy files, not binary files
+                        _ = self.__dump_tensors__(birsim_dir, output_golden, lambda name: f"value_{name}", True)
                 else:
                     assert False, (
                         "Birsim does not support custom validator as golden output! Please disable bir sim or switch to a different golden generator"
                     )
-
-                # birsim is looking for files with specific naming pattern. moreover, they have to
-                # be numpy files, not binary files.
-                _ = self.__dump_tensors__(birsim_dir, output_golden, lambda name: f"value_{name}", True)
 
     def __dump_kernel_inputs__(self, target_directory: str, kernel_under_test: KernelArgs) -> dict[str, str]:
         """
@@ -852,7 +999,7 @@ class Orchestrator:
         # Write multi-input file
         multi_input_filename = f"{num_ranks}rank_inputs.txt"
         multi_input_file = os.path.join(target_directory, multi_input_filename)
-        with open(multi_input_file, 'w') as f:
+        with open(multi_input_file, "w") as f:
             f.write("\n".join(multi_input_lines) + "\n")
 
         logging.info(f"Created multi-input file: {multi_input_file}")

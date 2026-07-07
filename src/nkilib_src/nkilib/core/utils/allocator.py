@@ -194,6 +194,7 @@ class BufferManager(nl.NKIObject):
         self.scopes: list[Scope] = []
         self.heap = []
         self.heap_names = []
+        self.heap_addrs = []  # saved heap_curr_addr before each alloc, for exact pop restore
         self.tree_logger = TreeLogger("SBM", self.logger)
 
         # Stats tracking
@@ -465,11 +466,15 @@ class BufferManager(nl.NKIObject):
             self._print_stats()
             kernel_assert(False, "Heap out of memory")
 
-        if align != None:
-            self.heap_curr_addr = align_to(self.heap_curr_addr - (align - 1), align)
-        base_addr = self.heap_curr_addr - bytes_per_partition
+        # Save pre-alloc address for exact restore in pop_heap
+        pre_alloc_addr = self.heap_curr_addr
+
+        if align == None:
+            align = 4
+
         self.heap_curr_addr -= bytes_per_partition
-        self.heap_curr_addr = align_to(self.heap_curr_addr - 3, 4)  # heap grows down, so should the align
+        self.heap_curr_addr = align_to(self.heap_curr_addr - (align - 1), align)  # heap grows down, so should the align
+        base_addr = self.heap_curr_addr
 
         tensor_name = self._get_prefixed_name(name)
         if self.use_auto_alloc:
@@ -484,6 +489,7 @@ class BufferManager(nl.NKIObject):
             )
         self.heap.append(mloc)
         self.heap_names.append(tensor_name or "(unnamed)")
+        self.heap_addrs.append(pre_alloc_addr)
         self.total_heap_allocs = self.total_heap_allocs + 1
         self._update_stats()
         self.tree_logger.log(
@@ -506,12 +512,12 @@ class BufferManager(nl.NKIObject):
         heap_top = self.heap[-1]
         heap_name = self.heap_names[-1]
         N = num_elts(heap_top.shape[1:])
-        # Note to FE: the nl.ndarray or the sbuf.ptr should have a way of querying the shape
         bytes_per_partition = N * sizeinbytes(heap_top.dtype)
-        self.heap_curr_addr = self.heap_curr_addr + bytes_per_partition
-        self.heap_curr_addr = align_to(self.heap_curr_addr - 3, 4)
+        # Restore heap_curr_addr to the exact value before this alloc
+        self.heap_curr_addr = self.heap_addrs[-1]
         self.heap.pop()
         self.heap_names.pop()
+        self.heap_addrs.pop()
         self.tree_logger.log(
             f"[HEAP-] FREE {heap_name}: {bytes_per_partition} B, remaining={len(self.heap)}", len(self.scopes)
         )

@@ -64,13 +64,27 @@ FEATURES:
    - Each query position has a [bound_min, bound_max) range defining which KV positions it attends to
    - Positions outside the range are masked with -inf, preventing cross-sequence attention
    - Compatible with causal masking (both masks are applied simultaneously)
-   - Not compatible with prefix caching or context parallelism
+   - Not compatible with prefix caching
 
 7. Grouped Query Attention (GQA, batch_size_kv < batch_size):
    - Kernel handles GQA natively without explicit K/V replication
 
 7. Support for training:
    - Kernel can optionally return maximum attention score and softmax denominator (per row) for backpropagation.
+
+8. Position Bias (position_bias provided):
+   - Adds a position-bias tensor to QK scores before scaling and masking
+   - Supports relative position bias schemes such as T5 and ALiBi
+   - Bias is pre-loaded into PSUM before the matmul (accumulate mode), giving zero overhead
+   - Masking paths operate on the already-biased scores: final = mask(scale * (QK + bias))
+   - Two storage layouts are supported via the bias_layout kwarg:
+       * "dense" (default): rectangular (batch, seqlen_q, seqlen_kv) in the kernel's
+         padded KV layout (prior_padded | active). Simplest, highest HBM footprint.
+       * "banded": compact (batch, seqlen_q, total_band_cols) for locally-banded biases
+         (e.g. sliding-window attention). The third axis stacks a rectangular prior
+         region, a sheared active band, and zero-fill padding so the shear stays
+         in-bounds at segment boundaries. See bias_band_params for the contract.
+   - Compatible with causal masking, sliding window, and prefix caching
 
 IMPLEMENTATION DETAILS AND LOOP STRUCTURE:
 
@@ -125,8 +139,15 @@ from nki.isa import engine, reduce_cmd
 from nki.language.opcode import maximum as _maximum
 
 from ..utils.allocator import align_to
+from ..utils.interleave_copy import interleave_copy
 from ..utils.kernel_assert import assert_shape, kernel_assert
-from ..utils.kernel_helpers import PSUM_BANK_SIZE, div_ceil, get_verified_program_sharding_info, is_sbuf_tensor
+from ..utils.kernel_helpers import (
+    PSUM_BANK_SIZE,
+    _psum_num_banks,
+    div_ceil,
+    get_verified_program_sharding_info,
+    is_sbuf_tensor,
+)
 from ..utils.logging import get_logger
 from ..utils.modular_allocator import ModularAllocator
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
@@ -142,7 +163,7 @@ Kernel constraints (based on tested range, values outside range might work in pr
 _MAX_BS = 512  # max tested batch size
 _MAX_SEQLEN = 131072  # max allowed seqlen
 _MAX_BS_TIMES_SEQLEN_QK = 32.0 * 36864 * 36864  # max tested bs*seqlen_q*seqlen_k
-_MAX_HEAD_DIM = 128  # max supported head dim (d)
+_MAX_HEAD_DIM = 512  # max supported head dim (d)
 _MIN_GLOBAL_CP_DEGREE = 1  # minimum context parallel degree
 _MAX_GLOBAL_CP_DEGREE = 32  # minimum context parallel degree
 
@@ -156,6 +177,8 @@ _SEQLEN_SHARDING_SPLIT_FACTOR_CAUSAL = (
     0.65  # When sharding LNC2 on seqlen, split 65%-35% in causal case to balance compute
 )
 _Q_GRP_SZ = 128
+_D_TILE_SZ = 128  # Head dim tile size for K partition dim and Q loading
+_V_D_TILE_SZ = 512  # Head dim tile size for V free dim (MM2)
 _V_TILE_SZ = 128  # V tile size for loading and MM2 operations
 _K_TILE_SZ = 512  # K tile size for loading and MM1+masking operations
 _EXP_TILE_SZ = 512  # Tile size for exp instructions (must equal _K_TILE_SZ)
@@ -192,6 +215,9 @@ def attention_cte(
     bound_max: Optional[nl.ndarray] = None,
     cp_striped_input: bool = False,
     skip_output_normalization: bool = False,
+    position_bias: Optional[nl.ndarray] = None,
+    bias_layout: str = "dense",
+    bias_band_params: Optional[dict] = None,
 ):
     """Entrypoint NKI kernel that supports multiple attention variants.
 
@@ -229,7 +255,7 @@ def attention_cte(
       bound_min (nt.tensor, optional): (Sequence packing) Per-query lower bound (inclusive) of the KV range
                      to attend to, with shape (batch, seqlen_q, 1). Query position i attends only to KV
                      positions j where bound_min[..., i, :] <= j < bound_max[..., i, :]. Must be provided
-                     together with bound_max. Not compatible with prefix caching or context parallelism.
+                     together with bound_max. Not compatible with prefix caching.
       bound_max (nt.tensor, optional): (Sequence packing) Per-query upper bound (exclusive) of the KV range
                      to attend to, with shape (batch, seqlen_q, 1). Must be provided together with bound_min.
       cp_striped_input (bool, optional): Whether the input sequence was distributed across CP ranks
@@ -247,6 +273,51 @@ def attention_cte(
                        - Third return value is raw sum S (not 1/S)
                        - Caller is responsible for final normalization: final_out = out / S
                      Default False.
+      position_bias (nt.tensor, optional): Position bias tensor added to QK scores
+                     before scaling and masking. Implements relative position bias as used
+                     in T5 and ALiBi. The bias is pre-loaded into PSUM and the matmul
+                     accumulates on top, giving:
+                         final_scores = mask(scale * (Q @ K^T + position_bias)).
+                     Shape depends on ``bias_layout``:
+                       - ``"dense"`` (default): ``(batch_size, seqlen_q, seqlen_kv)``, where
+                         the third dim covers the kernel's padded KV range. When prefix
+                         caching is active that range is
+                         ``align_to(seqlen_prior, 512) + seqlen_k_active``.
+                       - ``"banded"``: ``(batch_size, seqlen_q, total_band_cols)``. The third
+                         axis packs a rectangular prior region and a sheared active band
+                         separated by zero padding so the shear stays in-bounds for
+                         boundary Q tiles. The exact column layout is given by
+                         ``bias_band_params`` (see below).
+                     Constraints (both layouts):
+                       - seqlen_q must be a multiple of 128
+                     Note: the bias is scaled along with QK. For ALiBi-style unscaled bias,
+                     pre-divide by scale: ``position_bias = alibi / scale``.
+                     Default None (no position bias).
+      bias_layout (str, optional): ``"dense"`` or ``"banded"``. Default ``"dense"``.
+      bias_band_params (dict, optional): Required when ``bias_layout="banded"``. Describes
+                     the column layout along the last axis of ``position_bias``. Keys:
+                       - ``prior_band_width`` (int, >= 0): width of the rectangular prior
+                         region. Columns ``[0, prior_band_width)`` hold prior bias values
+                         (identical across Q rows, i.e. not sheared).
+                       - ``active_offset`` (int, >= 0): column at which the sheared active
+                         band begins. Must satisfy
+                         ``active_offset >= prior_band_width + (_Q_GRP_SZ - 1)``. The
+                         ``_Q_GRP_SZ - 1 = 127`` columns between the prior region and the
+                         active band MUST be zero-filled by the caller; they absorb the
+                         shear undershoot at the first Q tile of a segment.
+                       - ``active_band_width`` (int, >= 0): width of the active band.
+                         The mapping into the sheared axis is
+                         ``position_bias[b, q, active_offset + j] ==
+                          dense_active[b, q, q + j + active_origin]``
+                         for ``j`` in ``[0, active_band_width)`` where ``dense_active`` is
+                         the equivalent dense (batch, seqlen_q, seqlen_k_active) bias.
+                       - ``active_origin`` (int): shift for the active band. For a causal
+                         SWA window of radius ``R`` ending at the diagonal, set
+                         ``active_origin = -(active_band_width - 1)`` so
+                         ``j = active_band_width - 1`` is the diagonal.
+                     The third axis must also leave ``>= _K_TILE_SZ - 1 = 511`` zero-filled
+                     padding columns after the active band to absorb shear overshoot on
+                     the last Q tile.
 
     Returns:
       Output tensor with attention results. Shape depends on tp_out parameter.
@@ -361,6 +432,9 @@ def attention_cte(
         bound_max=bound_max,
         cp_striped_input=cp_striped_input,
         skip_output_normalization=skip_output_normalization,
+        position_bias=position_bias,
+        bias_layout=bias_layout,
+        bias_band_params=bias_band_params,
     )
 
 
@@ -396,8 +470,18 @@ def _attention_cte(
     out_neg_max_hbm=None,
     out_sum_hbm=None,
     init_sbuf_addr: int = 0,
+    position_bias: Optional[nl.ndarray] = None,
+    bias_layout: str = "dense",
+    bias_band_params: Optional[dict] = None,
     k_scale_sb=None,
     kv_used_len: Optional[nl.ndarray] = None,
+    block_size: int = 0,
+    kvp_rank_id=None,
+    kvp_group_size: int = 0,
+    kvp_seg_block_offset=None,
+    kvp_cp_offset_int: int = 0,
+    kvp_k_threshold_sb=None,
+    kvp_seg_block_offset_int: int = 0,
 ):
     """Internal attention implementation with full parameter set including SBUF I/O.
 
@@ -422,6 +506,14 @@ def _attention_cte(
                   the k_cache_sbuf / v_cache_sbuf tensor can be reused for both
                   the active segment and the prior segment, enabling support
                   for large prior_seg_size in the segmented kernel.
+      block_size: int: KV cache block size for round-robin KV distribution.
+      kvp_rank_id: Optional[nl.ndarray]: (1,1) HBM int32, this rank's index within the KV-parallel group.
+      kvp_group_size: int: Number of ranks in the KV-parallel group (0 = disabled).
+      kvp_seg_block_offset: Optional[nl.ndarray]: (1,1) HBM int32, segment starting local block
+          index. Used to compute the runtime offset for static mask bounds adjustment.
+      kvp_cp_offset_int: int: Compile-time Q global offset for tile_fully_visible check.
+      kvp_k_threshold_sb: Optional SBUF tensor with pre-generated static K-position threshold pattern.
+      kvp_seg_block_offset_int: int: Compile-time seg_block_offset for tile_fully_visible check.
     """
     if sliding_window is None:
         sliding_window = 0
@@ -548,9 +640,19 @@ def _attention_cte(
             f"bound_max shape must be (batch, seqlen_q, 1)=({batch_size}, {seqlen_q}, 1), got {bound_max.shape}",
         )
         kernel_assert(not is_prefix_caching, "is_sequence_packed is not supported with prefix caching")
-        kernel_assert(
-            global_cp_deg is None or global_cp_deg <= 1, "is_sequence_packed is not supported with context parallelism"
-        )
+        if global_cp_deg is not None and global_cp_deg > 1:
+            kernel_assert(
+                cp_striped_input,
+                "is_sequence_packed with CP requires cp_striped_input=True (contiguous CP not supported)",
+            )
+            kernel_assert(
+                not cp_strided_q_slicing,
+                "is_sequence_packed with CP does not support cp_strided_q_slicing",
+            )
+            kernel_assert(
+                sliding_window == 0,
+                "is_sequence_packed with CP does not support sliding window attention",
+            )
 
     # Use out_o_hbm if provided, otherwise allocate result in HBM
     if out_o_hbm is not None:
@@ -648,6 +750,68 @@ def _attention_cte(
         f"Got: k_cache_sbuf={has_k_sbuf}, v_cache_sbuf={has_v_sbuf}",
     )
 
+    # Validate position_bias shape and dtype
+    if position_bias is not None:
+        _seqlen_k_prior_padded_for_pb = align_to(seqlen_k_prior, _K_TILE_SZ) if seqlen_k_prior else 0
+        seqlen_kv_expected = seqlen_k_active + _seqlen_k_prior_padded_for_pb
+        kernel_assert(
+            len(position_bias.shape) == 3,
+            f"position_bias must be 3D (batch, seqlen_q, ...), got shape {position_bias.shape}",
+        )
+        kernel_assert(
+            position_bias.shape[0] == q.shape[0],
+            f"position_bias batch dim must match Q batch dim, got {position_bias.shape[0]} vs {q.shape[0]}",
+        )
+        kernel_assert(
+            position_bias.shape[1] == seqlen_q,
+            f"position_bias seqlen_q dim must be {seqlen_q}, got {position_bias.shape[1]}",
+        )
+        kernel_assert(
+            seqlen_q % _Q_GRP_SZ == 0,
+            f"When using position_bias, seqlen_q must be a multiple of {_Q_GRP_SZ}, got {seqlen_q}",
+        )
+        kernel_assert(
+            bias_layout in ("dense", "banded"),
+            f"bias_layout must be 'dense' or 'banded', got {bias_layout!r}",
+        )
+        if bias_layout == "dense":
+            kernel_assert(
+                position_bias.shape[2] >= seqlen_kv_expected,
+                f"dense position_bias seqlen_kv dim must be >= {seqlen_kv_expected}, got {position_bias.shape[2]}",
+            )
+        else:  # banded
+            kernel_assert(
+                bias_band_params is not None,
+                "bias_band_params is required when bias_layout='banded'",
+            )
+            for _k in ("prior_band_width", "active_offset", "active_band_width", "active_origin"):
+                kernel_assert(
+                    _k in bias_band_params,
+                    f"bias_band_params missing key {_k!r}",
+                )
+            _pbw = int(bias_band_params["prior_band_width"])
+            _aoff = int(bias_band_params["active_offset"])
+            _abw = int(bias_band_params["active_band_width"])
+            kernel_assert(
+                _pbw >= 0 and _abw >= 0 and _aoff >= _pbw,
+                f"band widths must be non-negative and active_offset>=prior_band_width, "
+                f"got prior_band_width={_pbw}, active_offset={_aoff}, active_band_width={_abw}",
+            )
+            # Require left zero-padding so shear undershoot on Q tile 0 is safe.
+            kernel_assert(
+                _aoff - _pbw >= _Q_GRP_SZ - 1,
+                f"active_offset - prior_band_width must be >= _Q_GRP_SZ-1={_Q_GRP_SZ - 1} "
+                f"(left zero-padding for shear undershoot), got {_aoff - _pbw}",
+            )
+            # Require right zero-padding so shear overshoot on the last Q tile is safe.
+            _trailing = position_bias.shape[2] - (_aoff + _abw)
+            kernel_assert(
+                _trailing >= _K_TILE_SZ - 1,
+                f"trailing zero-padding after active band must be >= _K_TILE_SZ-1={_K_TILE_SZ - 1}, "
+                f"got {_trailing} (position_bias.shape[2]={position_bias.shape[2]}, "
+                f"active_offset={_aoff}, active_band_width={_abw})",
+            )
+
     # Create AttnConfig with high-level configuration
     ac = AttnConfig(
         seqlen_q=seqlen_q,
@@ -673,6 +837,27 @@ def _attention_cte(
         mm_out_dtype=mm_out_dtype,
         is_sequence_packed=is_sequence_packed,
         has_kv_used_len=has_kv_used_len,
+        use_position_bias=position_bias is not None,
+        bias_layout=bias_layout,
+        bias_prior_band_width=(
+            int(bias_band_params["prior_band_width"]) if (position_bias is not None and bias_layout == "banded") else 0
+        ),
+        bias_active_offset=(
+            int(bias_band_params["active_offset"]) if (position_bias is not None and bias_layout == "banded") else 0
+        ),
+        bias_active_band_width=(
+            int(bias_band_params["active_band_width"]) if (position_bias is not None and bias_layout == "banded") else 0
+        ),
+        bias_active_origin=(
+            int(bias_band_params["active_origin"]) if (position_bias is not None and bias_layout == "banded") else 0
+        ),
+        block_size=block_size,
+        kvp_rank_id=kvp_rank_id,
+        kvp_group_size=kvp_group_size,
+        kvp_seg_block_offset=kvp_seg_block_offset,
+        kvp_cp_offset_int=kvp_cp_offset_int,
+        kvp_seg_block_offset_int=kvp_seg_block_offset_int,
+        kvp_k_threshold_sb=kvp_k_threshold_sb,
     )
 
     # skip_output_normalization requires cache_softmax so the caller gets the raw sum
@@ -726,6 +911,7 @@ def _attention_cte(
             k_prior_sbuf=k_prior_sbuf,
             v_prior_sbuf=v_prior_sbuf,
             init_sbuf_addr=init_sbuf_addr,
+            position_bias=position_bias,
             k_scale_sb=k_scale_sb,
             kv_used_len=kv_used_len,
         )
@@ -780,6 +966,7 @@ def _attention_cte(
                 k_prior_sbuf=k_prior_sbuf,
                 v_prior_sbuf=v_prior_sbuf,
                 kv_used_len=kv_used_len,
+                position_bias=position_bias,
             )
         else:
             # Have core 0 do all the work
@@ -804,6 +991,7 @@ def _attention_cte(
                     k_prior_sbuf=k_prior_sbuf,
                     v_prior_sbuf=v_prior_sbuf,
                     kv_used_len=kv_used_len,
+                    position_bias=position_bias,
                 )
 
     if cache_softmax:
@@ -861,6 +1049,28 @@ class AttnConfig(nl.NKIObject):
     # and incompatible with SWA/CP/sequence packing/prefix caching.
     has_kv_used_len: bool = None
 
+    # Position bias: a per-(batch, seqlen_q, col) tensor added into the MM1
+    # PSUM before masking so the final score is mask(scale * (QK + bias)). The
+    # tensor is pre-loaded into PSUM and the matmul accumulates on top of it.
+    use_position_bias: bool = None
+    bias_layout: str = None  # "dense" or "banded"
+    # Banded-layout column geometry (unused when bias_layout == "dense").
+    # See public attention_cte docstring for semantics.
+    bias_prior_band_width: int = None  # columns [0, prior_band_width) hold rectangular prior bias
+    bias_active_offset: int = None  # active band starts at this column (>= prior_band_width + _Q_GRP_SZ - 1)
+    bias_active_band_width: int = None
+    bias_active_origin: int = None  # banded[b,q,active_offset+j] = dense_active[b,q, q+j+active_origin]
+
+    # round-robin KV distribution
+    block_size: int = 0  # KV cache block size
+    kvp_rank_id: Any = None  # (1,1) HBM int32, this rank's index within the KV-parallel group
+    kvp_group_size: int = 0  # Number of ranks in the KV-parallel group (0 = disabled)
+    kvp_seg_block_offset: Any = None  # (1,1) HBM int32, segment starting local block index
+    kvp_cp_offset_int: int = 0  # Compile-time cp_offset for interleaved (= global_q_offset)
+    kvp_seg_block_offset_int: int = 0  # Compile-time seg_block_offset for tile_fully_visible check
+    kvp_k_threshold_sb: Any = None  # Pre-generated static k_threshold pattern in SBUF
+    kvp_all_tiles_visible: bool = False  # Compile-time: all tiles in this segment are fully visible
+
 
 def _attention_cte_impl(
     q,
@@ -886,6 +1096,9 @@ def _attention_cte_impl(
     k_prior_sbuf: Optional[List[nl.ndarray]] = None,
     v_prior_sbuf: Optional[List[nl.ndarray]] = None,
     init_sbuf_addr: int = 0,
+    position_bias: Optional[nl.ndarray] = None,
+    bias_layout: str = "dense",
+    bias_band_params: Optional[dict] = None,
     k_scale_sb=None,
     kv_used_len: Optional[nl.ndarray] = None,
 ):
@@ -905,8 +1118,9 @@ def _attention_cte_impl(
       out_neg_max, out_sum_recip: Optional softmax cache outputs
       shard_seqlen_q_start, shard_seqlen_q_length: Seqlen sharding parameters
       cp_offset: Context parallel offset tensor
-      k_cache_sbuf: List of K cache tiles in SBUF
-      v_cache_sbuf: List of V cache tiles in SBUF
+      bound_min, bound_max: Optional bound tensors for sequence packing
+      k_cache_sbuf, v_cache_sbuf: Optional pre-loaded K/V cache tiles in SBUF
+      k_prior_sbuf, v_prior_sbuf: Optional pre-loaded K/V prior tiles in SBUF
       init_sbuf_addr: Initial SBUF address for allocation
       k_scale_sb: Optional SBUF tensor (pmax, 1) for delayed fp8 K dequantization
 
@@ -975,6 +1189,87 @@ def _attention_cte_impl(
         kv_used_len=kv_used_len,
     )
 
+    # Setup static mask for interleaved KV (round-robin block distribution across ranks)
+    if ac.kvp_group_size > 0:
+        stride = ac.kvp_group_size * ac.block_size
+        num_blocks_in_section = atp.num_k_tiles_per_section * _K_TILE_SZ // ac.block_size
+        max_k_threshold = (num_blocks_in_section - 1) * stride + ac.block_size - 1 if num_blocks_in_section > 0 else 0
+        # Skip static mask setup when all tiles are fully visible OR fully masked
+        adjusted_cp = ac.kvp_cp_offset_int - ac.kvp_seg_block_offset_int * stride
+        all_tiles_visible = adjusted_cp > max_k_threshold
+        # Also skip when all tiles are fully masked (max Q < min K threshold)
+        max_q_adjusted = ac.seqlen_q - 1 + adjusted_cp
+        all_tiles_masked = max_q_adjusted < 0  # all k_threshold >= 0
+        skip_static_mask = all_tiles_visible or all_tiles_masked
+        ac.kvp_all_tiles_visible = all_tiles_visible
+
+        if not skip_static_mask:
+            if ac.kvp_k_threshold_sb is not None:
+                bufs.k_threshold_sb = ac.kvp_k_threshold_sb
+            else:
+                section_size = atp.num_k_tiles_per_section * _K_TILE_SZ
+                blocks_per_section = section_size // ac.block_size
+                bufs.k_threshold_sb = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, section_size), dtype=nl.float32)
+                nisa.iota(
+                    bufs.k_threshold_sb,
+                    pattern=[[stride, blocks_per_section], [1, ac.block_size]],
+                    offset=0,
+                    channel_multiplier=0,
+                )
+
+            # Compute adjusted_ubs by subtracting the runtime offset
+            kvp_runtime_offset_sb = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, 1), dtype=nl.float32)
+            nisa.dma_copy(
+                dst=kvp_runtime_offset_sb[0, 0],
+                src=ac.kvp_seg_block_offset.ap(pattern=[[1, 1], [1, 1]], offset=0),
+            )
+            nisa.tensor_scalar(
+                dst=kvp_runtime_offset_sb[0:1, 0:1],
+                data=kvp_runtime_offset_sb[0:1, 0:1],
+                op0=nl.multiply,
+                operand0=float(stride),
+            )
+            rank_offset_sb = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, 1), dtype=nl.float32)
+            nisa.dma_copy(
+                dst=rank_offset_sb[0, 0],
+                src=ac.kvp_rank_id.ap(pattern=[[1, 1], [1, 1]], offset=0),
+            )
+            nisa.tensor_scalar(
+                dst=rank_offset_sb[0:1, 0:1],
+                data=rank_offset_sb[0:1, 0:1],
+                op0=nl.multiply,
+                operand0=float(ac.block_size),
+            )
+            nisa.tensor_tensor(
+                dst=kvp_runtime_offset_sb[0:1, 0:1],
+                data1=kvp_runtime_offset_sb[0:1, 0:1],
+                data2=rank_offset_sb[0:1, 0:1],
+                op=nl.add,
+            )
+            stream_shuffle_broadcast(src=kvp_runtime_offset_sb, dst=kvp_runtime_offset_sb)
+
+            # adjusted_ubs[q] = range_sel_ubs[q] - runtime_offset
+            nisa.tensor_scalar(
+                dst=bufs.range_sel_ubs[...],
+                data=bufs.range_sel_ubs[...],
+                op0=nl.subtract,
+                operand0=kvp_runtime_offset_sb,
+            )
+            if bufs.range_sel_lbs is not None:
+                nisa.tensor_scalar(
+                    dst=bufs.range_sel_lbs[...],
+                    data=bufs.range_sel_lbs[...],
+                    op0=nl.subtract,
+                    operand0=kvp_runtime_offset_sb,
+                )
+        else:
+            # skip_static_mask=True: either all_tiles_visible or all_tiles_masked.
+            # For all_tiles_visible: per-tile kvp_tile_fully_visible routes to no-masking path.
+            # For all_tiles_masked: range_select with bound=-1 masks everything correctly.
+            nisa.memset(bufs.range_sel_ubs[...], value=-1.0)
+            if bufs.range_sel_lbs is not None:
+                nisa.memset(bufs.range_sel_lbs[...], value=-1.0)
+
     # Allocate running statistics (persistent across sections)
     bufs.mm1_running_max = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
     bufs.exp_running_sum = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, atp.num_grps), dtype=nl.float32)
@@ -1007,6 +1302,9 @@ def _attention_cte_impl(
         allocator.set_current_address(sbuf_addr_outer)
         _allocate_attention_buffers(allocator, ac, atp, bufs, sink, k_cache_sbuf, v_cache_sbuf)
         sbuf_addr = allocator.get_current_address()
+
+        # Store HBM position bias reference in bufs for use by _qk_and_max_large_tile_impl
+        bufs.position_bias_hbm = position_bias
 
         # Store prior SBUF tiles if provided (for SBUF-based prefix caching)
         if k_prior_sbuf is not None and len(k_prior_sbuf) > 0:
@@ -1065,12 +1363,15 @@ def _attention_cte_impl(
 
             for grp_i in range(shard_seqlen_q_start, shard_seqlen_q_end - 2):  # for each block of seq_q
                 if ac.use_swa and atp.is_causal:
-                    nisa.memset(bufs.mm2_sb[grp_i][...], value=0.0)  # when use_swa, mm_i == 0 is not the initial tile
+                    for _d_tile in range(atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim):
+                        nisa.memset(
+                            bufs.mm2_sb[grp_i][_d_tile][...], value=0.0
+                        )  # when use_swa, mm_i == 0 is not the initial tile
 
                 # We try to perform software pipelining where the following operations are overlapped:
                 # grp_i   :  PV, write_back
                 # grp_i+1 :  EXP
-                # grp_i+2 :  Load Q, QK+Max
+                # grp_i+2 :  Load Q, QK+Max (with position bias if present)
                 _load_q_impl(grp_i + 2, ac, atp, sp, bufs, q, batch_id, sbuf_addr)
                 _exp_impl(grp_i + 1, ac, atp, sp, bufs, sink)
                 _fused_qkmax_and_pv_impl(grp_i, ac, atp, sp, bufs, batch_id)
@@ -1171,6 +1472,11 @@ class AttnInternalBuffers(nl.NKIObject):
     range_sel_lbs_prior = None  # lower bound for range_select for Prefix caching
     range_sel_ubs_prior = None  # upper bound for range_select for Prefix caching
     k_offset_sb_u32 = None  # used for dynamic load for only required k/v for CP+SWA
+    k_threshold_sb = None  # static interleaved K-position threshold for masking
+
+    # Position bias
+    position_bias_sb = None  # SBUF tile used to stage [sb_p, _K_TILE_SZ] bias slices before PSUM preload
+    position_bias_hbm = None  # Reference to the HBM position bias tensor (dense or banded)
 
 
 @dataclass
@@ -1366,9 +1672,16 @@ def _compute_tile_parameters(
     else:
         total_seqlen_k = atp.seqlen_k_active_updated
 
-    use_flash_attn = total_seqlen_k > _FLASH_ATTENTION_THRESHOLD
+    # head dim D tile size (must be computed before section_len for SBUF scaling)
+    atp.num_d_tiles = div_ceil(ac.d, _D_TILE_SZ)
+    atp.d_tile_size_par_dim = min(ac.d, _D_TILE_SZ)
+    atp.d_tile_size_free_dim = min(ac.d, _V_D_TILE_SZ)
+    atp.num_d_tiles_free_dim = div_ceil(ac.d, _V_D_TILE_SZ)
+
+    use_flash_attn = total_seqlen_k > (_FLASH_ATTENTION_THRESHOLD // atp.num_d_tiles)
     if use_flash_attn:
-        atp.section_len = min(total_seqlen_k, _FLASH_ATTENTION_SECTION_LENGTH)
+        scaled_section_len = _FLASH_ATTENTION_SECTION_LENGTH // atp.num_d_tiles
+        atp.section_len = min(total_seqlen_k, scaled_section_len)
     else:
         atp.section_len = total_seqlen_k
 
@@ -1599,7 +1912,7 @@ def _setup_range_select_bounds(
 
     # If using SWA and CP, compute K load offset = max(0, cp_offset - sliding_window + 1)
     # Also adjust range select bounds because K seqlen now does not start from 0
-    if ac.use_swa and ac.use_cp and not ac.cp_strided_q_slicing:
+    if ac.use_swa and ac.use_cp and not ac.cp_strided_q_slicing and ac.kvp_group_size == 0:
         # Find K load offset to fp32 (required dtype as tensor scalar operand)
         k_offset_sb = allocator.alloc_sbuf_tensor(shape=(atp.sb_p, 1), dtype=nl.float32)
         nisa.tensor_scalar(
@@ -1649,7 +1962,10 @@ def _allocate_attention_buffers(
 
     # Define the partition and free dimension for the two matmuls
     mm1_p, mm1_n = atp.sb_p, nl.tile_size.psum_fmax
-    mm2_p, mm2_n = atp.sb_p, ac.d
+    if ac.tp_out:
+        mm2_p, mm2_n = atp.sb_p, atp.d_tile_size_par_dim
+    else:
+        mm2_p, mm2_n = atp.sb_p, atp.d_tile_size_free_dim
 
     # Use provided K/V cache sbuf if available, otherwise allocate
     # Note: For prefix caching with SBUF, k_cache_sbuf contains ACTIVE tiles
@@ -1657,31 +1973,40 @@ def _allocate_attention_buffers(
     if k_cache_sbuf is not None and len(k_cache_sbuf) > 0:
         bufs.k_sb = k_cache_sbuf
     else:
-        p_k, n_k = ac.d, _K_TILE_SZ  # d is reduction dim for MM1
+        p_k, n_k = atp.d_tile_size_par_dim, _K_TILE_SZ  # d is reduction dim for MM1
         bufs.k_sb = allocator.alloc_sbuf_tensor(
             shape=(p_k, n_k),
             dtype=nl.bfloat16,
-            block_dim=[atp.num_k_tiles_per_section],
-            num_free_tiles=[atp.num_k_tiles_per_section],
+            block_dim=[atp.num_k_tiles_per_section, atp.num_d_tiles],
+            num_free_tiles=[atp.num_k_tiles_per_section, atp.num_d_tiles],
             align_to=32,  # align for dma transpose
         )
 
     if v_cache_sbuf is not None and len(v_cache_sbuf) > 0:
         bufs.v_sb = v_cache_sbuf
     else:
-        p_v, n_v = atp.sb_p, ac.d  # d is free dim for MM2
-        bufs.v_sb = allocator.alloc_sbuf_tensor(
-            shape=(p_v, n_v),
-            dtype=nl.bfloat16,
-            block_dim=[atp.num_v_tiles_per_section],
-            num_free_tiles=[atp.num_v_tiles_per_section],
-        )
+        if ac.tp_out:
+            p_v, n_v = atp.sb_p, atp.d_tile_size_par_dim  # d is free dim for MM2
+            bufs.v_sb = allocator.alloc_sbuf_tensor(
+                shape=(p_v, n_v),
+                dtype=nl.bfloat16,
+                block_dim=[atp.num_v_tiles_per_section, atp.num_d_tiles],
+                num_free_tiles=[atp.num_v_tiles_per_section, atp.num_d_tiles],
+            )
+        else:
+            p_v, n_v = atp.sb_p, atp.d_tile_size_free_dim  # d is free dim for MM2
+            bufs.v_sb = allocator.alloc_sbuf_tensor(
+                shape=(p_v, n_v),
+                dtype=nl.bfloat16,
+                block_dim=[atp.num_v_tiles_per_section, atp.num_d_tiles_free_dim],
+                num_free_tiles=[atp.num_v_tiles_per_section, atp.num_d_tiles_free_dim],
+            )
 
     bufs.q_sb = allocator.alloc_sbuf_tensor(
-        shape=(ac.d, atp.sb_p * atp.num_q_grps_per_load),
+        shape=(atp.d_tile_size_par_dim, atp.sb_p * atp.num_q_grps_per_load),
         dtype=nl.bfloat16,
-        block_dim=[div_ceil(atp.num_grps, atp.num_q_grps_per_load)],
-        num_free_tiles=[2],
+        block_dim=[div_ceil(atp.num_grps, atp.num_q_grps_per_load), atp.num_d_tiles],
+        num_free_tiles=[2, atp.num_d_tiles],
         align_to=32,  # align for dma transpose
     )
 
@@ -1740,103 +2065,109 @@ def _allocate_attention_buffers(
 
     if ac.tp_out:
         bufs.mm2_prev_output = allocator.alloc_sbuf_tensor(
-            shape=(ac.d, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim, atp.sb_p),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles],
+            num_free_tiles=[2, atp.num_d_tiles],
         )
     else:
         bufs.mm2_prev_output = allocator.alloc_sbuf_tensor(
-            shape=(atp.sb_p, ac.d),
+            shape=(atp.sb_p, atp.d_tile_size_free_dim),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles_free_dim],
+            num_free_tiles=[2, atp.num_d_tiles_free_dim],
         )
 
     if ac.tp_out:
         bufs.mm2_accum_flash_attn = allocator.alloc_sbuf_tensor(
-            shape=(ac.d, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim, atp.sb_p),
             dtype=nl.float32,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles],
+            num_free_tiles=[2, atp.num_d_tiles],
         )
     else:
         bufs.mm2_accum_flash_attn = allocator.alloc_sbuf_tensor(
-            shape=(atp.sb_p, ac.d),
+            shape=(atp.sb_p, atp.d_tile_size_free_dim),
             dtype=nl.float32,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles_free_dim],
+            num_free_tiles=[2, atp.num_d_tiles_free_dim],
         )
 
     if ac.tp_out:
         bufs.mm2_prev_output_scaled = allocator.alloc_sbuf_tensor(
-            shape=(ac.d, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim, atp.sb_p),
             dtype=nl.float32,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles],
+            num_free_tiles=[2, atp.num_d_tiles],
         )
 
         # PSUM allocations for tp_flash_attn_correction_factor_psum and tp_exp_sum_reciprocal_psum
         bufs.tp_flash_attn_correction_factor_psum = []
         bufs.tp_exp_sum_reciprocal_psum = []
         for grp_idx in range(atp.num_grps):
-            tp_flash_attn_correction_factor_psum_tile = nl.ndarray(
-                (ac.d, atp.sb_p),
-                dtype=nl.float32,
-                buffer=nl.psum,
-                address=(0, ((grp_idx % 2) * 4 + 3) * PSUM_BANK_SIZE),
-            )
-            bufs.tp_flash_attn_correction_factor_psum.append(tp_flash_attn_correction_factor_psum_tile)
-            tp_exp_sum_reciprocal_psum_tile = nl.ndarray(
-                (ac.d, atp.sb_p),
-                dtype=nl.float32,
-                buffer=nl.psum,
-                address=(0, ((grp_idx % 2) * 4 + 3) * PSUM_BANK_SIZE),
-            )
-            bufs.tp_exp_sum_reciprocal_psum.append(tp_exp_sum_reciprocal_psum_tile)
+            tmp_flash_attn_correction_factor = []
+            tmp_exp_sum_reciprocal = []
+            for d_idx in range(atp.num_d_tiles):
+                tp_flash_attn_correction_factor_psum_tile = nl.ndarray(
+                    (atp.d_tile_size_par_dim, atp.sb_p),
+                    dtype=nl.float32,
+                    buffer=nl.psum,
+                    address=(0, ((grp_idx % 2) * (_psum_num_banks() - 4) + 3) * PSUM_BANK_SIZE),
+                )
+                tmp_flash_attn_correction_factor.append(tp_flash_attn_correction_factor_psum_tile)
+                tp_exp_sum_reciprocal_psum_tile = nl.ndarray(
+                    (atp.d_tile_size_par_dim, atp.sb_p),
+                    dtype=nl.float32,
+                    buffer=nl.psum,
+                    address=(0, ((grp_idx % 2) * (_psum_num_banks() - 4) + 3) * PSUM_BANK_SIZE),
+                )
+                tmp_exp_sum_reciprocal.append(tp_exp_sum_reciprocal_psum_tile)
+
+            bufs.tp_flash_attn_correction_factor_psum.append(tmp_flash_attn_correction_factor)
+            bufs.tp_exp_sum_reciprocal_psum.append(tmp_exp_sum_reciprocal)
 
         bufs.tp_flash_attn_correction_factor_sb = allocator.alloc_sbuf_tensor(
-            shape=(ac.d, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim, atp.sb_p),
             dtype=nl.float32,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[4],
+            block_dim=[atp.num_grps, atp.num_d_tiles],
+            num_free_tiles=[4, atp.num_d_tiles],
         )
 
         bufs.tp_exp_sum_reciprocal_sb = allocator.alloc_sbuf_tensor(
-            shape=(ac.d, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim, atp.sb_p),
             dtype=nl.float32,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[4],
+            block_dim=[atp.num_grps, atp.num_d_tiles],
+            num_free_tiles=[4, atp.num_d_tiles],
         )
 
     if ac.tp_out:
         bufs.mm2_final = allocator.alloc_sbuf_tensor(
-            shape=(ac.d, atp.sb_p),
+            shape=(atp.d_tile_size_par_dim, atp.sb_p),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles],
+            num_free_tiles=[2, atp.num_d_tiles],
         )
     else:
         bufs.mm2_final = allocator.alloc_sbuf_tensor(
-            shape=(atp.sb_p, ac.d),
+            shape=(atp.sb_p, atp.d_tile_size_free_dim),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles_free_dim],
+            num_free_tiles=[2, atp.num_d_tiles_free_dim],
         )
 
     if ac.tp_out:
         bufs.mm2_sb = allocator.alloc_sbuf_tensor(
-            shape=(mm2_n, mm2_p),
+            shape=(atp.d_tile_size_par_dim, mm2_p),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles],
+            num_free_tiles=[2, atp.num_d_tiles],
         )
     else:
         bufs.mm2_sb = allocator.alloc_sbuf_tensor(
-            shape=(mm2_p, mm2_n),
+            shape=(mm2_p, atp.d_tile_size_free_dim),
             dtype=ac.mm_out_dtype,
-            block_dim=[atp.num_grps],
-            num_free_tiles=[2],
+            block_dim=[atp.num_grps, atp.num_d_tiles_free_dim],
+            num_free_tiles=[2, atp.num_d_tiles_free_dim],
         )
 
     bufs.mm1_masked = allocator.alloc_sbuf_tensor(
@@ -1893,11 +2224,7 @@ def _allocate_attention_buffers(
             atp.num_large_tiles_per_section,
             atp.num_tps_in_mm2_grp,
         ],
-        num_free_tiles=(
-            [4, 2, atp.num_tps_in_mm2_grp]
-            if atp.use_swa_optimized_allocation
-            else [2, atp.num_large_tiles_per_section, atp.num_tps_in_mm2_grp]
-        ),
+        num_free_tiles=[2, atp.num_large_tiles_per_section, atp.num_tps_in_mm2_grp],
         align_to=32,  # align for dma transpose
     )
 
@@ -1906,22 +2233,38 @@ def _allocate_attention_buffers(
     for grp_idx in range(atp.num_grps):
         grp_row = []
         for large_tile_idx in range(atp.num_large_tiles_per_section):
+            tmp = []
             if ac.tp_out:
-                mm2_psum_tile = nl.ndarray(
-                    (mm2_n, mm2_p),
-                    dtype=ac.mm_out_dtype,
-                    buffer=nl.psum,
-                    address=(0, ((4 + (large_tile_idx % 4)) * PSUM_BANK_SIZE)),
-                )
+                for d_idx in range(atp.num_d_tiles):
+                    mm2_psum_tile = nl.ndarray(
+                        (mm2_n, mm2_p),
+                        dtype=ac.mm_out_dtype,
+                        buffer=nl.psum,
+                        address=(0, ((4 + (large_tile_idx % (_psum_num_banks() - 4))) * PSUM_BANK_SIZE)),
+                    )
+                    tmp.append(mm2_psum_tile)
             else:
-                mm2_psum_tile = nl.ndarray(
-                    (mm2_p, mm2_n),
-                    dtype=ac.mm_out_dtype,
-                    buffer=nl.psum,
-                    address=(0, ((4 + (large_tile_idx % 4)) * PSUM_BANK_SIZE)),
-                )
-            grp_row.append(mm2_psum_tile)
+                for d_idx in range(atp.num_d_tiles_free_dim):
+                    mm2_psum_tile = nl.ndarray(
+                        (mm2_p, mm2_n),
+                        dtype=ac.mm_out_dtype,
+                        buffer=nl.psum,
+                        address=(0, ((4 + (large_tile_idx % (_psum_num_banks() - 4))) * PSUM_BANK_SIZE)),
+                    )
+                    tmp.append(mm2_psum_tile)
+            grp_row.append(tmp)
         bufs.mm2_psum.append(grp_row)
+
+    # Position bias SBUF tile — one [sb_p, _K_TILE_SZ] scratch per Q group.
+    # Loaded from HBM before each matmul and tensor_copy'd into mm1_psum_tile
+    # so nc_matmul(accumulate=True) gives PSUM = QK + position_bias.
+    if ac.use_position_bias:
+        bufs.position_bias_sb = allocator.alloc_sbuf_tensor(
+            shape=(atp.sb_p, _K_TILE_SZ),
+            dtype=nl.bfloat16,
+            block_dim=[atp.num_grps],
+            num_free_tiles=[2],
+        )
 
 
 def _q_to_kv_batch_id(batch_id: int, bs: int, bs_kv: int) -> int:
@@ -1991,9 +2334,9 @@ def _check_input_and_return_shape(
             v_cache_sbuf is not None and len(v_cache_sbuf) > 0, "v_cache_sbuf must be provided when using sbuf kv"
         )
 
-        # Extract d from k_cache_sbuf tile shape (d, 512)
-        d_from_k = k_cache_sbuf[0].shape[0]
-        kernel_assert(d == d_from_k, f"Head dimension mismatch: q has d={d}, but k_cache_sbuf has d={d_from_k}")
+        # k_cache_sbuf is a 2D list [seq_tile][d_tile], each tensor shape (d_tile_size, _K_TILE_SZ)
+        d_from_k = len(k_cache_sbuf[0]) * k_cache_sbuf[0][0].shape[0]
+        kernel_assert(d <= d_from_k, f"Head dimension mismatch: q has d={d}, but k_cache_sbuf covers d={d_from_k}")
 
         # Compute seqlen_k from number of tiles (each tile is _K_TILE_SZ elements)
         seqlen_k = len(k_cache_sbuf) * _K_TILE_SZ
@@ -2053,83 +2396,94 @@ def _load_q_tile(q, out, tp_q, batch_id, grp_i, seqlen_offset, load_dtype, sbuf_
 
     When tp_q is False, assumes q = (bs, d, seqlen), will perform transpose then save into out.
 
-    out[grp_i // grps_per_load] has shape (d, 128 * grps_per_load)
+    out[grp_i // grps_per_load][d_tile] has shape (d_tile_size, 128 * grps_per_load)
     """
-    kernel_assert(str(load_dtype) == str(out[0].dtype), "Conflicting dtype")
+    kernel_assert(str(load_dtype) == str(out[0][0].dtype), "Conflicting dtype")
     local_allocator = ModularAllocator(initial_address=sbuf_addr)
     if tp_q:
-        _, seqlen, d = q.shape
-        if grps_per_load > 1:
-            # Use DMA transpose
-            num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ * grps_per_load)
+        _, seqlen, actual_d = q.shape
+        d_tile_size = out[0][0].shape[0]
+        num_d_tiles = len(out[0])
 
-            # TODO: fix below check once proper type is available for tensor dtype
-            if str(q.dtype) == str(nl.bfloat16):
-                nisa.dma_transpose(
-                    dst=out[grp_i // grps_per_load].ap([[_Q_GRP_SZ * grps_per_load, d], [1, 1], [1, 1], [1, num_p]]),
-                    src=q.ap(
-                        [[d, num_p], [1, 1], [1, 1], [1, d]],
-                        offset=batch_id * seqlen * d + seqlen_offset * d,
-                    ),
-                )
+        for d_tile in range(num_d_tiles):
+            d = min(d_tile_size, actual_d - d_tile * d_tile_size)
+            d_offset = d_tile * d_tile_size
+            dst_buf = out[grp_i // grps_per_load][d_tile]
+
+            if grps_per_load > 1:
+                # Use DMA transpose
+                num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ * grps_per_load)
+
+                # TODO: fix below check once proper type is available for tensor dtype
+                if str(q.dtype) == str(nl.bfloat16):
+                    nisa.dma_transpose(
+                        dst=dst_buf.ap([[_Q_GRP_SZ * grps_per_load, d], [1, 1], [1, 1], [1, num_p]]),
+                        src=q.ap(
+                            [[actual_d, num_p], [1, 1], [1, 1], [1, d]],
+                            offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
+                        ),
+                    )
+                else:
+                    # Need a buffer with same dtype as q as dma_transpose requires same I/O dtype
+                    buffer = local_allocator.alloc_sbuf_tensor(
+                        shape=(d, _Q_GRP_SZ * grps_per_load),
+                        dtype=q.dtype,
+                        align_to=32,  # align for dma transpose
+                    )
+
+                    nisa.dma_transpose(
+                        dst=buffer.ap([[_Q_GRP_SZ * grps_per_load, d], [1, 1], [1, 1], [1, num_p]]),
+                        src=q.ap(
+                            [[actual_d, num_p], [1, 1], [1, 1], [1, d]],
+                            offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
+                        ),
+                    )
+
+                    nisa.tensor_copy(dst_buf[:d, :num_p], buffer[:d, :num_p])
             else:
-                # Need a buffer with same dtype as q as dma_transpose requires same I/O dtype
-                buffer = local_allocator.alloc_sbuf_tensor(
-                    shape=(d, _Q_GRP_SZ * grps_per_load),
-                    dtype=q.dtype,
-                    align_to=32,  # align for dma transpose
+                # Use NC transpose
+                kernel_assert(
+                    grps_per_load == 1,
+                    "tp Q on Trn1/shard on seqlen does not yet support packed load",
                 )
+                loaded = local_allocator.alloc_sbuf_tensor(shape=(_Q_GRP_SZ, d), dtype=load_dtype)
+                tp_dt = load_dtype
+                psum_buf = nl.ndarray((d, _Q_GRP_SZ), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
 
-                nisa.dma_transpose(
-                    dst=buffer.ap([[_Q_GRP_SZ * grps_per_load, d], [1, 1], [1, 1], [1, num_p]]),
-                    src=q.ap(
-                        [[d, num_p], [1, 1], [1, 1], [1, d]],
-                        offset=batch_id * seqlen * d + seqlen_offset * d,
-                    ),
+                num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ)
+                # q shape: (bs, seqlen, actual_d), loading q[batch_id, seqlen_offset:seqlen_offset+num_p, d_offset:d_offset+d]
+                # Pattern stride: actual_d between seqlen positions, d elements per position
+                # Offset: batch_id*seqlen*actual_d + seqlen_offset*actual_d + d_offset
+                loaded_dst_pat = loaded.ap(pattern=[[d, num_p], [1, d]], offset=0)
+                q_src_pat = q.ap(
+                    pattern=[[actual_d, num_p], [1, d]],
+                    offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
                 )
+                nisa.dma_copy(dst=loaded_dst_pat, src=q_src_pat)
 
-                nisa.tensor_copy(out[grp_i // grps_per_load][:, :num_p], buffer[:, :num_p])
-        else:
-            # Use NC transpose
-            kernel_assert(
-                grps_per_load == 1,
-                "tp Q on Trn1/shard on seqlen does not yet support packed load",
-            )
-            loaded = local_allocator.alloc_sbuf_tensor(shape=(_Q_GRP_SZ, d), dtype=load_dtype)
-            tp_dt = load_dtype
-            psum_buf = nl.ndarray((d, _Q_GRP_SZ), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
-
-            num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ)
-            # Convert load() to access pattern
-            # Original: load(dst=loaded[nl.ds(0, num_p), :], src=q[batch_id, nl.ds(seqlen_offset, _Q_GRP_SZ), 0:d], dtype=load_dtype)
-            # q shape: (bs, seqlen, d), accessing q[batch_id, seqlen_offset:seqlen_offset+_Q_GRP_SZ, 0:d]
-            # Pattern: [[d, num_p], [1, d]]
-            # Offset: batch_id*seqlen*d + seqlen_offset*d
-            loaded_dst_pat = loaded.ap(pattern=[[d, num_p], [1, d]], offset=0)
-            q_src_pat = q.ap(
-                pattern=[[d, num_p], [1, d]],
-                offset=batch_id * seqlen * d + seqlen_offset * d,
-            )
-            nisa.dma_copy(dst=loaded_dst_pat, src=q_src_pat)
-
-            nisa.nc_transpose(psum_buf[:d, :num_p], loaded[:num_p, :d])
-            num_f = min(seqlen - seqlen_offset, _Q_GRP_SZ)
-            nisa.tensor_copy(out[grp_i][:d, :num_f], psum_buf[:d, :num_f])
+                nisa.nc_transpose(psum_buf[:d, :num_p], loaded[:num_p, :d])
+                num_f = min(seqlen - seqlen_offset, _Q_GRP_SZ)
+                nisa.tensor_copy(dst_buf[:d, :num_f], psum_buf[:d, :num_f])
     else:
-        _, d, seqlen = q.shape
+        _, actual_d, seqlen = q.shape
+        d_tile_size = out[0][0].shape[0]
+        num_d_tiles = len(out[0])
 
         num_f = min(seqlen - seqlen_offset, _Q_GRP_SZ * grps_per_load)
-        # Convert load() to access pattern
-        # Original: load(dst=out[grp_i // grps_per_load][nl.ds(0, d), nl.ds(0, num_f)], src=q[batch_id, nl.ds(0, d), nl.ds(seqlen_offset, num_f)], dtype=load_dtype)
-        # q shape: (bs, d, seqlen), accessing q[batch_id, 0:d, seqlen_offset:seqlen_offset+num_f]
-        # Pattern: [[seqlen, d], [1, num_f]]
-        # Offset: batch_id*d*seqlen + seqlen_offset
-        out_dst_pat = out[grp_i // grps_per_load].ap(pattern=[[_Q_GRP_SZ * grps_per_load, d], [1, num_f]], offset=0)
-        q_src_pat = q.ap(
-            pattern=[[seqlen, d], [1, num_f]],
-            offset=batch_id * d * seqlen + seqlen_offset,
-        )
-        nisa.dma_copy(dst=out_dst_pat, src=q_src_pat)
+        for d_tile in range(num_d_tiles):
+            d = min(d_tile_size, actual_d - d_tile * d_tile_size)
+            d_offset = d_tile * d_tile_size
+            dst_buf = out[grp_i // grps_per_load][d_tile]
+
+            out_dst_pat = dst_buf.ap(pattern=[[_Q_GRP_SZ * grps_per_load, d], [1, num_f]], offset=0)
+            # q shape: (bs, actual_d, seqlen), loading q[batch_id, d_offset:d_offset+d, seqlen_offset:seqlen_offset+num_f]
+            # Pattern stride: seqlen between d positions, num_f elements per row
+            # Offset: batch_id*actual_d*seqlen + d_offset*seqlen + seqlen_offset
+            q_src_pat = q.ap(
+                pattern=[[seqlen, d], [1, num_f]],
+                offset=batch_id * actual_d * seqlen + d_offset * seqlen + seqlen_offset,
+            )
+            nisa.dma_copy(dst=out_dst_pat, src=q_src_pat)
 
 
 def _get_kv_tile_apc(
@@ -2186,9 +2540,9 @@ def _load_k_tile(
     Return shape of out[i] is (d, _K_TILE_SIZE) where i = 0..num_k_tiles_per_section
     """
     if tp_k:
-        _, seqlen_active, _ = k_active.shape
+        _, seqlen_active, actual_d = k_active.shape
     else:
-        _, _, seqlen_active = k_active.shape
+        _, actual_d, seqlen_active = k_active.shape
     seqlen_prior = None
     is_prefix_caching = k_prior is not None
     if is_prefix_caching:
@@ -2197,19 +2551,18 @@ def _load_k_tile(
         else:
             _, _, seqlen_prior = k_prior.shape
     if num_tiles > 0:
-        d, n = out[0].shape
+        d_tile_size, n = out[0][0].shape
+        num_d_tiles = len(out[0])
     sb_p = nl.tile_size.pmax
     stride_f = _K_TILE_SZ
 
     kernel_assert(n == _K_TILE_SZ, f"expect to load in tile of size {_K_TILE_SZ=}")
-    kernel_assert(str(load_dtype) == str(out[0].dtype), "load dtype mismatch")
+    kernel_assert(str(load_dtype) == str(out[0][0].dtype), "load dtype mismatch")
     local_allocator = ModularAllocator(initial_address=sbuf_addr)
     sbuf_addr_max = sbuf_addr
     if tp_k:
         sbuf_addr_outer = local_allocator.get_current_address()
         for tile in range(num_tiles):
-            local_allocator.set_current_address(sbuf_addr_outer)
-
             # for APC we need to use either k or k_prior and appropriately adjust sequence length and other quantities
             k, seqlen, seqlen_offset, load_offset = _get_kv_tile_apc(
                 is_prefix_caching,
@@ -2225,120 +2578,124 @@ def _load_k_tile(
                 # since we always use section_len/512 tiles even for last section
                 # we might exit early
                 return sbuf_addr_max
+            for d_tile in range(num_d_tiles):
+                d = min(d_tile_size, actual_d - d_tile * d_tile_size)
+                d_offset = d_tile * d_tile_size
+                dst_buf = out[tile][d_tile]
+                local_allocator.set_current_address(sbuf_addr_outer)
 
-            use_dma_tp = load_offset is None  # cannot use dma tp when using dynamic offset
-            if use_dma_tp:
-                num_p = min(seqlen - seqlen_offset, n)
-                # TODO: fix below check once proper type is available for tensor dtype
-                if str(k.dtype) == str(nl.bfloat16):
-                    nisa.dma_transpose(
-                        dst=out[tile].ap([[n, d], [1, 1], [1, 1], [1, num_p]]),
-                        src=k.ap(
-                            [[d, num_p], [1, 1], [1, 1], [1, d]],
-                            offset=batch_id * seqlen * d + seqlen_offset * d,
-                        ),
-                    )
-                else:
-                    # Need a buffer with same dtype as k as dma_transpose requires same I/O dtype
-                    buffer = local_allocator.alloc_sbuf_tensor(
-                        shape=(d, n),
-                        dtype=k.dtype,
-                        align_to=32,  # align for dma transpose
-                    )
+                use_dma_tp = load_offset is None  # cannot use dma tp when using dynamic offset
+                if use_dma_tp:
+                    num_p = min(seqlen - seqlen_offset, n)
+                    # TODO: fix below check once proper type is available for tensor dtype
+                    if str(k.dtype) == str(nl.bfloat16):
+                        nisa.dma_transpose(
+                            dst=dst_buf.ap([[n, d], [1, 1], [1, 1], [1, num_p]]),
+                            src=k.ap(
+                                [[actual_d, num_p], [1, 1], [1, 1], [1, d]],
+                                offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
+                            ),
+                        )
+                    else:
+                        # Need a buffer with same dtype as k as dma_transpose requires same I/O dtype
+                        buffer = local_allocator.alloc_sbuf_tensor(
+                            shape=(d, n),
+                            dtype=k.dtype,
+                            align_to=32,  # align for dma transpose
+                        )
+                        sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
+                        nisa.dma_transpose(
+                            dst=buffer.ap([[n, d], [1, 1], [1, 1], [1, num_p]]),
+                            src=k.ap(
+                                [[actual_d, num_p], [1, 1], [1, 1], [1, d]],
+                                offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
+                            ),
+                        )
+
+                        nisa.tensor_copy(dst_buf[:d, :num_p], buffer[:d, :num_p])
+                else:  # not use_dma_tp
+                    num_pe_tps = _K_TILE_SZ // sb_p  # number of transposes (4)
+                    loaded = local_allocator.alloc_sbuf_tensor(shape=(sb_p, num_pe_tps, d), dtype=load_dtype)
                     sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
-                    nisa.dma_transpose(
-                        dst=buffer.ap([[n, d], [1, 1], [1, 1], [1, num_p]]),
-                        src=k.ap(
-                            [[d, num_p], [1, 1], [1, 1], [1, d]],
-                            offset=batch_id * seqlen * d + seqlen_offset * d,
-                        ),
-                    )
+                    tp_dt = load_dtype
+                    psum_buf = nl.ndarray((d, num_pe_tps, sb_p), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
 
-                    nisa.tensor_copy(out[tile][:, :num_p], buffer[:, :num_p])
-            else:  # not use_dma_tp
-                num_pe_tps = _K_TILE_SZ // sb_p  # number of transposes (4)
-                loaded = local_allocator.alloc_sbuf_tensor(shape=(sb_p, num_pe_tps, d), dtype=load_dtype)
-                sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
-                tp_dt = load_dtype
-                psum_buf = nl.ndarray((d, num_pe_tps, sb_p), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
-
-                if load_offset is not None:
-                    # NOTE: NKI is incapable of handling both dynamic and constant offsets in IndirectLoad, also it cannot handle
-                    # dynamic offset used with more than one axis, so we must use four DMAs
-                    for tp_idx in range(num_pe_tps):
-                        num_p = min(seqlen - seqlen_offset - tp_idx * sb_p, sb_p)
-                        if num_p > 0:
-                            ind_offset = local_allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
-                            sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
-                            nisa.tensor_scalar(
-                                ind_offset,
-                                load_offset,
-                                nl.add,
-                                seqlen_offset + tp_idx * sb_p,
-                            )
+                    if load_offset is not None:
+                        # NOTE: NKI is incapable of handling both dynamic and constant offsets in IndirectLoad, also it cannot handle
+                        # dynamic offset used with more than one axis, so we must use four DMAs
+                        for tp_idx in range(num_pe_tps):
+                            num_p = min(seqlen - seqlen_offset - tp_idx * sb_p, sb_p)
+                            if num_p > 0:
+                                ind_offset = local_allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
+                                sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
+                                nisa.tensor_scalar(
+                                    ind_offset,
+                                    load_offset,
+                                    nl.add,
+                                    seqlen_offset + tp_idx * sb_p,
+                                )
+                                loaded_dst_pat = loaded.ap(
+                                    pattern=[[num_pe_tps * d, num_p], [1, d]],
+                                    offset=tp_idx * d,
+                                )
+                                k_src_pat = k.ap(
+                                    pattern=[[actual_d, num_p], [1, d]],
+                                    scalar_offset=ind_offset,
+                                    offset=batch_id * seqlen * actual_d + d_offset,
+                                    indirect_dim=1,
+                                )
+                                nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
+                    else:  # not load_offset
+                        # Use strided load to load four tiles of [128, d]
+                        if seqlen_offset < seqlen:
+                            # case 1: handle rectangular
+                            num_inner_f = min(num_pe_tps, (seqlen - seqlen_offset) // sb_p)
+                            num_p = sb_p
                             loaded_dst_pat = loaded.ap(
-                                pattern=[[num_pe_tps * d, num_p], [1, d]],
-                                offset=tp_idx * d,
+                                pattern=[[num_pe_tps * d, num_p], [d, num_inner_f], [1, d]],
+                                offset=0,
                             )
+
                             k_src_pat = k.ap(
-                                pattern=[[d, num_p], [1, d]],
-                                scalar_offset=ind_offset,
-                                offset=batch_id * seqlen * d,
-                                indirect_dim=1,
+                                pattern=[[actual_d, num_p], [actual_d * sb_p, num_inner_f], [1, d]],
+                                offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
                             )
                             nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
-                else:  # not load_offset
-                    # Use strided load to load four tiles of [128, d]
-                    num_inner_f = min(div_ceil(seqlen - seqlen_offset, sb_p), num_pe_tps)
-                    num_p = min(seqlen - seqlen_offset - num_inner_f * num_pe_tps, sb_p)
+                            # case 2: handle last row
+                            if num_inner_f < num_pe_tps and (seqlen - seqlen_offset) % sb_p != 0:
+                                num_p = min(
+                                    sb_p,
+                                    seqlen - seqlen_offset - (seqlen - seqlen_offset) // sb_p * sb_p,
+                                )
+                                offset = (
+                                    batch_id * seqlen * actual_d
+                                    + seqlen_offset * actual_d
+                                    + d_offset
+                                    + num_inner_f * sb_p * actual_d
+                                )
+                                loaded_dst_pat = loaded.ap(
+                                    pattern=[[num_pe_tps * d, num_p], [1, d]],
+                                    offset=num_inner_f * d,
+                                )
+                                k_src_pat = k.ap(pattern=[[actual_d, num_p], [1, d]], offset=offset)
+                                nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
 
-                    # Convert load() to access pattern with 2D mask
-                    # Original: load(dst=loaded[...], src=k[batch_id, seqlen_offset + i_b*128 + i_p, i_f], mask=i_b*128+i_p < seqlen-seqlen_offset)
                     if seqlen_offset < seqlen:
-                        # case 1: handle rectangular
-                        # Offset: batch_id*seqlen*d + seqlen_offset*d
-                        num_inner_f = min(num_pe_tps, (seqlen - seqlen_offset) // sb_p)
-                        num_p = sb_p
-                        loaded_dst_pat = loaded.ap(
-                            pattern=[[num_pe_tps * d, num_p], [d, num_inner_f], [1, d]],
-                            offset=0,
+                        # Transpose loaded[128, 4, d] with four PE transposes
+                        for tp_idx in range(num_pe_tps):
+                            num_p = min(seqlen - seqlen_offset - tp_idx * sb_p, sb_p)
+                            if num_p > 0:
+                                nisa.nc_transpose(
+                                    psum_buf[:d, tp_idx, :num_p],
+                                    loaded[:num_p, tp_idx, :d],
+                                )
+
+                        # Copy out transposed results
+                        num_f = min(seqlen - seqlen_offset, n)
+                        nisa.tensor_copy(
+                            dst_buf[:d, :num_f],
+                            psum_buf.reshape((d, _K_TILE_SZ))[:d, :num_f],
                         )
-
-                        k_src_pat = k.ap(
-                            pattern=[[d, num_p], [d * sb_p, num_inner_f], [1, d]],
-                            offset=batch_id * seqlen * d + seqlen_offset * d,
-                        )
-                        nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
-                        # case 2: handle last row
-                        if num_inner_f < num_pe_tps and (seqlen - seqlen_offset) % sb_p != 0:
-                            num_p = min(
-                                sb_p,
-                                seqlen - seqlen_offset - (seqlen - seqlen_offset) // sb_p * sb_p,
-                            )
-                            offset = batch_id * seqlen * d + seqlen_offset * d + num_inner_f * sb_p * d
-                            loaded_dst_pat = loaded.ap(
-                                pattern=[[num_pe_tps * d, num_p], [1, d]],
-                                offset=num_inner_f * d,
-                            )
-                            k_src_pat = k.ap(pattern=[[d, num_p], [1, d]], offset=offset)
-                            nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
-
-                if seqlen_offset < seqlen:
-                    # Transpose loaded[128, 4, d] with four PE transposes
-                    for tp_idx in range(num_pe_tps):
-                        num_p = min(seqlen - seqlen_offset - tp_idx * sb_p, sb_p)
-                        if num_p > 0:
-                            nisa.nc_transpose(
-                                psum_buf[:d, tp_idx, :num_p],
-                                loaded[:num_p, tp_idx, :d],
-                            )
-
-                    # Copy out transposed results
-                    num_f = min(seqlen - seqlen_offset, n)
-                    nisa.tensor_copy(
-                        out[tile][:d, :num_f],
-                        psum_buf.reshape((d, _K_TILE_SZ))[:d, :num_f],
-                    )
     else:  # no tp k
         for tile in range(num_tiles):
             # for APC we need to use either k or k_prior and appropriately adjust sequence length and other quantities
@@ -2353,34 +2710,33 @@ def _load_k_tile(
             )
 
             num_f = min(seqlen - seqlen_offset, n)
-            if num_f > 0:
-                if load_offset is not None:
-                    # NOTE: NKI is incapable of handling both dynamic and constant offsets in IndirectLoad
-                    ind_offset = local_allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
-                    sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
-                    nisa.tensor_scalar(ind_offset, load_offset, nl.add, seqlen_offset)
+            for d_tile in range(num_d_tiles):
+                d = min(d_tile_size, actual_d - d_tile * d_tile_size)
+                d_offset = d_tile * d_tile_size
+                dst_buf = out[tile][d_tile]
+                if num_f > 0:
+                    if load_offset is not None:
+                        # NOTE: NKI is incapable of handling both dynamic and constant offsets in IndirectLoad
+                        ind_offset = local_allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
+                        sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
+                        nisa.tensor_scalar(ind_offset, load_offset, nl.add, seqlen_offset)
 
-                    out_dst_pat = out[tile].ap(pattern=[[stride_f, d], [1, num_f]], offset=0)
-                    k_src_pat = k.ap(
-                        pattern=[[seqlen, d], [1, num_f]],
-                        scalar_offset=ind_offset,
-                        offset=batch_id * d * seqlen,
-                        indirect_dim=2,
-                    )
-                    nisa.dma_copy(dst=out_dst_pat, src=k_src_pat)
-                else:
-                    # Convert load() to access pattern
-                    # Original: load(dst=out[i][nl.ds(0, d), nl.ds(0, num_f)], src=k[batch_id, nl.ds(0, d), nl.ds(seqlen_offset, num_f)], dtype=load_dtype)
-                    # k shape: (bs, d, seqlen), accessing k[batch_id, 0:d, seqlen_offset:seqlen_offset+num_f]
-                    # Pattern: [[seqlen, d], [1, num_f]]
-                    # Offset: batch_id*d*seqlen + seqlen_offset
-                    out_dst_pat = out[tile].ap(pattern=[[stride_f, d], [1, num_f]], offset=0)
-                    k_src_pat = k.ap(
-                        pattern=[[seqlen, d], [1, num_f]],
-                        offset=batch_id * d * seqlen + seqlen_offset,
-                    )
+                        out_dst_pat = dst_buf.ap(pattern=[[stride_f, d], [1, num_f]], offset=0)
+                        k_src_pat = k.ap(
+                            pattern=[[seqlen, d], [1, num_f]],
+                            scalar_offset=ind_offset,
+                            offset=batch_id * actual_d * seqlen + d_offset * seqlen,
+                            indirect_dim=2,
+                        )
+                        nisa.dma_copy(dst=out_dst_pat, src=k_src_pat)
+                    else:
+                        out_dst_pat = dst_buf.ap(pattern=[[stride_f, d], [1, num_f]], offset=0)
+                        k_src_pat = k.ap(
+                            pattern=[[seqlen, d], [1, num_f]],
+                            offset=batch_id * actual_d * seqlen + d_offset * seqlen + seqlen_offset,
+                        )
 
-                    nisa.dma_copy(dst=out_dst_pat, src=k_src_pat)
+                        nisa.dma_copy(dst=out_dst_pat, src=k_src_pat)
 
     return sbuf_addr_max
 
@@ -2403,16 +2759,16 @@ def _load_v_tile(
     - v_prior (if passed) has shape identical to v except for the seqlen.
     """
     local_allocator = ModularAllocator(initial_address=sbuf_addr)
-    _, seqlen_active, _ = v_active.shape
+    _, seqlen_active, actual_d = v_active.shape
     seqlen_prior = None
     is_prefix_caching = v_prior is not None
     if is_prefix_caching:
         _, seqlen_prior, _ = v_prior.shape
     if num_tiles > 0:
-        p, n = out[0].shape
+        p, d_tile_size = out[0][0].shape
+        num_d_tiles = len(out[0])
 
-    d = n
-    kernel_assert(str(load_dtype) == str(out[0].dtype), "load dtype mismatch")
+    kernel_assert(str(load_dtype) == str(out[0][0].dtype), "load dtype mismatch")
 
     for tile in range(num_tiles):
         v, seqlen, seqlen_offset, load_offset = _get_kv_tile_apc(
@@ -2427,28 +2783,24 @@ def _load_v_tile(
         num_p = min(seqlen - seqlen_offset, p)
         if num_p > 0:
             if load_offset is not None:
-                # NOTE: NKI is incapable of handling both dynamic and constant offsets in IndirectLoad
                 ind_offset = local_allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
                 nisa.tensor_scalar(ind_offset, load_offset, nl.add, seqlen_offset)
-                out_dst_pat = out[tile].ap(pattern=[[n, num_p], [1, n]], offset=0)
-                v_src_pat = v.ap(
-                    pattern=[[d, num_p], [1, n]],
-                    scalar_offset=ind_offset,
-                    offset=batch_id * seqlen * d,
-                    indirect_dim=1,
-                )
-                nisa.dma_copy(dst=out_dst_pat, src=v_src_pat)
-            else:
-                # Convert load() to access pattern
-                # Original: load(dst=out[i][nl.ds(0, num_p), nl.ds(0, n)], src=v[batch_id, nl.ds(seqlen_offset, num_p), nl.ds(0, n)], dtype=load_dtype)
-                # v shape: (bs, seqlen, d), accessing v[batch_id, seqlen_offset:seqlen_offset+num_p, 0:n]
-                # Pattern: [[d, num_p], [1, n]]
-                # Offset: batch_id*seqlen*d + seqlen_offset*d
-                out_dst_pat = out[tile].ap(pattern=[[n, num_p], [1, n]], offset=0)
-                v_src_pat = v.ap(
-                    pattern=[[d, num_p], [1, n]],
-                    offset=batch_id * seqlen * d + seqlen_offset * d,
-                )
+            for d_tile in range(num_d_tiles):
+                d = min(d_tile_size, actual_d - d_tile * d_tile_size)
+                d_offset = d_tile * d_tile_size
+                out_dst_pat = out[tile][d_tile].ap(pattern=[[d_tile_size, num_p], [1, d]], offset=0)
+                if load_offset is not None:
+                    v_src_pat = v.ap(
+                        pattern=[[actual_d, num_p], [1, d]],
+                        scalar_offset=ind_offset,
+                        offset=batch_id * seqlen * actual_d + d_offset,
+                        indirect_dim=1,
+                    )
+                else:
+                    v_src_pat = v.ap(
+                        pattern=[[actual_d, num_p], [1, d]],
+                        offset=batch_id * seqlen * actual_d + seqlen_offset * actual_d + d_offset,
+                    )
                 nisa.dma_copy(dst=out_dst_pat, src=v_src_pat)
 
     return local_allocator.get_current_address()
@@ -2496,21 +2848,23 @@ def _load_q_impl(
                 batch_id,
                 grp_i,
                 q_seqlen_offset,
-                bufs.q_sb[0].dtype,
+                bufs.q_sb[0][0].dtype,
                 sbuf_addr,
                 grps_per_load=atp.num_q_grps_per_load,
             )
             # Delayed fp8 K dequant: scale Q in SBUF instead of scaling all K tiles.
-            # q_sb has shape (d, 128*grps_per_load) with partition dim = d (head_dim).
+            # q_sb has shape (d_tile_size, 128*grps_per_load) with partition dim = d_tile_size.
             # k_scale_sb is (pmax, 1) SBUF tensor applied along partition dim.
             if bufs.k_scale_sb is not None:
                 num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ * atp.num_q_grps_per_load)
-                nisa.tensor_scalar(
-                    dst=bufs.q_sb[grp_i // atp.num_q_grps_per_load][: ac.d, :num_f],
-                    data=bufs.q_sb[grp_i // atp.num_q_grps_per_load][: ac.d, :num_f],
-                    op0=nl.multiply,
-                    operand0=bufs.k_scale_sb[: ac.d, :],
-                )
+                for d_tile in range(atp.num_d_tiles):
+                    d = min(atp.d_tile_size_par_dim, ac.d - d_tile * atp.d_tile_size_par_dim)
+                    nisa.tensor_scalar(
+                        dst=bufs.q_sb[grp_i // atp.num_q_grps_per_load][d_tile][:d, :num_f],
+                        data=bufs.q_sb[grp_i // atp.num_q_grps_per_load][d_tile][:d, :num_f],
+                        op0=nl.multiply,
+                        operand0=bufs.k_scale_sb[:d, :],
+                    )
 
 
 def _qk_and_max_impl(
@@ -2522,7 +2876,7 @@ def _qk_and_max_impl(
     batch_id: int = 0,
 ):
     """Compute QK^T matmul (MM1) and find row-wise maximum for this Q group.
-    Also apply masking if relevant.
+    Also apply masking and position bias if relevant.
     """
     has_any_compute_pred = (
         _has_any_compute_causal(grp_i, sp.section_offset_active, ac)
@@ -2749,7 +3103,8 @@ def _pv_impl(
         else True
     )
     if has_any_compute_pred:
-        nisa.memset(bufs.mm2_sb[grp_i][...], value=0.0)
+        for _d_tile in range(atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim):
+            nisa.memset(bufs.mm2_sb[grp_i][_d_tile][...], value=0.0)
 
         for large_tile_idx in range(atp.num_large_tiles_per_section):
             _pv_large_tile_impl(grp_i, large_tile_idx, ac, atp, sp, bufs)
@@ -2776,8 +3131,7 @@ def _fused_qkmax_and_pv_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
-    if has_any_compute_pred_qkmax:
-        nisa.memset(bufs.mm1_partial_max[qkmax_grp][...], value=_FLOAT32_MIN)
+    nisa.memset(bufs.mm1_partial_max[qkmax_grp][...], value=_FLOAT32_MIN)
 
     for large_tile_idx in range(atp.num_large_tiles_per_section):
         if has_any_compute_pred_pv:
@@ -2863,97 +3217,88 @@ def _write_back_impl(
         - write to HBM after scaling by reciprocal
       - write to HBM
     """
+    num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
+    d_tile_size = atp.d_tile_size_par_dim if ac.tp_out else atp.d_tile_size_free_dim
     if atp.num_sections != 1:
         if sp.section_idx == 0:
             if is_last_section_with_compute:
                 if ac.skip_output_normalization:
-                    # Skip normalization: write unnormalized output directly
                     _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
                 else:
-                    # Last section, so scale by reciprocal and write current output
                     _scale_reciprocal_write_back_impl(
                         bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f
                     )
             else:
-                # Not last section, so just write current output
                 _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
 
         if sp.section_idx > 0:
-            # Load previous output scale by flash_attn_correction_factor and accumulate
-            if ac.tp_out:
-                # Original: load(dst=mm2_prev_output[grp_i], src=o[batch_id, nl.ds(0, d), nl.ds(grp_i*sb_p, 128)], mask=mm2_sbuf_f_mask)
-                # o shape: (batch_size, d, seqlen), accessing o[batch_id, 0:d, grp_i*sb_p:grp_i*sb_p+num_f]
-                # Offset: batch_id*d*seqlen_q + grp_i*sb_p
-                prev_dst_pat = bufs.mm2_prev_output[grp_i].ap(pattern=[[atp.sb_p, ac.d], [1, num_f]], offset=0)
-                o_src_pat = o.ap(
-                    pattern=[[ac.seqlen_q, ac.d], [1, num_f]],
-                    offset=batch_id * ac.d * ac.seqlen_q + grp_i * atp.sb_p,
-                )
-                nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
+            # Load previous output, scale by flash_attn_correction_factor and accumulate
+            for d_tile in range(num_d_tiles_iter):
+                d = min(d_tile_size, ac.d - d_tile * d_tile_size)
+                d_offset = d_tile * d_tile_size
+                if ac.tp_out:
+                    prev_dst_pat = bufs.mm2_prev_output[grp_i][d_tile].ap(pattern=[[atp.sb_p, d], [1, num_f]], offset=0)
+                    o_src_pat = o.ap(
+                        pattern=[[ac.seqlen_q, d], [1, num_f]],
+                        offset=batch_id * ac.d * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
+                    )
+                    nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
 
-                nisa.nc_transpose(
-                    bufs.tp_flash_attn_correction_factor_psum[grp_i].ap(
-                        pattern=[[atp.sb_p, ac.d], [1, atp.sb_p]], offset=0
-                    ),
-                    bufs.flash_attn_correction_factor[grp_i].ap(pattern=[[1, atp.sb_p], [0, ac.d]], offset=0),
-                )
-                nisa.tensor_copy(
-                    bufs.tp_flash_attn_correction_factor_sb[grp_i][:, :num_f],
-                    bufs.tp_flash_attn_correction_factor_psum[grp_i][:, :num_f],
-                )
-                nisa.tensor_tensor(
-                    bufs.mm2_prev_output_scaled[grp_i][:, :num_f],
-                    bufs.mm2_prev_output[grp_i][:, :num_f],
-                    bufs.tp_flash_attn_correction_factor_sb[grp_i][:, :num_f],
-                    nl.multiply,
-                )
-                nisa.tensor_tensor(
-                    bufs.mm2_accum_flash_attn[grp_i][:, :num_f],
-                    bufs.mm2_prev_output_scaled[grp_i][:, :num_f],
-                    bufs.mm2_sb[grp_i][:, :num_f],
-                    nl.add,
-                )
-            else:
-                # Original: load(dst=mm2_prev_output[grp_i], src=o[batch_id, grp_i*sb_p+ip_o, if_o], mask=mm2_sbuf_p_mask)
-                # o shape: (batch_size, seqlen, d), accessing o[batch_id, grp_i*sb_p:grp_i*sb_p+num_p, 0:num_f]
-                # Offset: batch_id*seqlen_q*d + grp_i*sb_p*d
-                prev_dst_pat = bufs.mm2_prev_output[grp_i].ap(pattern=[[ac.d, num_p], [1, ac.d]], offset=0)
-                o_src_pat = o.ap(
-                    pattern=[[ac.d, num_p], [1, ac.d]],
-                    offset=batch_id * ac.seqlen_q * ac.d + grp_i * atp.sb_p * ac.d,
-                )
-                nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
-                nisa.scalar_tensor_tensor(
-                    bufs.mm2_accum_flash_attn[grp_i][:num_p, : ac.d],
-                    data=bufs.mm2_prev_output[grp_i][:num_p, : ac.d],
-                    op0=nl.multiply,
-                    operand0=bufs.flash_attn_correction_factor[grp_i][:num_p, 0],
-                    op1=nl.add,
-                    operand1=bufs.mm2_sb[grp_i][:num_p, : ac.d],
-                )
+                    nisa.nc_transpose(
+                        bufs.tp_flash_attn_correction_factor_psum[grp_i][d_tile].ap(
+                            pattern=[[atp.sb_p, d], [1, atp.sb_p]], offset=0
+                        ),
+                        bufs.flash_attn_correction_factor[grp_i].ap(pattern=[[1, atp.sb_p], [0, d]], offset=0),
+                    )
+                    nisa.tensor_copy(
+                        bufs.tp_flash_attn_correction_factor_sb[grp_i][d_tile][:d, :num_f],
+                        bufs.tp_flash_attn_correction_factor_psum[grp_i][d_tile][:d, :num_f],
+                    )
+                    nisa.tensor_tensor(
+                        bufs.mm2_prev_output_scaled[grp_i][d_tile][:d, :num_f],
+                        bufs.mm2_prev_output[grp_i][d_tile][:d, :num_f],
+                        bufs.tp_flash_attn_correction_factor_sb[grp_i][d_tile][:d, :num_f],
+                        nl.multiply,
+                    )
+                    nisa.tensor_tensor(
+                        bufs.mm2_accum_flash_attn[grp_i][d_tile][:d, :num_f],
+                        bufs.mm2_prev_output_scaled[grp_i][d_tile][:d, :num_f],
+                        bufs.mm2_sb[grp_i][d_tile][:d, :num_f],
+                        nl.add,
+                    )
+                else:
+                    prev_dst_pat = bufs.mm2_prev_output[grp_i][d_tile].ap(pattern=[[d, num_p], [1, d]], offset=0)
+                    o_src_pat = o.ap(
+                        pattern=[[ac.d, num_p], [1, d]],
+                        offset=batch_id * ac.seqlen_q * ac.d + grp_i * atp.sb_p * ac.d + d_offset,
+                    )
+                    nisa.dma_copy(dst=prev_dst_pat, src=o_src_pat)
+                    nisa.scalar_tensor_tensor(
+                        bufs.mm2_accum_flash_attn[grp_i][d_tile][:num_p, :d],
+                        data=bufs.mm2_prev_output[grp_i][d_tile][:num_p, :d],
+                        op0=nl.multiply,
+                        operand0=bufs.flash_attn_correction_factor[grp_i][:num_p, 0],
+                        op1=nl.add,
+                        operand1=bufs.mm2_sb[grp_i][d_tile][:num_p, :d],
+                    )
             if sp.section_idx == atp.num_sections - 1 or is_last_section_with_compute:
                 if ac.skip_output_normalization:
-                    # Skip normalization: write unnormalized accumulated output directly
                     _write_back_o_impl(bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
                 else:
-                    # Last section, so scale by reciprocal and write accumulated output
                     _scale_reciprocal_write_back_impl(
                         bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f
                     )
             else:
-                # Not last section, just write accumulated output
                 _write_back_o_impl(bufs.mm2_accum_flash_attn[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
     else:
         if ac.skip_output_normalization:
-            # Skip normalization: write unnormalized output directly
             _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
         else:
-            # Only one section, so scale by reciprocal and write current output
             _scale_reciprocal_write_back_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, bufs, o, batch_id, num_p, num_f)
 
 
 def _scale_reciprocal_write_back_impl(
-    src_buf,
+    src_bufs,
     grp_i,
     ac: AttnConfig,
     atp: AttnTileParams,
@@ -2965,65 +3310,186 @@ def _scale_reciprocal_write_back_impl(
 ):
     """
     Write back o for the final section after multiplication by reciprocal. Transposes reciprocal if tp_out.
+    Iterates over d-tiles internally.
     """
-    if ac.tp_out:
-        nisa.nc_transpose(
-            bufs.tp_exp_sum_reciprocal_psum[grp_i].ap(pattern=[[atp.sb_p, ac.d], [1, atp.sb_p]], offset=0),
-            bufs.exp_sum_reciprocal.ap(pattern=[[atp.num_grps, atp.sb_p], [0, ac.d]], offset=grp_i),
-        )
-        nisa.tensor_copy(
-            bufs.tp_exp_sum_reciprocal_sb[grp_i][: ac.d, :num_f],
-            bufs.tp_exp_sum_reciprocal_psum[grp_i][: ac.d, :num_f],
-        )
-        nisa.tensor_tensor(
-            bufs.mm2_final[grp_i][: ac.d, :num_f],
-            src_buf[: ac.d, :num_f],
-            bufs.tp_exp_sum_reciprocal_sb[grp_i][: ac.d, :num_f],
-            nl.multiply,
-        )
-    else:
-        nisa.tensor_scalar(
-            bufs.mm2_final[grp_i][:num_p, : ac.d],
-            src_buf[:num_p, : ac.d],
-            nl.multiply,
-            bufs.exp_sum_reciprocal[:num_p, grp_i],
-            engine=engine.vector,
-        )
+    num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
+    d_tile_size = atp.d_tile_size_par_dim if ac.tp_out else atp.d_tile_size_free_dim
+    for d_tile in range(num_d_tiles_iter):
+        d = min(d_tile_size, ac.d - d_tile * d_tile_size)
+        src_buf = src_bufs[d_tile]
+
+        if ac.tp_out:
+            nisa.nc_transpose(
+                bufs.tp_exp_sum_reciprocal_psum[grp_i][d_tile].ap(pattern=[[atp.sb_p, d], [1, atp.sb_p]], offset=0),
+                bufs.exp_sum_reciprocal.ap(pattern=[[atp.num_grps, atp.sb_p], [0, d]], offset=grp_i),
+            )
+            nisa.tensor_copy(
+                bufs.tp_exp_sum_reciprocal_sb[grp_i][d_tile][:d, :num_f],
+                bufs.tp_exp_sum_reciprocal_psum[grp_i][d_tile][:d, :num_f],
+            )
+            nisa.tensor_tensor(
+                bufs.mm2_final[grp_i][d_tile][:d, :num_f],
+                src_buf[:d, :num_f],
+                bufs.tp_exp_sum_reciprocal_sb[grp_i][d_tile][:d, :num_f],
+                nl.multiply,
+            )
+        else:
+            nisa.tensor_scalar(
+                bufs.mm2_final[grp_i][d_tile][:num_p, :d],
+                src_buf[:num_p, :d],
+                nl.multiply,
+                bufs.exp_sum_reciprocal[:num_p, grp_i],
+                engine=engine.vector,
+            )
 
     _write_back_o_impl(bufs.mm2_final[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
 
 
-def _write_back_o_impl(src_buf, grp_i, ac: AttnConfig, atp: AttnTileParams, o, batch_id, num_p, num_f):
-    """Helper function to write a source buffer to output (o) with proper transpose handling.
+def _write_back_o_impl(src_bufs, grp_i, ac: AttnConfig, atp: AttnTileParams, o, batch_id, num_p, num_f):
+    """Write source buffers to output (o) with proper transpose handling, iterating over d-tiles.
 
     Args:
-      src_buf: Source buffer in SBUF to copy from
+      src_bufs: List of source buffers in SBUF, one per d-tile (src_bufs[d_tile])
       grp_i: Q group index
       ac: Attention configuration
       atp: Tile parameters
-      o: Output tensor (HBM) or list of SBUF tiles
+      o: Output tensor (HBM)
       batch_id: Batch index
-      num_p: Number of partition elements
-      num_f: Number of free elements
+      num_p: Number of partition elements (seqlen_q tile size)
+      num_f: Number of free elements (seqlen_q tile size, used for tp_out=True)
     """
+    num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
+    d_tile_size = atp.d_tile_size_par_dim if ac.tp_out else atp.d_tile_size_free_dim
+    for d_tile in range(num_d_tiles_iter):
+        d = min(d_tile_size, ac.d - d_tile * d_tile_size)
+        d_offset = d_tile * d_tile_size
+        src_buf = src_bufs[d_tile]
 
-    if ac.tp_out:
-        # o shape: (batch_size, d, seqlen), accessing o[batch_id, 0:d, grp_i*sb_p:grp_i*sb_p+num_f]
-        # Offset: batch_id*d*seqlen_q + grp_i*sb_p
-        o_dst_pat = o.ap(
-            pattern=[[ac.seqlen_q, ac.d], [1, num_f]],
-            offset=batch_id * ac.d * ac.seqlen_q + grp_i * atp.sb_p,
+        if ac.tp_out:
+            o_dst_pat = o.ap(
+                pattern=[[ac.seqlen_q, d], [1, num_f]],
+                offset=batch_id * ac.d * ac.seqlen_q + d_offset * ac.seqlen_q + grp_i * atp.sb_p,
+            )
+            src_pat = src_buf.ap(pattern=[[atp.sb_p, d], [1, num_f]], offset=0)
+        else:
+            o_dst_pat = o.ap(
+                pattern=[[ac.d, num_p], [1, d]],
+                offset=batch_id * ac.seqlen_q * ac.d + grp_i * atp.sb_p * ac.d + d_offset,
+            )
+            src_pat = src_buf.ap(pattern=[[d, num_p], [1, d]], offset=0)
+        nisa.dma_copy(dst=o_dst_pat, src=src_pat)
+
+
+def _load_position_bias_tile(
+    ac: AttnConfig,
+    atp: AttnTileParams,
+    bufs: AttnInternalBuffers,
+    bias_sb_tile,
+    batch_id: int,
+    q_seqlen_offset: int,
+    num_p_bias: int,
+    abs_k_pos: int,
+    num_f: int,
+) -> bool:
+    """Load a [num_p_bias, num_f] slice of the position-bias tensor from HBM to SBUF.
+
+    The caller selects the layout via ``ac.bias_layout``:
+
+    - ``"dense"``: simple rectangular slice
+      ``position_bias[batch_id, q_seqlen_offset:+num_p_bias, abs_k_pos:+num_k_bias]``.
+      When the K tile overlaps the end of the bias tensor, the trailing
+      columns of ``bias_sb_tile`` are zeroed so the subsequent
+      ``accumulate=True`` matmul doesn't pick up stale SBUF values.
+
+    - ``"banded"``: sheared access. Columns ``[0, prior_band_width)`` hold a
+      rectangular prior band (identical across Q rows); the sheared active band
+      lives at ``[active_offset, active_offset + active_band_width)`` with
+      ``banded[b, q, active_offset + j] == dense_active[b, q, q + j + active_origin]``.
+      Because the kernel's prior range is 512-aligned, a single K tile of width
+      ``_K_TILE_SZ`` is guaranteed to sit either fully inside the prior range
+      (``abs_k_pos + num_f <= seqlen_k_prior_padded``) or fully inside the
+      active range (``abs_k_pos >= seqlen_k_prior_padded``). Mixed tiles are
+      rejected by the upstream validation.
+
+    Returns True if bias was loaded (PSUM should be preloaded via tensor_copy
+    and the matmul should use ``accumulate=True``). Returns False when the
+    requested K range is fully outside the bias tensor (no preload needed;
+    matmul overwrites PSUM).
+    """
+    pb = bufs.position_bias_hbm
+    if ac.bias_layout == "dense":
+        seqlen_kv_bias = pb.shape[2]
+        if abs_k_pos >= seqlen_kv_bias:
+            return False
+        num_k_bias = min(seqlen_kv_bias - abs_k_pos, num_f)
+        # Zero the tail when the DMA covers fewer columns than num_f so the
+        # accumulate=True matmul doesn't sample stale SBUF cells.
+        if num_k_bias < num_f:
+            nisa.memset(bias_sb_tile[:num_p_bias, num_k_bias:num_f], 0.0)
+        nisa.dma_copy(
+            dst=bias_sb_tile[:num_p_bias, :num_k_bias],
+            src=pb[
+                batch_id,
+                q_seqlen_offset : q_seqlen_offset + num_p_bias,
+                abs_k_pos : abs_k_pos + num_k_bias,
+            ],
         )
-        src_pat = src_buf.ap(pattern=[[atp.sb_p, ac.d], [1, num_f]], offset=0)
-    else:
-        # o shape: (batch_size, seqlen, d), accessing o[batch_id, grp_i*sb_p:grp_i*sb_p+num_p, 0:d]
-        # Offset: batch_id*seqlen_q*d + grp_i*sb_p*d
-        o_dst_pat = o.ap(
-            pattern=[[ac.d, num_p], [1, ac.d]],
-            offset=batch_id * ac.seqlen_q * ac.d + grp_i * atp.sb_p * ac.d,
+        return True
+
+    # Banded layout
+    prior_w = ac.bias_prior_band_width
+    active_offset = ac.bias_active_offset
+    active_w = ac.bias_active_band_width
+    active_origin = ac.bias_active_origin
+    seqlen_k_prior_padded = atp.seqlen_k_prior_padded if ac.is_prefix_caching else 0
+
+    if ac.is_prefix_caching and abs_k_pos < seqlen_k_prior_padded:
+        # Prior portion: rectangular slice of columns [0, prior_w).
+        # abs_k_pos is relative to the padded prior range [0, seqlen_k_prior_padded).
+        if prior_w == 0 or abs_k_pos >= prior_w:
+            # Prior band only covers the first prior_w columns; K tiles beyond
+            # have zero bias (K tile lies on padded-but-unused prior).
+            return False
+        num_k_bias = min(prior_w - abs_k_pos, num_f)
+        if num_k_bias < num_f:
+            nisa.memset(bias_sb_tile[:num_p_bias, :num_f], 0.0)
+        nisa.dma_copy(
+            dst=bias_sb_tile[:num_p_bias, :num_k_bias],
+            src=pb[
+                batch_id,
+                q_seqlen_offset : q_seqlen_offset + num_p_bias,
+                abs_k_pos : abs_k_pos + num_k_bias,
+            ],
         )
-        src_pat = src_buf.ap(pattern=[[ac.d, num_p], [1, ac.d]], offset=0)
-    nisa.dma_copy(dst=o_dst_pat, src=src_pat)
+        return True
+
+    # Active portion: sheared. For query row q = q_seqlen_offset + r (r in
+    # [0, num_p_bias)) and column c in [0, num_f), the dense active column is
+    # k_active + c, and the banded index is
+    #   j_banded = active_offset + (k_active + c) - q - active_origin
+    #            = (active_offset + k_active - active_origin) + c - (q_seqlen_offset + r)
+    # Affine access pattern: partition stride (over r) = band_width - 1,
+    # free stride (over c) = 1. Left/right zero-padding of the banded tensor
+    # (enforced by upstream validation) guarantees the DMA stays in-bounds even
+    # when r=0 or r=num_p_bias-1 pushes j_banded outside the active band.
+    if active_w == 0:
+        return False
+    k_active = abs_k_pos - seqlen_k_prior_padded
+    band_width = pb.shape[2]
+    seqlen_q = ac.seqlen_q
+    base_col = active_offset + k_active - active_origin - q_seqlen_offset
+    batch_offset = batch_id * seqlen_q * band_width
+    row_base_offset = q_seqlen_offset * band_width + base_col
+    # num_f columns are always safe thanks to the caller's right-padding guard.
+    num_k_bias = num_f
+    nisa.dma_copy(
+        dst=bias_sb_tile[:num_p_bias, :num_k_bias],
+        src=pb.ap(
+            pattern=[[band_width - 1, num_p_bias], [1, num_k_bias]],
+            offset=batch_offset + row_base_offset,
+        ),
+    )
+    return True
 
 
 def _qk_and_max_large_tile_impl(
@@ -3036,10 +3502,19 @@ def _qk_and_max_large_tile_impl(
     batch_id: int = 0,
 ):
     """Compute QK^T matmul (MM1) and find row-wise maximum for this Q group and large (2048) K tile.
-    Also apply masking if relevant.
+    Also apply masking and position bias if relevant.
+
+    When position_bias is provided, bias is pre-loaded into PSUM before the matmul, and the matmul
+    accumulates QK on top of it (accumulate=True). This gives PSUM = QK + bias with zero extra
+    instructions beyond a single tensor_copy (SBUF→PSUM). The masking paths then operate on the
+    already-biased scores unchanged, giving: final = mask(scale * (QK + bias)).
     """
 
     q_seqlen_offset = qkmax_grp * atp.sb_p
+
+    # Whether position-bias preload is active for this invocation. The actual
+    # bias preload happens per-K-tile in the matmul loop below.
+    has_bias = ac.use_position_bias and bufs.position_bias_hbm is not None
 
     # perform matmul and masking in 512 (_K_TILE_SZ) tile increment on the seqlen dimension
     num_k_tiles_in_large_tile = _LARGE_TILE_SZ // _K_TILE_SZ
@@ -3082,51 +3557,84 @@ def _qk_and_max_large_tile_impl(
             num_f = min(seqlen_k - k_start_pos, _K_TILE_SZ)
             num_q_free = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
 
-            # Step 1: MM1 matmul
-            # For SBUF-based prefix caching, select correct SBUF list based on is_prior_tile
-            # k_start_pos from _get_kv_tile_apc is already relative to prior/active
+            # Step 1: Load position bias into PSUM before matmul (if present)
+            # This pre-seeds PSUM with bias so that after matmul accumulation,
+            # PSUM contains QK + bias. The DMA for bias can overlap with Q/K loads.
+            use_accumulate = False
+            if has_bias:
+                abs_k_pos = sp.section_offset + k_tile_idx_in_section * _K_TILE_SZ
+                num_p_bias = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
+                bias_sb_tile = bufs.position_bias_sb[qkmax_grp]
+                preload_ok = _load_position_bias_tile(
+                    ac=ac,
+                    atp=atp,
+                    bufs=bufs,
+                    bias_sb_tile=bias_sb_tile,
+                    batch_id=batch_id,
+                    q_seqlen_offset=q_seqlen_offset,
+                    num_p_bias=num_p_bias,
+                    abs_k_pos=abs_k_pos,
+                    num_f=num_f,
+                )
+                if preload_ok:
+                    # Preload bias into PSUM; matmul below will accumulate on top.
+                    interleave_copy(
+                        mm1_psum_tile[:num_q_free, :num_f], bias_sb_tile[:num_q_free, :num_f], index=k_tile_idx
+                    )
+                    use_accumulate = True
+
+            # Step 2: MM1 matmul (accumulates onto bias if pre-loaded, otherwise overwrites)
             if is_prior_tile and bufs.k_sb_prior is not None:
-                # Prior tile: use k_sb_prior, k_start_pos is relative to prior
                 k_tile_to_use = bufs.k_sb_prior[k_start_pos // _K_TILE_SZ]
             elif bufs.k_sb_prior is not None:
-                # Active tile in SBUF prefix caching: use k_sb, k_start_pos is relative to active
                 k_tile_to_use = bufs.k_sb[k_start_pos // _K_TILE_SZ]
             else:
-                # Non-APC or HBM-based APC: use k_tile_idx_in_section
                 k_tile_to_use = bufs.k_sb[k_tile_idx_in_section]
 
-            nisa.nc_matmul(
-                mm1_psum_tile[:num_q_free, :num_f],
-                bufs.q_sb[qkmax_grp // atp.num_q_grps_per_load][
-                    : ac.d,
-                    nl.ds((qkmax_grp % atp.num_q_grps_per_load) * _Q_GRP_SZ, num_q_free),
-                ],
-                k_tile_to_use[:, :num_f],
-            )
+            for d_tile in range(atp.num_d_tiles):
+                d_chunk = min(atp.d_tile_size_par_dim, ac.d - d_tile * atp.d_tile_size_par_dim)
+                nisa.nc_matmul(
+                    mm1_psum_tile[:num_q_free, :num_f],
+                    bufs.q_sb[qkmax_grp // atp.num_q_grps_per_load][d_tile][
+                        :d_chunk,
+                        nl.ds((qkmax_grp % atp.num_q_grps_per_load) * _Q_GRP_SZ, num_q_free),
+                    ],
+                    k_tile_to_use[d_tile][:d_chunk, :num_f],
+                    accumulate=True if use_accumulate else None,
+                )
 
-            # Step 2: Masking
+            # Step 3: Masking + scale + max reduce (unchanged from no-bias path)
+            # PSUM now contains QK + bias (or just QK if no bias)
             num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
             num_f = min(seqlen_k - k_start_pos, _K_TILE_SZ)
 
+            # For interleaved KV: skip masking entirely if tile is fully visible
+            kvp_tile_fully_visible = False
+            if ac.kvp_group_size > 0 and not is_prior_tile:
+                if ac.kvp_all_tiles_visible:
+                    kvp_tile_fully_visible = True
+                elif ac.kvp_cp_offset_int > 0:
+                    stride = ac.kvp_group_size * ac.block_size
+                    last_block_in_tile = (k_start_pos + num_f - 1) // ac.block_size
+                    max_k_threshold_in_tile = last_block_in_tile * stride + ac.block_size - 1
+                    # Use adjusted coordinates: min_adjusted_ubs = min_q - seg_block_offset*stride (rank=0 best case)
+                    min_adjusted_ubs = (
+                        qkmax_grp * _Q_GRP_SZ + ac.kvp_cp_offset_int - ac.kvp_seg_block_offset_int * stride
+                    )
+                    kvp_tile_fully_visible = min_adjusted_ubs > max_k_threshold_in_tile
+
             diagonal_sel_mask = (
                 matmul_selection and ((qkmax_grp * _Q_GRP_SZ) < (k_start_pos + _K_TILE_SZ))
-                if (atp.is_causal and not is_prior_tile and not atp.dynamic_sel_mask)
+                if (atp.is_causal and not is_prior_tile and not atp.dynamic_sel_mask and not kvp_tile_fully_visible)
                 else False
             )
             if ac.use_swa and atp.is_causal and not is_prior_tile:
-                # when we are using SWA, above condition for diagonal_sel_mask
-                # might miss some conditions where masking needs to be applied
-                # since it only checks for causal condition. Therefore we either
-                # need dynamic mask or affine select mask
+                # When using SWA, above condition for diagonal_sel_mask might miss some
+                # conditions where masking needs to be applied since it only checks for
+                # causal condition. Therefore we either need dynamic mask or affine select mask.
                 diagonal_sel_mask = not atp.dynamic_sel_mask
 
             if diagonal_sel_mask:  # static diagonal mask
-                # q_pos = qkmax_grp*sb_p + nl.arange(num_p)[:, None]
-                # k_pos = k_start_pos + nl.arange(num_f)[None, :]
-
-                # Mask off upper-triangle with affine_select
-                # causal_pred = (q_pos >= k_pos)  # causal predicate preventing q tokens to look beyond
-                # qkmax_grp*sb_p - k_start_pos
                 nisa.tensor_copy(
                     mm1_copy_sb_tile[:num_p, :num_f],
                     mm1_psum_tile[:num_p, :num_f],
@@ -3141,9 +3649,7 @@ def _qk_and_max_large_tile_impl(
                     on_false_value=_FLOAT32_MIN,
                 )
 
-                # Need extra affine_sel for smaller lower-triangle if use_swa (affine_sel cannot combination of masks)
                 if ac.use_swa:
-                    # swa_pred = (q_pos < k_pos + sliding_window) # k_pos + sliding_window - 1 >= q_pos
                     nisa.affine_select(
                         mm1_affine_select_output_tile[:num_p, :num_f],
                         pattern=[[1, num_f]],
@@ -3163,34 +3669,107 @@ def _qk_and_max_large_tile_impl(
                     reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
                 )
 
-            elif atp.dynamic_sel_mask or is_prior_tile:  # dynamic (compile-time unknown) mask
-                if is_prior_tile:
+            elif (
+                atp.dynamic_sel_mask or is_prior_tile
+            ) and not kvp_tile_fully_visible:  # dynamic (compile-time unknown) mask
+                if ac.kvp_group_size > 0 and not is_prior_tile and bufs.k_threshold_sb is not None:
+                    # Static mask path for interleaved KV (3 instructions)
+                    k_threshold_tile = bufs.k_threshold_sb[:num_p, nl.ds(k_start_pos, num_f)]
+                    adjusted_ub = bufs.range_sel_ubs[:num_p, qkmax_grp : qkmax_grp + 1]
+
+                    # Instruction 1: mask[q,j] = k_threshold[j] > adjusted_ubs[q]
+                    nisa.tensor_scalar(
+                        dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        data=k_threshold_tile,
+                        op0=nl.greater,
+                        operand0=adjusted_ub,
+                    )
+
+                    # SWA: also mask positions below lower bound
+                    if ac.use_swa and bufs.range_sel_lbs is not None:
+                        adjusted_lb = bufs.range_sel_lbs[:num_p, qkmax_grp : qkmax_grp + 1]
+                        nisa.scalar_tensor_tensor(
+                            dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                            data=k_threshold_tile,
+                            op0=nl.less,
+                            operand0=adjusted_lb,
+                            op1=nl.maximum,
+                            operand1=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        )
+
+                    # Instruction 2: masked_scores = mask * FLOAT32_MIN + scores
+                    nisa.scalar_tensor_tensor(
+                        dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        data=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        op0=nl.multiply,
+                        operand0=_FLOAT32_MIN,
+                        op1=nl.add,
+                        operand1=mm1_psum_tile[:num_p, :num_f],
+                    )
+
+                    # Instruction 3: scale + max reduction
+                    nisa.tensor_scalar_reduce(
+                        dst=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        data=mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        op0=nl.multiply,
+                        operand0=ac.scale,
+                        reduce_op=nl.maximum,
+                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
+                    )
+                elif is_prior_tile:
                     bound0 = bufs.range_sel_lbs_prior[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
                     bound1 = bufs.range_sel_ubs_prior[:num_p, qkmax_grp]
                     comp_op1 = nl.less  # k < prior_used_len
+                    kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
+                    nisa.range_select(
+                        mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        on_true_tile=mm1_psum_tile[:num_p, :num_f],
+                        on_false_value=_FLOAT32_MIN,
+                        comp_op0=nl.greater_equal,
+                        comp_op1=comp_op1,
+                        bound0=bound0[:num_p, :1],
+                        bound1=bound1[:num_p, :1],
+                        reduce_op=_maximum,
+                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
+                        reduce_cmd=reduce_cmd.reset_reduce,
+                        range_start=k_start_pos,
+                    )
                 elif ac.is_sequence_packed:
                     bound0 = bufs.range_sel_lbs[:num_p, nl.ds(qkmax_grp, 1)]
                     bound1 = bufs.range_sel_ubs[:num_p, nl.ds(qkmax_grp, 1)]
                     comp_op1 = nl.less_equal if atp.is_causal else nl.less
+                    kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
+                    nisa.range_select(
+                        mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        on_true_tile=mm1_psum_tile[:num_p, :num_f],
+                        on_false_value=_FLOAT32_MIN,
+                        comp_op0=nl.greater_equal,
+                        comp_op1=comp_op1,
+                        bound0=bound0[:num_p, :1],
+                        bound1=bound1[:num_p, :1],
+                        reduce_op=_maximum,
+                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
+                        reduce_cmd=reduce_cmd.reset_reduce,
+                        range_start=k_start_pos,
+                    )
                 else:
                     bound0 = bufs.range_sel_lbs[:num_p, qkmax_grp] if ac.use_swa else bufs.zero_bias_tensor
                     bound1 = bufs.range_sel_ubs[:num_p, qkmax_grp]
                     comp_op1 = nl.less_equal  # k <= q + cp_offset
-
-                kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
-                nisa.range_select(
-                    mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
-                    on_true_tile=mm1_psum_tile[:num_p, :num_f],
-                    on_false_value=_FLOAT32_MIN,
-                    comp_op0=nl.greater_equal,
-                    comp_op1=comp_op1,
-                    bound0=bound0[:num_p, :1],
-                    bound1=bound1[:num_p, :1],
-                    reduce_op=_maximum,
-                    reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
-                    reduce_cmd=reduce_cmd.reset_reduce,
-                    range_start=k_start_pos,
-                )
+                    kernel_assert(ac.scale == 1.0, "range_select path doesn't support scale != 1.0")
+                    nisa.range_select(
+                        mm1_masked_tile[:num_p, nl.ds(k_tile_idx * _K_TILE_SZ, num_f)],
+                        on_true_tile=mm1_psum_tile[:num_p, :num_f],
+                        on_false_value=_FLOAT32_MIN,
+                        comp_op0=nl.greater_equal,
+                        comp_op1=comp_op1,
+                        bound0=bound0[:num_p, :1],
+                        bound1=bound1[:num_p, :1],
+                        reduce_op=_maximum,
+                        reduce_res=mm1_partial_max_tile[:num_p, k_tile_idx_in_section],
+                        reduce_cmd=reduce_cmd.reset_reduce,
+                        range_start=k_start_pos,
+                    )
 
             else:  # no masking
                 nisa.tensor_scalar_reduce(
@@ -3215,77 +3794,13 @@ def _pv_large_tile_impl(
 
     q_seqlen_offset = pv_grp * atp.sb_p
     num_mm2_grps_in_large_tile = _LARGE_TILE_SZ // atp.mm2_grp_sz
-    mm2_psum_set = False  # track if matmul happens so we can skip later step
+    num_mm2_per_grp = atp.mm2_grp_sz // _V_TILE_SZ
+    num_mm2_per_large_tile = num_mm2_per_grp * num_mm2_grps_in_large_tile
 
     mm2_psum_tile = bufs.mm2_psum[pv_grp][large_tile_idx]
 
-    # Step 1: Perform matmul and accumulate in PSUM for each group
-    for mm2_grp_i in range(num_mm2_grps_in_large_tile):
-        num_mm2_per_grp = atp.mm2_grp_sz // _V_TILE_SZ
-        num_mm2_per_large_tile = num_mm2_per_grp * num_mm2_grps_in_large_tile
-
-        exp_tp_sb_tile = bufs.exp_tp_sb[pv_grp][large_tile_idx][mm2_grp_i]
-
-        is_prior_tile, seqlen_k, k_start_pos_512_tile, _ = _get_kv_tile_apc(
-            ac.is_prefix_caching,
-            False,
-            True,
-            atp.seqlen_k_active_updated,
-            ac.seqlen_k_prior,
-            sp.section_offset + large_tile_idx * _LARGE_TILE_SZ + mm2_grp_i * atp.mm2_grp_sz,
-            None,
-        )
-
-        for mm2_i in range(num_mm2_per_grp):
-            v_tile_idx = large_tile_idx * num_mm2_per_large_tile + mm2_grp_i * num_mm2_per_grp + mm2_i
-            k_start_pos = k_start_pos_512_tile + mm2_i * _V_TILE_SZ
-
-            num_p = min(seqlen_k - k_start_pos, _V_TILE_SZ)
-            num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-
-            # Only produce matmul if the tile is in the lower triangle, use tile bot-left corner so adjust q
-            mm2_sel_mask = (
-                _has_any_compute_causal(pv_grp, k_start_pos, ac) if (atp.is_causal and not is_prior_tile) else True
-            )
-            # If using SWA, also skip bot-left lower triangle.
-            if ac.use_swa and atp.is_causal and not is_prior_tile:
-                # Use tile top-right corner so adjust k; also adjust q for sliding window
-                mm2_sel_mask = mm2_sel_mask and _has_any_compute_swa(pv_grp, k_start_pos, _V_TILE_SZ, ac)
-
-            if mm2_sel_mask and v_tile_idx < atp.num_v_tiles_per_section and num_p > 0 and num_f > 0:
-                mm2_psum_set = True
-
-                # For SBUF-based prefix caching, select correct V SBUF list based on is_prior_tile
-                if is_prior_tile and bufs.v_sb_prior is not None:
-                    # Prior tile: k_start_pos_512_tile is relative to prior
-                    v_tile_to_use = bufs.v_sb_prior[k_start_pos_512_tile // _V_TILE_SZ + mm2_i]
-                elif bufs.v_sb_prior is not None:
-                    # Active tile in SBUF prefix caching: k_start_pos_512_tile is relative to active
-                    v_tile_to_use = bufs.v_sb[k_start_pos_512_tile // _V_TILE_SZ + mm2_i]
-                else:
-                    # Non-APC or HBM-based APC: use v_tile_idx
-                    v_tile_to_use = bufs.v_sb[v_tile_idx]
-
-                # src partition mask: (k_start_pos+nl.arange(128)[:, None]<seqlen_k)
-                # exp_tp_sb free mask: if_l_mm2 + q_seqlen_offset < seqlen_q
-                if ac.tp_out:
-                    nisa.nc_matmul(
-                        mm2_psum_tile[: ac.d, :num_f],
-                        v_tile_to_use[:num_p, : ac.d],
-                        exp_tp_sb_tile[:num_p, nl.ds(mm2_i * _V_TILE_SZ, num_f)],
-                    )
-                else:
-                    nisa.nc_matmul(
-                        mm2_psum_tile[:num_f, : ac.d],
-                        exp_tp_sb_tile[:num_p, nl.ds(mm2_i * _V_TILE_SZ, num_f)],
-                        v_tile_to_use[:num_p, : ac.d],
-                    )
-
-    # Step 2: accumulate the MM2 groups (reduction dim 512) into the large tile reduction dim 2048
-
-    # check if first 512 tile in the large tile (2048) is a prior tile, in that case we always need to
-    # apply loop_reduce_sel.
-    is_prior_tile, seqlen_k, k_start_pos, _ = _get_kv_tile_apc(
+    # Pre-compute loop_reduce_sel for Step 2
+    is_prior_tile_first, seqlen_k_first, k_start_pos_first, _ = _get_kv_tile_apc(
         ac.is_prefix_caching,
         False,
         True,
@@ -3294,46 +3809,96 @@ def _pv_large_tile_impl(
         sp.section_offset + large_tile_idx * _LARGE_TILE_SZ,
         None,
     )
-    k_seqlen_mask = k_start_pos < seqlen_k
-    if is_prior_tile:
-        kernel_assert(
-            k_seqlen_mask, "Internal validation failed."
-        )  # if first 512 tile is prior, we must have k_start_pos<seqlen_k since prior is only padded to 512 max
-
-    # Only produce matmul if the tile is in the lower triangle, use tile bot-left corner so adjust q
+    k_seqlen_mask = k_start_pos_first < seqlen_k_first
+    if is_prior_tile_first:
+        kernel_assert(k_seqlen_mask, "Internal validation failed.")
     loop_reduce_sel = (
-        _has_any_compute_causal(pv_grp, k_start_pos, ac) if (atp.is_causal and not is_prior_tile) else True
+        _has_any_compute_causal(pv_grp, k_start_pos_first, ac) if (atp.is_causal and not is_prior_tile_first) else True
     )
-    # If using SWA, also skip bot-left lower triangle.
-    if ac.use_swa and atp.is_causal and not is_prior_tile:
-        # Use tile top-right corner so adjust k; also adjust q for sliding window
-        loop_reduce_sel = loop_reduce_sel and _has_any_compute_swa(pv_grp, k_start_pos, _LARGE_TILE_SZ, ac)
+    if ac.use_swa and atp.is_causal and not is_prior_tile_first:
+        loop_reduce_sel = loop_reduce_sel and _has_any_compute_swa(pv_grp, k_start_pos_first, _LARGE_TILE_SZ, ac)
 
-    if loop_reduce_sel and k_seqlen_mask and mm2_psum_set:
-        if ac.tp_out:
-            num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-            if large_tile_idx == 0:
-                nisa.tensor_copy(bufs.mm2_sb[pv_grp][:, :num_f], mm2_psum_tile[:, :num_f])
-            else:
-                nisa.tensor_tensor(
-                    bufs.mm2_sb[pv_grp][:, :num_f],
-                    bufs.mm2_sb[pv_grp][:, :num_f],
-                    mm2_psum_tile[:, :num_f],
-                    nl.add,
+    # Loop over d-tiles as outermost to avoid PSUM bank conflicts (all d-tiles share same bank)
+    num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
+    for d_tile in range(num_d_tiles_iter):
+        # Tracks whether any MM2 matmul wrote to PSUM in this iteration; gates the
+        # PSUM→SBUF copy to avoid reading uninitialized PSUM when all tiles are masked.
+        mm2_psum_set = False
+
+        # Step 1: Perform matmul and accumulate in PSUM for each K-seqlen group
+        for mm2_grp_i in range(num_mm2_grps_in_large_tile):
+            exp_tp_sb_tile = bufs.exp_tp_sb[pv_grp][large_tile_idx][mm2_grp_i]
+
+            is_prior_tile, seqlen_k, k_start_pos_512_tile, _ = _get_kv_tile_apc(
+                ac.is_prefix_caching,
+                False,
+                True,
+                atp.seqlen_k_active_updated,
+                ac.seqlen_k_prior,
+                sp.section_offset + large_tile_idx * _LARGE_TILE_SZ + mm2_grp_i * atp.mm2_grp_sz,
+                None,
+            )
+
+            for mm2_i in range(num_mm2_per_grp):
+                v_tile_idx = large_tile_idx * num_mm2_per_large_tile + mm2_grp_i * num_mm2_per_grp + mm2_i
+                k_start_pos = k_start_pos_512_tile + mm2_i * _V_TILE_SZ
+
+                num_p = min(seqlen_k - k_start_pos, _V_TILE_SZ)
+                num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
+
+                mm2_sel_mask = (
+                    _has_any_compute_causal(pv_grp, k_start_pos, ac) if (atp.is_causal and not is_prior_tile) else True
                 )
-        else:
-            num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
-            if (
-                large_tile_idx == 0
-            ):  # when using swa, this is going to be skipped, which is why we require mm2_sb to be zero-memset
-                nisa.tensor_copy(bufs.mm2_sb[pv_grp][:num_p, :], mm2_psum_tile[:num_p, :])
+                if ac.use_swa and atp.is_causal and not is_prior_tile:
+                    mm2_sel_mask = mm2_sel_mask and _has_any_compute_swa(pv_grp, k_start_pos, _V_TILE_SZ, ac)
+
+                if mm2_sel_mask and v_tile_idx < atp.num_v_tiles_per_section and num_p > 0 and num_f > 0:
+                    mm2_psum_set = True
+
+                    if is_prior_tile and bufs.v_sb_prior is not None:
+                        v_tile_to_use = bufs.v_sb_prior[k_start_pos_512_tile // _V_TILE_SZ + mm2_i]
+                    elif bufs.v_sb_prior is not None:
+                        v_tile_to_use = bufs.v_sb[k_start_pos_512_tile // _V_TILE_SZ + mm2_i]
+                    else:
+                        v_tile_to_use = bufs.v_sb[v_tile_idx]
+
+                    if ac.tp_out:
+                        nisa.nc_matmul(
+                            mm2_psum_tile[d_tile][: atp.d_tile_size_par_dim, :num_f],
+                            v_tile_to_use[d_tile][:num_p, : atp.d_tile_size_par_dim],
+                            exp_tp_sb_tile[:num_p, nl.ds(mm2_i * _V_TILE_SZ, num_f)],
+                        )
+                    else:
+                        nisa.nc_matmul(
+                            mm2_psum_tile[d_tile][:num_f, : atp.d_tile_size_free_dim],
+                            exp_tp_sb_tile[:num_p, nl.ds(mm2_i * _V_TILE_SZ, num_f)],
+                            v_tile_to_use[d_tile][:num_p, : atp.d_tile_size_free_dim],
+                        )
+
+        # Step 2: Copy PSUM to SBUF for this d-tile (frees PSUM bank for next d-tile)
+        if loop_reduce_sel and k_seqlen_mask and mm2_psum_set:
+            if ac.tp_out:
+                num_f = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
+                if large_tile_idx == 0:
+                    nisa.tensor_copy(bufs.mm2_sb[pv_grp][d_tile][:, :num_f], mm2_psum_tile[d_tile][:, :num_f])
+                else:
+                    nisa.tensor_tensor(
+                        bufs.mm2_sb[pv_grp][d_tile][:, :num_f],
+                        bufs.mm2_sb[pv_grp][d_tile][:, :num_f],
+                        mm2_psum_tile[d_tile][:, :num_f],
+                        nl.add,
+                    )
             else:
-                nisa.tensor_tensor(
-                    bufs.mm2_sb[pv_grp][:num_p, :],
-                    bufs.mm2_sb[pv_grp][:num_p, :],
-                    mm2_psum_tile[:num_p, :],
-                    nl.add,
-                )
+                num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
+                if large_tile_idx == 0:
+                    nisa.tensor_copy(bufs.mm2_sb[pv_grp][d_tile][:num_p, :], mm2_psum_tile[d_tile][:num_p, :])
+                else:
+                    nisa.tensor_tensor(
+                        bufs.mm2_sb[pv_grp][d_tile][:num_p, :],
+                        bufs.mm2_sb[pv_grp][d_tile][:num_p, :],
+                        mm2_psum_tile[d_tile][:num_p, :],
+                        nl.add,
+                    )
 
 
 def _has_any_compute_causal(q_grp: int, k_start_pos: int, ac: AttnConfig, num_grps: int = 1):
@@ -3344,6 +3909,11 @@ def _has_any_compute_causal(q_grp: int, k_start_pos: int, ac: AttnConfig, num_gr
     :param q_grp: q group index
     :param k_start_pos: start pos of k
     """
+    # With round-robin KV, k_start_pos is the SBUF position, not the global position.
+    # A Q group might be above some blocks but below others within the same tile.
+    # With round-robin KV, conservatively assume all tiles have compute.
+    if ac.kvp_group_size > 0:
+        return True
     # We can completely eliminate compute when even the largest q in the group is
     # less than the smallest k in tile
     max_q_in_grp = q_grp * _Q_GRP_SZ + _Q_GRP_SZ * num_grps - 1

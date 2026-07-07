@@ -19,7 +19,7 @@ import nki.language as nl
 import numpy as np
 import torch
 
-from ..utils.common_types import NormType, QuantizationType
+from ..utils.common_types import DtypeMode, NormType, QuantizationType
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
 
 # FP8 clipping constants for quantization references.
@@ -38,7 +38,7 @@ def rmsnorm_quant_torch_ref(
     input_dequant_scale: torch.Tensor = None,
     pre_norm_gamma: torch.Tensor = None,
     residual: torch.Tensor = None,
-    quant_dtype=nl.float8_e4m3,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> dict[str, np.ndarray]:
     """Torch reference for rmsnorm_quant_kernel.
 
@@ -56,7 +56,9 @@ def rmsnorm_quant_torch_ref(
             When provided, applies RMSNorm to hidden before the main computation.
         residual (torch.Tensor, optional): Residual tensor of shape [B, S, H].
             When provided, added to hidden after optional pre-normalization.
-        quant_dtype: Target FP8 quant dtype. Defaults to ``nl.float8_e4m3`` (legacy, max=240).
+        dtype_mode (DtypeMode): FP8 E4M3 dtype selection for quantized output.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448).
             Pass ``nl.float8_e4m3fn`` (OCP, max=448) when the kernel runs on TRN3/gen4 so
             the reference clips to the same range as the kernel output. Tests typically
             branch on ``platform_target.is_trn3()`` to pick this.
@@ -67,6 +69,7 @@ def rmsnorm_quant_torch_ref(
           - "dequant_scale": [B, S, 1] fp32 dequant scale (ROW quant only, None for STATIC)
           - "residual_out": [B, S, H] fp32 residual output (only when residual is provided)
     """
+    quant_dtype = nl.float8_e4m3fn if dtype_mode == DtypeMode.OCP else nl.float8_e4m3
     FP8_RANGE = FP8_E4M3FN_CLIP_VALUE if quant_dtype == nl.float8_e4m3fn else FP8_E4M3_CLIP_VALUE
 
     inp = hidden.numpy().astype(np.float32)

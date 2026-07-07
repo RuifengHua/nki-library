@@ -43,7 +43,7 @@ from ..utils.allocator import (
     create_auto_alloc_manager,
     sizeinbytes,
 )
-from ..utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from ..utils.common_types import DtypeMode, NormType, QKVOutputLayout, QuantizationType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_max_positive_value_for_dtype, get_verified_program_sharding_info
 from ..utils.logging import get_logger
@@ -55,9 +55,6 @@ from .qkv_tkg_mx_impl import _qkv_tkg_mx_impl
 P_MAX = 128
 F_MAX = 512
 NUM_PSUM_BANKS = 8
-
-I_TILE_SIZE = F_MAX
-I_BLOCK_SIZE = NUM_PSUM_BANKS * I_TILE_SIZE
 
 # Heuristic tile size for H dimension weight loading
 H_BLOCK_SIZE = 2048
@@ -91,6 +88,7 @@ def qkv_tkg(
     hidden_actual: Optional[int] = None,
     sbm: Optional[SbufManager] = None,
     transposed_in: bool = False,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> nl.ndarray | Tuple[nl.ndarray, nl.ndarray]:
     """
     QKV Projection Kernel for Token Generation
@@ -130,8 +128,8 @@ def qkv_tkg(
             Shape:    [H, I]
             Dtype:
                 - QuantizationType.NONE: nl.float32, nl.float16, or nl.bfloat16
-                - QuantizationType.STATIC: nl.float8_e4m3
-                - QuantizationType.ROW: nl.float8_e4m3
+                - QuantizationType.STATIC: nl.float8_e4m3 or nl.float8_e4m3fn
+                - QuantizationType.ROW: nl.float8_e4m3 or nl.float8_e4m3fn
         norm_w (nl.ndarray, optional):
             Normalization weight tensor in HBM. Required when norm_type is RMS_NORM or LAYER_NORM.
             Shape:    [1, H]
@@ -206,6 +204,11 @@ def qkv_tkg(
             The kernel loads the per-NC shard, permutes to [H0, BxS, H1_shard], applies
             shard_on_h RMSNorm if norm_type is RMS_NORM, and returns the per-shard result
             for QKV projection. Default: False.
+        dtype_mode (DtypeMode):
+            Quantization dtype policy, accepted for API parity with ``qkv`` and
+            ``qkv_cte``. ``qkv_tkg`` does not branch on this argument today —
+            the FP8 dtype is determined by the caller-provided weight tensors
+            and matmul accumulator dtype. Default: ``DtypeMode.NON_OCP``.
 
     Returns:
         output (nl.ndarray | Tuple[nl.ndarray, nl.ndarray]):
@@ -425,6 +428,11 @@ class QkvTkgConfig(nl.NKIObject):
     remainder_array_tiling_factor: int
     array_tiled_H1: int
     remainder_array_tiled_H1: int
+    # I dimension tiling
+    i_tile_size: int
+    i_block_size: int
+    # Column tiling strategy
+    use_I_column_tiling: bool
 
 
 def _validate_and_create_config(
@@ -645,8 +653,19 @@ def _validate_and_create_config(
         array_tiling_dim = 64
 
     array_tiling_factor = 128 // array_tiling_dim
-    array_tiled_H1 = NUM_TILES_PER_H_BLOCK // array_tiling_factor
 
+    '''
+    We have two variants of column-tiling: on H or on I.
+    # H-tiling (array tiling): Packs multiple H chunks into one matmul to fill partition rows. Same output column, different partial sums → must reduce.
+    # I-tiling (column tiling): Packs multiple output columns into one matmul to fill partition rows. Same input, different outputs → no reduce needed.
+    '''
+    # For now, only use I_tiling on GPT-OSS config. After more performance testing, it should be enabled in general.
+    use_I_column_tiling = False
+    if H == 3072:
+        use_I_column_tiling = True
+
+    # Only used in case of H-column-tiling.
+    array_tiled_H1 = NUM_TILES_PER_H_BLOCK // array_tiling_factor
     # If H is not multiple of H_BLOCK_SIZE and num_128_tiles_per_remainder_H_block is not multiple of array_tiling_factor,
     # kernel won't use array tiling
     remainder_array_tiling_dim = array_tiling_dim
@@ -655,6 +674,15 @@ def _validate_and_create_config(
         remainder_array_tiling_dim = 128
         remainder_array_tiling_factor = 1
     remainder_array_tiled_H1 = num_128_tiles_per_remainder_H_block // remainder_array_tiling_factor
+
+    if use_I_column_tiling and I <= F_MAX * array_tiling_factor:
+        # We are losing on column-tiling when I is small. Use smaller I_tile in this case.
+        # In this case moving f-dim will be smaller than F_MAX, and we have more PSUM evitions.
+        # However, due to faster matmult perf is still better.
+        i_tile_size = I // array_tiling_factor
+    else:
+        i_tile_size = F_MAX
+    i_block_size = NUM_PSUM_BANKS * i_tile_size
 
     return QkvTkgConfig(
         B=B,
@@ -678,6 +706,9 @@ def _validate_and_create_config(
         remainder_array_tiling_factor=remainder_array_tiling_factor,
         array_tiled_H1=array_tiled_H1,
         remainder_array_tiled_H1=remainder_array_tiled_H1,
+        i_tile_size=i_tile_size,
+        i_block_size=i_block_size,
+        use_I_column_tiling=use_I_column_tiling,
     )
 
 
@@ -1136,6 +1167,12 @@ def _compute_qkv_i_block(
     preapply_bias = (
         quantization_type == QuantizationType.NONE and qkv_bias != None and qkv_bias.dtype == qkv_out_sb.dtype
     )
+
+    # Not pre-applying bias is slightly efficient if we use I_column_tiling.
+    # In this case no reductoin is needed post-matmult, so we can engine balance tensor_copy and apply bias later.
+    if cfg.use_I_column_tiling and cfg.array_tiling_factor == 4:
+        preapply_bias = False
+
     if preapply_bias:
         qkv_bias_block = qkv_bias[:, i_block.start_offset : i_block.end_offset]
     else:
@@ -1155,6 +1192,7 @@ def _compute_qkv_i_block(
         cfg=cfg,
         i_block_idx=i_block.index,
         sbm=sbm,
+        has_preapplied_bias=preapply_bias,
     )
 
     if quantization_type == QuantizationType.STATIC:
@@ -1223,7 +1261,7 @@ def _qkv_projection_sbuf_output(
     qkv_out_sb = sbm.alloc_heap((BxS, I), dtype=io_dtype, buffer=nl.sbuf)
 
     # Process each I-block
-    for i_block in TiledRange(I, I_BLOCK_SIZE):
+    for i_block in TiledRange(I, cfg.i_block_size):
         sbm.open_scope(name=f"qkv_sbuf_output_i_block_{i_block.index}")
 
         # Output slice for this I-block
@@ -1286,7 +1324,7 @@ def _qkv_projection_hbm_output(
         )
 
     # Process each I block
-    for i_block in TiledRange(I, I_BLOCK_SIZE):
+    for i_block in TiledRange(I, cfg.i_block_size):
         sbm.open_scope(name=f"qkv_hbm_output_i_block_{i_block.index}")
 
         # Allocate output SB that gets accumulated in HBM
@@ -1372,92 +1410,42 @@ def _qkv_projection(
     cfg: QkvTkgConfig,
     i_block_idx: int,
     sbm: SbufManager,
+    has_preapplied_bias: bool = False,
 ) -> nl.ndarray:
-    _, _, I = qkv_w_hbm.shape  # I-block size from tensor
+    # Note: "column_tiling" here refers to special perf-mode of nc_matmult, that allows us fill PE-array with multiple tiles.
+    if cfg.use_I_column_tiling:
+        return _qkv_projection_I_column_tiled(
+            hidden_sb, qkv_w_hbm, qkv_out_sb, cfg, i_block_idx, sbm, has_preapplied_bias
+        )
+    else:
+        return _qkv_projection_H_column_tiled(
+            hidden_sb, qkv_w_hbm, qkv_out_sb, cfg, i_block_idx, sbm, has_preapplied_bias
+        )
+
+
+def _qkv_projection_H_column_tiled(
+    hidden_sb: TensorView,
+    qkv_w_hbm: TensorView,
+    qkv_out_sb: nl.ndarray,
+    cfg: QkvTkgConfig,
+    i_block_idx: int,
+    sbm: SbufManager,
+    has_preapplied_bias: bool = False,
+) -> nl.ndarray:
+    """Original array-tiling path: tiles H chunks across partition rows, requires reduction."""
+    _, _, I = qkv_w_hbm.shape
     output_dtype = hidden_sb.dtype
     weight_dtype = qkv_w_hbm.dtype
 
     sbm.open_scope(name=f"qkv_projection_block_{i_block_idx}")
-
-    # Allocate all temp buffers: weights, PSUMs
-    qkv_w_sb, num_w_blocks, result_psum = _allocate_qkv_buffers(
-        I=I,
-        qkv_out_shape=qkv_out_sb.shape,
-        output_dtype=output_dtype,
-        weight_dtype=weight_dtype,
-        cfg=cfg,
-        i_block_idx=i_block_idx,
-        sbm=sbm,
-    )
-
-    # Process all H blocks (full + remainder)
-    for h_block in TiledRange(cfg.H1_shard, NUM_TILES_PER_H_BLOCK):
-        is_remainder = h_block.size < NUM_TILES_PER_H_BLOCK
-        hidden_block = hidden_sb.slice(dim=2, start=h_block.start_offset, end=h_block.end_offset)
-        qkv_w_block = qkv_w_hbm.slice(dim=1, start=h_block.start_offset, end=h_block.end_offset)
-
-        _process_h_block(
-            H_block_idx=h_block.index,
-            num_128_tiles=h_block.size,
-            array_tiled_H1=cfg.remainder_array_tiled_H1 if is_remainder else cfg.array_tiled_H1,
-            array_tiling_dim=cfg.remainder_array_tiling_dim if is_remainder else cfg.array_tiling_dim,
-            array_tiling_factor=cfg.remainder_array_tiling_factor if is_remainder else cfg.array_tiling_factor,
-            qkv_w_hbm=qkv_w_block,
-            qkv_w_sb=qkv_w_sb,
-            hidden_sb=hidden_block,
-            result_psum=result_psum,
-            cfg=cfg,
-            num_w_blocks=num_w_blocks,
-        )
-
-    # Accumulate PSUMs into output
-    _accumulate_psum_to_output(qkv_out_sb=qkv_out_sb, result_psum=result_psum, cfg=cfg)
-
-    sbm.close_scope()
-
-    return qkv_out_sb
-
-
-def _allocate_qkv_buffers(
-    I: int,
-    qkv_out_shape: Tuple[int, ...],
-    output_dtype,
-    weight_dtype,
-    cfg: QkvTkgConfig,
-    i_block_idx: int,
-    sbm: SbufManager,
-) -> Tuple[nl.ndarray, int, list]:
-    """
-    Allocate all buffers needed for QKV projection: weights, and PSUMs.
-
-    Allocates:
-    1. Weight tile buffer (qkv_w_sb) sized to fit remaining SBUF space
-    2. PSUM tiles for accumulation (one per I tile)
-
-    Args:
-        I: I-block size (from tensor shape)
-        qkv_out_shape: Shape of the output slice, used to reserve space for post-projection
-            buffers (bias broadcast, sendrecv) that coexist at the same scope level
-        output_dtype: Data type for output tensor
-        weight_dtype: Data type for weight tensor
-        cfg: QKV TKG config
-        i_block_idx: I-block index for buffer naming
-        sbm: SbufManager for SBUF allocation
-
-    Returns:
-        Tuple of (qkv_w_sb, num_w_blocks, result_psum):
-        - qkv_w_sb: Weight tile buffer
-        - num_w_blocks: Number of weight tiles allocated
-        - result_psum: List of PSUM tiles
-    """
 
     # Reserve space for post-projection buffers (bias broadcast, sendrecv) that will be
     # allocated at the same scope level after the projection scope closes.
     # get_free_space() already accounts for all prior allocations (stack and heap),
     # but not for these future sibling-scope allocations.
     extra_space_needed = sizeinbytes(output_dtype)
-    for i in range(len(qkv_out_shape)):
-        extra_space_needed *= qkv_out_shape[i]
+    for i in range(len(qkv_out_sb.shape)):
+        extra_space_needed *= qkv_out_sb.shape[i]
 
     remaining_space = sbm.get_free_space() - extra_space_needed
     size_of_qkv_w_block = I * NUM_TILES_PER_H_BLOCK * sizeinbytes(weight_dtype)
@@ -1465,13 +1453,10 @@ def _allocate_qkv_buffers(
     num_H_blocks = div_ceil(cfg.H_shard, H_BLOCK_SIZE)
     num_w_blocks = min(num_H_blocks, num_available_w_blocks)
     # With auto_alloc, remaining_space underestimates available memory due to automatic reuse,
-    # so ensure at least one tile can be allocated
+    # so ensure at least one tile can be allocate
     if sbm.is_auto_alloc():
         num_w_blocks = max(1, num_w_blocks)
-    kernel_assert(
-        num_w_blocks > 0,
-        f"Not enough SBUF space for qkv projection weight, need {size_of_qkv_w_block}, got {remaining_space}",
-    )
+    kernel_assert(num_w_blocks > 0, f"Not enough SBUF space for qkv projection weight")
 
     # Allocate weight tiles
     qkv_w_sb = sbm.alloc_stack(
@@ -1483,134 +1468,184 @@ def _allocate_qkv_buffers(
     qkv_w_sb = TensorView(qkv_w_sb)
 
     # Allocate PSUM tiles - one per I tile in this I-block
-    n_psum = div_ceil(I, I_TILE_SIZE)
+    n_psum = div_ceil(I, cfg.i_tile_size)
     result_psum = []
     prefix = sbm.get_name_prefix()
     for psum_idx in range(n_psum):
         psum_tensor = nl.ndarray(
-            (128, I_TILE_SIZE),
+            (128, cfg.i_tile_size),
             dtype=nl.float32,
             name=f"{prefix}batch_result_psum_{i_block_idx}_{psum_idx}",
             buffer=nl.psum,
             address=None
             if sbm.is_auto_alloc()
-            else (
-                0,
-                (psum_idx % NUM_PSUM_BANKS) * (F_MAX * sizeinbytes(nl.float32)),
-            ),
+            else (0, (psum_idx % NUM_PSUM_BANKS) * (F_MAX * sizeinbytes(nl.float32))),
         )
         result_psum.append(psum_tensor)
 
-    return qkv_w_sb, num_w_blocks, result_psum
+    # Process all H blocks with array tiling
+    for h_block in TiledRange(cfg.H1_shard, NUM_TILES_PER_H_BLOCK):
+        is_remainder = h_block.size < NUM_TILES_PER_H_BLOCK
+        hidden_block = hidden_sb.slice(dim=2, start=h_block.start_offset, end=h_block.end_offset)
+        qkv_w_block = qkv_w_hbm.slice(dim=1, start=h_block.start_offset, end=h_block.end_offset)
 
+        array_tiling_dim = cfg.remainder_array_tiling_dim if is_remainder else cfg.array_tiling_dim
+        array_tiling_factor = cfg.remainder_array_tiling_factor if is_remainder else cfg.array_tiling_factor
+        array_tiled_H1 = cfg.remainder_array_tiled_H1 if is_remainder else cfg.array_tiled_H1
 
-def _process_h_block(
-    H_block_idx: int,
-    num_128_tiles: int,
-    array_tiled_H1: int,
-    array_tiling_dim: int,
-    array_tiling_factor: int,
-    qkv_w_hbm: TensorView,
-    qkv_w_sb: TensorView,
-    hidden_sb: TensorView,
-    result_psum: list,
-    cfg: QkvTkgConfig,
-    num_w_blocks: int,
-) -> None:
-    """
-    Process a single H block: load weights and perform tiled matrix multiplication.
+        w_block_slot = h_block.index % num_w_blocks
+        qkv_w_sb_block = qkv_w_sb.select(dim=1, index=w_block_slot).slice(dim=1, start=0, end=h_block.size)
+        nisa.dma_copy(qkv_w_sb_block.get_view(), qkv_w_block.get_view())
 
-    Unified implementation for both full and remainder H blocks.
-    Caller determines block type and provides appropriate parameters.
+        for h1_tile in range(array_tiled_H1):
+            array_tile_offset = array_tiling_factor * h1_tile
+            for factor in range(array_tiling_factor):
+                h1_tile_idx = array_tile_offset + factor
+                hidden_tile = hidden_block.select(dim=2, index=h1_tile_idx)
 
-    Steps:
-    1. Load weight tile from HBM to SBUF using TensorView
-    2. Perform nested tiled matmul with array tiling optimization:
-       - Outer loop: h1_tile (array tiling chunks)
-       - Middle loop: factor (array tiling factor)
-       - Inner loop: i_tile (I tiles within this I-block)
+                for i_tile in TiledRange(I, cfg.i_tile_size):
+                    qkv_w_sb_tile = qkv_w_sb_block.select(dim=1, index=h1_tile_idx).slice(
+                        dim=1, start=i_tile.start_offset, end=i_tile.end_offset
+                    )
+                    psum_row_start = array_tiling_dim * factor
+                    result_slice = result_psum[i_tile.index][psum_row_start : psum_row_start + cfg.BxS, 0 : i_tile.size]
+                    nisa.nc_matmul(
+                        result_slice,
+                        hidden_tile.get_view(),
+                        qkv_w_sb_tile.get_view(),
+                        tile_position=(0, array_tiling_dim * factor),
+                        tile_size=(cfg.H0, array_tiling_dim),
+                    )
 
-    Args:
-        H_block_idx: Index of current H block
-        num_128_tiles: Number of 128-element tiles in this H block
-        array_tiled_H1: Number of array-tiled H1 chunks for this tile
-        array_tiling_dim: Array tiling dimension (32, 64, or 128)
-        array_tiling_factor: Array tiling factor (128 / array_tiling_dim)
-        qkv_w_hbm: QKV projection weights (TensorView, already sliced to H and I). Shape: (H0, num_128_tiles, I_block_size)
-        qkv_w_sb: Weight tile buffer in SBUF (TensorView). Shape: (H0, num_w_blocks, NUM_TILES_PER_H_BLOCK, I_block_size)
-        hidden_sb: Hidden states in SBUF (TensorView, already sliced to H block). Shape: (H0, BxS, num_128_tiles)
-        result_psum: List of PSUM tensors for accumulation
-        cfg: QKV TKG config
-        num_w_blocks: Number of weight tiles allocated in SBUF
-    """
-
-    I = qkv_w_sb.shape[3]  # I-block size from tensor shape
-
-    # Select the weight tile slot for this H_block (circular buffer), slice to actual num_128_tiles
-    w_block_slot = H_block_idx % num_w_blocks
-    qkv_w_sb_block = qkv_w_sb.select(dim=1, index=w_block_slot).slice(dim=1, start=0, end=num_128_tiles)
-
-    nisa.dma_copy(qkv_w_sb_block.get_view(), qkv_w_hbm.get_view())
-
-    # Perform tiled matrix multiplication with array tiling
-    for h1_tile in range(array_tiled_H1):
-        array_tile_offset = array_tiling_factor * h1_tile
-
-        for factor in range(array_tiling_factor):
-            h1_tile_idx = array_tile_offset + factor
-            hidden_tile = hidden_sb.select(dim=2, index=h1_tile_idx)
-
-            # Process all I tiles (full + remainder) within this I-block
-            for i_tile in TiledRange(I, I_TILE_SIZE):
-                qkv_w_sb_tile = qkv_w_sb_block.select(dim=1, index=h1_tile_idx).slice(
-                    dim=1, start=i_tile.start_offset, end=i_tile.end_offset
-                )
-
-                psum_row_start = array_tiling_dim * factor
-                result_slice = result_psum[i_tile.index][psum_row_start : psum_row_start + cfg.BxS, 0 : i_tile.size]
-
-                nisa.nc_matmul(
-                    result_slice,
-                    hidden_tile.get_view(),
-                    qkv_w_sb_tile.get_view(),
-                    tile_position=(0, array_tiling_dim * factor),
-                    tile_size=(cfg.H0, array_tiling_dim),
-                )
-
-
-def _accumulate_psum_to_output(
-    qkv_out_sb: nl.ndarray,
-    result_psum: list,
-    cfg: QkvTkgConfig,
-) -> None:
-    """
-    Accumulate PSUM tiles into final output tensor.
-
-    Args:
-        qkv_out_sb: Output buffer to accumulate into. Shape: (BxS, I_block_size)
-        result_psum: List of PSUM tensors. Shape: (128, I_TILE_SIZE) each
-        cfg: QKV TKG config
-    """
-
-    array_tiling_factor = cfg.array_tiling_factor
-    array_tiling_dim = cfg.array_tiling_dim
+    # Accumulate: reduce array-tiled PSUM partitions
+    _i_array_tiling_factor = cfg.array_tiling_factor
+    _i_array_tiling_dim = cfg.array_tiling_dim
     has_only_remainder_H_block = cfg.H_shard < H_BLOCK_SIZE
     if has_only_remainder_H_block:
-        # When there is only H remainder tile, use the remainder tiling level
-        array_tiling_factor = cfg.remainder_array_tiling_factor
-        array_tiling_dim = cfg.remainder_array_tiling_dim
+        _i_array_tiling_factor = cfg.remainder_array_tiling_factor
+        _i_array_tiling_dim = cfg.remainder_array_tiling_dim
 
-    I = qkv_out_sb.shape[1]  # I-block size from output shape
-
-    # Accumulate all I tiles (full + remainder)
-    for i_tile in TiledRange(I, I_TILE_SIZE):
-        for factor in range(array_tiling_factor):
-            result_psum_slice_start = array_tiling_dim * factor
-            result_psum_slice_end = array_tiling_dim * factor + cfg.BxS
-
+    for i_tile in TiledRange(I, cfg.i_tile_size):
+        for factor in range(_i_array_tiling_factor):
+            result_psum_slice_start = _i_array_tiling_dim * factor
             nisa.tensor_tensor(
                 qkv_out_sb[0 : cfg.BxS, i_tile.start_offset : i_tile.end_offset],
                 qkv_out_sb[0 : cfg.BxS, i_tile.start_offset : i_tile.end_offset],
-                result_psum[i_tile.index][result_psum_slice_start:result_psum_slice_end, 0 : i_tile.size],
+                result_psum[i_tile.index][result_psum_slice_start : result_psum_slice_start + cfg.BxS, 0 : i_tile.size],
                 op=nl.add,
             )
+
+    sbm.close_scope()
+    return qkv_out_sb
+
+
+def _qkv_projection_I_column_tiled(
+    hidden_sb: TensorView,
+    qkv_w_hbm: TensorView,
+    qkv_out_sb: nl.ndarray,
+    cfg: QkvTkgConfig,
+    i_block_idx: int,
+    sbm: SbufManager,
+    has_preapplied_bias: bool = False,
+) -> nl.ndarray:
+    """I-column-tiling path: tiles I across partition rows, no reduction needed."""
+    _, _, I = qkv_w_hbm.shape
+    output_dtype = hidden_sb.dtype
+    weight_dtype = qkv_w_hbm.dtype
+
+    sbm.open_scope(name=f"qkv_projection_block_{i_block_idx}")
+
+    col_tiling_dim = cfg.array_tiling_dim
+    col_tiling_factor = cfg.array_tiling_factor
+
+    # Reserve space for post-projection buffers
+    extra_space_needed = sizeinbytes(output_dtype)
+    for i in range(len(qkv_out_sb.shape)):
+        extra_space_needed *= qkv_out_sb.shape[i]
+
+    remaining_space = sbm.get_free_space() - extra_space_needed
+    size_of_qkv_w_block = I * NUM_TILES_PER_H_BLOCK * sizeinbytes(weight_dtype)
+    num_available_w_blocks = remaining_space // size_of_qkv_w_block
+    num_H_blocks = div_ceil(cfg.H_shard, H_BLOCK_SIZE)
+    num_w_blocks = min(num_H_blocks, num_available_w_blocks)
+    if sbm.is_auto_alloc():
+        num_w_blocks = max(1, num_w_blocks)
+    kernel_assert(num_w_blocks > 0, f"Not enough SBUF space for qkv projection weight")
+
+    qkv_w_sb = sbm.alloc_stack(
+        (cfg.H0, num_w_blocks, NUM_TILES_PER_H_BLOCK, I),
+        name=f"qkv_w_sb_block_{i_block_idx}",
+        dtype=weight_dtype,
+        buffer=nl.sbuf,
+    )
+    qkv_w_sb = TensorView(qkv_w_sb)
+
+    # Allocate PSUM - one per group of col_tiling_factor I tiles
+    n_psum = div_ceil(I, cfg.i_tile_size * col_tiling_factor)
+    psum_pdim = min(128, col_tiling_dim * col_tiling_factor)
+    result_psum = []
+    prefix = sbm.get_name_prefix()
+    for psum_idx in range(n_psum):
+        psum_tensor = nl.ndarray(
+            (psum_pdim, cfg.i_tile_size),
+            dtype=nl.float32,
+            name=f"{prefix}batch_result_psum_{i_block_idx}_{psum_idx}",
+            buffer=nl.psum,
+            address=None
+            if sbm.is_auto_alloc()
+            else (0, (psum_idx % NUM_PSUM_BANKS) * (F_MAX * sizeinbytes(nl.float32))),
+        )
+        result_psum.append(psum_tensor)
+
+    # Matmul: column tiling on I with all H1 tiles accumulating naturally
+    for h_block in TiledRange(cfg.H1_shard, NUM_TILES_PER_H_BLOCK):
+        hidden_block = hidden_sb.slice(dim=2, start=h_block.start_offset, end=h_block.end_offset)
+        qkv_w_block = qkv_w_hbm.slice(dim=1, start=h_block.start_offset, end=h_block.end_offset)
+
+        w_block_slot = h_block.index % num_w_blocks
+        qkv_w_sb_block = qkv_w_sb.select(dim=1, index=w_block_slot).slice(dim=1, start=0, end=h_block.size)
+        nisa.dma_copy(qkv_w_sb_block.get_view(), qkv_w_block.get_view())
+
+        for h1_tile_idx in range(h_block.size):
+            hidden_tile = hidden_block.select(dim=2, index=h1_tile_idx)
+
+            for i_group in TiledRange(I, cfg.i_tile_size * col_tiling_factor):
+                n_col_tiles = min(col_tiling_factor, div_ceil(i_group.size, cfg.i_tile_size))
+                group_idx = i_group.index
+
+                for col_idx in range(n_col_tiles):
+                    i_offset = i_group.start_offset + col_idx * cfg.i_tile_size
+                    i_size = min(cfg.i_tile_size, I - i_offset)
+                    qkv_w_sb_tile = qkv_w_sb_block.select(dim=1, index=h1_tile_idx).slice(
+                        dim=1, start=i_offset, end=i_offset + i_size
+                    )
+                    nisa.nc_matmul(
+                        result_psum[group_idx][nl.ds(col_tiling_dim * col_idx, cfg.BxS), 0:i_size],
+                        hidden_tile.get_view(),
+                        qkv_w_sb_tile.get_view(),
+                        tile_position=(0, col_tiling_dim * col_idx),
+                        tile_size=(cfg.H0, col_tiling_dim),
+                    )
+
+    # Evict: one copy per column tile (no reduction)
+    for i_group in TiledRange(I, cfg.i_tile_size * col_tiling_factor):
+        n_col_tiles = min(col_tiling_factor, div_ceil(i_group.size, cfg.i_tile_size))
+        group_idx = i_group.index
+
+        for col_idx in range(n_col_tiles):
+            i_offset = i_group.start_offset + col_idx * cfg.i_tile_size
+            i_size = min(cfg.i_tile_size, I - i_offset)
+            psum_slice = result_psum[group_idx][nl.ds(col_tiling_dim * col_idx, cfg.BxS), 0:i_size]
+            out_slice = qkv_out_sb[0 : cfg.BxS, nl.ds(i_offset, i_size)]
+
+            if has_preapplied_bias:
+                nisa.tensor_tensor(out_slice, out_slice, psum_slice, op=nl.add)
+            # Unlike with H-column-tiling, there is no reduction needed.
+            else:
+                if col_idx % 2 == 0:
+                    nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.vector)
+                else:
+                    nisa.tensor_copy(out_slice, psum_slice, engine=nisa.engine.scalar)
+
+    sbm.close_scope()
+    return qkv_out_sb

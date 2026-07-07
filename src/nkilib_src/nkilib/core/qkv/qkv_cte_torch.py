@@ -14,15 +14,14 @@
 
 """PyTorch reference implementation for qkv_cte kernel."""
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import nki.language as nl
 import numpy as np
 import torch
 
-from test.integration.nkilib.utils.test_kernel_common import norm_name2func_torch
-
-from ..utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from ..subkernels.norm_torch_dispatch import norm_name2func_torch
+from ..utils.common_types import DtypeMode, NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
 from ..utils.mx_torch_common import (
     mx_matmul,
@@ -33,9 +32,6 @@ from ..utils.mx_torch_common import (
 # MX quantization constants
 _Q_WIDTH = 4  # MX quantization group width (number of elements packed together)
 _PMAX = 128  # Hardware partition dimension size (nl.tile_size.pmax resolves to -1 on host)
-
-# FP8 clipping constant for STATIC quantization (float8_e4m3 max representable value)
-FP8_E4M3_CLIP_VALUE = get_max_positive_value_for_dtype(nl.float8_e4m3)
 
 
 def _apply_qk_norm(
@@ -89,6 +85,11 @@ def qkv_cte_torch_ref(
     fused_rope: Optional[bool] = False,
     cos_cache: Optional[torch.Tensor] = None,
     sin_cache: Optional[torch.Tensor] = None,
+    # K-specific gamma-fused caches; accepted for parity. The test framework's
+    # gamma_unfused_ref wrapper unfuses gamma before invoking this ref, so
+    # k_cos_cache / k_sin_cache are unused here.
+    k_cos_cache: Optional[torch.Tensor] = None,  # noqa: ARG001
+    k_sin_cache: Optional[torch.Tensor] = None,  # noqa: ARG001
     d_head: Optional[int] = None,
     num_q_heads: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
@@ -103,17 +104,30 @@ def qkv_cte_torch_ref(
     # --- Block KV Cache Related
     use_block_kv: bool = False,
     transpose_k_cache: bool = False,
+    fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[torch.Tensor] = None,
+    # --- Hardware-only — accepted for kernel signature parity, no-op on CPU
+    store_output_in_sbuf: bool = False,  # noqa: ARG001
+    sbm: Any = None,  # noqa: ARG001
+    use_auto_allocation: bool = False,  # noqa: ARG001
+    load_input_with_DMA_transpose: bool = True,  # noqa: ARG001
     # --- Quantization Related
     quantization_type: QuantizationType = QuantizationType.NONE,
     qkv_w_scale: Optional[torch.Tensor] = None,
     qkv_in_scale: Optional[torch.Tensor] = None,
     # --- Input Swizzle (MX only)
     is_input_swizzled: bool = False,
+    # Weight layout; torch ref assumes CONTIGUOUS (default). Other layouts
+    # would need an unswizzle in the framework wrapper before calling.
+    weight_layout: QKVWeightLayout = QKVWeightLayout.CONTIGUOUS,
     # --- QK-Norm Related
     qk_norm_pre_rope=None,
     qk_norm_post_rope=None,
+    # --- Output / Input layout — accepted for kernel signature parity, no-op on CPU
+    output_hbm: Any = None,  # noqa: ARG001
+    strided_input_config: Any = None,  # noqa: ARG001
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> Dict[str, torch.Tensor]:
     """PyTorch reference implementation for the QKV CTE (Context Encoding) kernel.
 
@@ -142,7 +156,7 @@ def qkv_cte_torch_ref(
     Args:
         input (torch.Tensor): Input hidden states [B, S, H].
         fused_qkv_weights (torch.Tensor): Fused QKV weight matrix [H, I], or
-            [H//4, I] for MX quantization.
+            [H//4, I, 4] fp8 for MX/ROW_MX quantization.
         output_layout (QKVOutputLayout): Output layout: BSD [B,S,I],
             NBSd [N,B,S,d_head], or NBdS [N,B,d_head,S]. Default: BSD.
         bias (Optional[torch.Tensor]): QKV bias [1, I]. Default: None.
@@ -197,7 +211,19 @@ def qkv_cte_torch_ref(
     # Convert all inputs to float32 because CPU doesn't support half precision
     input_original_dtype = input.dtype
     input = input.to(torch.float32)
-    if quantization_type not in (QuantizationType.MX, QuantizationType.ROW_MX):
+    # AUTO must be pre-resolved by the caller (see resolve_dtype_mode_for_torch_ref);
+    # the torch ref runs on CPU and can't query hardware.
+    assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
+        "qkv_cte_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+    )
+    _fp8_e4m3_dtype = nl.float8_e4m3fn if dtype_mode == DtypeMode.OCP else nl.float8_e4m3
+    fp8_clip_value = get_max_positive_value_for_dtype(_fp8_e4m3_dtype)
+    # Resolve the torch dtype that mirrors ``_fp8_e4m3_dtype`` for the
+    # post-clip FP8 round-trip. Torch ships ``float8_e4m3fn`` but historically
+    # did not expose the non-FN ``float8_e4m3`` (TRN2's clipped-at-240 variant)
+    # on CPU; fall back to clamp-only there by leaving this ``None``.
+    _fp8_torch_dtype = torch.float8_e4m3fn if dtype_mode == DtypeMode.OCP else getattr(torch, "float8_e4m3", None)
+    if not quantization_type.is_mx():
         fused_qkv_weights = fused_qkv_weights.to(torch.float32)
     mlp_prev = mlp_prev.to(torch.float32) if mlp_prev is not None else None
     attention_prev = attention_prev.to(torch.float32) if attention_prev is not None else None
@@ -258,15 +284,10 @@ def qkv_cte_torch_ref(
     if quantization_type == QuantizationType.ROW_MX:
         B, S, H = input.shape
         weights_np = fused_qkv_weights if isinstance(fused_qkv_weights, np.ndarray) else fused_qkv_weights.numpy()
-        H_quarter = weights_np.shape[0]
-        I = weights_np.shape[1]
+        H_quarter, I, _ = weights_np.shape  # [H//4, I, 4] fp8
 
-        # Unpack x4 weights and reverse MX_CONTIGUOUS packing (identity reorder):
-        # (H//4, I*4) -> (H//4, I, 4) -> (H//4, 4, I) -> (H, I)
-        w_unpacked_np = unpack_float8_e4m3fn_x4(weights_np).numpy()
-        w_f32 = torch.from_numpy(
-            w_unpacked_np.reshape(H_quarter, I, _Q_WIDTH).transpose(0, 2, 1).reshape(H, I).astype(np.float32)
-        )
+        # Reverse MX_CONTIGUOUS packing: (H//4, I, 4) -> (H//4, 4, I) -> (H, I)
+        w_f32 = torch.from_numpy(weights_np.transpose(0, 2, 1).reshape(H, I).astype(np.float32))
 
         # Matmul: input [B, S, H] @ weights [H, I] -> [B, S, I]
         qkv_out = input.reshape(B * S, H) @ w_f32
@@ -292,31 +313,16 @@ def qkv_cte_torch_ref(
             w_scale_broadcast = w_scale[0:1, :]  # Take first row, [1, I]
         qkv_out = qkv_out * in_scale * w_scale_broadcast
 
-    # MX quantization path
-    elif quantization_type == QuantizationType.MX:
+    # STATIC_MX: per-tensor static dequant via MX engine
+    elif quantization_type == QuantizationType.STATIC_MX:
         B, S, H = input.shape
+        weights_np = fused_qkv_weights if isinstance(fused_qkv_weights, np.ndarray) else fused_qkv_weights.numpy()
+        H_quarter, I, _ = weights_np.shape  # [H//4, I, 4] fp8
 
-        if qkv_in_scale is not None:
-            # MX static dequant path: input is pre-quantized FP8 or BF16 with static scales.
-            # Instead of MX block quantization, do simple matmul of raw values + per-Q/K/V scaling.
-            #
-            # With preserve_lower_precision=True in torch_ref_wrapper:
-            #   - FP8 input arrives as float32 (torch doesn't support float8)
-            #   - BF16 input arrives as torch.bfloat16
-            # BF16 needs static quantization (clip(input/in_scale, ±fp8_max)) before matmul.
-            weights_np = fused_qkv_weights if isinstance(fused_qkv_weights, np.ndarray) else fused_qkv_weights.numpy()
-            # Unpack x4 to individual float8 values, then reverse x4 packing to get (H, I)
-            w_unpacked_np = unpack_float8_e4m3fn_x4(weights_np).numpy()  # (H//4, I*4)
-            H_quarter = weights_np.shape[0]
-            I = w_unpacked_np.shape[1] // _Q_WIDTH
-            # Reverse x4 packing: (H//4, I*4) -> (H//4, I, 4) -> (H//4, 4, I) -> (H, I)
-            w_f32_reordered = (
-                w_unpacked_np.reshape(H_quarter, I, _Q_WIDTH).transpose(0, 2, 1).reshape(H, I).astype(np.float32)
-            )
+        # Reverse packing: (H//4, I, 4) -> (H//4, 4, I) -> (H, I)
+        w_f32_reordered = weights_np.transpose(0, 2, 1).reshape(H, I).astype(np.float32)
 
-            # Reverse DMA transpose interleaving (MX_INTERLEAVED layout)
-            # The forward reordering maps original row i to h_idx[i].
-            # We need the inverse: for each reordered row r, find original row.
+        if weight_layout == QKVWeightLayout.MX_INTERLEAVED:
             h_idx = np.empty(H, dtype=np.int64)
             for p in range(H // 4):
                 h_idx[4 * p] = 2 * p
@@ -325,82 +331,94 @@ def qkv_cte_torch_ref(
                 h_idx[4 * p + 3] = H // 2 + 2 * p + 1
             inv_idx = np.argsort(h_idx)
             w_f32 = torch.from_numpy(w_f32_reordered[inv_idx, :])
+        elif weight_layout == QKVWeightLayout.MX_CONTIGUOUS:
+            w_f32 = torch.from_numpy(w_f32_reordered)
 
-            # Extract scalar in_scale and per-Q/K/V w_scale
-            in_scale = (
-                qkv_in_scale[0, 0].to(torch.float32)
-                if isinstance(qkv_in_scale, torch.Tensor)
-                else float(qkv_in_scale.flat[0])
-            )
-            w_scale = (
-                qkv_w_scale[0, :].to(torch.float32)
-                if isinstance(qkv_w_scale, torch.Tensor)
-                else torch.from_numpy(qkv_w_scale[0, :].astype(np.float32))
-            )
+        in_scale = (
+            qkv_in_scale[0, 0].to(torch.float32)
+            if isinstance(qkv_in_scale, torch.Tensor)
+            else float(qkv_in_scale.flat[0])
+        )
+        w_scale = (
+            qkv_w_scale[0, :].to(torch.float32)
+            if isinstance(qkv_w_scale, torch.Tensor)
+            else torch.from_numpy(qkv_w_scale[0, :].astype(np.float32))
+        )
 
-            is_bf16_input = input_original_dtype == torch.bfloat16
-            input_f32 = input.to(torch.float32)
+        is_bf16_input = input_original_dtype == torch.bfloat16
+        input_f32 = input.to(torch.float32)
 
-            if is_bf16_input:
-                # BF16 path: simulate static quantization before matmul
-                input_f32 = (input_f32 / in_scale).clamp(-FP8_E4M3_CLIP_VALUE, FP8_E4M3_CLIP_VALUE)
+        if is_bf16_input:
+            input_f32 = (input_f32 / in_scale).clamp(-fp8_clip_value, fp8_clip_value)
+            if _fp8_torch_dtype is not None:
+                input_f32 = input_f32.to(_fp8_torch_dtype).to(torch.float32)
 
-            qkv_out = input_f32.reshape(B * S, H) @ w_f32
-            qkv_out = qkv_out.reshape(B, S, I)
+        qkv_out = input_f32.reshape(B * S, H) @ w_f32
+        qkv_out = qkv_out.reshape(B, S, I)
 
-            # Apply per-Q/K/V dequant scaling
-            q_end_idx = num_q_heads * d_head
-            k_end_idx = (num_q_heads + num_kv_heads) * d_head
-            v_end_idx = (num_q_heads + 2 * num_kv_heads) * d_head
-            combined_scale = in_scale * w_scale
-            qkv_out[:, :, :q_end_idx] *= combined_scale[0]
-            qkv_out[:, :, q_end_idx:k_end_idx] *= combined_scale[1]
-            qkv_out[:, :, k_end_idx:v_end_idx] *= combined_scale[2]
+        # Apply per-Q/K/V dequant scaling
+        q_end_idx = num_q_heads * d_head
+        k_end_idx = (num_q_heads + num_kv_heads) * d_head
+        v_end_idx = (num_q_heads + 2 * num_kv_heads) * d_head
+        combined_scale = in_scale * w_scale
+        qkv_out[:, :, :q_end_idx] *= combined_scale[0]
+        qkv_out[:, :, q_end_idx:k_end_idx] *= combined_scale[1]
+        qkv_out[:, :, k_end_idx:v_end_idx] *= combined_scale[2]
+
+    # Native MX path: per-block e8m0 scales
+    elif quantization_type == QuantizationType.MX:
+        B, S, H = input.shape
+        weights_np = fused_qkv_weights if isinstance(fused_qkv_weights, np.ndarray) else fused_qkv_weights.numpy()
+        _, I, _ = weights_np.shape
+
+        # Reshape normalized hidden to [P, F] layout for MX block quantization.
+        # P = H // _Q_WIDTH, F = _Q_WIDTH * B * S
+        hidden_np = input.reshape(B * S, H).T.numpy()  # [H, B*S]
+        hidden_np = (
+            hidden_np.reshape(H // _Q_WIDTH, _Q_WIDTH, B * S)
+            .transpose(0, 2, 1)
+            .reshape(H // _Q_WIDTH, _Q_WIDTH * B * S)
+            .astype(np.float32)
+        )
+
+        # Quantize hidden to MX FP8
+        hidden_mx, hidden_scale = quantize_to_mx(hidden_np, nl.float8_e4m3fn_x4)
+
+        # Convert weights [H//4, I, 4] fp8 to float32 [H//4, I*4] for mx_matmul
+        weights_unpacked = torch.from_numpy(weights_np.reshape(weights_np.shape[0], I * _Q_WIDTH).astype(np.float32))
+        hidden_mx_torch = unpack_float8_e4m3fn_x4(hidden_mx)
+
+        # Prepare scales as float64 torch tensors for mx_matmul
+        hidden_scale_torch = torch.from_numpy(hidden_scale.astype(np.float64))
+        if isinstance(qkv_w_scale, torch.Tensor):
+            qkv_w_scale_torch = qkv_w_scale.to(torch.float64)
         else:
-            # Standard MX path: MX block quantization of input + mx_matmul
-            # For MX, weights are x4 packed numpy arrays; get I from the weight shape
-            weights_np = fused_qkv_weights if isinstance(fused_qkv_weights, np.ndarray) else fused_qkv_weights.numpy()
-            _, I = weights_np.shape
+            qkv_w_scale_torch = torch.from_numpy(qkv_w_scale.astype(np.float64))
 
-            # Reshape normalized hidden to [P, F] layout for MX block quantization.
-            # P = H // _Q_WIDTH, F = _Q_WIDTH * B * S
-            hidden_np = input.reshape(B * S, H).T.numpy()  # [H, B*S]
-            hidden_np = (
-                hidden_np.reshape(H // _Q_WIDTH, _Q_WIDTH, B * S)
-                .transpose(0, 2, 1)
-                .reshape(H // _Q_WIDTH, _Q_WIDTH * B * S)
-                .astype(np.float32)
-            )
+        qkv_out = mx_matmul(
+            stationary=hidden_mx_torch,
+            moving=weights_unpacked,
+            stationary_scale=hidden_scale_torch,
+            moving_scale=qkv_w_scale_torch,
+        )
 
-            # Quantize hidden to MX FP8
-            hidden_mx, hidden_scale = quantize_to_mx(hidden_np, nl.float8_e4m3fn_x4)
-
-            # Unpack weights and hidden from x4 packed format to torch float32
-            weights_unpacked = unpack_float8_e4m3fn_x4(weights_np)
-            hidden_mx_torch = unpack_float8_e4m3fn_x4(hidden_mx)
-
-            # Prepare scales as float64 torch tensors for mx_matmul
-            hidden_scale_torch = torch.from_numpy(hidden_scale.astype(np.float64))
-            if isinstance(qkv_w_scale, torch.Tensor):
-                qkv_w_scale_torch = qkv_w_scale.to(torch.float64)
-            else:
-                qkv_w_scale_torch = torch.from_numpy(qkv_w_scale.astype(np.float64))
-
-            qkv_out = mx_matmul(
-                stationary=hidden_mx_torch,
-                moving=weights_unpacked,
-                stationary_scale=hidden_scale_torch,
-                moving_scale=qkv_w_scale_torch,
-            )
-
-            # Reshape result back to [B, S, I]
-            qkv_out = qkv_out.reshape(B, S, I)
+        # Reshape result back to [B, S, I]
+        qkv_out = qkv_out.reshape(B, S, I)
     else:
         # NONE, ROW, and STATIC: standard matmul
         if quantization_type == QuantizationType.STATIC:
-            # Quantize input: clip(input / in_scale, -240, 240)
+            # Quantize input: clip(input / in_scale, -fp8_max, fp8_max),
+            # then round-trip through FP8 to apply the actual grid
+            # rounding the kernel does on hardware. Without the cast the
+            # reference is only an approximation: values in the
+            # high-magnitude band (snapped to FP8 grid points by the
+            # hardware) stay continuous here, drifting from the kernel
+            # output on real-model activations where those values are
+            # common.
             input = input / qkv_in_scale
-            input = input.clip(-FP8_E4M3_CLIP_VALUE, FP8_E4M3_CLIP_VALUE)
+            input = input.clip(-fp8_clip_value, fp8_clip_value)
+            if _fp8_torch_dtype is not None:
+                input = input.to(_fp8_torch_dtype).to(torch.float32)
 
         qkv_out = input @ fused_qkv_weights
 
@@ -545,7 +563,22 @@ def qkv_cte_torch_ref(
 
         cache_shape = k_cache.shape
         if use_block_kv:
-            if transpose_k_cache:
+            if fp8_packed:
+                # FP8 packed layout: [num_blocks, block_size//2, kv_dim, 2] fp8
+                # where [:,:,:,0] = even seq positions, [:,:,:,1] = odd seq positions.
+                num_blocks_actual = k_cache.shape[0]
+                k_fp8_full = np.zeros((num_blocks_actual, block_size, kv_dim), dtype=kv_dtype)
+                v_cache_out = np.zeros(v_cache.shape, dtype=kv_dtype)
+                for b in range(B):
+                    for s in range(S):
+                        slot = slot_mapping[b, s].item()
+                        block_idx = slot // block_size
+                        pos_in_block = slot % block_size
+                        k_fp8_full[block_idx, pos_in_block, :] = k_processed[b, s, :]
+                        v_cache_out[block_idx, pos_in_block, :] = v_processed[b, s, :]
+                # Reshape to [nb, block_size//2, 2, kv_dim] then transpose to [nb, block_size//2, kv_dim, 2]
+                k_cache_out = k_fp8_full.reshape(num_blocks_actual, block_size // 2, 2, kv_dim).transpose(0, 1, 3, 2)
+            elif transpose_k_cache:
                 k_cache_out = np.zeros(k_cache.shape, dtype=kv_dtype)
                 v_cache_out = np.zeros(v_cache.shape, dtype=kv_dtype)
 

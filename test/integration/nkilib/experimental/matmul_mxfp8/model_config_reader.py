@@ -46,16 +46,14 @@ class TorchTitanModelConfig:
         return cfg
 
 
-def generate_transformer_block_shapes(config_path: str, TP=1, CP=1):
+def generate_attention_shapes(config_path: str, TP=1, CP=1):
     """
-    Generate all major matrix-multiply shapes for one transformer block.
+    Generate attention matmul shapes for one transformer block.
 
-    Covers every large matmul that executes per layer during FWD and BWD:
+    Covers every large matmul in the attention portion of a layer (FWD and BWD):
       - Fused QKV projection
       - Attention QK^T and Attn*V (per-head shapes)
       - Output (O) projection
-      - MLP gate+up projection (fused, SwiGLU style)
-      - MLP down projection
 
     Note: The following operations are NOT included because they are
     element-wise, or not matmuls:
@@ -63,8 +61,6 @@ def generate_transformer_block_shapes(config_path: str, TP=1, CP=1):
       - RoPE (element-wise rotary embedding)
       - Residual additions
       - SiLU / softmax activations
-      - Embedding lookup (table lookup, not a matmul)
-      - LM head (runs once, not per block)
 
     Args:
         config_path (str): Path to model configuration JSON file.
@@ -81,13 +77,15 @@ def generate_transformer_block_shapes(config_path: str, TP=1, CP=1):
     Q = cfg["n_heads"]
     KV = cfg["n_kv_heads"]
     h = cfg["head_dim"]
-    FFN = cfg["hidden_dim"]
 
     seq = S / CP
 
     all_shapes = []
 
-    # 1. Fused QKV Projection: [S/CP, H] → Q,K,V heads. Weight: [H, (Q*h + 2*KV*h)/TP]
+    # ================================================================
+    # 1. Fused QKV Projection: [S/CP, H] → Q,K,V heads.
+    #    Weight: [H, (Q*h + 2*KV*h)/TP]
+    # ================================================================
 
     qkv_out = (Q * h + 2 * KV * h) / TP
 
@@ -144,14 +142,42 @@ def generate_transformer_block_shapes(config_path: str, TP=1, CP=1):
     # BWD weight grad: [H, S/CP] @ [S/CP, Q*h/TP]
     all_shapes.append(["BWD-OProj-WTGrad", H, seq, attn_out])
 
+    return all_shapes
+
+
+def generate_dense_mlp_shapes(config_path: str, TP=1, CP=1):
+    """
+    Generate dense MLP matmul shapes (SwiGLU gate+up and down projections).
+
+    For dense transformer blocks only. MoE models should use
+    generate_moe_expert_mlp_shapes instead.
+
+    Args:
+        config_path (str): Path to model configuration JSON file.
+        TP (int): Tensor parallelism degree.
+        CP (int): Context parallelism degree.
+
+    Returns:
+        list: List of [name, M, K, N] shape tuples.
+    """
+    cfg = TorchTitanModelConfig.from_json(config_path)
+
+    S = cfg["max_seq_len"]
+    H = cfg["dim"]
+    FFN = cfg["hidden_dim"]
+
+    seq = S / CP
+
+    all_shapes = []
+
     # ================================================================
-    # 4. MLP — Fused Gate + Up Projection  (SwiGLU)
+    # MLP — Fused Gate + Up Projection  (SwiGLU)
     #    gate_proj and up_proj are fused into one matmul.
     #    Input:  [S/CP, H]
     #    Weight: [H, 2*FFN/TP]   (gate and up concatenated)
     # ================================================================
 
-    gate_up_out = 2 * FFN / TP
+    gate_up_out = 2 * FFN // TP
 
     # FWD: [S/CP, H] @ [H, 2*FFN/TP]
     all_shapes.append(["FWD-MLP-FuseGateUp", seq, H, gate_up_out])
@@ -163,13 +189,13 @@ def generate_transformer_block_shapes(config_path: str, TP=1, CP=1):
     all_shapes.append(["BWD-MLP-FuseGateUp-WTGrad", gate_up_out, seq, H])
 
     # ================================================================
-    # 5. MLP — Down Projection
+    # MLP — Down Projection
     #    Projects FFN intermediate back to model dim.
     #    Input:  [S/CP, FFN/TP]
     #    Weight: [FFN/TP, H]
     # ================================================================
 
-    down_in = FFN / TP
+    down_in = FFN // TP
 
     # FWD: [S/CP, FFN/TP] @ [FFN/TP, H]
     all_shapes.append(["FWD-MLP-Down", seq, down_in, H])
@@ -179,6 +205,70 @@ def generate_transformer_block_shapes(config_path: str, TP=1, CP=1):
 
     # BWD weight grad: [H, S/CP] @ [S/CP, FFN/TP]
     all_shapes.append(["BWD-MLP-Down-WTGrad", H, seq, down_in])
+
+    return all_shapes
+
+
+def generate_transformer_block_shapes(config_path: str, TP=1, CP=1):
+    """
+    Generate all matmul shapes for one dense transformer block (attention + MLP).
+
+    For MoE models, use generate_attention_shapes + generate_moe_expert_mlp_shapes instead.
+
+    Args:
+        config_path (str): Path to model configuration JSON file.
+        TP (int): Tensor parallelism degree.
+        CP (int): Context parallelism degree.
+
+    Returns:
+        list: List of [name, M, K, N] shape tuples.
+    """
+    return generate_attention_shapes(config_path, TP, CP) + generate_dense_mlp_shapes(config_path, TP, CP)
+
+
+def generate_moe_expert_mlp_shapes(config_path: str, TP=1, moe_block_sizes=None):
+    """
+    Generate per-expert MLP matmul shapes for MoE models.
+
+    MoE models replace the dense MLP with multiple experts. Each expert runs
+    a SwiGLU MLP on a subset of tokens (block size). TP shards expert
+    weights regardless of expert parallelism.
+
+    Args:
+        config_path (str): Path to model configuration JSON file.
+        TP (int): Tensor parallelism degree.
+        moe_block_sizes (list): Block sizes (tokens per expert block). Defaults to [128, 256, 512].
+
+    Returns:
+        list: List of [name, M, K, N] shape tuples.
+    """
+    if moe_block_sizes is None:
+        moe_block_sizes = [128, 256, 512]
+
+    cfg = TorchTitanModelConfig.from_json(config_path)
+
+    H = cfg["dim"]
+    expert_ffn = cfg["moe_inter_dim"]
+
+    all_shapes = []
+    for moe_block_size in moe_block_sizes:
+        gate_up_out = 2 * expert_ffn // TP
+        down_in = expert_ffn // TP
+
+        # FWD GateUp: [cap, H] @ [H, gate_up_out]
+        all_shapes.append([f"FWD-MoE-GateUp(cap={moe_block_size})", moe_block_size, H, gate_up_out])
+        # FWD Down: [cap, down_in] @ [down_in, H]
+        all_shapes.append([f"FWD-MoE-Down(cap={moe_block_size})", moe_block_size, down_in, H])
+        # BWD GateUp IPGrad: [cap, gate_up_out] @ [gate_up_out, H]
+        all_shapes.append([f"BWD-MoE-GateUp-IPGrad(cap={moe_block_size})", moe_block_size, gate_up_out, H])
+        # BWD GateUp WTGrad: gate and up compute gradients separately
+        # dW_gate = X^T @ dY_gate = [H, cap] @ [cap, FFN/TP]
+        # dW_up   = X^T @ dY_up   = [H, cap] @ [cap, FFN/TP]
+        all_shapes.append([f"BWD-MoE-GateUp-WTGrad(cap={moe_block_size})", H, moe_block_size, down_in])
+        # BWD Down IPGrad: [cap, H] @ [H, down_in]
+        all_shapes.append([f"BWD-MoE-Down-IPGrad(cap={moe_block_size})", moe_block_size, H, down_in])
+        # BWD Down WTGrad: dW = X^T @ dY = [down_in, cap] @ [cap, H]
+        all_shapes.append([f"BWD-MoE-Down-WTGrad(cap={moe_block_size})", down_in, moe_block_size, H])
 
     return all_shapes
 
@@ -228,25 +318,48 @@ def load_model_configs(config_dir: str = None) -> dict:
 
     configs = {}
 
-    # Qwen3 8B with TP=4
+    # Qwen3 8B
     qwen3_8b_path = os.path.join(config_dir, "qwen3_8B.json")
     if os.path.exists(qwen3_8b_path):
+        shapes = generate_transformer_block_shapes(qwen3_8b_path, TP=1, CP=1)
+        configs['qwen3_8b_tp1'] = shapes_to_test_configs(shapes, "Qwen3-8B-TP1")
+
         shapes = generate_transformer_block_shapes(qwen3_8b_path, TP=4, CP=1)
         configs['qwen3_8b_tp4'] = shapes_to_test_configs(shapes, "Qwen3-8B-TP4")
 
-    # Qwen3 8B with TP=16
-    if os.path.exists(qwen3_8b_path):
         shapes = generate_transformer_block_shapes(qwen3_8b_path, TP=16, CP=1)
         configs['qwen3_8b_tp16'] = shapes_to_test_configs(shapes, "Qwen3-8B-TP16")
 
-    # Qwen3 235B with CP=16, TP=4
+    # Qwen3 32B (dense)
+    qwen3_32b_path = os.path.join(config_dir, "qwen3_32B.json")
+    if os.path.exists(qwen3_32b_path):
+        shapes = generate_transformer_block_shapes(qwen3_32b_path, TP=1, CP=1)
+        configs['qwen3_32b_tp1'] = shapes_to_test_configs(shapes, "Qwen3-32B-TP1")
+
+        shapes = generate_transformer_block_shapes(qwen3_32b_path, TP=4, CP=1)
+        configs['qwen3_32b_tp4'] = shapes_to_test_configs(shapes, "Qwen3-32B-TP4")
+
+    # GPT-OSS-20B (MoE): attention shapes + expert MLP shapes
+    gpt_oss_path = os.path.join(config_dir, "gpt_oss_20B.json")
+    if os.path.exists(gpt_oss_path):
+        attn_shapes = generate_attention_shapes(gpt_oss_path, TP=4, CP=1)
+        moe_shapes = generate_moe_expert_mlp_shapes(gpt_oss_path, TP=4)
+        configs['gpt_oss_20b_tp4'] = shapes_to_test_configs(attn_shapes + moe_shapes, "GPT-OSS-20B-TP4")
+
+        attn_shapes = generate_attention_shapes(gpt_oss_path, TP=2, CP=1)
+        moe_shapes = generate_moe_expert_mlp_shapes(gpt_oss_path, TP=2)
+        configs['gpt_oss_20b_tp2'] = shapes_to_test_configs(attn_shapes + moe_shapes, "GPT-OSS-20B-TP2")
+
+    # Qwen3 235B (MoE): attention shapes + expert MLP shapes
     qwen3_235b_path = os.path.join(config_dir, "qwen3_235B-A22B.json")
     if os.path.exists(qwen3_235b_path):
+        attn_shapes = generate_attention_shapes(qwen3_235b_path, TP=4, CP=1)
+        moe_shapes = generate_moe_expert_mlp_shapes(qwen3_235b_path, TP=4)
+        configs['qwen3_235b_tp4'] = shapes_to_test_configs(attn_shapes + moe_shapes, "Qwen3-235B-TP4")
+
         shapes = generate_transformer_block_shapes(qwen3_235b_path, TP=4, CP=16)
         configs['qwen3_235b_cp16_tp4'] = shapes_to_test_configs(shapes, "Qwen3-235B-CP16-TP4")
 
-    # Qwen3 235B with CP=4, TP=4
-    if os.path.exists(qwen3_235b_path):
         shapes = generate_transformer_block_shapes(qwen3_235b_path, TP=4, CP=4)
         configs['qwen3_235b_cp4_tp4'] = shapes_to_test_configs(shapes, "Qwen3-235B-CP4-TP4")
 
@@ -257,7 +370,13 @@ def load_model_configs(config_dir: str = None) -> dict:
 _all_configs = load_model_configs()
 
 # Export individual config lists
+qwen3_8b_tp1 = _all_configs.get('qwen3_8b_tp1', [])
 qwen3_8b_tp4 = _all_configs.get('qwen3_8b_tp4', [])
 qwen3_8b_tp16 = _all_configs.get('qwen3_8b_tp16', [])
+qwen3_32b_tp1 = _all_configs.get('qwen3_32b_tp1', [])
+qwen3_32b_tp4 = _all_configs.get('qwen3_32b_tp4', [])
+gpt_oss_20b_tp4 = _all_configs.get('gpt_oss_20b_tp4', [])
+gpt_oss_20b_tp2 = _all_configs.get('gpt_oss_20b_tp2', [])
+qwen3_235b_tp4 = _all_configs.get('qwen3_235b_tp4', [])
 qwen3_235b_cp16_tp4 = _all_configs.get('qwen3_235b_cp16_tp4', [])
 qwen3_235b_cp4_tp4 = _all_configs.get('qwen3_235b_cp4_tp4', [])

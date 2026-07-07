@@ -48,7 +48,7 @@ def _output_tensor_descriptor(kernel_input):
 FAST_PARAM_NAMES = \
     "T, E, f_len"
 FAST_TEST_PARAMS = [
-    (4096,  1,   128),
+    pytest.param(4096,  1,   128, marks=pytest.mark.fast),
     (4096,  2,   128),
     (4096,  2,   256),
     (4096,  3,   128),
@@ -73,7 +73,7 @@ SPARSE_ROUTING_PARAM_NAMES = \
     "T, E, f_len, row_offsets_start, tokens_per_expert"
 SPARSE_ROUTING_TEST_PARAMS = [
     # Empty expert: cross-NC race (expert 1 on NC0, expert 2 on NC1 share offset).
-    (256,  4, 16, 0,  [16, 0, 16, 16]),
+    pytest.param(256,  4, 16, 0,  [16, 0, 16, 16], marks=pytest.mark.fast),
     # Empty expert: with row_offsets_start.
     (256,  4, 16, 8,  [16, 0, 16, 16]),
     # Multiple empty experts: cross-NC overlap.
@@ -111,7 +111,6 @@ class TestIndexedFlattenKernel:
             rtol=0,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(FAST_PARAM_NAMES, FAST_TEST_PARAMS)
     def test_indexed_flatten_fast(
         self,
@@ -139,7 +138,6 @@ class TestIndexedFlattenKernel:
 
         self._run_test(test_manager, platform_target, input_generator)
 
-    @pytest.mark.fast
     @pytest_parametrize(ROW_OFFSET_PARAM_NAMES, ROW_OFFSET_TEST_PARAMS)
     def test_indexed_flatten_row_offsets_start(
         self,
@@ -169,7 +167,6 @@ class TestIndexedFlattenKernel:
 
         self._run_test(test_manager, platform_target, input_generator)
 
-    @pytest.mark.fast
     @pytest_parametrize(SPARSE_ROUTING_PARAM_NAMES, SPARSE_ROUTING_TEST_PARAMS)
     def test_indexed_flatten_sparse_token_routing(
         self,

@@ -28,6 +28,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...quantization.fp8_quantize import pre_combine_dequant_scales
+from ...utils.allocator import SbufManager
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import NUM_HW_PSUM_BANKS, PSUM_BANK_SIZE, _psum_alloc, _sbm_alloc, div_ceil
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
@@ -36,6 +37,7 @@ from .projection_mx_constants import (
     SBUF_QUADRANT_SIZE,
     ProjConfig,
     _pmax,
+    _psum_bmax,
     _psum_fmax,
     _q_height,
     _q_width,
@@ -124,6 +126,9 @@ def _down_proj_prep_inter_and_weights(
             dst=weight_qtz[:p_I, :, :],
             dge_mode=nisa.dge_mode.hwdge,
         )
+        # If weight arrived as uint32 (torch_xla E2E), reinterpret SBUF to float8_e4m3fn_x4
+        if weight.dtype == nl.uint32:
+            weight_qtz = TensorView(weight_qtz).reinterpret_cast(nl.float8_e4m3fn_x4).get_view()
 
     # Check if weight scale is already in SBUF or needs to be loaded from HBM
     weight_qtz_scale = None
@@ -172,6 +177,7 @@ def down_projection_mx_tp_shard_H(
     weight_scale: nl.ndarray,
     bias_sb: Optional[nl.ndarray],
     cfg: ProjConfig,
+    sbm: SbufManager = None,
     partial_output: bool = False,
     pre_quantized: bool = False,
     pre_quantized_scale: Optional[nl.ndarray] = None,
@@ -218,16 +224,30 @@ def down_projection_mx_tp_shard_H(
         weight_base = TensorView(weight).base_tensor if isinstance(weight, TensorView) else weight
         if weight_base.buffer == nl.sbuf:
             # Weight already in SBUF
-            weight_qtz = weight_base
+            # If weight arrived as uint32 (torch_xla E2E), reinterpret SBUF to float8_e4m3fn_x4.
+            if weight_base.dtype == nl.uint32:
+                weight_qtz = TensorView(weight_base).reinterpret_cast(nl.float8_e4m3fn_x4).get_view()
+            else:
+                weight_qtz = weight_base
             weight_qtz_scale = weight_scale
         else:
             # Load weight from HBM
             p_I = _pmax if cfg.I > _psum_fmax else cfg.I // _q_width
-            weight_qtz = nl.ndarray(
-                (_pmax, cfg.n_total_I512_tile, cfg.H_sharded),
-                dtype=weight.dtype,
-                buffer=nl.sbuf,
-                name=f'{cfg.name_prefix}down_w_qtz_sb',
+            weight_qtz = (
+                sbm.alloc_stack(
+                    (_pmax, cfg.n_total_I512_tile, cfg.H_sharded),
+                    dtype=weight.dtype,
+                    buffer=nl.sbuf,
+                    name=f'{cfg.name_prefix}down_w_qtz_sb',
+                    align=32,
+                )
+                if sbm is not None
+                else nl.ndarray(
+                    (_pmax, cfg.n_total_I512_tile, cfg.H_sharded),
+                    dtype=weight.dtype,
+                    buffer=nl.sbuf,
+                    name=f'{cfg.name_prefix}down_w_qtz_sb',
+                )
             )
             if p_I != _pmax:
                 nisa.memset(dst=weight_qtz[:, cfg.n_total_I512_tile - 1, :], value=0.0)
@@ -237,6 +257,9 @@ def down_projection_mx_tp_shard_H(
                 dst=weight_qtz[:p_I, :, :],
                 dge_mode=nisa.dge_mode.hwdge,
             )
+            # If weight arrived as uint32 (torch_xla E2E), reinterpret SBUF to float8_e4m3fn_x4
+            if weight.dtype == nl.uint32:
+                weight_qtz = TensorView(weight_qtz).reinterpret_cast(nl.float8_e4m3fn_x4).get_view()
             weight_qtz_scale = weight_scale
     else:
         # ── MX path: quantize intermediate and load weights ──
@@ -250,10 +273,22 @@ def down_projection_mx_tp_shard_H(
 
     # Matmul compute, tiles on H
     out_shape = (cfg.H0, cfg.H1_sharded, cfg.BxS) if partial_output else (cfg.H0, cfg.H1, cfg.BxS)
-    out_sb = nl.ndarray(out_shape, dtype=nl.bfloat16, buffer=nl.sbuf)
+    out_sb = (
+        sbm.alloc_stack(out_shape, dtype=nl.bfloat16, buffer=nl.sbuf, align=32)
+        if sbm is not None
+        else nl.ndarray(out_shape, dtype=nl.bfloat16, buffer=nl.sbuf)
+    )
+
+    # Pre-compute combined dequant scale for STATIC_MX so we can fuse it into the
+    # per-H1 PSUM->SBUF copy, eliminating the post-loop global dequant barrier.
+    fuse_dequant_into_copy = w_dequant_scale is not None and w_dequant_scale.shape[1] == 1
+    combined_scale = (
+        pre_combine_dequant_scales(input_dequant_scale, w_dequant_scale) if fuse_dequant_into_copy else None
+    )
 
     for i_H1 in range(cfg.H1_sharded):
         # Allocate psum for current H128 tile
+        psum_idx = i_H1 % _psum_bmax
         h128_psum = nl.ndarray((cfg.H0, cfg.BxS), dtype=nl.bfloat16, buffer=nl.psum)
 
         # Loop over I512 tiles
@@ -263,14 +298,19 @@ def down_projection_mx_tp_shard_H(
                 dst=h128_psum,
                 stationary=weight_qtz[:, i_I512_tile, i_H1 * _pmax : (i_H1 + 1) * _pmax],
                 moving=inter_qtz_tv.slice(1, i_I512_tile, i_I512_tile + 1).get_view(),
-                stationary_scale=weight_qtz_scale[:, i_I512_tile, i_H1 * _pmax : (i_H1 + 1) * _pmax],
-                moving_scale=inter_qtz_scale[:, i_I512_tile, :],
+                stationary_scale=pre_quantized_scale[:, :_pmax]
+                if pre_quantized
+                else weight_qtz_scale[:, i_I512_tile, i_H1 * _pmax : (i_H1 + 1) * _pmax],
+                moving_scale=pre_quantized_scale[:, : cfg.BxS] if pre_quantized else inter_qtz_scale[:, i_I512_tile, :],
             )
 
-        # Copy out the current H128 tile to SB, use ACT because DVE is usually bottlenecked
+        # Copy PSUM->SBUF with fused dequant scale, interleaving Scalar and Vector engines
         idx = i_H1 if partial_output else cfg.H1_sharded * prg_id + i_H1
-        if w_dequant_scale is not None:
-            # ── Software quant path: copy psum to sbuf first, dequant applied after sendrecv ──
+        if combined_scale is not None:
+            # ── STATIC_MX: fuse combined (w_scale * in_scale) into PSUM->SBUF copy ──
+            nisa.activation(dst=out_sb[:, idx, :], op=nl.copy, data=h128_psum, scale=combined_scale)
+        elif w_dequant_scale is not None:
+            # ── ROW_MX: bare copy, dequant applied after sendrecv ──
             nisa.activation(dst=out_sb[:, idx, :], op=nl.copy, data=h128_psum)
         else:
             # ── MX path or no dequant: fuse bias into the copy ──
@@ -289,45 +329,34 @@ def down_projection_mx_tp_shard_H(
             pipe_id=0,
         )
 
-    # ── Post-matmul dequant (STATIC_MX / ROW_MX): apply w_dequant_scale, input_dequant_scale, bias ──
-    # Applied AFTER LNC reduce so bias is added once and scale is applied to the full sum.
+    # ── Post-matmul dequant (ROW_MX only — STATIC_MX already fused above) ──
     if w_dequant_scale is not None:
         H1_out = out_sb.shape[1]
-        # When partial_output=True, out_sb only has H1_sharded columns corresponding to
-        # the local shard, so we need H1_offset to index into the full weight scale.
-        # When partial_output=False, out_sb has the full H1 range and indices are global.
         H1_offset = cfg.H1_sharded * prg_id if partial_output else 0
-        if w_dequant_scale.shape[1] == 1:
-            # ── STATIC_MX: both scales are [_pmax, 1], pre-combine and broadcast ──
-            combined = pre_combine_dequant_scales(input_dequant_scale, w_dequant_scale)
-            nisa.activation(
-                dst=out_sb,
-                op=nl.copy,
-                data=out_sb,
-                scale=combined,
-            )
-        else:
+        if w_dequant_scale.shape[1] != 1:
+            # STATIC_MX: already applied per-H1 during PSUM->SBUF copy
             # ── ROW_MX: fuse per-row weight scale × per-token input scale ──
             for i_H1 in nl.affine_range(H1_out):
                 h_col = H1_offset + i_H1
-                if input_dequant_scale is not None:
-                    # Fuse both dequant scales into one instruction
-                    nisa.scalar_tensor_tensor(
-                        dst=out_sb[:, i_H1, :],
-                        data=out_sb[:, i_H1, :],
-                        op0=nl.multiply,
-                        operand0=w_dequant_scale[:, h_col : h_col + 1],
-                        op1=nl.multiply,
-                        operand1=input_dequant_scale[:, : cfg.BxS, 0],
-                    )
-                else:
-                    # Weight dequant only (caller handles input dequant externally)
-                    nisa.activation(
-                        dst=out_sb[:, i_H1, :],
-                        op=nl.copy,
-                        data=out_sb[:, i_H1, :],
-                        scale=w_dequant_scale[:, h_col : h_col + 1],
-                    )
+                nisa.activation(
+                    dst=out_sb[:, i_H1, :],
+                    op=nl.copy,
+                    data=out_sb[:, i_H1, :],
+                    scale=w_dequant_scale[:, h_col : h_col + 1],
+                )
+            if input_dequant_scale is not None:
+                # Broadcast input_dequant_scale [_pmax, BxS] across H1 dim to avoid per-H1 loop
+                scale_broadcast = (
+                    TensorView(input_dequant_scale[:, : cfg.BxS, 0])
+                    .reshape_dim(dim=1, shape=(1, cfg.BxS))
+                    .broadcast(dim=1, size=H1_out)
+                )
+                nisa.tensor_tensor(
+                    dst=out_sb[:, :H1_out, :],
+                    data1=out_sb[:, :H1_out, :],
+                    data2=scale_broadcast.get_view(),
+                    op=nl.multiply,
+                )
 
         # Add bias if present (after dequant for both STATIC_MX and ROW_MX)
         # Bias is [H0, H1_shard] — only covers the local shard's H1 range.

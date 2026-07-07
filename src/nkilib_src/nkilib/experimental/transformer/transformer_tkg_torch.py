@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 
 from ...core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
+from ...core.utils.common_types import DtypeMode
 from ...core.utils.kernel_assert import kernel_assert
 
 
@@ -450,6 +451,7 @@ def llama3_transformer_fwd_tkg_torch(
     use_bir_mlp_kernel: bool = True,
     DBG: bool = False,
     DBG_LNC1: bool = False,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001 — accepted for kernel signature parity
 ):
     """
     Full PyTorch reference implementation of the transformer TKG megakernel.
@@ -489,6 +491,8 @@ def llama3_transformer_fwd_tkg_torch(
         use_bir_mlp_kernel (bool): Use BIR MLP kernel (default True)
         DBG (bool): Enable debug outputs (default False)
         DBG_LNC1 (bool): Force LNC1 for debug (default False)
+        dtype_mode (DtypeMode): Quantization dtype policy (accepted for kernel
+            signature parity; unused on CPU).
 
     Returns:
         final_output (torch.Tensor): [B, S_tkg, H], Final hidden states after all layers.

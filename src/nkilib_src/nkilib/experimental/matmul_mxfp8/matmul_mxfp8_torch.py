@@ -130,6 +130,9 @@ def matmul_mxfp8_torch_ref(
     spill_reload=False,
     lhs_is_swizzled=True,
     rhs_is_swizzled=True,
+    load_with_PE_swizzle=False,
+    lhs_is_f_by_k=True,
+    rhs_is_f_by_k=True,
 ):
     """Compute golden matmul output for MXFP8 matrix multiplication.
 
@@ -148,18 +151,30 @@ def matmul_mxfp8_torch_ref(
     lhs_prequantized = lhs_scales is not None
     rhs_prequantized = rhs_scales is not None
 
+    # Normalize the layout flags: None (auto/unset) means F-by-K, matching the kernel default.
+    # Doing this once lets the branches below use the simpler `not lhs_is_f_by_k` form while
+    # still treating an unset (None) flag as F-by-K rather than K-by-F.
+    lhs_is_f_by_k = lhs_is_f_by_k is not False
+    rhs_is_f_by_k = rhs_is_f_by_k is not False
+
     if not lhs_prequantized and not rhs_prequantized:
         # Both BF16: swizzle if needed, then quantize and matmul
         if lhs_is_swizzled:
             lhs_sw = lhs
+        elif not lhs_is_f_by_k:
+            # lhs is [K, M] already (K-by-F); swizzle directly
+            lhs_sw = _swizzle(lhs.copy())
         else:
-            # lhs is [M, K] unswizzled; transpose to [K, M] then swizzle
+            # lhs is [M, K] unswizzled (F-by-K, the default); transpose to [K, M] then swizzle
             lhs_sw = _swizzle(lhs.T.copy())
 
         if rhs_is_swizzled:
             rhs_sw = rhs
+        elif not rhs_is_f_by_k:
+            # rhs is [K, N] already (K-by-F); swizzle directly
+            rhs_sw = _swizzle(rhs.copy())
         else:
-            # rhs is [N, K] unswizzled; transpose to [K, N] then swizzle
+            # rhs is [N, K] unswizzled (F-by-K, the default); transpose to [K, N] then swizzle
             rhs_sw = _swizzle(rhs.T.copy())
 
         result = golden_matmul(lhs_sw, rhs_sw, compute_dtype_x4)
@@ -167,7 +182,7 @@ def matmul_mxfp8_torch_ref(
         # At least one operand is pre-quantized.
         # For BF16 operands, swizzle and quantize. For pre-quantized, use directly.
         if not lhs_prequantized:
-            lhs_sw = lhs if lhs_is_swizzled else _swizzle(lhs.T.copy())
+            lhs_sw = lhs if lhs_is_swizzled else (_swizzle(lhs.copy()) if not lhs_is_f_by_k else _swizzle(lhs.T.copy()))
             a_data, a_scale = mx_util.quantize_mx_golden(lhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
         else:
             # Pre-quantized: data may be non-x4 dtype, view as x4
@@ -182,7 +197,7 @@ def matmul_mxfp8_torch_ref(
                 a_scale = _compact_scales(lhs_scales)
 
         if not rhs_prequantized:
-            rhs_sw = rhs if rhs_is_swizzled else _swizzle(rhs.T.copy())
+            rhs_sw = rhs if rhs_is_swizzled else (_swizzle(rhs.copy()) if not rhs_is_f_by_k else _swizzle(rhs.T.copy()))
             b_data, b_scale = mx_util.quantize_mx_golden(rhs_sw, compute_dtype_x4, custom_mx_max_exp=_get_mx_max_exp)
         else:
             b_data = rhs

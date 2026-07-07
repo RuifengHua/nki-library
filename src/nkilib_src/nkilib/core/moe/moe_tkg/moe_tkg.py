@@ -20,13 +20,12 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
-# MLP utils
-from ...mlp.mlp_parameters import MLPExpertParameters, MLPParameters, get_T_from_hidden_input
 from ...utils.allocator import sizeinbytes
 
 # common utils
 from ...utils.common_types import (
     ActFnType,
+    DtypeMode,
     ExpertAffinityScaleMode,
     MoEAllToAllVStrategy,
     MoEBlockIOLayout,
@@ -37,13 +36,20 @@ from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_verified_program_sharding_info
 from .all_expert_impl import _all_expert_moe_tkg
 from .all_expert_mx_impl import BF16_PER_INT32, _all_expert_moe_tkg_mx
+
+# MLP utils
+from .mlp_parameters import MLPExpertParameters, MLPParameters, get_T_from_hidden_input
 from .moe_tkg_affinity_masking import mask_expert_affinities
 from .selective_expert_impl import _selective_expert_moe_tkg
 from .selective_expert_mx_impl import _selective_expert_moe_tkg_mxfp4
 
 # Constants
 _SUPPORTED_MX_DTYPES = (nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4)
-_SUPPORTED_ALLTOALLV_STRATEGIES = (MoEAllToAllVStrategy.DISABLED, MoEAllToAllVStrategy.PERMUTED_OUTPUT)
+_SUPPORTED_ALLTOALLV_STRATEGIES = (
+    MoEAllToAllVStrategy.DISABLED,
+    MoEAllToAllVStrategy.PRESERVE_ROW_ORDER,
+    MoEAllToAllVStrategy.PACK_OUTPUT_ROWS,
+)
 _MOE_TKG_ERROR_PREFIX = "[MoE TKG Kernel]"
 
 
@@ -77,7 +83,9 @@ def moe_tkg(
     block_size: int = None,
     input_dequant_scale: Optional[nl.ndarray] = None,
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
-    outp_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
+    output_layout: MoEBlockIOLayout = MoEBlockIOLayout.B_S_H,
+    output: Optional[nl.ndarray] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> nl.ndarray:
     """
     Mixture of Experts (MoE) MLP token generation kernel.
@@ -101,14 +109,17 @@ def moe_tkg(
 
     Args:
         hidden_input (nl.ndarray): [T, H] or [T, H_concat] in HBM or [H0, T, H1] in SBUF, Input hidden states tensor.
-            When all_to_all_v_strategy! = DISABLED, input is expected to have layout [T, H_concat] and fp8 dtype.
+            When all_to_all_v_strategy != DISABLED, input is expected to have layout [T, H_concat] and fp8 dtype,
+            where H_concat = H + H/4 + E_L * 2 + 4 (hidden_quant | hidden_scale | expert_affinities | token_indices).
         expert_gate_up_weights (nl.ndarray): [E_L, H, 2, I] for bf16/fp16 or [E_L, 128, 2, ceil(H/512), I] for MxFP4,
             Fused gate and up projection weights.
         expert_down_weights (nl.ndarray): [E_L, I, H] for bf16/fp16 or [E_L, I_p, ceil(I/512), H] for MxFP4,
             Down projection weights.
-        expert_affinities (nl.ndarray): [T, E], Expert routing weights/affinities. For all-expert mode with
+        expert_affinities (nl.ndarray): [T, E], Expert routing weights/affinities. None when
+            all_to_all_v_strategy != DISABLED (affinities are packed in hidden_input). For all-expert mode with
             affinity scaling, this will be sliced to [T, E_L] internally.
-        expert_index (nl.ndarray): [T, K], Top-K expert indices per token.
+        expert_index (nl.ndarray): [T, K], Top-K expert indices per token. None when
+            all_to_all_v_strategy != DISABLED.
         is_all_expert (bool): If True, process all experts for all tokens; otherwise, process only selected
             top-k experts.
         rank_id (nl.ndarray, optional): [1, 1], Rank ID tensor specifying which worker processes experts
@@ -154,13 +165,24 @@ def moe_tkg(
             scale for STATIC_MX mode. Passed from moe_block_tkg which computes it during the fused
             RMSNorm+quantize step. Used by the all-expert MX path to combine with per-expert weight
             dequant scales for post-matmul dequantization. Derived from expert_gate_up_input_scale.
-        all_to_all_v_strategy (MoEAllToAllVStrategy): Input/output permutation strategy to use when MoE layer uses all_to_all_v collective.
+        all_to_all_v_strategy (MoEAllToAllVStrategy): Input/output permutation strategy when all_to_all_v (A2A-v) is used.
             Currently only supported on Trn3 with MX weights.
-        outp_layout (MoEBlockIOLayout): Output tensor layout. When _128_Nprgs_Hfree_T, output is
+            - DISABLED: Default; A2A-v is not used.
+            - PRESERVE_ROW_ORDER: Output row ordering matches input row ordering. Token indices are appended as trailing 2 columns of output.
+            - PACK_OUTPUT_ROWS: Output rows are packed, with routed tokens placed in the first N rows, where N is the number of routed tokens.
+                Final T-N rows are padded with 0s. Token indices are appended as trailing 2 columns of output.
+                When this strategy is used, the final 4 elements of hidden_input must be 0 for all padded rows, and the real token indices must be 1-indexed.
+        output_layout (MoEBlockIOLayout): Output tensor layout. When _128_Nprgs_Hfree_T, output is
             [128, n_prgs, H//128//n_prgs, T]. Not supported with output_in_sbuf. Default is B_S_H.
+        dtype_mode (DtypeMode): Explicit FP8 E4M3 dtype selection for STATIC/ROW
+            quantization weight tiles (mirrors core/mlp).
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3``
+              elsewhere.
 
     Returns:
-        output (nl.ndarray): [T, H] or [128, n_prgs, H//128//n_prgs, T] depending on outp_layout,
+        output (nl.ndarray): [T, H] or [128, n_prgs, H//128//n_prgs, T] depending on output_layout,
             or same shape as hidden_input if output_in_sbuf=True. Output tensor with
             MoE computation results.
 
@@ -243,6 +265,19 @@ def moe_tkg(
         f"output_dtype must be at least a 2-byte dtype, got {output_dtype}",
     )
 
+    # Column tiling improves PE utilization for small T (32, 64, 128) but requires:
+    #   - Quantized weights (FP8): unquantized bf16/fp16 weights are not supported
+    #   - 32 <= T <= 128: the column tiling path does not tile on the T dimension
+    #   - Non-MX quantization: MX path has its own path
+    T_for_heuristic = get_T_from_hidden_input(hidden_input, hidden_input_scale)
+    _use_gate_up_col_tiling = (
+        is_all_expert
+        and not is_mx_kernel
+        and quant_type in (QuantizationType.STATIC,)
+        and 32 <= T_for_heuristic
+        and T_for_heuristic <= 128
+    )
+
     mlp_params = MLPParameters(
         hidden_tensor=hidden_input,
         gate_proj_weights_tensor=expert_gate_up_weights,
@@ -261,7 +296,7 @@ def moe_tkg(
         hidden_input_scale=hidden_input_scale,
         input_dequant_scale=input_dequant_scale,
         output_dtype=output_dtype,
-        use_tkg_gate_up_proj_column_tiling=False,
+        use_tkg_gate_up_proj_column_tiling=_use_gate_up_col_tiling,
         use_tkg_down_proj_column_tiling=False,
         shard_on_h_disabled=is_mx_kernel and not is_all_expert,
         expert_params=expert_params,
@@ -270,7 +305,8 @@ def moe_tkg(
         up_clamp_upper_limit=up_clamp_upper_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
         quantization_type=quant_type,
-        transposed_out=outp_layout == MoEBlockIOLayout._128_Nprgs_Hfree_T,
+        transposed_out=output_layout == MoEBlockIOLayout._128_Nprgs_Hfree_T,
+        dtype_mode=dtype_mode,
     )
 
     T = mlp_params.sequence_len
@@ -294,29 +330,30 @@ def moe_tkg(
         expert_affinities_eager=expert_affinities_eager,
     )
 
-    # Allocate output tensor
+    # Allocate output tensor if not provided by caller
     _T_LAYOUT = MoEBlockIOLayout._128_Nprgs_Hfree_T
     kernel_assert(
-        not (outp_layout == _T_LAYOUT and output_in_sbuf),
-        f"{_MOE_TKG_ERROR_PREFIX} outp_layout=_128_Nprgs_Hfree_T is not supported with output_in_sbuf=True",
+        not (output_layout == _T_LAYOUT and output_in_sbuf),
+        f"{_MOE_TKG_ERROR_PREFIX} output_layout=_128_Nprgs_Hfree_T is not supported with output_in_sbuf=True",
     )
-    if output_in_sbuf:
-        output = nl.ndarray(hidden_input.shape, dtype=output_dtype, buffer=nl.sbuf, name="output_sb")
-    elif outp_layout == _T_LAYOUT:
-        _, n_prgs, _ = get_verified_program_sharding_info("moe_tkg", (0, 1))
-        H0 = 128
-        H1_shard = H // (H0 * n_prgs)
-        output = nl.ndarray((H0, n_prgs, H1_shard, T), dtype=output_dtype, buffer=nl.shared_hbm)
-    elif all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
-        output = nl.ndarray((T, H), dtype=output_dtype, buffer=nl.shared_hbm)
-    else:
-        # We add BF16_PER_INT32 additional columns to end when using all_to_all_v, to store concatenated token indices
-        output = nl.ndarray((T, H + BF16_PER_INT32), dtype=output_dtype, buffer=nl.shared_hbm)
+    if output is None:
+        if output_in_sbuf:
+            output = nl.ndarray(hidden_input.shape, dtype=output_dtype, buffer=nl.sbuf)
+        elif output_layout == _T_LAYOUT:
+            _, n_prgs, _ = get_verified_program_sharding_info("moe_tkg", (0, 1))
+            H0 = 128
+            H1_shard = H // (H0 * n_prgs)
+            output = nl.ndarray((H0, n_prgs, H1_shard, T), dtype=output_dtype, buffer=nl.shared_hbm)
+        elif all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
+            output = nl.ndarray((T, H), dtype=output_dtype, buffer=nl.shared_hbm)
+        else:
+            # We add BF16_PER_INT32 additional columns to end when using all_to_all_v, to store concatenated token indices
+            output = nl.ndarray((T, H + BF16_PER_INT32), dtype=output_dtype, buffer=nl.shared_hbm)
 
     # Dispatch to expert MLP implementation
     if is_all_expert:
         if is_mx_kernel:
-            _all_expert_moe_tkg_mx(mlp_params, output)
+            _all_expert_moe_tkg_mx(mlp_params, output, output_t_offset=0)
         else:
             _all_expert_moe_tkg(mlp_params, output)
     else:
@@ -429,10 +466,6 @@ def _validate_moe_tkg_inputs(
         kernel_assert(
             block_size != None,
             f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True requires block_size != None, but got {block_size=}",
-        )
-        kernel_assert(
-            is_mx_kernel,
-            f"{_MOE_TKG_ERROR_PREFIX} is_all_expert_dynamic=True is only supported with MX weights, but got {expert_weight_dtype=} ",
         )
         # Validate all_to_all_v_strategy supported with dynamic control flow
         kernel_assert(

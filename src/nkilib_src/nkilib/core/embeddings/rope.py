@@ -15,6 +15,8 @@
 
 """Rotary Position Embedding (RoPE) kernels for NeuronCore."""
 
+from typing import Union
+
 import nki
 import nki.isa as nisa
 import nki.language as nl
@@ -172,8 +174,8 @@ def RoPE(
 
 def RoPE_sbuf(
     x_in_sb: nl.ndarray,
-    cos_sb: nl.ndarray,
-    sin_sb: nl.ndarray,
+    cos_sb: Union[nl.ndarray, TensorView],
+    sin_sb: Union[nl.ndarray, TensorView],
     x_out_sb: nl.ndarray,
     convert_from_interleaved: bool = False,
 ) -> nl.ndarray:
@@ -186,9 +188,11 @@ def RoPE_sbuf(
         out[odd] = x[odd]*cos + x[even]*sin
 
     Args:
-        x_in_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - input embeddings
-        cos_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - cosine frequencies
-        sin_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - sine frequencies
+        x_in_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - input embeddings.
+            Can equal x_out_sb for in-place operation.
+        cos_sb: [d_head//2, B, S] @ SBUF - cosine frequencies. Accepts nl.ndarray or
+            TensorView. For sliced/strided inputs, pass a TensorView so strides are preserved.
+        sin_sb: [d_head//2, B, S] @ SBUF - sine frequencies. Accepts nl.ndarray or TensorView.
         x_out_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - output buffer
         convert_from_interleaved (bool): convert from interleaved to contiguous layout
 
@@ -285,17 +289,21 @@ def _compute_convert_to_interleaved_mat(x_sb: nl.ndarray) -> nl.ndarray:
 
     """
     Extract permutation via strided access pattern.
-    
-    Pattern [[d_head, d_head], [1, 2], [2, half_d]] reads identity with stride=2 in innermost dim.
+
+    Pattern [[partition_stride, d_head], [1, 2], [2, half_d]] reads identity with stride=2 in innermost dim.
+    Dim-0 stride is read from identity_sb's own pattern rather than assumed to be d_head, because
+    identity_sb is a d_head x d_head view of the cached 128x128 identity tile — consecutive rows are
+    pmax (not d_head) apart in the underlying storage.
     For each row i: reads [i[0], i[2], i[4], ...] then [i[1], i[3], i[5], ...].
     Destination reshape (d_head, 2, half_d) writes: row i -> [[even_cols], [odd_cols]].
     Result: even rows get 1 in first half, odd rows get 1 in second half.
     This creates P where P@X transforms [e0,e1,...,o0,o1,...] -> [e0,o0,e1,o1,...].
     """
+    partition_stride = identity_sb.get_pattern()[0][0]
     convert_to_interleaved_mat = nl.ndarray((d_head, d_head), dtype=x_sb.dtype, buffer=nl.sbuf)
     nisa.tensor_copy(
         dst=convert_to_interleaved_mat.reshape((d_head, 2, half_d)),
-        src=identity_sb.ap(pattern=[[d_head, d_head], [1, 2], [2, half_d]]),
+        src=identity_sb.ap(pattern=[[partition_stride, d_head], [1, 2], [2, half_d]]),
         engine=nisa.scalar_engine,
     )
 
@@ -371,14 +379,19 @@ def _convert_to_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.nda
     return x_sb
 
 
-def _validate_rope_inputs(x_in: nl.ndarray, cos: nl.ndarray, sin: nl.ndarray, func_name: str) -> None:
+def _validate_rope_inputs(
+    x_in: nl.ndarray,
+    cos: Union[nl.ndarray, TensorView],
+    sin: Union[nl.ndarray, TensorView],
+    func_name: str,
+) -> None:
     """
     Validate RoPE input tensor shapes and constraints.
 
     Args:
         x_in (nl.ndarray): [d_head, B, n_heads, S], Input embeddings
-        cos (nl.ndarray): [d_head//2, B, S], Cosine frequencies
-        sin (nl.ndarray): [d_head//2, B, S], Sine frequencies
+        cos: [d_head//2, B, S], Cosine frequencies (nl.ndarray or TensorView)
+        sin: [d_head//2, B, S], Sine frequencies (nl.ndarray or TensorView)
         func_name (str): Name of calling function for error messages
 
     Returns:

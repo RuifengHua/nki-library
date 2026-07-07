@@ -23,6 +23,8 @@ from ..mxfp_utils.mxfp8_utils import quantize_mxfp8_utils
 from ..mxfp_utils.mxfp8_utils.common_dataclasses import BlockDescriptor, TensorDescriptor
 from ..mxfp_utils.mxfp8_utils.common_utils import create_and_set_active_sbm, get_active_sbm
 from ..mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import get_fp8_dtype_x4
+from .matmul_mxfp8_config import MatmulMxfp8KernelConfig, auto_generate_default, resolve_lnc2_sharding, validate_shapes
+from .matmul_mxfp8_constants import PRECISION_BFLOAT16, PRECISION_FP32, PRECISION_MXFP8, PRECISION_MXFP8_X4
 from .matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
 
 
@@ -366,23 +368,9 @@ def _validate_and_calculate_shapes(
     BLOCKS_IN_M = div_ceil(M_LOGICAL, bd.BLOCK_M_LOGICAL)
     BLOCKS_IN_N = div_ceil(N_LOGICAL, bd.BLOCK_N_LOGICAL)
     BLOCKS_IN_K = div_ceil(K_LOGICAL, bd.BLOCK_K_LOGICAL)
-    if not lhs_td.is_swizzled:
+    if not lhs_td.is_swizzled or not rhs_td.is_swizzled:
         # TODO Remove requirement of K % 512 == 0 for DGT
-        kernel_assert(K_LOGICAL % 128 == 0, f"K must be divisible by 512 for DGT, got {K_LOGICAL}")
-        # Assert load tile size is (512, 512) for DGT
-        kernel_assert(
-            lhs_load_tile_shape == (512, 128) and TILES_IN_LOAD_M == 4,
-            f"LHS load tile shape must be (512, 128) with TILES_IN_LOAD_M=4 for DGT, got {lhs_load_tile_shape} and {TILES_IN_LOAD_M}",
-        )
-
-    if not rhs_td.is_swizzled:
-        # TODO Remove requirement of K % 512 == 0 for DGT
-        kernel_assert(K_LOGICAL % 128 == 0, f"K must be divisible by 512 for DGT, got {K_LOGICAL}")
-        # Assert load tile size is (512, 512) for DGT
-        kernel_assert(
-            rhs_load_tile_shape == (512, 512) and TILES_IN_LOAD_N == 1,
-            f"RHS load tile shape must be (512, 512) with TILES_IN_LOAD_N=1 for DGT, got {rhs_load_tile_shape} and {TILES_IN_LOAD_N}",
-        )
+        kernel_assert(K_LOGICAL % 128 == 0, f"K must be divisible by 128 for DGT, got {K_LOGICAL}")
 
     return {
         'lhs_matmul_tile_shape_physical': lhs_matmul_tile_shape_physical,
@@ -418,15 +406,18 @@ def matmul_mxfp8(
     block_loop_order: str = 'mnk',
     tile_loop_order: str = 'mnk',
     float8_dtype: str = "float8_e5m2",
-    output_dtype=nl.float32,
+    output_dtype=nl.bfloat16,
     run_with_lnc2: bool = True,
-    lnc_2_shard_rhs: bool = True,
+    lnc_2_shard_rhs=None,
     lhs_scales=None,
     rhs_scales=None,
     use_scale_packing: bool = False,
     spill_reload: bool = False,
     lhs_is_swizzled: bool = True,
     rhs_is_swizzled: bool = True,
+    load_with_PE_swizzle: bool = False,
+    lhs_is_f_by_k: bool = True,
+    rhs_is_f_by_k: bool = True,
 ) -> nl.ndarray:
     """
     Performs matrix multiplication with MXFP8 quantization.
@@ -555,46 +546,81 @@ def matmul_mxfp8(
 
     shard_rhs = run_with_lnc2 and lnc_2_shard_rhs
     shard_lhs = run_with_lnc2 and not lnc_2_shard_rhs
+    kernel_assert(
+        lhs_is_f_by_k or not lhs_is_swizzled,
+        "K-by-F layout (lhs_is_f_by_k=False) is not supported for pre-swizzled inputs.",
+    )
+    kernel_assert(
+        rhs_is_f_by_k or not rhs_is_swizzled,
+        "K-by-F layout (rhs_is_f_by_k=False) is not supported for pre-swizzled inputs.",
+    )
+    # NOTE: the K-by-F F-dimension requirement (F % 512 for non-swizzled BF16) is enforced
+    # centrally in validate_shapes() so every kernel using the generic API gets it.
     lhs_td = TensorDescriptor(
-        data=lhs, scales=lhs_scales, is_swizzled=lhs_is_swizzled, is_col_parallel_sharded=shard_lhs
+        data=lhs,
+        scales=lhs_scales,
+        is_swizzled=lhs_is_swizzled,
+        is_col_parallel_sharded=shard_lhs,
+        load_with_PE_swizzle=load_with_PE_swizzle if not lhs_is_swizzled else False,
+        is_f_by_k=None if lhs_is_f_by_k else False,
     )
     rhs_td = TensorDescriptor(
-        data=rhs, scales=rhs_scales, is_swizzled=rhs_is_swizzled, is_col_parallel_sharded=shard_rhs
+        data=rhs,
+        scales=rhs_scales,
+        is_swizzled=rhs_is_swizzled,
+        is_col_parallel_sharded=shard_rhs,
+        load_with_PE_swizzle=load_with_PE_swizzle if not rhs_is_swizzled else False,
+        is_f_by_k=None if rhs_is_f_by_k else False,
     )
 
-    (
-        TILES_IN_BLOCK_M,
-        TILES_IN_BLOCK_N,
-        TILES_IN_BLOCK_K,
-        TILES_IN_LOAD_M,
-        TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical,
-    ) = _auto_generate_config(
-        lhs_td=lhs_td,
-        rhs_td=rhs_td,
+    # Resolve lnc_2_shard_rhs: shard the larger output dim; disable if it fits in one tile.
+    run_with_lnc2, lnc_2_shard_rhs = resolve_lnc2_sharding(
+        lhs_td.logical_shape[1], rhs_td.logical_shape[1], run_with_lnc2, lnc_2_shard_rhs
+    )
+    shard_rhs = run_with_lnc2 and lnc_2_shard_rhs
+    shard_lhs = run_with_lnc2 and not lnc_2_shard_rhs
+    if shard_lhs:
+        lhs_td.is_col_parallel_sharded = True
+        lhs_td.sharded_physical_shape = (lhs_td.physical_shape[0], lhs_td.physical_shape[1] // 2)
+        lhs_td.sharded_logical_shape = (lhs_td.logical_shape[0], lhs_td.logical_shape[1] // 2)
+    elif shard_rhs:
+        rhs_td.is_col_parallel_sharded = True
+        rhs_td.sharded_physical_shape = (rhs_td.physical_shape[0], rhs_td.physical_shape[1] // 2)
+        rhs_td.sharded_logical_shape = (rhs_td.logical_shape[0], rhs_td.logical_shape[1] // 2)
+
+    # Build MatmulMxfp8KernelConfig and auto-generate missing fields
+    K_logical_lhs, M_logical = lhs_td.sharded_logical_shape
+    _, N_logical = rhs_td.sharded_logical_shape
+    lhs_precision = (
+        PRECISION_BFLOAT16 if not lhs_td.is_quantized else (PRECISION_MXFP8_X4 if lhs_td.is_x4 else PRECISION_MXFP8)
+    )
+    rhs_precision = (
+        PRECISION_BFLOAT16 if not rhs_td.is_quantized else (PRECISION_MXFP8_X4 if rhs_td.is_x4 else PRECISION_MXFP8)
+    )
+    output_precision = PRECISION_FP32 if output_dtype == nl.float32 else PRECISION_BFLOAT16
+
+    config = MatmulMxfp8KernelConfig(
+        M=M_logical,
+        K=K_logical_lhs,
+        N=N_logical,
+        tile_m=lhs_matmul_tile_shape_logical[1] if lhs_matmul_tile_shape_logical else None,
+        tile_k=lhs_matmul_tile_shape_logical[0] if lhs_matmul_tile_shape_logical else None,
+        tile_n=rhs_matmul_tile_shape_logical[1] if rhs_matmul_tile_shape_logical else None,
         TILES_IN_BLOCK_M=TILES_IN_BLOCK_M,
         TILES_IN_BLOCK_N=TILES_IN_BLOCK_N,
         TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical=lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
+        enable_scale_packing=use_scale_packing,
+        run_with_lnc2=run_with_lnc2,
+        lnc_2_shard_rhs=lnc_2_shard_rhs,
+        lhs_is_swizzled=lhs_is_swizzled,
+        rhs_is_swizzled=rhs_is_swizzled,
     )
+    auto_generate_default(config, lhs_precision, rhs_precision, output_precision)
 
     # Validate and calculate all shapes
-    shapes = _validate_and_calculate_shapes(
-        lhs_td=lhs_td,
-        rhs_td=rhs_td,
-        TILES_IN_BLOCK_M=TILES_IN_BLOCK_M,
-        TILES_IN_BLOCK_N=TILES_IN_BLOCK_N,
-        TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
-        TILES_IN_LOAD_M=TILES_IN_LOAD_M,
-        TILES_IN_LOAD_N=TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical=lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
-        use_scale_packing=use_scale_packing,
-    )
+    validate_shapes(config, lhs_td, rhs_td)
 
     output_tensor_hbm = nl.ndarray(
         (lhs_td.logical_shape[1], rhs_td.logical_shape[1]),
@@ -602,16 +628,16 @@ def matmul_mxfp8(
         buffer=nl.shared_hbm,
     )
     kernel_assert(
-        not run_with_lnc2 or not lnc_2_shard_rhs or shapes['BLOCKS_IN_N'] >= 2,
+        not run_with_lnc2 or not lnc_2_shard_rhs or config.BLOCKS_IN_N >= 2,
         (
-            f"LNC2 N-sharding requires at least 2 blocks in N dimension, but got {shapes['BLOCKS_IN_N']}. "
+            f"LNC2 N-sharding requires at least 2 blocks in N dimension, but got {config.BLOCKS_IN_N}. "
             f"Either increase N dimension, decrease block size, or use run_with_lnc2=False."
         ),
     )
     kernel_assert(
-        not run_with_lnc2 or lnc_2_shard_rhs or shapes['BLOCKS_IN_M'] >= 2,
+        not run_with_lnc2 or lnc_2_shard_rhs or config.BLOCKS_IN_M >= 2,
         (
-            f"LNC2 M-sharding requires at least 2 blocks in M dimension, but got {shapes['BLOCKS_IN_M']}. "
+            f"LNC2 M-sharding requires at least 2 blocks in M dimension, but got {config.BLOCKS_IN_M}. "
             f"Either increase M dimension, decrease block size, or use run_with_lnc2=False."
         ),
     )
@@ -642,20 +668,20 @@ def matmul_mxfp8(
             out_col_idx_end = out_col_idx_start + N_LOGICAL_SHARDED
             output_tensor_hbm_sharded = output_tensor_hbm[:, out_col_idx_start:out_col_idx_end]
             rhs_n_offset = LNC_ID * N_PHYSICAL_SHARDED
-            BLOCKS_IN_N_sharded = div_ceil(shapes['BLOCKS_IN_N'], 2)
-            BLOCKS_IN_M_sharded = shapes['BLOCKS_IN_M']
+            BLOCKS_IN_N_sharded = div_ceil(config.BLOCKS_IN_N, 2)
+            BLOCKS_IN_M_sharded = config.BLOCKS_IN_M
         else:
             # Shard on M dimension (LHS)
             out_row_idx_start = LNC_ID * M_LOGICAL_SHARDED
             out_row_idx_end = out_row_idx_start + M_LOGICAL_SHARDED
             output_tensor_hbm_sharded = output_tensor_hbm[out_row_idx_start:out_row_idx_end, :]
             lhs_m_offset = LNC_ID * M_PHYSICAL_SHARDED
-            BLOCKS_IN_M_sharded = div_ceil(shapes['BLOCKS_IN_M'], 2)
-            BLOCKS_IN_N_sharded = shapes['BLOCKS_IN_N']
+            BLOCKS_IN_M_sharded = div_ceil(config.BLOCKS_IN_M, 2)
+            BLOCKS_IN_N_sharded = config.BLOCKS_IN_N
     else:
         output_tensor_hbm_sharded = output_tensor_hbm
-        BLOCKS_IN_N_sharded = shapes['BLOCKS_IN_N']
-        BLOCKS_IN_M_sharded = shapes['BLOCKS_IN_M']
+        BLOCKS_IN_N_sharded = config.BLOCKS_IN_N
+        BLOCKS_IN_M_sharded = config.BLOCKS_IN_M
 
     # Allocate HBM for the quantized LHS and RHS.
     # Defaults to using X4 for spill/reload as this is an internal utility.
@@ -668,9 +694,9 @@ def matmul_mxfp8(
     # Private HBM is needed because each core is writing to the same locations
     data_buffer = nl.private_hbm if run_with_lnc2 else nl.hbm
 
-    TILE_K = shapes["lhs_load_tile_shape"][0]
+    TILE_K = config.lhs_load_tile_shape[0]
 
-    BLOCK_K_SIZE = TILE_K * TILES_IN_BLOCK_K
+    BLOCK_K_SIZE = TILE_K * config.TILES_IN_BLOCK_K
 
     NUM_TILES_K = div_ceil(lhs_td.physical_shape[0], TILE_K)
 
@@ -678,11 +704,11 @@ def matmul_mxfp8(
         NUM_TILES_K + quantize_mxfp8_utils.MAX_TILES_PER_SCALE_PACKING_GROUP - 1
     ) // quantize_mxfp8_utils.MAX_TILES_PER_SCALE_PACKING_GROUP
 
-    bd = shapes['bd']
+    bd = config.bd
 
     if spill_reload and not lhs_td.is_quantized:
         lhs_qdata_hbm = nl.ndarray(
-            (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, BLOCKS_IN_M_sharded * bd.BLOCK_M_LOGICAL),
+            (config.BLOCKS_IN_K * BLOCK_K_SIZE, BLOCKS_IN_M_sharded * bd.BLOCK_M_LOGICAL),
             dtype=fp8_x4_dtype,
             buffer=data_buffer,
         )
@@ -696,7 +722,7 @@ def matmul_mxfp8(
 
         else:
             lhs_scale_hbm = nl.ndarray(
-                (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, BLOCKS_IN_M_sharded * bd.BLOCK_M_LOGICAL),
+                (config.BLOCKS_IN_K * BLOCK_K_SIZE, BLOCKS_IN_M_sharded * bd.BLOCK_M_LOGICAL),
                 dtype=nl.uint8,
                 buffer=data_buffer,
             )
@@ -711,7 +737,7 @@ def matmul_mxfp8(
 
     if spill_reload and not rhs_td.is_quantized:
         rhs_qdata_hbm = nl.ndarray(
-            (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
+            (config.BLOCKS_IN_K * BLOCK_K_SIZE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
             dtype=fp8_x4_dtype,
             buffer=data_buffer,
         )
@@ -725,7 +751,7 @@ def matmul_mxfp8(
 
         else:
             rhs_scale_hbm = nl.ndarray(
-                (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
+                (config.BLOCKS_IN_K * BLOCK_K_SIZE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
                 dtype=nl.uint8,
                 buffer=data_buffer,
             )
@@ -745,20 +771,12 @@ def matmul_mxfp8(
         generic_matmul_mxfp8_api(
             lhs_hbm_td=lhs_td,
             rhs_hbm_td=rhs_td,
-            bd=shapes["bd"],
+            config=config,
             output_td=output_td,
             output_dtype=output_dtype,
-            TILES_IN_LOAD_M=TILES_IN_LOAD_M,
-            TILES_IN_LOAD_N=TILES_IN_LOAD_N,
             block_idx_m=(0, BLOCKS_IN_M_sharded),
             block_idx_n=(0, BLOCKS_IN_N_sharded),
-            block_idx_k=(0, shapes["BLOCKS_IN_K"]),
-            lhs_matmul_tile_shape_physical=shapes['lhs_matmul_tile_shape_physical'],
-            rhs_matmul_tile_shape_physical=shapes['rhs_matmul_tile_shape_physical'],
-            lhs_load_tile_shape=shapes['lhs_load_tile_shape'],
-            rhs_load_tile_shape=shapes['rhs_load_tile_shape'],
-            lhs_quantize_tile_shape=shapes['lhs_quantize_tile_shape'],
-            rhs_quantize_tile_shape=shapes['rhs_quantize_tile_shape'],
+            block_idx_k=(0, config.BLOCKS_IN_K),
             tile_loop_order=tile_loop_order,
             float8_dtype=float8_dtype,
             use_scale_packing=use_scale_packing,

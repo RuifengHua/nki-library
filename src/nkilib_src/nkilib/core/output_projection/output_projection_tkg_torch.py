@@ -20,7 +20,7 @@ import nki.language as nl
 import numpy as np
 import torch
 
-from ..utils.common_types import QuantizationType
+from ..utils.common_types import DtypeMode, QuantizationType
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
 from ..utils.mx_torch_common import mx_matmul, quantize_to_mx, unpack_float8_e4m3fn_x4
 
@@ -40,6 +40,7 @@ def output_projection_tkg_torch_ref(
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
     sbm=None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> dict:
     """PyTorch reference implementation of output projection for TKG (token generation).
 
@@ -68,6 +69,11 @@ def output_projection_tkg_torch_ref(
             False: [B*S, H]
             True: [128, lnc, H//(lnc*128), B*S] where lnc is inferred from H.
     """
+    # AUTO must be pre-resolved by the caller (see resolve_dtype_mode_for_torch_ref);
+    # the torch ref runs on CPU and can't query hardware.
+    assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
+        "output_projection_tkg_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+    )
 
     if quantization_type == QuantizationType.MX:
         return output_projection_tkg_mx_torch_ref(
@@ -119,7 +125,13 @@ def output_projection_tkg_torch_ref(
             if isinstance(input_scale, torch.Tensor)
             else float(np.asarray(input_scale).flat[0])
         )
-        clip_value = _FP8_E4M3FN_MAX if is_static_mx else _FP8_E4M3_MAX
+        # STATIC_MX is always OCP; STATIC follows dtype_mode (OCP → 448, NON_OCP → 240).
+        if is_static_mx:
+            clip_value = _FP8_E4M3FN_MAX
+        elif dtype_mode == DtypeMode.OCP:
+            clip_value = _FP8_E4M3FN_MAX
+        else:
+            clip_value = _FP8_E4M3_MAX
         attn = torch.clamp(attn / input_scale_value, -clip_value, clip_value)
     elif quantization_type == QuantizationType.ROW:
         weight_scale_value = weight_scale[0, :].float()

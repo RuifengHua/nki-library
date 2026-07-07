@@ -38,9 +38,9 @@ def allocate_hidden_tensor_tile(
         for bxs_subtile_idx in range(tile_info.mx_src_proj_bxs_dim_tile.subtile_dim_info.tile_count):
             hidden_tensor = heap_alloc(
                 (
-                    tile_info.mx_src_proj_hidden_dim_tile.subtile_dim_info.tile_count,  # 128
+                    nl.tile_size.pmax,  # 128_H
                     tile_info.mx_src_proj_hidden_dim_tile.tile_count,  # H/512
-                    tile_info.mx_src_proj_bxs_dim_tile.subtile_dim_info.tile_size,  # 256
+                    2 * nl.tile_size.pmax,  # 256_T
                     tile_info.mx_src_proj_hidden_dim_tile.subtile_dim_info.tile_size,  # 4
                 ),
                 dtype=constants.hidden_tile_data_type,

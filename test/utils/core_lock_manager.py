@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass
+from enum import Enum
 
 import fabric2
 
@@ -32,6 +34,42 @@ from .metrics_collector import IMetricsCollector, MetricName
 from .scripts.remote_lock_scripts import LockStatus
 
 logger = logging.getLogger(__name__)
+
+
+class AllocationStatus(Enum):
+    """Manager-level outcome of an allocation attempt.
+
+    Deliberately distinct from the wire ``remote_lock_scripts.LockStatus`` so the
+    low-level protocol types do not leak above the manager boundary; callers
+    branch only on this manager-level status.
+    """
+
+    ALLOCATED = "ALLOCATED"
+    QUEUED = "QUEUED"
+    DRAINING = "DRAINING"
+
+
+@dataclass
+class AllocationOutcome:
+    """Manager-level result of ``CoreLockManager.acquire``.
+
+    Mapped from the wire ``LockResult`` at the client boundary so callers branch
+    on ``status`` without importing the remote protocol types.
+
+    Attributes:
+        status: Manager-level allocation status.
+        logical_cores: Logical core IDs (set only when ALLOCATED).
+        physical_cores: Physical core IDs locked (set only when ALLOCATED).
+        position: 0-based FIFO queue position (set only when QUEUED/DRAINING).
+        worst_case_eta: Worst-case wait estimate in relative seconds from now
+            (QUEUED/DRAINING).
+    """
+
+    status: AllocationStatus
+    logical_cores: list[int] | None = None
+    physical_cores: list[int] | None = None
+    position: int | None = None
+    worst_case_eta: int | None = None
 
 
 @dataclass
@@ -149,11 +187,46 @@ class CoreLockManager:
         self.host = host
         self._collector = collector
         self._executor = executor
-        self._caller_id = getattr(collector, "test_name", None) or None
+        self._entry_id = uuid.uuid4().hex
+        self._caller_id = f"{self._entry_id}:{getattr(collector, 'test_name', None) or 'unknown'}"
         self._host_locking_version = host_locking_version
         self._no_cores_count = 0
-        self._contention_wait_time = 0.0
+        # Wall-clock span accounting: stamp the first observation of each waiting
+        # state and compute the span (terminal - first) at metric-emit time so the
+        # inter-poll sleeps between acquire() calls are included, not just each
+        # poll's RPC duration.
+        self._first_contention_ts: float | None = None
         self._current_expiry: int | None = None
+        # Queue-fairness observability state. Tracked manager-locally and emitted
+        # at the point of measurement (the commit / contention-metrics call),
+        # never propagated up the stack.
+        self._enqueue_ts: float | None = None
+        self._first_queue_position: int | None = None
+        self._first_queue_eta: int | None = None
+        self._last_position: int | None = None
+        self._bump_count = 0
+        self._bump_warned = False
+        self._reenqueue_count = 0
+        self._first_drain_ts: float | None = None
+        # Guards the queue-fairness commit metrics so they are emitted exactly
+        # once per attempt regardless of whether the attempt ends in an
+        # ALLOCATED commit or an abandon flush.
+        self._commit_metrics_recorded = False
+
+    @property
+    def entry_id(self) -> str:
+        """Get the stable per-allocation-attempt UUID for this manager."""
+        return self._entry_id
+
+    @property
+    def collector(self) -> IMetricsCollector:
+        """Get the metrics collector that owns this manager's allocation attempt.
+
+        Exposed read-only so the host layer can bind the cached manager's
+        validity to its owning collector (the per-test/per-attempt owner)
+        without reaching into private state.
+        """
+        return self._collector
 
     @property
     def host_locking_version(self) -> int:
@@ -200,34 +273,32 @@ class CoreLockManager:
         num_logical_cores: int,
         lnc_config: int,
         timeout_seconds: int = lock_client.DEFAULT_LOCK_TIMEOUT_SECONDS,
-    ) -> tuple[list[int], list[int]] | None:
-        """
-        Acquire logical cores by locking physical cores.
+        ready: bool = True,
+    ) -> AllocationOutcome:
+        """Acquire logical cores via one FIFO-queue ``poll`` call.
 
-        Locking is done on physical cores to prevent conflicts between LNC1 and LNC2 tests.
-        For example, LNC2 logical core 0 maps to physical cores [0,1], while LNC1 logical
-        cores 0-1 also map to physical cores [0,1]. By locking physical cores, we ensure
-        these tests don't run simultaneously on the same hardware.
+        Performs a single ``lock_client.poll`` against the host's FIFO core-
+        allocation queue and maps the wire ``LockResult`` to a manager-level
+        ``AllocationOutcome`` at this boundary. Physical cores are
+        locked to prevent conflicts between LNC1 and LNC2 tests; logical cores
+        are for NEURON_RT_VISIBLE_CORES.
 
         Args:
             num_logical_cores: Number of logical cores to allocate
             lnc_config: LNC configuration (1 or 2) - physical cores per logical core
             timeout_seconds: How long the lock should be held before auto-expiring
+            ready: Whether the caller is ready to commit. A ``ready=False`` poll
+                enqueues/refreshes a queue slot but never grabs cores.
 
         Returns:
-            Tuple of (logical_core_ids, physical_core_ids), or None if:
-            - System is draining (graceful shutdown in progress)
-            - Not enough contiguous cores available
-
-            Physical cores are locked via flock+JSON; logical cores are for NEURON_RT_VISIBLE_CORES.
+            AllocationOutcome with status:
+            - ALLOCATED: cores granted (logical_cores + physical_cores set)
+            - QUEUED: enqueued/waiting (position + worst_case_eta set)
+            - DRAINING: host draining, grants withheld (position + eta set)
 
         Raises:
-            LockAcquisitionError: If an unexpected error occurs during acquisition
-
-        Example:
-            # Acquire 2 logical cores with LNC2 (needs 4 physical cores)
-            result = manager.acquire(num_logical_cores=2, lnc_config=2, timeout_seconds=60)
-            # Returns e.g. ([0, 1], [0, 1, 2, 3]) or ([2, 3], [4, 5, 6, 7])
+            LockAcquisitionError: If an unexpected error occurs during the poll
+            InsufficientCoreCountError: If the host cannot satisfy the request
         """
         num_physical_cores = num_logical_cores * lnc_config
         assert num_physical_cores % lnc_config == 0, (
@@ -244,27 +315,18 @@ class CoreLockManager:
 
         try:
             with self._collector.timer(MetricName.CORE_LOCK_ACQUIRE_TIME):
-                lock_result = lock_client.acquire(
+                lock_result = lock_client.poll(
                     self._executor,
                     self.total_physical_cores,
                     num_physical_cores,
                     timeout_seconds,
                     self.host_locking_version,
+                    self._entry_id,
+                    ready,
                     caller_id=self._caller_id,
                 )
         except Exception as e:
             raise LockAcquisitionError(str(e))
-
-        if lock_result.status == LockStatus.DRAINING:
-            logging.info(f"[{self.host}] System is draining, rejecting acquisition")
-            self._contention_wait_time += time.time() - attempt_start
-            return None
-
-        if lock_result.status == LockStatus.NO_CORES:
-            logging.info(f"[{self.host}] No contiguous cores available")
-            self._no_cores_count += 1
-            self._contention_wait_time += time.time() - attempt_start
-            return None
 
         if lock_result.status == LockStatus.ALLOCATED:
             if lock_result.cores is None:
@@ -272,17 +334,61 @@ class CoreLockManager:
             allocated_physical_cores = lock_result.cores
             self._current_expiry = lock_result.expiry
             logical_cores = self._physical_to_logical_cores(allocated_physical_cores, lnc_config)
+            self._record_commit_metrics()
             logging.info(
                 f"[{self.host}] Acquired logical cores {logical_cores} "
                 f"(physical: {allocated_physical_cores}, expires in {timeout_seconds}s)"
             )
-            return logical_cores, allocated_physical_cores
+            return AllocationOutcome(
+                status=AllocationStatus.ALLOCATED,
+                logical_cores=logical_cores,
+                physical_cores=allocated_physical_cores,
+            )
+
+        if lock_result.status in (LockStatus.DRAINING, LockStatus.IN_QUEUE):
+            draining = lock_result.status == LockStatus.DRAINING
+            if draining:
+                logging.info(f"[{self.host}] System is draining, staying in queue")
+            self._no_cores_count += 1
+            if self._first_contention_ts is None:
+                self._first_contention_ts = attempt_start
+            if draining and self._first_drain_ts is None:
+                self._first_drain_ts = attempt_start
+            self._note_enqueued(
+                attempt_start,
+                lock_result.position,
+                lock_result.worst_case_eta,
+                lock_result.bumped,
+                lock_result.re_enqueued,
+            )
+            return AllocationOutcome(
+                status=AllocationStatus.DRAINING if draining else AllocationStatus.QUEUED,
+                position=lock_result.position,
+                worst_case_eta=lock_result.worst_case_eta,
+            )
 
         if lock_result.status == LockStatus.ERROR:
             raise LockAcquisitionError(f"[{self.host}] Lock helper error: {lock_result.message}")
 
         # Unknown status - treat as error
         raise LockAcquisitionError(f"[{self.host}] Unexpected lock status: {lock_result.status}")
+
+    def dequeue(self) -> None:
+        """Gracefully remove this manager's entry from the host FIFO queue.
+
+        Used when abandoning a host (patience rotation or pre-acquire error).
+        Removing a non-existent entry is a server-side no-op.
+        """
+        logging.info(f"[{self.host}] Dequeuing entry {self._entry_id}")
+        lock_result = lock_client.dequeue(
+            self._executor,
+            self.total_physical_cores,
+            self.host_locking_version,
+            self._entry_id,
+            caller_id=self._caller_id,
+        )
+        if lock_result.status != LockStatus.RELEASED:
+            logging.warning(f"[{self.host}] Dequeue may have failed: {lock_result.status}, {lock_result.message}")
 
     def release(self, core_ids: list[int]) -> None:
         """
@@ -346,15 +452,106 @@ class CoreLockManager:
         else:
             logging.warning(f"[{self.host}] Undrain may have failed: {lock_result.status}, {lock_result.message}")
 
-    def record_contention_metrics(self) -> None:
-        """Record contention metrics to the collector.
+    def _note_enqueued(
+        self,
+        enqueue_ts: float,
+        position: int | None,
+        worst_case_eta: int | None,
+        bumped: bool,
+        re_enqueued: bool = False,
+    ) -> None:
+        """Record queue-fairness state for one IN_QUEUE/DRAINING poll.
 
-        Call this after successfully acquiring cores to record how many
-        NO_CORES rejections occurred and how long was spent waiting.
+        Stamps the first enqueue time for ``QueueWaitTime``, captures the
+        first-IN_QUEUE position/ETA, and counts
+        bumps. Bump detection is driven by the explicit ``bumped`` signal the
+        server sets when reconcile moves THIS entry to the tail. This catches a
+        sole-entry bump (the head bumps to an empty tail and stays at position 0,
+        a 0->0 move a position delta cannot see) and avoids miscounting a
+        prune->re-enqueue position jump as a bump. Three bumps for one entry
+        signal a possible sole-entry bump livelock, so warn once at >=3.
+
+        ``re_enqueued`` is a distinct, mutually-exclusive signal: the server sets
+        it (and never ``bumped``) when THIS entry was pruned this cycle then
+        re-appended at the tail -- a silent FIFO position loss tracked separately
+        so the soft-join upload-grace cost is observable apart from bumps.
+
+        ``position``/``worst_case_eta`` are still tracked for position metrics.
         """
-        self._collector.record_metric(MetricName.CORE_LOCK_NO_CORES_COUNT, self._no_cores_count, "Count")
-        self._collector.record_timer(MetricName.CORE_LOCK_CONTENTION_WAIT_TIME, self._contention_wait_time)
-        if self._no_cores_count > 0:
-            logging.info(
-                f"[{self.host}] Contention: {self._no_cores_count} rejections, {self._contention_wait_time:.2f}s wait"
+        if self._enqueue_ts is None:
+            self._enqueue_ts = enqueue_ts
+        if bumped:
+            self._bump_count += 1
+            if self._bump_count >= 3 and not self._bump_warned:
+                self._bump_warned = True
+                logging.warning(
+                    f"[{self.host}] entry {self._entry_id} bumped {self._bump_count} times; "
+                    f"possible sole-entry bump livelock"
+                )
+        if re_enqueued:
+            self._reenqueue_count += 1
+        if position is None:
+            return
+        if self._first_queue_position is None:
+            self._first_queue_position = position
+            self._first_queue_eta = worst_case_eta
+        self._last_position = position
+
+    def _record_commit_metrics(self) -> None:
+        """Emit queue-fairness metrics once per attempt.
+
+        Called both at the ALLOCATED commit and on the abandon flush; the
+        ``_commit_metrics_recorded`` guard makes it idempotent so the two paths
+        (which are mutually exclusive within an attempt) never double-emit.
+
+        QueueDepthAtEnqueue is intentionally omitted: the wire ``LockResult``
+        carries only ``position``, not absolute queue depth, so
+        ``QueuePositionAtEnqueue`` is recorded instead as a truthful lower bound
+        on depth.
+        """
+        if self._commit_metrics_recorded:
+            return
+        self._commit_metrics_recorded = True
+        if self._enqueue_ts is not None:
+            actual_wait = time.time() - self._enqueue_ts
+            self._collector.record_timer(MetricName.CORE_LOCK_QUEUE_WAIT_TIME, actual_wait)
+            if self._first_queue_eta is not None:
+                # How much longer the caller actually waited than the
+                # worst-case ETA it was first quoted at enqueue. Clamped to
+                # zero so it is never negative: a positive value captures
+                # scheduling inefficiency (the optimistic ETA under-estimated).
+                overrun = max(0.0, actual_wait - self._first_queue_eta)
+                self._collector.record_timer(MetricName.CORE_LOCK_ETA_OVERRUN_TIME, overrun)
+        if self._first_queue_position is not None:
+            self._collector.record_metric(
+                MetricName.CORE_LOCK_QUEUE_POSITION_AT_ENQUEUE, self._first_queue_position, "Count"
             )
+        if self._first_queue_eta is not None:
+            self._collector.record_metric(MetricName.CORE_LOCK_ETA_AT_ENQUEUE, self._first_queue_eta, "Seconds")
+        self._collector.record_metric(MetricName.CORE_LOCK_BUMP_COUNT, self._bump_count, "Count")
+        self._collector.record_metric(MetricName.CORE_LOCK_REENQUEUE_COUNT, self._reenqueue_count, "Count")
+
+    def record_contention_metrics(self) -> None:
+        """Flush this attempt's queue-fairness and contention metrics.
+
+        Safe to call on either terminal path: the ALLOCATED success path and
+        every abandon path (patience rotation, retryable give-up, wall-clock
+        timeout). It first flushes the queue-fairness commit metrics (idempotent
+        via ``_record_commit_metrics``, so the success path's earlier commit-time
+        emission is not double-counted), then emits the per-attempt NO_CORES count
+        and the contention / drain-wait spans measured as wall-clock from the
+        first contended / draining poll to this terminal moment (inter-poll
+        sleeps included).
+        """
+        self._record_commit_metrics()
+        # Compute the wait spans as wall-clock from first observation to this
+        # terminal moment, so the inter-poll sleeps that elapse between acquire()
+        # calls in the host loop are included (not just each poll's RPC duration).
+        terminal = time.time()
+        contention_wait = terminal - self._first_contention_ts if self._first_contention_ts is not None else 0.0
+        drain_wait = terminal - self._first_drain_ts if self._first_drain_ts is not None else 0.0
+        self._collector.record_metric(MetricName.CORE_LOCK_NO_CORES_COUNT, self._no_cores_count, "Count")
+        self._collector.record_timer(MetricName.CORE_LOCK_CONTENTION_WAIT_TIME, contention_wait)
+        self._collector.record_timer(MetricName.CORE_LOCK_DRAIN_WAIT_TIME, drain_wait)
+        if self._no_cores_count > 0:
+            logging.info(f"[{self.host}] Contention: {self._no_cores_count} rejections, {contention_wait:.2f}s wait")

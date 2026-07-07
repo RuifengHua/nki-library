@@ -116,6 +116,9 @@ def build_attention_cte_input(
     softmax_dtype=np.float32,
     mm_out_dtype=np.float32,
     n_packed_sequences=None,
+    position_bias=None,
+    bias_layout="dense",
+    bias_band_params=None,
 ):
     """Generate kernel inputs as a dict matching the attention_cte kernel signature."""
     softmax_dtype = dtype_mapping[softmax_dtype]
@@ -184,6 +187,9 @@ def build_attention_cte_input(
         "mm_out_dtype": mm_out_dtype,
         "bound_min": bound_min_arr,
         "bound_max": bound_max_arr,
+        "position_bias": position_bias,
+        "bias_layout": bias_layout,
+        "bias_band_params": bias_band_params,
     }
 
 
@@ -249,6 +255,7 @@ _FULL_ONLY_KEYS = {
     (1, 1, 32768, None, None, 32768, 64, 128),
     (1, 1, 16384, 16384, 15873, 16384, 128, 1),
     (1, 1, 32768, None, None, 32768, 128, 2),
+    (3, 3, 25600, 5000, 4500, 5, 2, 63),
 }
 
 
@@ -520,6 +527,22 @@ class TestRangedAttentionCTEKernels:
         [1, 36864, 36864, 128, 1.000, nl.bfloat16, True, False, True, None],
         # [512, 4096, 4096, 128, 1.000, nl.bfloat16, False, False, True, None], TODO: timeout
 
+        # d > 128 support
+        # Gemma4 sliding: d=256, causal, various seqlens
+        [1, 4096, 4096, 256, 1.000, nl.bfloat16, True, False, False, None],
+        [1, 16384, 16384, 256, 1.000, nl.bfloat16, True, False, True, None],
+        # Gemma4 global: d=512
+        [1, 8192, 8192, 512, 1.000, nl.bfloat16, True, False, True, None],
+        # Qwen3.6: d=256, non-causal
+        [1, 12288, 12288, 256, 1.000, nl.bfloat16, False, False, False, None],
+        # Unequal Q/KV, non-multiple d
+        [1, 16384, 2048, 192, 1.000, nl.bfloat16, True, False, False, None],
+        [1, 4096, 4096, 192, 1.000, nl.bfloat16, True, False, True, None],
+        [3, 6144, 6144, 256, 1.000, nl.bfloat16, True, True, False, None],
+        [1, 9216, 9216, 512, 1.000, nl.bfloat16, True, False, False, None],
+        # 32k seqlen
+        [1, 32768, 32768, 256, 1.000, nl.bfloat16, True, False, True, None],
+
     ]
     # fmt: on
 
@@ -626,6 +649,25 @@ class TestRangedAttentionCTEKernels:
         [2, 1, 20480, 20480, 4096, 4096 - 512, 128, 1.0, nl.bfloat16, True, False, False, True, False, 0, (228e7, None)],
         [2, 1, 20480, 20480, 4096, 4096 - 512, 128, 1.0, nl.bfloat16, True, False, True, True, False, 0, (233e7, None)],
         [2, 1, 20480, 20480, 4096, 4096 - 512, 128, 1.0, nl.bfloat16, True, True, True, True, False, 0, (236e7, None)],
+
+        # d > 128 support (prefix caching)
+        [2, 2, 2048, 2048, 1024, 512, 192, 1.0, nl.bfloat16, True, False, False, False, False, 0, None],
+        [2, 1, 4096, 4096, 2048, 1543, 256, 1.0, nl.bfloat16, True, False, False, True, False, 0, None],
+        [2, 2, 8192, 8192, 4096, 900, 256, 1.0, nl.bfloat16, True, True, True, True, False, 0, None],
+        [1, 3, 12288, 12288, 512, 500, 256, 1.0, nl.bfloat16, False, False, False, False, False, 0, None],
+        [2, 1, 16384, 16384, 1024, 512, 512, 1.0, nl.bfloat16, True, False, False, True, False, 0, None],
+        [2, 2, 6144, 6144, 2048, 1024, 512, 1.0, nl.bfloat16, True, True, True, True, False, 0, None],
+
+        # Gemma4 sliding attention configs (d=256, nheads=32, nkv=16, swa=1024, prefix caching)
+        [2, 2, 4096, 4096, 2048, 2048 - 45, 256, 1.0, nl.bfloat16, True, False, False, False, False, 0, None],
+        [2, 2, 4096, 4096, 2048, 2048 - 45, 256, 1.0, nl.bfloat16, True, False, False, True, False, 1024, None],
+        [2, 2, 8192, 8192, 2048, 1543, 256, 1.0, nl.bfloat16, True, False, False, True, False, 0, None],
+        [2, 2, 8192, 8192, 2048, 1543, 256, 1.0, nl.bfloat16, True, False, True, True, False, 0, None],
+        [2, 2, 8192, 8192, 2048, 1543, 256, 1.0, nl.bfloat16, True, True, True, True, False, 0, None],
+        [2, 2, 4096, 4096, 512, 400, 256, 1.0, nl.bfloat16, True, False, False, True, False, 1024, None],
+        [2, 2, 6144, 6144, 1024, 512, 256, 1.0, nl.bfloat16, True, False, False, True, False, 1024, None],
+        [2, 1, 16384, 16384, 2048, 2048 - 512, 256, 1.0, nl.bfloat16, True, False, False, True, False, 0, None],
+        [2, 1, 16384, 16384, 2048, 2048 - 512, 256, 1.0, nl.bfloat16, True, False, True, True, False, 0, None],
     ]
     # fmt: on
 
@@ -759,6 +801,24 @@ class TestRangedAttentionCTEKernels:
         [2, 2, 16384, 16384, 64, 1.0, nl.bfloat16, True, False, True, True, 128, (583e6, None)],
         # [2, 2, 32768, 32768, 64, 1.0, nl.bfloat16, True, False, True, True, 0, (None, None)], # TODO: NKIFE-518
         [2, 2, 32768, 32768, 64, 1.0, nl.bfloat16, True, False, True, True, 128, (156e7, None)],
+
+        # d > 128 support
+        # Gemma4 sliding: d=256, swa=1024
+        [2, 2, 16384, 16384, 256, 1.0, nl.bfloat16, True, False, True, False, 1024, None],
+        [2, 2, 8192, 8192, 256, 1.0, nl.bfloat16, True, False, False, True, 0, None],
+        [2, 2, 12288, 12288, 256, 1.0, nl.bfloat16, True, False, True, True, 128, None],
+        # Gemma4 sliding: d=256, swa=1024, varied seqlens
+        [2, 2, 4096, 4096, 256, 1.0, nl.bfloat16, True, False, True, False, 1024, None],
+        [2, 2, 6144, 6144, 256, 1.0, nl.bfloat16, True, False, False, True, 1024, None],
+        # Gemma4 global: d=512, no swa, with sink
+        [2, 2, 16384, 16384, 512, 1.0, nl.bfloat16, True, False, True, True, 0, None],
+        [2, 2, 8192, 8192, 512, 1.0, nl.bfloat16, True, False, False, False, 0, None],
+        # Qwen3.6: d=256, causal, no swa
+        [2, 2, 16384, 16384, 256, 1.0, nl.bfloat16, True, False, False, False, 0, None],
+        [2, 2, 9216, 9216, 256, 1.0, nl.bfloat16, True, False, True, False, 0, None],
+        # d=512 + SWA
+        [2, 2, 4096, 4096, 512, 1.0, nl.bfloat16, True, False, True, False, 1024, None],
+        [2, 2, 4096, 4096, 512, 1.0, nl.bfloat16, True, False, False, True, 128, None],
     ]
     # fmt: on
 
@@ -843,6 +903,17 @@ class TestRangedAttentionCTEKernels:
         [2, 8, 1, 4096, 4096, 2048, 2048-513, 64, 1.0, nl.bfloat16, True, False, False, True, True, 128, (735e6, None)],
         [2, 8, 1, 6144, 6144, 512, 400, 64, 1.0, nl.bfloat16, True, False, False, True, True, 128, (751e6, None)],
         [2, 8, 1, 8192, 8192, 128, 100, 64, 1.0, nl.bfloat16, True, False, True, True, True, 128, (105e7, None)],
+
+        # d > 128 support (GQA)
+        # Gemma4 sliding: GQA=2 (32/16), d=256
+        [2, 4, 2, 6144, 6144, None, None, 192, 1.0, nl.bfloat16, True, False, False, False, False, 0, None],
+        [2, 8, 1, 16384, 16384, None, None, 256, 1.0, nl.bfloat16, True, False, False, True, False, 0, None],
+        # Gemma4 global: GQA=8 (32/4), d=512, with sink
+        [2, 8, 1, 12288, 12288, None, None, 256, 1.0, nl.bfloat16, True, True, True, True, True, 0, None],
+        # Qwen3.6: GQA=8 (16/2), d=256, SWA
+        [2, 8, 1, 8192, 8192, 512, 400, 256, 1.0, nl.bfloat16, True, False, False, True, True, 128, None],
+        [2, 4, 1, 16384, 16384, None, None, 512, 1.0, nl.bfloat16, True, False, False, False, False, 0, None],
+        [2, 8, 1, 9216, 9216, None, None, 512, 1.0, nl.bfloat16, True, False, False, True, False, 0, None],
     ]
     # fmt: on
 
@@ -912,6 +983,14 @@ class TestRangedAttentionCTEKernels:
         [2, 8, 4, 16384, 16384, None, None, 64, 0.125, nl.bfloat16, True, True, True, True, True, 0, (856e7, None)],
         [2, 3, 3, 24576, 24576, 123, 0, 128, 1.0, nl.bfloat16, True, True, True, True, False, 23, (221e7, None)],
         [2, 2, 2, 10240, 10240, None, None, 128, 1.0, nl.float32, False, True, True, True, False, 0, None],
+
+        # d > 128 support (barometer)
+        [2, 3, 1, 6144, 6144, None, None, 192, 1.0, nl.bfloat16, True, False, False, False, False, 0, None],
+        [2, 3, 1, 16384, 16384, None, None, 256, 1.0, nl.bfloat16, True, True, True, True, False, 0, None],
+        [2, 3, 1, 12288, 12288, 1024, 512, 256, 1.0, nl.bfloat16, True, False, False, True, False, 0, None],
+        [2, 3, 1, 9216, 9216, None, None, 256, 1.0, nl.bfloat16, True, False, False, True, True, 1024, None],
+        [1, 3, 1, 8192, 8192, None, None, 512, 1.0, nl.bfloat16, True, False, False, False, False, 0, None],
+        [2, 3, 1, 16384, 16384, None, None, 512, 1.0, nl.bfloat16, True, False, False, True, False, 0, None],
     ]
     # fmt: on
 
@@ -990,6 +1069,11 @@ class TestRangedAttentionCTEKernels:
         [4, 640, 10240, 2045, 234, 64, 1.0, nl.bfloat16, True, True, False, 13, 16, True, 128, 151e6],
         [10, 1024, 16384, 4096, 3244, 128, 1.0, nl.bfloat16, True, False, False, 12, 16, False, 0, 198e7],
         [10, 1024, 16384, 4096, 1244, 128, 1.0, nl.bfloat16, True, True, False, 12, 16, False, 128, 706e6],
+
+        # d > 128 support
+        [4, 512, 8192, 512, 256, 256, 1.0, nl.bfloat16, True, False, False, 0, 16, False, 0, None],
+        [3, 1024, 16384, 2047, 1024, 256, 1.0, nl.bfloat16, True, False, True, 1, 16, False, 0, None],
+        [3, 2048, 4096, 4096, 4096, 256, 1.0, nl.bfloat16, True, False, False, 0, 2, True, 1024, None],
     ]
     # fmt: on
 
@@ -1086,6 +1170,14 @@ class TestRangedAttentionCTEKernels:
         [3, 2048, 4096, 64, 1.0, nl.bfloat16, True, False, False, 0, 2, True, 0, 263e6],
         [3, 2048, 4096, 64, 1.0, nl.bfloat16, True, False, False, 0, 2, True, 256, 212e6],
         [1, 2048, 2048, 64, 1.0, nl.bfloat16, True, False, False, 0, 1, True, 512, 95e6],
+
+        # d > 128 support (CP without prefix caching)
+        [4, 1024, 16384, 192, 1.0, nl.bfloat16, True, False, False, 0, 16, False, 0, None],
+        [10, 640, 10240, 256, 1.0, nl.bfloat16, True, False, False, 4, 16, False, 0, None],
+        [4, 512, 8192, 256, 1.0, nl.bfloat16, True, False, True, 3, 16, False, 0, None],
+        [3, 2048, 4096, 256, 1.0, nl.bfloat16, True, False, False, 0, 2, True, 256, None],
+        [10, 1024, 16384, 512, 1.0, nl.bfloat16, True, False, False, 12, 16, False, 0, None],
+        [4, 640, 10240, 512, 1.0, nl.bfloat16, True, False, True, 4, 16, False, 0, None],
     ]
     # fmt: on
 
@@ -1168,6 +1260,17 @@ class TestRangedAttentionCTEKernels:
         # perf reference from non-GQA mode, with and without SWA
         [4, 1, 640, 10240, None, None, 64, 1.0, nl.bfloat16, True, True, False, 15, 16, True, 0, 298e6],
         [4, 1, 640, 10240, None, None, 64, 1.0, nl.bfloat16, True, True, False, 11, 16, True, 128, 106e6],
+
+        # d > 128 support (CP + GQA)
+        # Gemma4 GQA=2, d=256
+        [4, 2, 512, 8192, 512, 256, 192, 1.0, nl.bfloat16, True, False, False, 0, 16, False, 0, None],
+        [9, 3, 1024, 16384, 2047, 1024, 256, 1.0, nl.bfloat16, True, False, False, 6, 16, False, 0, None],
+        # Qwen3.6 GQA=8, d=256
+        [8, 1, 640, 10240, None, None, 256, 1.0, nl.bfloat16, True, False, True, 4, 16, False, 0, None],
+        [4, 1, 1024, 16384, None, None, 256, 1.0, nl.bfloat16, True, False, False, 11, 16, True, 128, None],
+        # Gemma4 global GQA=8, d=512
+        [8, 1, 512, 8192, None, None, 512, 1.0, nl.bfloat16, True, False, False, 0, 16, False, 0, None],
+        [9, 3, 1024, 16384, 2047, 1024, 512, 1.0, nl.bfloat16, True, False, True, 4, 16, False, 0, None],
     ]
     # fmt: on
 
@@ -1235,6 +1338,14 @@ class TestRangedAttentionCTEKernels:
         [4, 1, 640, 10240, None, None, 128, 1.0, nl.bfloat16, True, True, True, 7, 16, False, 128, 104e6],
         [4, 1, 640, 10240, 2044, 123, 128, 1.0, nl.bfloat16, True, True, True, 5, 16, True, 121, 159e6],
         [4, 2, 640, 10240, 1245, 142, 64, 1.0, nl.bfloat16, False, False, False, 11, 16, False, 1024, 155e6],
+
+        # d > 128 support (CP barometer)
+        [4, 1, 1024, 16384, None, None, 192, 1.0, nl.bfloat16, True, False, False, 4, 16, False, 0, None],
+        [4, 1, 640, 10240, 512, 256, 256, 1.0, nl.bfloat16, True, False, False, 1, 16, False, 0, None],
+        [10, 1, 1024, 16384, None, None, 256, 1.0, nl.bfloat16, True, False, True, 12, 16, False, 0, None],
+        [3, 1, 2048, 6144, None, None, 256, 1.0, nl.bfloat16, True, False, False, 0, 2, True, 1024, None],
+        [4, 1, 640, 10240, None, None, 512, 1.0, nl.bfloat16, True, False, False, 4, 16, False, 0, None],
+        [10, 1, 1024, 16384, 1024, 512, 512, 1.0, nl.bfloat16, True, False, True, 12, 16, False, 0, None],
     ]
     # fmt: on
 
@@ -1670,6 +1781,7 @@ class TestRangedAttentionCTEKernels:
         self,
         test_manager: Orchestrator,
         collector: IMetricsCollector,
+        platform_target: Platforms,
         lnc_degree,
         bs,
         gqa,
@@ -2044,11 +2156,11 @@ class TestRangedAttentionCTEKernels:
       [1,     1,          32768,      None,             None,           32,         31,         128,  2,            True,         False,False,False,  False],
       [1,     1,          32768,      None,             None,           32,         31,         128,  127,          True,         True, True, True,   False],
       [2,     2,          32768,      None,             None,           32,         13,         128,  30000,        True,         True, True, True,   False],
-      [3,     3,          25600,      5000,             4500,           5,          2,          63,   128,          True,         False,False,False,  False],
-      [3,     3,          17000,      15000,            500,            17,         16,         127,  0,            True,         True, True, True,   True],
     ]
     attn_cte_sweep_manual_cp_perms_slow = [
       [2,     2,          32768,      None,             None,           2,          1,          128,  0,            True,         False,True, True,   True],
+      [3,     3,          25600,      5000,             4500,           5,          2,          63,   128,          True,         False,False,False,  False],
+      [3,     3,          17000,      15000,            500,            17,         16,         127,  0,            True,         True, True, True,   True],
     ]
     # fmt: on
 
@@ -2171,6 +2283,13 @@ class TestRangedAttentionCTEKernels:
         [1, 1, 1, 4096, 128, 1.0, nl.bfloat16,  False, True,  False, True,  0,   16],
         [2, 1, 1, 4096, 128, 1.0, nl.bfloat16,  False, True,  False, True,  0,   32],
         [2, 2, 2, 2048, 96,  1.0, nl.bfloat16,  False, False, False, False, 0,   16],
+
+        # ── d > 128 support ──────────────────────────────────────────────
+        [1, 1, 1, 2048, 256, 1.0, nl.bfloat16,  True,  False, False, False, 0,   4],
+        [1, 1, 1, 2048, 256, 1.0, nl.bfloat16,  False, False, False, True,  0,   4],
+        [1, 1, 1, 2048, 256, 1.0, nl.bfloat16,  True,  False, False, True,  128, 4],
+        [1, 1, 1, 2048, 512, 1.0, nl.bfloat16,  True,  False, False, False, 0,   4],
+        [1, 1, 1, 2048, 512, 1.0, nl.bfloat16,  False, False, False, True,  0,   4],
     ]
     # fmt: on
 
@@ -2223,6 +2342,556 @@ class TestRangedAttentionCTEKernels:
             cp_rank_id=None,
             use_cp=False,
             n_packed_sequences=n_packed_sequences,
+        )
+
+    # ── Position bias tests ──
+
+    @pytest.mark.parametrize(
+        "bs, seqlen, d, causal_mask",
+        [
+            pytest.param(1, 256, 64, True, marks=pytest.mark.fast),
+            pytest.param(1, 256, 64, False, marks=pytest.mark.fast),
+            pytest.param(2, 256, 64, True, marks=pytest.mark.fast),
+            pytest.param(1, 512, 128, True, marks=pytest.mark.fast),
+            (1, 1024, 128, True),
+            (1, 2048, 128, True),
+            (1, 4096, 128, True),
+            (1, 8192, 128, True),
+            # Non-power-of-2 segment size
+            (1, 1536, 128, True),
+        ],
+        ids=[
+            "causal_s256_d64",
+            "nocausal_s256_d64",
+            "bs2_causal_s256_d64",
+            "causal_s512_d128",
+            "causal_s1024_d128",
+            "causal_s2048_d128",
+            "causal_s4096_d128",
+            "causal_s8192_d128",
+            "causal_s1536_d128",
+        ],
+    )
+    def test_attention_cte_position_bias_dense(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        seqlen,
+        d,
+        causal_mask,
+    ):
+        """Dense ``position_bias``: ``(bs, seqlen_q, seqlen_kv)`` bias added to QK
+        before scaling + masking. Exercises the static affine_select path (causal
+        and non-causal)."""
+        if platform_target.is_trn3():
+            pytest.xfail("NKI-2105: nc_matmul(accumulate=True) broken on trn3")
+        np.random.seed(42)
+        compiler_args = CompilerArgs(platform_target=platform_target)
+
+        # Keep bias small so it doesn't dominate QK and amplify bf16 error at
+        # long sequences.
+        position_bias = np_random_sample()(shape=(bs, seqlen, seqlen), dtype=nl.bfloat16) * 0.01
+
+        def input_generator(test_config):
+            return build_attention_cte_input(
+                bs=bs,
+                bs_kv=bs,
+                d=d,
+                dtype=nl.bfloat16,
+                seqlen_q=seqlen,
+                seqlen_kv=seqlen,
+                is_prefix_caching=False,
+                seqlen_kv_prior=None,
+                prior_used_len=None,
+                tp_q=True,
+                tp_k=False,
+                tp_out=False,
+                sink=False,
+                softmax_scale=1.0,
+                causal_mask=causal_mask,
+                sliding_window=0,
+                use_cp=False,
+                cp_strided_q_slicing=False,
+                cp_degree=None,
+                cp_rank_id=None,
+                cache_softmax=False,
+                position_bias=position_bias,
+            )
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_cte,
+            torch_ref=torch_ref_wrapper(attention_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_tensors,
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    @pytest.mark.parametrize(
+        "bs, seqlen, d, sliding_window",
+        [
+            pytest.param(1, 256, 64, 128, marks=pytest.mark.fast),
+            pytest.param(1, 512, 128, 128, marks=pytest.mark.fast),
+            (1, 1024, 128, 128),
+            (1, 2048, 128, 128),
+            (1, 4096, 128, 128),
+            (1, 8192, 128, 128),
+            (1, 1536, 128, 128),
+        ],
+        ids=[
+            "swa_s256_d64_sw128",
+            "swa_s512_d128_sw128",
+            "swa_s1024_d128_sw128",
+            "swa_s2048_d128_sw128",
+            "swa_s4096_d128_sw128",
+            "swa_s8192_d128_sw128",
+            "swa_s1536_d128_sw128",
+        ],
+    )
+    def test_attention_cte_position_bias_dense_swa(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        seqlen,
+        d,
+        sliding_window,
+    ):
+        """Dense ``position_bias`` with sliding-window attention — exercises the
+        dynamic range_select mask path."""
+        if platform_target.is_trn3():
+            pytest.xfail("NKI-2105: nc_matmul(accumulate=True) broken on trn3")
+        np.random.seed(42)
+        compiler_args = CompilerArgs(platform_target=platform_target)
+
+        position_bias = np_random_sample()(shape=(bs, seqlen, seqlen), dtype=nl.bfloat16) * 0.01
+
+        def input_generator(test_config):
+            return build_attention_cte_input(
+                bs=bs,
+                bs_kv=bs,
+                d=d,
+                dtype=nl.bfloat16,
+                seqlen_q=seqlen,
+                seqlen_kv=seqlen,
+                is_prefix_caching=False,
+                seqlen_kv_prior=None,
+                prior_used_len=None,
+                tp_q=True,
+                tp_k=False,
+                tp_out=False,
+                sink=False,
+                softmax_scale=1.0,
+                causal_mask=True,
+                sliding_window=sliding_window,
+                use_cp=False,
+                cp_strided_q_slicing=False,
+                cp_degree=None,
+                cp_rank_id=None,
+                cache_softmax=False,
+                position_bias=position_bias,
+            )
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_cte,
+            torch_ref=torch_ref_wrapper(attention_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_tensors,
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    @pytest.mark.parametrize(
+        "bs, seqlen, seqlen_prior, prior_used_len, d",
+        [
+            pytest.param(1, 256, 512, 256, 64, marks=pytest.mark.fast),
+            pytest.param(1, 384, 512, 256, 64, marks=pytest.mark.fast),
+            pytest.param(1, 512, 512, 512, 128, marks=pytest.mark.fast),
+            (1, 1024, 512, 512, 128),
+            (1, 1536, 1024, 768, 128),
+            (1, 2048, 1024, 512, 128),
+            (1, 4096, 2048, 1024, 128),
+            (1, 8192, 4096, 4096, 128),
+        ],
+        ids=[
+            "pc_s256_prior512_pul256_d64",
+            "pc_s384_prior512_pul256_d64",
+            "pc_s512_prior512_pul512_d128",
+            "pc_s1024_prior512_pul512_d128",
+            "pc_s1536_prior1024_pul768_d128",
+            "pc_s2048_prior1024_pul512_d128",
+            "pc_s4096_prior2048_pul1024_d128",
+            "pc_s8192_prior4096_pul4096_d128",
+        ],
+    )
+    def test_attention_cte_position_bias_dense_prefix_caching(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        seqlen,
+        seqlen_prior,
+        prior_used_len,
+        d,
+    ):
+        """Dense ``position_bias`` laid out in the kernel's padded
+        ``[prior_padded | active]`` KV layout."""
+        if platform_target.is_trn3():
+            pytest.xfail("NKI-2105: nc_matmul(accumulate=True) broken on trn3")
+        np.random.seed(42)
+        compiler_args = CompilerArgs(platform_target=platform_target)
+
+        from nkilib_src.nkilib.core.utils.allocator import align_to
+
+        seqlen_kv_total = align_to(seqlen_prior, 512) + seqlen
+        position_bias = np_random_sample()(shape=(bs, seqlen, seqlen_kv_total), dtype=nl.bfloat16) * 0.01
+
+        def input_generator(test_config):
+            return build_attention_cte_input(
+                bs=bs,
+                bs_kv=bs,
+                d=d,
+                dtype=nl.bfloat16,
+                seqlen_q=seqlen,
+                seqlen_kv=seqlen,
+                is_prefix_caching=True,
+                seqlen_kv_prior=seqlen_prior,
+                prior_used_len=prior_used_len,
+                tp_q=True,
+                tp_k=False,
+                tp_out=False,
+                sink=False,
+                softmax_scale=1.0,
+                causal_mask=True,
+                sliding_window=0,
+                use_cp=False,
+                cp_strided_q_slicing=False,
+                cp_degree=None,
+                cp_rank_id=None,
+                cache_softmax=False,
+                position_bias=position_bias,
+            )
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_cte,
+            torch_ref=torch_ref_wrapper(attention_cte_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_tensors,
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    # ── Banded position bias ──
+    # Column layout requirements (matches the kernel's validation):
+    #   left pad  >= _Q_GRP_SZ - 1 = 127  (shear undershoot guard)
+    #   right pad >= _K_TILE_SZ - 1 = 511 (shear overshoot guard)
+    _BANDED_LEFT_PAD = 127
+    _BANDED_RIGHT_PAD = 511
+
+    @staticmethod
+    def _dense_active_to_banded(
+        dense_active: np.ndarray,  # [bs, seqlen_q, seqlen_k_active]
+        active_band_width: int,
+        active_origin: int,
+    ) -> np.ndarray:
+        """Pack a dense active-region bias into banded layout.
+
+        ``banded[b, q, j] = dense_active[b, q, q + j + active_origin]`` when in-range,
+        zero outside. Returns ``[bs, seqlen_q, active_band_width]``.
+        """
+        bs, seqlen_q, seqlen_k_active = dense_active.shape
+        out = np.zeros((bs, seqlen_q, active_band_width), dtype=dense_active.dtype)
+        for q in range(seqlen_q):
+            for j in range(active_band_width):
+                k = q + j + active_origin
+                if 0 <= k < seqlen_k_active:
+                    out[:, q, j] = dense_active[:, q, k]
+        return out
+
+    @classmethod
+    def _pack_banded(
+        cls,
+        bs: int,
+        seqlen_q: int,
+        seqlen_k_active: int,
+        seqlen_k_prior_padded: int,
+        prior_band_width: int,
+        active_band_width: int,
+        active_origin: int,
+        dense_full: np.ndarray,  # [bs, seqlen_q, prior_padded + active]
+    ):
+        """Build the padded banded bias tensor expected by ``attention_cte``.
+
+        Returns ``(banded, active_offset, total_band_cols)`` where the last axis of
+        ``banded`` is laid out as:
+          [0, prior_band_width)                                : rectangular prior band
+          [prior_band_width, active_offset)                    : zero left-pad
+          [active_offset, active_offset + active_band_width)   : sheared active band
+          [active_offset + active_band_width, total_band_cols) : zero right-pad
+        """
+        active_offset = prior_band_width + cls._BANDED_LEFT_PAD
+        total_band_cols = active_offset + active_band_width + cls._BANDED_RIGHT_PAD
+
+        banded = np.zeros((bs, seqlen_q, total_band_cols), dtype=dense_full.dtype)
+
+        if prior_band_width > 0:
+            banded[:, :, :prior_band_width] = dense_full[:, :, :prior_band_width]
+
+        active_full = dense_full[:, :, seqlen_k_prior_padded : seqlen_k_prior_padded + seqlen_k_active]
+        banded[:, :, active_offset : active_offset + active_band_width] = cls._dense_active_to_banded(
+            active_full, active_band_width, active_origin
+        )
+
+        return banded, active_offset, total_band_cols
+
+    @pytest.mark.parametrize(
+        "bs, bs_kv, seqlen, d, sliding_window, prior_band_width, seqlen_prior, prior_used_len, use_sink",
+        [
+            # SWA only (no prior band, no prefix caching).
+            pytest.param(1, None, 256, 64, 128, 0, None, None, False, marks=pytest.mark.fast),
+            pytest.param(1, None, 512, 128, 128, 0, None, None, False, marks=pytest.mark.fast),
+            pytest.param(2, None, 256, 64, 128, 0, None, None, False, marks=pytest.mark.fast),
+            # SWA + prefix caching (prior band active).
+            pytest.param(1, None, 256, 64, 128, 128, 128, 128, False, marks=pytest.mark.fast),
+            pytest.param(1, None, 256, 64, 128, 128, 128, 64, False, marks=pytest.mark.fast),
+            pytest.param(1, None, 256, 64, 128, 128, 128, 0, False, marks=pytest.mark.fast),
+            # GQA + sinks.
+            pytest.param(4, 2, 256, 64, 128, 128, 128, 128, True, marks=pytest.mark.fast),
+            pytest.param(4, 2, 256, 64, 128, 128, 128, 64, True, marks=pytest.mark.fast),
+            # Production scale.
+            (1, None, 1024, 128, 128, 0, None, None, False),
+            (1, None, 2048, 128, 128, 0, None, None, False),
+            (1, None, 4096, 128, 128, 0, None, None, False),
+            (1, None, 8192, 128, 128, 0, None, None, False),
+        ],
+        ids=[
+            "swa_s256_d64",
+            "swa_s512_d128",
+            "swa_bs2_s256_d64",
+            "swa_prefix_s256_prior128_pul128",
+            "swa_prefix_s256_prior128_pul64",
+            "swa_prefix_s256_prior128_pul0",
+            "gqa_sink_swa_prefix_s256_pul128",
+            "gqa_sink_swa_prefix_s256_pul64",
+            "swa_s1024_d128",
+            "swa_s2048_d128",
+            "swa_s4096_d128",
+            "swa_s8192_d128",
+        ],
+    )
+    def test_attention_cte_position_bias_banded(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        bs_kv,
+        seqlen,
+        d,
+        sliding_window,
+        prior_band_width,
+        seqlen_prior,
+        prior_used_len,
+        use_sink,
+    ):
+        """Banded ``position_bias`` with causal SWA. Builds the banded tensor from
+        an equivalent dense bias (zeroed outside the band) so both kernel and
+        reference compute the same thing.
+
+        The kernel gets the banded tensor + ``bias_band_params``; the torch ref
+        gets the equivalent dense bias (since the reference operates on dense
+        tensors only)."""
+        if platform_target.is_trn3():
+            pytest.xfail("NKI-2105: nc_matmul(accumulate=True) broken on trn3")
+        np.random.seed(42)
+        compiler_args = CompilerArgs(platform_target=platform_target)
+
+        from nkilib_src.nkilib.core.utils.allocator import align_to
+
+        bs_kv_actual = bs_kv if bs_kv is not None else bs
+        assert bs % bs_kv_actual == 0, f"bs={bs} must be a multiple of bs_kv={bs_kv_actual}"
+
+        active_band_width = sliding_window
+        active_origin = -(active_band_width - 1)  # column (active_band_width-1) == diagonal (causal SWA)
+
+        is_prefix_caching = seqlen_prior is not None
+        seqlen_k_prior_padded = align_to(seqlen_prior, 512) if is_prefix_caching else 0
+        seqlen_kv_total = seqlen_k_prior_padded + seqlen
+
+        # Build a dense bias in the kernel's padded layout, then zero-fill outside
+        # the band so the banded repacking is lossless; pack the banded tensor.
+        dense_f32 = (
+            np.asarray(
+                np_random_sample()(shape=(bs, seqlen, seqlen_kv_total), dtype=nl.bfloat16),
+                dtype=np.float32,
+            )
+            * 0.01
+        )
+
+        # Zero prior padding past prior_band_width.
+        if prior_band_width < seqlen_k_prior_padded:
+            dense_f32[:, :, prior_band_width:seqlen_k_prior_padded] = 0.0
+        # Zero active outside [q + active_origin, q + active_origin + active_band_width).
+        for q_idx in range(seqlen):
+            k_lo = q_idx + 0 + active_origin
+            k_hi = q_idx + active_band_width + active_origin
+            active_start = seqlen_k_prior_padded
+            k_lo_clamped = max(k_lo, 0)
+            k_hi_clamped = min(k_hi, seqlen)
+            dense_f32[:, q_idx, active_start : active_start + k_lo_clamped] = 0.0
+            dense_f32[:, q_idx, active_start + k_hi_clamped : active_start + seqlen] = 0.0
+
+        dense_bf16 = dt.static_cast(dense_f32, nl.bfloat16)
+
+        banded_f32, active_offset, _total = self._pack_banded(
+            bs=bs,
+            seqlen_q=seqlen,
+            seqlen_k_active=seqlen,
+            seqlen_k_prior_padded=seqlen_k_prior_padded,
+            prior_band_width=prior_band_width,
+            active_band_width=active_band_width,
+            active_origin=active_origin,
+            dense_full=dense_f32,
+        )
+        banded_bf16 = dt.static_cast(banded_f32, nl.bfloat16)
+
+        bias_band_params = {
+            "prior_band_width": prior_band_width,
+            "active_offset": active_offset,
+            "active_band_width": active_band_width,
+            "active_origin": active_origin,
+        }
+
+        # Kernel inputs: banded bias.
+        def input_generator(test_config):
+            inputs = build_attention_cte_input(
+                bs=bs,
+                bs_kv=bs_kv_actual,
+                d=d,
+                dtype=nl.bfloat16,
+                seqlen_q=seqlen,
+                seqlen_kv=seqlen,
+                is_prefix_caching=is_prefix_caching,
+                seqlen_kv_prior=seqlen_prior,
+                prior_used_len=prior_used_len,
+                tp_q=True,
+                tp_k=False,
+                tp_out=False,
+                sink=use_sink,
+                softmax_scale=1.0,
+                causal_mask=True,
+                sliding_window=sliding_window,
+                use_cp=False,
+                cp_strided_q_slicing=False,
+                cp_degree=None,
+                cp_rank_id=None,
+                cache_softmax=False,
+                position_bias=banded_bf16,
+                bias_layout="banded",
+                bias_band_params=bias_band_params,
+            )
+            return inputs
+
+        # Reference sees the equivalent dense bias; the kernel-only knobs are
+        # accepted (and ignored) by ``attention_cte_torch_ref``. Use an explicit
+        # signature (no **kwargs) so ``torch_ref_wrapper``'s kernel/ref signature
+        # check passes. Promote the dense bias to a torch tensor to match the
+        # wrapper's numpy->torch conversion path.
+        import torch as _torch  # local import to avoid adding a module-level dep
+
+        dense_bias_torch_input = _torch.from_numpy(np.asarray(dense_bf16, dtype=np.float32))
+
+        def _torch_ref_dense(
+            q,
+            k,
+            v,
+            scale,
+            causal_mask,
+            k_prior,
+            v_prior,
+            prior_used_len,
+            sink,
+            sliding_window,
+            tp_q,
+            tp_k,
+            tp_out,
+            cache_softmax,
+            softmax_dtype,
+            mm_out_dtype,
+            cp_offset,
+            global_cp_deg,
+            cp_strided_q_slicing,
+            bound_min,
+            bound_max,
+            position_bias,
+            bias_layout,
+            bias_band_params,
+            cp_striped_input=False,
+            skip_output_normalization=False,
+        ):
+            return attention_cte_torch_ref(
+                q=q,
+                k=k,
+                v=v,
+                scale=scale,
+                causal_mask=causal_mask,
+                k_prior=k_prior,
+                v_prior=v_prior,
+                prior_used_len=prior_used_len,
+                sink=sink,
+                sliding_window=sliding_window,
+                tp_q=tp_q,
+                tp_k=tp_k,
+                tp_out=tp_out,
+                cache_softmax=cache_softmax,
+                softmax_dtype=softmax_dtype,
+                mm_out_dtype=mm_out_dtype,
+                cp_offset=cp_offset,
+                global_cp_deg=global_cp_deg,
+                cp_strided_q_slicing=cp_strided_q_slicing,
+                bound_min=bound_min,
+                bound_max=bound_max,
+                cp_striped_input=cp_striped_input,
+                skip_output_normalization=skip_output_normalization,
+                # Replace banded bias with the equivalent dense bias for the reference.
+                position_bias=dense_bias_torch_input,
+            )
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=attention_cte,
+            torch_ref=torch_ref_wrapper(_torch_ref_dense),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=_output_tensors,
+            collector=collector,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=compiler_args,
+            rtol=2e-2,
+            atol=1e-5,
         )
 
 

@@ -20,6 +20,7 @@ from typing import Tuple, Union
 
 import nki.language as nl
 
+from ...core.utils.kernel_assert import kernel_assert
 from .view_spec import Permute, ReshapeDim, ViewSpec
 
 

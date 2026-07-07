@@ -14,6 +14,7 @@
 
 """Integration tests for the output projection CTE kernel using UnitTestFramework."""
 
+import functools
 from typing import final
 
 import nki.language as nl
@@ -25,7 +26,7 @@ from nkilib_src.nkilib.core.output_projection.output_projection_cte.output_proje
     output_projection_cte_mx_torch_ref,
     output_projection_cte_torch_ref,
 )
-from nkilib_src.nkilib.core.utils.common_types import QuantizationType
+from nkilib_src.nkilib.core.utils.common_types import DtypeMode, QuantizationType
 
 try:
     from test.integration.nkilib.core.output_projection.test_output_proj_cte_model_config import (
@@ -40,6 +41,7 @@ from test.integration.nkilib.utils.tensor_generators import (
     np_random_sample,
     np_random_sample_static_quantize_inp,
 )
+from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
 from test.utils.common_dataclasses import (
     CompilerArgs,
     ModelTestType,
@@ -62,6 +64,7 @@ def generate_output_proj_cte_inputs(
     d_head: int,
     test_bias: bool,
     quantization_type: QuantizationType = QuantizationType.NONE,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> dict:
     """Generate inputs for output projection CTE test."""
     dtype = nl.bfloat16
@@ -75,11 +78,13 @@ def generate_output_proj_cte_inputs(
     if quantization_type == QuantizationType.NONE:
         weight = random_gen(shape=(n_head * d_head, hidden), dtype=dtype)
     else:
-        quant_dtype = (
-            nl.float8_e4m3fn
-            if quantization_type in (QuantizationType.STATIC_MX, QuantizationType.ROW_MX)
-            else nl.float8_e4m3
-        )
+        # Pick E4M3 dtype based on dtype_mode for STATIC/ROW. MX-family always OCP.
+        if quantization_type in (QuantizationType.STATIC_MX, QuantizationType.ROW_MX):
+            quant_dtype = nl.float8_e4m3fn
+        elif dtype_mode == DtypeMode.OCP:
+            quant_dtype = nl.float8_e4m3fn
+        else:
+            quant_dtype = nl.float8_e4m3
         static_quant_gen = np_random_sample_static_quantize_inp()
         weight, weight_scale_val, input_scale_val = static_quant_gen(shape=(n_head * d_head, hidden), dtype=quant_dtype)
 
@@ -112,6 +117,7 @@ def generate_output_proj_cte_inputs(
         "quantization_type": quantization_type,
         "input_scales": input_scales,
         "weight_scales": weight_scales,
+        "dtype_mode": dtype_mode,
     }
 
 
@@ -174,6 +180,63 @@ def generate_output_proj_cte_mx_inputs(
     }
 
 
+def generate_output_proj_cte_mx_compact_inputs(
+    batch: int,
+    seqlen: int,
+    hidden: int,
+    n_head: int,
+    d_head: int,
+    test_bias: bool = False,
+) -> dict:
+    """Generate inputs for MX FP8 output projection CTE with block-128 compact scales.
+
+    Weights are float8_e4m3fn_x4 with one uint8 scale per 128x128 block. Input
+    is bf16 (online quantization). Tests the compact scale path.
+
+    The kernel and torch reference both interpret the compact scale identically
+    (broadcast to dense block-32 layout), so we don't need to stabilize the
+    weight bytes — random fp8x4 bytes plus random compact scales produce
+    matching results in both paths.
+    """
+    dtype = nl.bfloat16
+    np.random.seed(42)
+    nd = n_head * d_head
+    DS_SCALE_BLOCK = 128
+
+    bias = gaussian_tensor_generator(std=100)(shape=(1, hidden), dtype=dtype, name="bias") if test_bias else None
+
+    is_invalid = (nd % DS_SCALE_BLOCK != 0) or (hidden % DS_SCALE_BLOCK != 0)
+
+    if is_invalid:
+        weight_quantized = np.zeros((nd // 4, hidden), dtype=np.uint8)
+        compact_scales = np.zeros((max(nd // DS_SCALE_BLOCK, 1), max(hidden // DS_SCALE_BLOCK, 1)), dtype=np.uint8)
+    else:
+        # quantize to fp8x4 with the standard MX block-32 pipeline, then collapse the dense scales to
+        # compact block-128 by taking the per-block max.
+        from nkilib_src.nkilib.core.utils.mx_torch_common import quantize_to_mx
+
+        # generate values within fp8 representable range (max=448).
+        fp_weight = (np.random.random((nd // 4, hidden * 4)) * 2 - 1) * 16.0
+        weight_quantized, dense_scale = quantize_to_mx(fp_weight.astype(np.float32), nl.float8_e4m3fn_x4)
+
+        ds_view = dense_scale.reshape(nd // DS_SCALE_BLOCK, 4, hidden // DS_SCALE_BLOCK, DS_SCALE_BLOCK)
+        compact_scales = ds_view.max(axis=(1, 3)).astype(np.uint8)
+        weight_quantized = np.asarray(weight_quantized)
+
+    attention = (np.random.randn(batch, n_head, d_head, seqlen) * 0.1).astype(np.float32)
+    attention = attention.astype(np.float16).view(np.uint16).view(np.float16).astype(nl.bfloat16)
+
+    return {
+        "attention": attention,
+        "weight": weight_quantized,
+        "bias": bias,
+        "quantization_type": QuantizationType.MX,
+        "input_scales": None,
+        "weight_scales": compact_scales,
+        "compact_weight_scales": True,
+    }
+
+
 # Manual test cases: (batch, seqlen, hidden, n_head, d_head, test_bias)
 OUTPUT_PROJ_CTE_UNIT_CASES = [
     # New model, 2025-Jul
@@ -227,9 +290,6 @@ OUTPUT_PROJ_CTE_UNIT_CASES = [
     (1, 1024 + 64, 7168, 4, 128, False),
     (1, 2048 + 120, 8192, 5, 128, False),
     (1, 4096 + 1000, 16384, 6, 128, False),
-    (1, 8192 + 1120, 16384, 7, 128, False),
-    (1, 10240 + 1234, 16384, 8, 128, False),
-    (1, 16384 + 4321, 16384, 9, 128, False),
     # Test cases for d_head > 128 (D folded back into N)
     (1, 1024, 8192, 4, 256, False),
     (1, 1024, 3072, 8, 192, False),
@@ -245,13 +305,124 @@ OUTPUT_PROJ_CTE_UNIT_CASES = [
     (1, 1024 + 64, 7168, 4, 256, False),
     (1, 2048 + 120, 8192, 5, 256, False),
     (1, 4096 + 1000, 16384, 6, 256, False),
-    (1, 8192 + 1120, 16384, 7, 256, False),
-    (1, 10240 + 1234, 16384, 8, 256, False),
+]
+
+# Slow unit cases (>2min compile time), run in full pipeline but not dry-run
+OUTPUT_PROJ_CTE_SLOW_UNIT_CASES = [
     (1, 16384 + 4321, 16384, 9, 256, False),
+    (1, 16384 + 4321, 16384, 9, 128, False),
+    (1, 8192 + 1120, 16384, 7, 256, False),
+    (1, 8192 + 1120, 16384, 7, 128, False),
+    (1, 10240 + 1234, 16384, 8, 256, False),
+    (1, 10240 + 1234, 16384, 8, 128, False),
 ]
 
 OUTPUT_PROJ_CTE_UNIT_PARAMS = "batch, seqlen, hidden, n_head, d_head, test_bias"
 _ABBREVS = {"batch": "b", "seqlen": "s", "hidden": "h", "n_head": "nh", "d_head": "dh", "test_bias": "bias"}
+
+
+# Each method that consumes OUTPUT_PROJ_CTE_UNIT_CASES has its own set of fast keys
+# `(batch, seqlen, hidden, n_head, d_head, test_bias)`. Robust to row reordering.
+def _output_proj_cte_with_fast_keys(fast_keys):
+    """Return OUTPUT_PROJ_CTE_UNIT_CASES with marks=fast on rows whose tuple
+    matches one in fast_keys.
+    """
+    fk = frozenset(fast_keys)
+    out = []
+    for c in OUTPUT_PROJ_CTE_UNIT_CASES:
+        if tuple(c) in fk:
+            out.append(pytest.param(*c, marks=pytest.mark.fast))
+        else:
+            out.append(pytest.param(*c))
+    return out
+
+
+_OPROJ_CTE_UNIT_BF16_FAST = _output_proj_cte_with_fast_keys(
+    {
+        (1, 128, 3072, 16, 10, True),
+        (1, 8192, 16384, 1, 128, False),
+    }
+)
+_OPROJ_CTE_UNIT_STATIC_FP8_FAST = _output_proj_cte_with_fast_keys(
+    {
+        (1, 128, 3072, 16, 64, True),
+        (1, 4096, 16384, 1, 128, False),
+        (1, 1024, 8192, 4, 256, False),
+        (1, 1024, 3072, 8, 192, False),
+        (1, 1024, 8192, 3, 256, False),
+        (1, 5096, 16384, 6, 256, False),
+    }
+)
+_OPROJ_CTE_UNIT_MXFP4_FAST = _output_proj_cte_with_fast_keys(
+    {
+        (1, 1024, 3072, 16, 64, True),
+        (1, 128, 3072, 16, 10, True),
+        (1, 16384, 16384, 1, 128, False),
+        (1, 1024, 2048, 1, 64, False),
+        (4, 256, 7168, 1, 128, False),
+        (1, 5096, 16384, 6, 128, False),
+    }
+)
+_OPROJ_CTE_UNIT_MXFP4_PREQ_FAST = _output_proj_cte_with_fast_keys(
+    {
+        (1, 128, 3072, 16, 10, True),
+        (1, 128, 3072, 17, 10, True),
+        (1, 10240, 16384, 1, 128, False),
+        (1, 1024, 3072, 1, 64, False),
+        (1, 1024, 8192, 1, 64, False),
+        (1, 1024, 20480, 3, 128, False),
+    }
+)
+_OPROJ_CTE_UNIT_STATIC_MXFP8_FAST = _output_proj_cte_with_fast_keys(
+    {
+        (1, 128, 3072, 16, 10, True),
+        (1, 128, 3072, 8, 32, True),
+        (1, 4096, 16384, 1, 128, False),
+        (1, 1024, 3072, 1, 64, False),
+        (1, 1024, 20480, 3, 128, False),
+        (1, 1024, 8192, 3, 256, False),
+        (1, 5096, 16384, 6, 256, False),
+    }
+)
+_OPROJ_CTE_UNIT_ROW_MXFP8_FAST = _output_proj_cte_with_fast_keys(
+    {
+        (1, 128, 3072, 16, 64, True),
+        (1, 128, 3072, 16, 10, True),
+        (1, 8192, 16384, 1, 128, False),
+        (1, 1024, 8192, 1, 64, False),
+        (1, 1024, 8192, 3, 256, False),
+        (1, 5096, 16384, 6, 256, False),
+    }
+)
+_OPROJ_CTE_UNIT_ROW_FP8_FAST = _output_proj_cte_with_fast_keys(
+    {
+        (1, 1024, 3072, 16, 64, True),
+        (1, 128, 8192, 1, 128, False),
+        (1, 1024, 3072, 8, 192, False),
+        (1, 1024, 8192, 3, 256, False),
+    }
+)
+
+_OPROJ_CTE_UNIT_MX_COMPACT_FAST = _output_proj_cte_with_fast_keys(
+    {
+        (1, 128, 8192, 1, 128, False),
+        (1, 512, 8192, 1, 128, False),
+        (1, 1024, 8192, 1, 128, False),
+        (1, 2048, 8192, 1, 128, False),
+        (1, 4096, 8192, 1, 128, False),
+        (1, 8192, 8192, 1, 128, False),
+        (1, 16384, 8192, 1, 128, False),
+        (1, 128, 3072, 16, 64, True),
+        (1, 1024, 16384, 1, 128, False),
+        (1, 16384, 16384, 1, 128, False),
+        (1, 1024, 8192, 4, 256, False),
+        (1, 1024, 3072, 8, 192, False),
+        (1, 1024, 8192, 3, 256, False),
+        (4, 256, 7168, 4, 128, False),
+        (1, 256, 7168, 1, 128, False),
+        (1, 1024, 8192, 1, 64, False),
+    }
+)
 
 # Kernel constraints
 _MAX_B_TIMES_S = 128 * 1024
@@ -344,8 +515,7 @@ class TestOutputProjCteKernel:
     # Float (Non-Quantized) Tests
     # ============================================================================
 
-    @pytest.mark.fast
-    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, _OPROJ_CTE_UNIT_BF16_FAST, abbrevs=_ABBREVS)
     def test_output_proj_cte_bf16_unit(
         self,
         test_manager: Orchestrator,
@@ -382,12 +552,28 @@ class TestOutputProjCteKernel:
             atol=1e-5,
         )
 
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_SLOW_UNIT_CASES, abbrevs=_ABBREVS)
+    def test_output_proj_cte_bf16_slow_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        n_head: int,
+        d_head: int,
+        test_bias: bool,
+        platform_target: Platforms,
+    ):
+        self.test_output_proj_cte_bf16_unit(
+            test_manager, collector, batch, seqlen, hidden, n_head, d_head, test_bias, platform_target
+        )
+
     # ============================================================================
     # FP8 Static Quantization Tests
     # ============================================================================
 
-    @pytest.mark.fast
-    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, _OPROJ_CTE_UNIT_STATIC_FP8_FAST, abbrevs=_ABBREVS)
     def test_output_proj_cte_static_fp8_unit(
         self,
         test_manager: Orchestrator,
@@ -428,6 +614,23 @@ class TestOutputProjCteKernel:
             compiler_args=CompilerArgs(platform_target=platform_target),
             rtol=0.036,
             atol=1e-5,
+        )
+
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_SLOW_UNIT_CASES, abbrevs=_ABBREVS)
+    def test_output_proj_cte_static_fp8_slow_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        n_head: int,
+        d_head: int,
+        test_bias: bool,
+        platform_target: Platforms,
+    ):
+        self.test_output_proj_cte_static_fp8_unit(
+            test_manager, collector, batch, seqlen, hidden, n_head, d_head, test_bias, platform_target
         )
 
     # ============================================================================
@@ -544,8 +747,7 @@ class TestOutputProjCteKernel:
     # MX Quantization Tests
     # ============================================================================
 
-    @pytest.mark.fast
-    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, _OPROJ_CTE_UNIT_MXFP4_FAST, abbrevs=_ABBREVS)
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     def test_output_proj_cte_mxfp4_unit(
         self,
@@ -578,7 +780,10 @@ class TestOutputProjCteKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(platform_target=platform_target),
+            compiler_args=CompilerArgs(
+                platform_target=platform_target,
+                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+            ),
             rtol=5e-2,
             atol=1e-5,
             is_negative_test=is_negative_test_case,
@@ -639,8 +844,7 @@ class TestOutputProjCteKernel:
     # MX Pre-Quantized Input Tests
     # ============================================================================
 
-    @pytest.mark.fast
-    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, _OPROJ_CTE_UNIT_MXFP4_PREQ_FAST, abbrevs=_ABBREVS)
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     def test_output_proj_cte_mxfp4_prequantized_unit(
         self,
@@ -683,12 +887,68 @@ class TestOutputProjCteKernel:
         )
 
     # ============================================================================
+    # MX FP8 Compact (block-128) Tests
+    # ============================================================================
+
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, _OPROJ_CTE_UNIT_MX_COMPACT_FAST, abbrevs=_ABBREVS)
+    def test_output_proj_cte_mx_compact_unit(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        batch: int,
+        seqlen: int,
+        hidden: int,
+        n_head: int,
+        d_head: int,
+        test_bias: bool,
+    ):
+        """Unit test for MX FP8 output projection CTE with block-128 compact scales.
+
+        Mirrors the qkv_cte_mla compact-scale path: weights are float8_e4m3fn_x4
+        with one uint8 scale per 128x128 block, input is bf16 (online MX
+        quantization on-device).
+        """
+        DS_SCALE_BLOCK = 128
+        n_d = n_head * d_head
+        is_negative_test_case = (n_d % DS_SCALE_BLOCK != 0) or (hidden % DS_SCALE_BLOCK != 0)
+        dtype = nl.bfloat16
+
+        def input_generator(test_config):
+            return generate_output_proj_cte_mx_compact_inputs(
+                batch=batch,
+                seqlen=seqlen,
+                hidden=hidden,
+                n_head=n_head,
+                d_head=d_head,
+                test_bias=test_bias,
+            )
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch, seqlen, hidden), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_cte,
+            torch_ref=output_projection_cte_mx_torch_ref,
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-5,
+            is_negative_test=is_negative_test_case,
+        )
+
+    # ============================================================================
     # STATIC_MX Quantization Tests
     # ============================================================================
 
-    @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, _OPROJ_CTE_UNIT_STATIC_MXFP8_FAST, abbrevs=_ABBREVS)
     def test_output_proj_cte_static_mxfp8_unit(
         self,
         test_manager: Orchestrator,
@@ -739,9 +999,8 @@ class TestOutputProjCteKernel:
     # ROW_MX Quantization Tests
     # ============================================================================
 
-    @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, _OPROJ_CTE_UNIT_ROW_MXFP8_FAST, abbrevs=_ABBREVS)
     def test_output_proj_cte_row_mxfp8_unit(
         self,
         test_manager: Orchestrator,
@@ -782,7 +1041,10 @@ class TestOutputProjCteKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(platform_target=platform_target),
+            compiler_args=CompilerArgs(
+                platform_target=platform_target,
+                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+            ),
             rtol=0.036,
             atol=1e-5,
             is_negative_test=is_negative_test_case,
@@ -792,8 +1054,7 @@ class TestOutputProjCteKernel:
     # ROW FP8 Quantization Tests (TRN2)
     # ============================================================================
 
-    @pytest.mark.fast
-    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, OUTPUT_PROJ_CTE_UNIT_CASES, abbrevs=_ABBREVS)
+    @pytest_parametrize(OUTPUT_PROJ_CTE_UNIT_PARAMS, _OPROJ_CTE_UNIT_ROW_FP8_FAST, abbrevs=_ABBREVS)
     def test_output_proj_cte_row_fp8_unit(
         self,
         test_manager: Orchestrator,
@@ -838,6 +1099,79 @@ class TestOutputProjCteKernel:
             is_negative_test=d_head > _MAX_D_ROW,
         )
 
+    # ============================================================================
+    # Opt-in FP8 E4M3 canary (dtype_mode).
+    #
+    # Parametrized over STATIC and ROW × [NON_OCP, OCP, AUTO]. Both reach
+    # build_quantization_config and allocate the internal quantized attention
+    # SBUF with the resolved FP8 dtype. OCP is TRN3-gated via pytest.skip;
+    # NON_OCP and AUTO run on any platform.
+    # ============================================================================
+    _OUTPUT_PROJ_CTE_BY_DTYPE_MODE_CONFIG = dict(
+        batch=1,
+        seqlen=512,
+        hidden=3072,
+        n_head=8,
+        d_head=128,
+        test_bias=True,
+    )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
+    @pytest.mark.parametrize("quantization_type", [QuantizationType.STATIC, QuantizationType.ROW])
+    def test_output_proj_cte_by_dtype_mode(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        quantization_type: QuantizationType,
+        dtype_mode: DtypeMode,
+    ):
+        """Smoke-test each DtypeMode through output_projection_cte STATIC/ROW.
+
+        NON_OCP → ``nl.float8_e4m3`` (240), any platform.
+        OCP     → ``nl.float8_e4m3fn`` (448), TRN3 only.
+        AUTO    → ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3`` elsewhere.
+        """
+        if dtype_mode == DtypeMode.OCP and not platform_target.is_trn3():
+            pytest.skip("dtype_mode=DtypeMode.OCP only exercises the OCP path on TRN3")
+        dtype = nl.bfloat16
+        cfg = self._OUTPUT_PROJ_CTE_BY_DTYPE_MODE_CONFIG
+        batch, seqlen, hidden = cfg["batch"], cfg["seqlen"], cfg["hidden"]
+
+        # Pre-resolve AUTO so the generated weight dtype (kernel-side) and torch-ref
+        # clip agree with the platform the kernel actually traces on.
+        resolved_dtype_mode = resolve_dtype_mode_for_torch_ref(dtype_mode, platform_target)
+
+        def input_generator(test_config):
+            return generate_output_proj_cte_inputs(
+                quantization_type=quantization_type,
+                dtype_mode=resolved_dtype_mode,
+                **cfg,
+            )
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((batch, seqlen, hidden), dtype=dtype)}
+
+        @functools.wraps(output_projection_cte_torch_ref)
+        def _torch_ref_with_resolved_dtype_mode(**kwargs):
+            kwargs["dtype_mode"] = resolved_dtype_mode
+            return output_projection_cte_torch_ref(**kwargs)
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=output_projection_cte,
+            torch_ref=torch_ref_wrapper(_torch_ref_with_resolved_dtype_mode),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target),
+            rtol=5e-2,
+            atol=1e-3,
+        )
+
 
 @pytest_marks(["output_projection", "cte", "model", "mx"])
 @final
@@ -864,13 +1198,11 @@ class TestOutputProjCteModel:
         test_bias = kwargs["test_bias"]
         quantization_type = kwargs["quant_type"]
 
-        if quantization_type == QuantizationType.STATIC and platform_target != Platforms.TRN2:
-            pytest.skip("STATIC (fp8) only supported on TRN2")
         if (
             quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX)
             and not platform_target.is_trn3()
         ):
-            pytest.skip("MX/STATIC_MX only supported on TRN3")
+            pytest.skip("MX/STATIC_MX/ROW_MX only supported on TRN3")
 
         n_d = n_head * d_head
         is_negative_test_case = quantization_type in (

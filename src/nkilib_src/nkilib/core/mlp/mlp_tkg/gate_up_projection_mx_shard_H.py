@@ -66,6 +66,8 @@ def gate_up_projection_mx_tp_shard_H(
     psum_bank_offset: int = 0,
     name_prefix: str = None,
     out_sb=None,
+    activation_op=None,
+    pre_quantized: bool = False,
 ) -> nl.ndarray:
     """
     Performs the Gate/Up projection. This is the TP version of the projection, i.e. the output will be in transposed
@@ -101,12 +103,22 @@ def gate_up_projection_mx_tp_shard_H(
     n_BxS_tile = div_ceil(BxS, BxS_tile_sz)
 
     # Either load weight_qtz from HBM to sbuf or directly use it if it is already in SBUF
+    # _weight_use_direct_idx: when True, use direct NKI indexing instead of TensorView slicing
+    # for the weight operand in nc_matmul_mx. Required for uint32->fp8_x4 reinterpret_cast.
+    _weight_use_direct_idx = False
     if weight_qtz.base_tensor.buffer == nl.sbuf:
         kernel_assert(
             weight_qtz.shape == (_pmax, cfg.n_H512_tile_sharded, I),
             f"Expect weight_qtz in SBUF to be in shape ({H0}, {cfg.n_H512_tile_sharded}, {I}), got {weight_qtz.shape}",
         )
-        weight_qtz_tv = weight_qtz
+        # If weight arrived as uint32 (torch_xla E2E), reinterpret SBUF to float8_e4m3fn_x4.
+        if weight_qtz.base_tensor.dtype == nl.uint32:
+            weight_qtz_sb = weight_qtz.base_tensor
+            weight_qtz_sb = TensorView(weight_qtz_sb).reinterpret_cast(nl.float8_e4m3fn_x4).get_view()
+            _weight_use_direct_idx = True
+            weight_qtz_tv = TensorView(weight_qtz_sb)
+        else:
+            weight_qtz_tv = weight_qtz
     else:
         kernel_assert(
             weight_qtz.shape == (_pmax, cfg.n_H512_tile, I),
@@ -125,19 +137,27 @@ def gate_up_projection_mx_tp_shard_H(
             src=weight_qtz.base_tensor[:, prg_id * cfg.n_H512_tile_sharded : (prg_id + 1) * cfg.n_H512_tile_sharded, :],
             dge_mode=nisa.dge_mode.hwdge,
         )
+        # If weight arrived as uint32 (torch_xla E2E), reinterpret and use direct indexing
+        if weight_qtz_sb.dtype == nl.uint32:
+            weight_qtz_sb = TensorView(weight_qtz_sb).reinterpret_cast(nl.float8_e4m3fn_x4).get_view()
+            _weight_use_direct_idx = True
         weight_qtz_tv = TensorView(weight_qtz_sb)
 
     if cfg.dbg_hidden:
         return hidden_qtz_sb.base_tensor, hidden_scale_sb.base_tensor
 
-    if weight_scale.base_tensor.buffer == nl.sbuf:
+    if pre_quantized:
+        # Software quant: use weight_qtz_tv as placeholder for parser (3D, never actually read as scale)
+        weight_scale_3d = weight_qtz_tv
+        hidden_scale_3d = hidden_qtz_sb
+    elif weight_scale.base_tensor.buffer == nl.sbuf:
         kernel_assert(
             weight_scale.shape == (_pmax, cfg.n_H512_tile_sharded, I),
             f"Expect weight_scale in SBUF to have the shape of (128, {cfg.n_H512_tile_sharded}, {I}), got {weight_scale.shape}",
         )
-        weight_scale_tv = weight_scale
+        weight_scale_3d = weight_scale
+        hidden_scale_3d = hidden_scale_sb
     else:
-        # Load weight scale into [H0, n_H512_tile, I] NOTE: we have 1 scale per 8(p)x4(f) tile, but still span across full pdim with gaps
         kernel_assert(
             weight_scale.shape == (_pmax // _q_height, cfg.n_H512_tile, I),
             f"Expect weight_scale in SBUF to have the shape of (16, {cfg.n_H512_tile}, {I}), got {weight_scale.shape}",
@@ -149,7 +169,6 @@ def gate_up_projection_mx_tp_shard_H(
             name=f"{name_prefix}_weight_scale_sb" if name_prefix else None,
             align=SBUF_QUADRANT_SIZE,
         )
-        # Load 4 partitions of scales for every quadrant
         n_quadrants_needed = H0 // SBUF_QUADRANT_SIZE
         for i_quad in range(n_quadrants_needed):
             nisa.dma_copy(
@@ -161,10 +180,11 @@ def gate_up_projection_mx_tp_shard_H(
                 dst=weight_scale_sb[i_quad * SBUF_QUADRANT_SIZE : i_quad * SBUF_QUADRANT_SIZE + 4, :, :],
                 dge_mode=nisa.dge_mode.hwdge,
             )
-        weight_scale_tv = TensorView(weight_scale_sb)
+        weight_scale_3d = TensorView(weight_scale_sb)
+        hidden_scale_3d = hidden_scale_sb
 
     if cfg.dbg_weight:
-        return weight_qtz_tv.base_tensor, weight_scale_tv.base_tensor
+        return weight_qtz_tv.base_tensor, weight_scale_3d.base_tensor
 
     out_sb = (
         out_sb
@@ -215,16 +235,22 @@ def gate_up_projection_mx_tp_shard_H(
 
                     nisa.nc_matmul_mx(
                         dst=out_psum_lst[i_I512_tile][:cur_I128_tile_sz, i_I_mm_tile, :cur_BxS_tile_sz],
-                        stationary=weight_qtz_tv.slice(1, i_H512_tile, i_H512_tile + 1)
+                        stationary=weight_qtz_sb[:, i_H512_tile, weight_I_offset : weight_I_offset + cur_I128_tile_sz]
+                        if _weight_use_direct_idx
+                        else weight_qtz_tv.slice(1, i_H512_tile, i_H512_tile + 1)
                         .slice(2, weight_I_offset, weight_I_offset + cur_I128_tile_sz)
                         .get_view(),
                         moving=hidden_qtz_sb.slice(1, i_H512_tile, i_H512_tile + 1)
                         .slice(2, cur_BxS_tile_offset, cur_BxS_tile_offset + cur_BxS_tile_sz)
                         .get_view(),
-                        stationary_scale=weight_scale_tv.slice(1, i_H512_tile, i_H512_tile + 1)
+                        stationary_scale=weight_scale.base_tensor[:, :cur_I128_tile_sz]
+                        if pre_quantized
+                        else weight_scale_3d.slice(1, i_H512_tile, i_H512_tile + 1)
                         .slice(2, weight_I_offset, weight_I_offset + cur_I128_tile_sz)
                         .get_view(),
-                        moving_scale=hidden_scale_sb.slice(1, i_H512_tile, i_H512_tile + 1)
+                        moving_scale=hidden_scale_sb.base_tensor[:, :cur_BxS_tile_sz]
+                        if pre_quantized
+                        else hidden_scale_3d.slice(1, i_H512_tile, i_H512_tile + 1)
                         .slice(2, cur_BxS_tile_offset, cur_BxS_tile_offset + cur_BxS_tile_sz)
                         .get_view(),
                     )
@@ -315,14 +341,15 @@ def gate_up_projection_mx_tp_shard_H(
         if w_dequant_scale.shape[1] == 1:
             # ── STATIC_MX: both scales are [_pmax, 1], pre-combine and broadcast ──
             combined = pre_combine_dequant_scales(input_dequant_scale, w_dequant_scale)
+            act_op = activation_op if activation_op is not None else nl.copy
             if bias_2d != None:
-                # Fuse scale + bias: out = out * combined + bias
+                # Fuse scale + bias (+ optional activation): out = act(out * combined + bias)
                 for i_tile in nl.affine_range(cfg.n_total_I512_tile):
                     for i_q in nl.affine_range(_q_width):
                         col_idx = i_tile * _q_width + i_q
                         nisa.activation(
                             dst=out_sb[:, i_tile, :, i_q],
-                            op=nl.copy,
+                            op=act_op,
                             data=out_sb[:, i_tile, :, i_q],
                             scale=combined,
                             bias=bias_2d[:, col_idx],
@@ -330,7 +357,7 @@ def gate_up_projection_mx_tp_shard_H(
             else:
                 nisa.activation(
                     dst=out_sb,
-                    op=nl.copy,
+                    op=act_op,
                     data=out_sb,
                     scale=combined,
                 )
@@ -567,7 +594,6 @@ def process_fused_gate_up_projection_mxfp4(
     is_row_quant = attrs.quant_params.is_quant_row_mx()
     # STATIC_MX: bias applied after dequant in this function (not inside projection kernel)
     # ROW_MX/MX: bias applied inside projection kernel
-    # STATIC_MX: bias applied after dequant in this function, not inside projection kernel
     bias_tv = (TensorView(bias_sb) if bias_sb != None else None) if not is_static_quant else None
 
     # ROW_MX: pass weight dequant scales to underlying kernel (dispatches on shape internally)
@@ -599,19 +625,22 @@ def process_fused_gate_up_projection_mxfp4(
         _lnc_reduce_proj_out(gate_proj_out_sb, shard_id)
 
     # STATIC_MX: post-matmul dequant + bias (ROW_MX dequant handled inside projection kernel)
-    # TODO: Fuse scale+bias into single scalarTensorTensor or pipeline them
+    # Fuse scale+bias: out = out * scale + bias in one nisa.activation per (i_tile, i_q) slice.
     if is_static_quant:
-        nisa.activation(dst=gate_proj_out_sb, op=nl.copy, data=gate_proj_out_sb, scale=gate_dequant_scale)
-        # TODO: Replace loop with single nisa.tensor_tensor + broadcast access pattern
         if gate_up_bias != None:
+            bias_2d = bias_sb.reshape((_pmax, 2 * n_I512_tile * _q_width))
             for i_tile in range(n_I512_tile):
                 for i_q in range(_q_width):
+                    col_idx = i_tile * _q_width + i_q
                     nisa.activation(
                         dst=gate_proj_out_sb[:, i_tile, :, i_q],
                         op=nl.copy,
                         data=gate_proj_out_sb[:, i_tile, :, i_q],
-                        bias=bias_sb[:, 0, i_tile, i_q],
+                        scale=gate_dequant_scale,
+                        bias=bias_2d[:, col_idx],
                     )
+        else:
+            nisa.activation(dst=gate_proj_out_sb, op=nl.copy, data=gate_proj_out_sb, scale=gate_dequant_scale)
 
     # Optionally perform clamping on gate projection results
     if attrs.gate_clamp_upper_limit != None or attrs.gate_clamp_lower_limit != None:
@@ -633,16 +662,20 @@ def process_fused_gate_up_projection_mxfp4(
 
     # STATIC_MX: post-matmul dequant + bias (ROW_MX dequant handled inside projection kernel)
     if is_static_quant:
-        nisa.activation(dst=up_proj_out_sb, op=nl.copy, data=up_proj_out_sb, scale=up_dequant_scale)
         if gate_up_bias != None:
+            # bias_2d already computed above for gate; reuse the same reshape
             for i_tile in range(n_I512_tile):
                 for i_q in range(_q_width):
+                    col_idx = n_I512_tile * _q_width + i_tile * _q_width + i_q
                     nisa.activation(
                         dst=up_proj_out_sb[:, i_tile, :, i_q],
                         op=nl.copy,
                         data=up_proj_out_sb[:, i_tile, :, i_q],
-                        bias=bias_sb[:, 1, i_tile, i_q],
+                        scale=up_dequant_scale,
+                        bias=bias_2d[:, col_idx],
                     )
+        else:
+            nisa.activation(dst=up_proj_out_sb, op=nl.copy, data=up_proj_out_sb, scale=up_dequant_scale)
 
     # Optionally perform clamping on up projection results
     if attrs.up_clamp_upper_limit != None or attrs.up_clamp_lower_limit != None:

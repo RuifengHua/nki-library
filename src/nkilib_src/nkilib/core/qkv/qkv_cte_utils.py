@@ -28,6 +28,7 @@ from ..utils.allocator import SbufManager
 
 # NKI Library
 from ..utils.common_types import (
+    DtypeMode,
     NormType,
     QKNormConfig,
     QKVOutputLayout,
@@ -39,6 +40,7 @@ from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import (
     get_max_positive_value_for_dtype,
     get_program_sharding_info,
+    resolve_fp8_e4m3_dtype,
 )
 from ..utils.logging import get_logger
 
@@ -121,6 +123,7 @@ class QKV_CTE_UserInput(nl.NKIObject):
     # --- Block KV Cache Related
     use_block_kv: bool
     transpose_k_cache: bool
+    fp8_packed: bool
     block_size: Optional[int]
     slot_mapping: Optional[nl.ndarray]
     # --- Performance Related
@@ -140,6 +143,8 @@ class QKV_CTE_UserInput(nl.NKIObject):
     # --- Strided Input
     strided_input_config: Optional[StridedInputConfig]
     output_hbm: Optional[nl.ndarray]
+    # --- FP8 E4M3 dtype mode. See DtypeMode enum.
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP
 
 
 # Represent quantization config
@@ -148,7 +153,7 @@ class QKV_Quant_Config(nl.NKIObject):
     quantization_type: QuantizationType
     qkv_w_scale: Optional[nl.ndarray] = None  # weight quant scale for qkv projection
     qkv_in_scale: Optional[nl.ndarray] = None  # in_scale are same for q, k, v
-    quant_dtype: str = nl.float8_e4m3
+    quant_dtype: Optional[Any] = None  # Follow _fp8_e4m3_dtype for fp8 and fused_qkv_weights.dtype for other cases
     has_mx_static_dequant_scales: bool = False
     has_row_mx_dequant: bool = False
 
@@ -180,6 +185,7 @@ class QKV_CTE_Config(nl.NKIObject):
 
     # User Requested
     output_layout: QKVOutputLayout
+    weight_layout: QKVWeightLayout
     add_bias: bool
     fused_residual_add: bool
     fused_norm_type: NormType
@@ -195,6 +201,7 @@ class QKV_CTE_Config(nl.NKIObject):
     # Block KV Cache
     use_block_kv: bool
     transpose_k_cache: bool
+    fp8_packed: bool
     block_size: Optional[int]
     # Additional Internal Config
     load_input_with_DMA_transpose: bool
@@ -221,6 +228,7 @@ class QKV_CTE_Config(nl.NKIObject):
         print("QKV_CTE_Config Data Members:")
         print("User Requested:")
         print(f"  output_layout:        {self.output_layout}")
+        print(f"  weight_layout         {self.weight_layout}")
         print(f"  add_bias:             {self.add_bias}")
         print(f"  fused_residual_add:   {self.fused_residual_add}")
         print(f"  fused_norm_type:      {self.fused_norm_type}")
@@ -466,8 +474,25 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
     """
 
     B, S, H = args.input.shape
-    _H, I = args.fused_qkv_weights.shape
     _, num_shards, _ = get_program_sharding_info()
+
+    # MX weights: 3D [H//4, I, 4] with unpacked fp8 dtype
+    if args.quantization_type.is_mx():
+        kernel_assert(
+            len(args.fused_qkv_weights.shape) == 3,
+            f"[QKV CTE Kernel] MX weights must be 3D [H//4, I, 4], got shape {args.fused_qkv_weights.shape}.",
+        )
+        _H, I, _pack_dim = args.fused_qkv_weights.shape
+        kernel_assert(
+            _pack_dim == 4,
+            f"[QKV CTE Kernel] MX weights must have innermost dimension of 4, got {_pack_dim}.",
+        )
+        kernel_assert(
+            args.fused_qkv_weights.dtype in [nl.float8_e4m3, nl.float8_e4m3fn],
+            f"[QKV CTE Kernel] MX weights must have fp8 dtype, got {args.fused_qkv_weights.dtype}.",
+        )
+    else:
+        _H, I = args.fused_qkv_weights.shape
 
     # ROW_MX: input is [B, S, H + ROW_MX_TAIL_SCALE_BYTES] with tail-packed float32 scale. Derive true H.
     if args.quantization_type == QuantizationType.ROW_MX:
@@ -492,14 +517,15 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
     )
 
     # I
-    kernel_assert(
-        I <= 4096,
-        f"[QKV CTE Kernel] weights.shape[1] must be <= 4096, but got {I}."
-        f" Kernel matrix multiplication is optimized for performance for I <= 4096, and does not provide support for "
-        f" larger weights.shape[1] at the moment.",
-    )
+    if not args.quantization_type.is_mx():
+        kernel_assert(
+            I <= 4096,
+            f"[QKV CTE Kernel] weights.shape[1] must be <= 4096, but got {I}."
+            f" Kernel matrix multiplication is optimized for performance for I <= 4096, and does not provide support for "
+            f" larger weights.shape[1] at the moment.",
+        )
 
-    if args.quantization_type not in (QuantizationType.MX, QuantizationType.ROW_MX):
+    if not args.quantization_type.is_mx():
         kernel_assert(
             _H == H,
             f"[QKV CTE Kernel] Hidden dimensions of 'input' and 'fused_qkv_weights' must match,"
@@ -654,6 +680,11 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
             f"[QKV CTE Kernel] fused_qkv_dim {I} must equal q_dim {q_dim} + 2 * kv_dim {2 * kv_dim}",
         )
 
+    kernel_assert(
+        not args.fp8_packed or args.use_block_kv,
+        "[QKV CTE Kernel] fp8_packed requires use_block_kv=True.",
+    )
+
     if args.use_block_kv:
         kernel_assert(
             args.slot_mapping is not None,
@@ -672,6 +703,33 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
                 (args.block_size & (args.block_size - 1)) == 0,
                 f"[QKV CTE Kernel] transpose_k_cache requires power-of-2 block_size for block kv cache, got {args.block_size}",
             )
+        if args.fp8_packed:
+            kernel_assert(
+                args.k_cache is not None,
+                "[QKV CTE Kernel] fp8_packed requires k_cache to be provided.",
+            )
+            kernel_assert(
+                not args.transpose_k_cache,
+                "[QKV CTE Kernel] fp8_packed is mutually exclusive with transpose_k_cache.",
+            )
+            kernel_assert(
+                args.k_scale is not None and args.v_scale is not None,
+                "[QKV CTE Kernel] fp8_packed requires FP8 KV quantization (k_scale and v_scale must be provided).",
+            )
+            kernel_assert(
+                args.block_size % 2 == 0,
+                f"[QKV CTE Kernel] fp8_packed requires even block_size, got {args.block_size}.",
+            )
+            kernel_assert(
+                args.d_head <= 128,
+                f"[QKV CTE Kernel] fp8_packed requires d_head <= 128 (NKI partition dimension limit), but got d_head = {args.d_head}.",
+            )
+            # fp8_packed pairs consecutive tokens, so every tile must have an even token count.
+            _S = args.input.shape[1]
+            kernel_assert(
+                _S % 2 == 0,
+                f"[QKV CTE Kernel] fp8_packed requires S to be even, got S = {_S}.",
+            )
 
     kernel_assert(
         args.store_output_in_sbuf == False,
@@ -687,7 +745,7 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
     # MX Quantization and is_input_swizzled validation
     if args.quantization_type == QuantizationType.ROW_MX:
         _validate_row_mx_inputs(args, H, I, S, num_shards, _H)
-    elif args.quantization_type == QuantizationType.MX:
+    elif args.quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX):
         kernel_assert(
             _H == H // 4,
             f"[QKV CTE Kernel] Hidden dimensions of 'input' must be 4 * 'fused_qkv_weights' when weights are in MX,"
@@ -720,7 +778,10 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         )
 
     # FP8 input validation for MX path
-    if args.quantization_type == QuantizationType.MX and args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]:
+    if args.quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX) and args.input.dtype in [
+        nl.float8_e4m3,
+        nl.float8_e4m3fn,
+    ]:
         kernel_assert(
             args.fused_norm_type == NormType.NO_NORM,
             f"[QKV CTE Kernel] FP8 input with MX quantization does not support normalization.",
@@ -731,14 +792,14 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         )
 
     # Weight layout validation
-    if args.quantization_type == QuantizationType.MX:
+    if args.quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX):
         _is_fp8_input = args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
-        _has_dequant = args.qkv_in_scale != None and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
-        _use_dma_xpose = (_is_fp8_input or (not _is_fp8_input and _has_dequant)) and args.load_input_with_DMA_transpose
+        _is_static_mx = args.quantization_type == QuantizationType.STATIC_MX
+        _use_dma_xpose = (_is_fp8_input or _is_static_mx) and args.load_input_with_DMA_transpose
         if _use_dma_xpose:
             kernel_assert(
-                args.weight_layout == QKVWeightLayout.MX_INTERLEAVED,
-                f"[QKV CTE Kernel] DMA transpose MX path requires MX_INTERLEAVED weight layout, got {args.weight_layout}.",
+                args.weight_layout in (QKVWeightLayout.MX_INTERLEAVED, QKVWeightLayout.MX_CONTIGUOUS),
+                f"[QKV CTE Kernel] DMA transpose MX path requires MX_INTERLEAVED or MX_CONTIGUOUS weight layout, got {args.weight_layout}.",
             )
         else:
             kernel_assert(
@@ -752,16 +813,15 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
                 f"[QKV CTE Kernel] Non-MX quantization requires CONTIGUOUS weight layout, got {args.weight_layout}.",
             )
 
-    # MX static dequantization scales validation
-    _is_mx_static_dequant = (
-        args.quantization_type == QuantizationType.MX
-        and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
-        and args.qkv_in_scale != None
-    )
-    if _is_mx_static_dequant:
+    # STATIC_MX dequantization scales validation
+    if args.quantization_type == QuantizationType.STATIC_MX:
+        kernel_assert(
+            args.qkv_in_scale is not None,
+            f"[QKV CTE Kernel] qkv_in_scale must be provided for STATIC_MX quantization.",
+        )
         kernel_assert(
             args.qkv_w_scale is not None,
-            f"[QKV CTE Kernel] qkv_w_scale must be provided when qkv_in_scale is set with MX_INTERLEAVED layout.",
+            f"[QKV CTE Kernel] qkv_w_scale must be provided for STATIC_MX quantization.",
         )
         kernel_assert(
             args.qkv_in_scale.shape == (1, 1) or args.qkv_in_scale.shape == (nl.tile_size.pmax, 1),
@@ -769,17 +829,18 @@ def _validate_user_inputs(args: QKV_CTE_UserInput):
         )
         kernel_assert(
             args.qkv_w_scale.shape == (1, 3) or args.qkv_w_scale.shape == (nl.tile_size.pmax, 3),
-            f"[QKV CTE Kernel] qkv_w_scale shape must be [1, 3] or [128, 3] for MX static dequant, got {args.qkv_w_scale.shape}.",
+            f"[QKV CTE Kernel] qkv_w_scale shape must be [1, 3] or [128, 3] for STATIC_MX, got {args.qkv_w_scale.shape}.",
         )
         kernel_assert(
             args.d_head != None and args.num_q_heads != None and args.num_kv_heads != None,
-            f"[QKV CTE Kernel] d_head, num_q_heads, and num_kv_heads must be specified when MX static dequant scales are provided.",
+            f"[QKV CTE Kernel] d_head, num_q_heads, and num_kv_heads must be specified for STATIC_MX quantization.",
         )
 
     # Quantization validation
     if args.quantization_type == QuantizationType.STATIC:
         kernel_assert(
-            args.fused_qkv_weights.dtype == nl.float8_e4m3 or str(args.fused_qkv_weights.dtype) == "float8e4",
+            args.fused_qkv_weights.dtype in (nl.float8_e4m3, nl.float8_e4m3fn)
+            or str(args.fused_qkv_weights.dtype) in ("float8e4", "float8_e4m3fn"),
             f"[QKV CTE Kernel] When quantization_type is STATIC, currently only fp8 is supported as the qkv_weights dtype, "
             f"but got dtype={args.fused_qkv_weights.dtype}.",
         )
@@ -917,7 +978,7 @@ def _validate_strided_input_config(args: QKV_CTE_UserInput, dims: Optional[QKV_C
     # Skipped for KV-cache path (kernel allocates q_tensor_hbm; output_hbm is unused).
     if not _uses_kv_cache:
         B_orig = args.input.shape[0]
-        _, I = args.fused_qkv_weights.shape
+        I = args.fused_qkv_weights.shape[1]
         if args.output_layout == QKVOutputLayout.BSD:
             expected_out_shape = (B_orig, si.num_local_tokens, I)
         else:  # NBSd
@@ -976,15 +1037,17 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     _is_fp8_input = args.input.dtype in [nl.float8_e4m3, nl.float8_e4m3fn]
     _is_2byte_input = args.input.dtype == nl.bfloat16 or args.input.dtype == nl.float16
     _is_row_mx = args.quantization_type == QuantizationType.ROW_MX
+    _is_static_mx = args.quantization_type == QuantizationType.STATIC_MX
+    _is_mx_or_static_mx = args.quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX)
     load_input_with_DMA_transpose = (
         args.load_input_with_DMA_transpose
         and nki.isa.get_nc_version() >= nki.isa.nc_version.gen3
         and (args.fused_norm_type == NormType.NO_NORM)
         and args.fused_residual_add == False
-        and (_is_2byte_input or (_is_fp8_input and (args.quantization_type == QuantizationType.MX or _is_row_mx)))
+        and (_is_2byte_input or (_is_fp8_input and (_is_mx_or_static_mx or _is_row_mx)))
     )
 
-    if _is_fp8_input and args.quantization_type == QuantizationType.MX:
+    if _is_fp8_input and _is_mx_or_static_mx:
         if load_input_with_DMA_transpose:
             _logger.info("QKV CTE: Using FP8 MX DMA transpose path (pre-scaled FP8 input with neutral MX input scales)")
         else:
@@ -992,21 +1055,26 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
                 "QKV CTE: FP8 MX input detected but DMA transpose disabled — falling back to PE transpose path"
             )
 
-    _has_mx_static_dequant = (
-        args.quantization_type == QuantizationType.MX
-        and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
-        and args.qkv_in_scale != None
-    )
-    if _is_2byte_input and _has_mx_static_dequant and args.quantization_type == QuantizationType.MX:
+    if _is_2byte_input and _is_static_mx:
         if load_input_with_DMA_transpose:
-            _logger.info("QKV CTE: Using BF16 MX DMA transpose path (pre-scaled BF16 input with static dequant scales)")
-        else:
             _logger.info(
-                "QKV CTE: BF16 MX input with static dequant scales but DMA transpose disabled — falling back to PE transpose path"
+                "QKV CTE: Using BF16 STATIC_MX DMA transpose path (pre-scaled BF16 input with static dequant scales)"
             )
+        else:
+            _logger.info("QKV CTE: BF16 STATIC_MX input but DMA transpose disabled — falling back to PE transpose path")
+
+    _fp8_e4m3_dtype = resolve_fp8_e4m3_dtype(args.dtype_mode)
 
     if args.quantization_type == QuantizationType.STATIC:
-        compute_mm_dtype = nl.float8_e4m3
+        # Use the caller's concrete weight dtype when available; resolve from
+        # dtype_mode only for the opaque "float8e4" sentinel. Avoids EOCP001
+        # mismatches when the caller passes nl.float8_e4m3 with dtype_mode=AUTO
+        # on TRN3.
+        weight_dtype_str = str(args.fused_qkv_weights.dtype)
+        if weight_dtype_str == "float8e4":
+            compute_mm_dtype = _fp8_e4m3_dtype
+        else:
+            compute_mm_dtype = args.fused_qkv_weights.dtype
     else:
         # Compute dtype used in the kernel. Even if inputs are fp32 or fp8, computations will be done with bf16.
         compute_mm_dtype = nl.bfloat16 if (args.input.dtype == nl.float32 or _is_fp8_input) else args.input.dtype
@@ -1047,7 +1115,15 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     # KV Cache config
     use_kv_cache = args.k_cache is not None or args.v_cache is not None
     use_kv_quantization = args.k_scale is not None and args.v_scale is not None
-    kv_dtype = args.kv_dtype if args.kv_dtype is not None else args.input.dtype
+    # FP8 KV cache: use caller's concrete dtype when explicit; resolve from
+    # dtype_mode only for the opaque "float8e4" sentinel. bf16 and other
+    # non-FP8 dtypes pass through unchanged.
+    if args.kv_dtype is None:
+        kv_dtype = args.input.dtype
+    elif str(args.kv_dtype) == "float8e4":
+        kv_dtype = resolve_fp8_e4m3_dtype(args.dtype_mode)
+    else:
+        kv_dtype = args.kv_dtype
 
     if use_kv_quantization:
         max_val = get_max_positive_value_for_dtype(kv_dtype)
@@ -1062,15 +1138,21 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
     if args.quantization_type != QuantizationType.NONE:
         quant_config.qkv_w_scale = args.qkv_w_scale
         quant_config.qkv_in_scale = args.qkv_in_scale
-    quant_config.has_mx_static_dequant_scales = (
-        args.quantization_type == QuantizationType.MX
-        and args.weight_layout == QKVWeightLayout.MX_INTERLEAVED
-        and args.qkv_in_scale != None
-    )
+    # Mirror the FP8 dtype onto the quant config for downstream sites.
+    # Use the caller's concrete weight dtype when available; resolve from
+    # dtype_mode only for the opaque "float8e4" sentinel.
+    if args.quantization_type in (QuantizationType.STATIC, QuantizationType.ROW):
+        weight_dtype_str = str(args.fused_qkv_weights.dtype)
+        if weight_dtype_str == "float8e4":
+            quant_config.quant_dtype = _fp8_e4m3_dtype
+        else:
+            quant_config.quant_dtype = args.fused_qkv_weights.dtype
+    quant_config.has_mx_static_dequant_scales = args.quantization_type == QuantizationType.STATIC_MX
     quant_config.has_row_mx_dequant = args.quantization_type == QuantizationType.ROW_MX
 
     return QKV_CTE_Config(
         output_layout=args.output_layout,
+        weight_layout=args.weight_layout,
         add_bias=add_bias,
         fused_residual_add=args.fused_residual_add,
         fused_norm_type=args.fused_norm_type,
@@ -1084,6 +1166,7 @@ def _build_config(args: QKV_CTE_UserInput) -> QKV_CTE_Config:
         fp8_min=fp8_min,
         use_block_kv=args.use_block_kv,
         transpose_k_cache=args.transpose_k_cache,
+        fp8_packed=args.fp8_packed,
         block_size=args.block_size,
         # Internal Config
         load_input_with_DMA_transpose=load_input_with_DMA_transpose,
@@ -1127,7 +1210,7 @@ def _get_tensor_dimensions(args: QKV_CTE_UserInput, cfg: QKV_CTE_Config) -> QKV_
     if args.quantization_type == QuantizationType.ROW_MX:
         H = H - ROW_MX_TAIL_SCALE_BYTES
     BxS = B_orig * S_orig
-    _, I = args.fused_qkv_weights.shape
+    I = args.fused_qkv_weights.shape[1]
     H_actual = args.hidden_actual if args.hidden_actual else H
     d_head = args.d_head
 

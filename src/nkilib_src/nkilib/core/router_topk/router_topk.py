@@ -25,13 +25,13 @@ import nki.language as nl
 from nki.isa import core_barrier, engine, reduce_cmd
 
 from ..utils import (
-    common_types,
     cross_partition_copy,
     kernel_helpers,
     stream_shuffle_broadcast,
     tensor_view,
     tiled_range,
 )
+from ..utils.common_types import RouterActFnType
 from ..utils.kernel_assert import kernel_assert
 
 P_MAX = 128
@@ -61,7 +61,7 @@ def router_topk(
     router_logits: nt.mutable_tensor,
     expert_affinities: nt.mutable_tensor,
     expert_index: nt.mutable_tensor,
-    act_fn: common_types.RouterActFnType,
+    act_fn: RouterActFnType,
     k: int,
     x_hbm_layout: XHBMLayout_H_T__0,
     x_sb_layout: XSBLayout_tp102__0,
@@ -103,7 +103,7 @@ def router_topk(
                         Buffer type is auto-detected.
         expert_index (nt.mutable_tensor): Output expert indices [T, K] in HBM or SBUF.
                         Buffer type is auto-detected.
-        act_fn (common_types.RouterActFnType): Activation function (SOFTMAX or SIGMOID)
+        act_fn (RouterActFnType): Activation function (SOFTMAX or SIGMOID)
         k (int): Number of top experts to select (must be <= 8)
         x_hbm_layout (int): Layout of x in HBM (0=[H,T], 1=[T,H])
         x_sb_layout (int): Layout of x in SBUF (0-3, see router_topk_input_x_load for details)
@@ -144,7 +144,7 @@ def router_topk(
                 x_tile = extract_tile(x_sb, h_tile, t_tile)
                 w_tile = extract_tile(w_sb, h_tile)
                 router_logits_psum += matmul(x_tile, w_tile)
-            router_logits_sb[t_tile] = router_logits_psum + bias_sb
+            router_logits_sb_valid[t_tile] = router_logits_psum + bias_sb
 
         # Optional ACT1 (pre-norm activation)
         if router_pre_norm:
@@ -237,7 +237,7 @@ def router_topk(
     # SIGMOID with router_pre_norm=False requires indirect-DMA scatter as one-hot scatter ACT2 path doesn't support SIGMOID
     # TODO: this could be supported, however.
     kernel_assert(
-        not (act_fn == common_types.RouterActFnType.SIGMOID and not use_indirect_dma_scatter and not router_pre_norm),
+        not (act_fn == RouterActFnType.SIGMOID and not use_indirect_dma_scatter and not router_pre_norm),
         f"SIGMOID activation with router_pre_norm=False requires use_indirect_dma_scatter=True",
     )
 
@@ -309,9 +309,14 @@ def router_topk(
 
     t_p_dim = T_local if num_t_tiles == 1 else P_MAX
 
-    # Result of the x@w matmul, shape [t_p_dim,num_t_tiles,E]
-    # This will be oversized if T>pmax and T is not a multiple of pmax.
-    router_logits_sb = nl.ndarray((t_p_dim, num_t_tiles, E), dtype=nl.float32, buffer=nl.sbuf)
+    # Result of the x@w matmul, shape [t_p_dim,num_t_tiles,E_padded]
+    # Pad E to at least 8 for max8/nc_find_index8 instruction requirements.
+    E_padded = max(E, 8)
+    router_logits_sb = nl.ndarray((t_p_dim, num_t_tiles, E_padded), dtype=nl.float32, buffer=nl.sbuf)
+    if E_padded > E:
+        nisa.memset(router_logits_sb, value=-3.4028235e38)  # float32 min so padding never wins top-K
+    # Sliced view for operations that only touch the valid E columns
+    router_logits_sb_valid = router_logits_sb[:, :, :E]
 
     """
     Internal x_sb_layout defaults to x_sb_layout, which makes sense when the 'x' input is in SBUF.
@@ -337,7 +342,7 @@ def router_topk(
 
     # Load 'w'. See the comments in router_topk_input_w_load() to understand the HBM-to-SBUF
     # layouts/access patterns as they depend on the 'x' layout.
-    w_sb = router_topk_input_w_load(w, x_sb_layout=internal_x_sb_layout, name='router_w_sb')
+    w_sb = router_topk_input_w_load(w, x_sb_layout=internal_x_sb_layout)
 
     # Load optional bias
     router_logits_bias_broadcasted_sb = None
@@ -346,7 +351,7 @@ def router_topk(
         Load the bias vector, shape [1,E]. Broadcast into a tensor of shape [t_tile_size,E]
         (i.e. every row contains a copy of w_bias).
         """
-        router_logits_bias_vector_sb = nl.ndarray((1, E), dtype=nl.float32, buffer=nl.sbuf, name='router_bias_sb')
+        router_logits_bias_vector_sb = nl.ndarray((1, E), dtype=nl.float32, buffer=nl.sbuf)
         router_logits_bias_broadcasted_sb = nl.ndarray(
             shape=(t_tile_size, E), dtype=router_logits_bias_vector_sb.dtype, buffer=nl.sbuf
         )
@@ -356,9 +361,7 @@ def router_topk(
             src=tensor_view.TensorView(w_bias).get_view(),
         )
         if use_PE_broadcast_w_bias:  # Use TensorE/matmul to do the broadcast
-            ones_mask = nl.ndarray(
-                (1, t_tile_size), dtype=router_logits_bias_vector_sb.dtype, name="ones_mask_sb", buffer=nl.sbuf
-            )
+            ones_mask = nl.ndarray((1, t_tile_size), dtype=router_logits_bias_vector_sb.dtype, buffer=nl.sbuf)
             nisa.memset(dst=ones_mask, value=1.0, engine=engine.gpsimd)
             bias_bc_psum = nl.ndarray((t_tile_size, E), dtype=nl.float32, buffer=nl.psum)
             nisa.nc_matmul(
@@ -442,7 +445,7 @@ def router_topk(
             - router_logits_bias_broadcasted_sb: [t_tile_size, E]
             """
             nisa.tensor_tensor(
-                dst=router_logits_sb[:t_tile_size_actual, t_tile_idx, :],
+                dst=router_logits_sb_valid[:t_tile_size_actual, t_tile_idx, :],
                 data1=router_logits_psum[:t_tile_size_actual, :E],
                 data2=router_logits_bias_broadcasted_sb[:t_tile_size_actual, :E],
                 op=nl.add,
@@ -452,7 +455,7 @@ def router_topk(
         # Straight copy the first tile result, but not if we have bias because we already spilled PSUM using the above tensor_tensor
         if not has_bias:
             nisa.tensor_copy(
-                dst=router_logits_sb[:t_tile_size_actual, t_tile_idx, :],
+                dst=router_logits_sb_valid[:t_tile_size_actual, t_tile_idx, :],
                 src=router_logits_psum[:t_tile_size_actual, :E],
             )
 
@@ -463,8 +466,8 @@ def router_topk(
         for column_tile_idx in range(1, num_active_column_tiles):
             current_column_tile_column_offset = column_tile_idx * pe_array_column_tiling_size
             nisa.tensor_tensor(
-                dst=router_logits_sb[:t_tile_size_actual, t_tile_idx, :],
-                data1=router_logits_sb[:t_tile_size_actual, t_tile_idx, :],
+                dst=router_logits_sb_valid[:t_tile_size_actual, t_tile_idx, :],
+                data1=router_logits_sb_valid[:t_tile_size_actual, t_tile_idx, :],
                 data2=router_logits_psum[nl.ds(current_column_tile_column_offset, t_tile_size_actual), :],
                 op=nl.add,
             )
@@ -490,7 +493,6 @@ def router_topk(
             nisa.dma_copy(
                 src=router_logits_sb[:t_remainder, num_t_whole_tiles, :E],
                 dst=_hbm_remainder_store_view(router_logits, T_offset, num_t_whole_tiles, t_p_dim, t_remainder),
-                name="store_router_logits_sb_remainder",
             )
 
     """Configure Pipeline Flags."""
@@ -567,7 +569,6 @@ def router_topk(
                 nisa.dma_copy(
                     src=expert_affinities_full_sb[:t_remainder, num_t_whole_tiles, :E],
                     dst=_hbm_remainder_store_view(expert_affinities, T_offset, num_t_whole_tiles, t_p_dim, t_remainder),
-                    name="store_expert_affinities_1hot_scattered_remainder",
                 )
 
             core_barrier(expert_affinities, (0, 1))
@@ -759,14 +760,14 @@ def router_topk(
                     router_logits_topk_sb,
                     t_tile,
                     act_fn,
-                    router_logits_topk_negmax_sb if act_fn == common_types.RouterActFnType.SOFTMAX else None,
-                    router_logits_topk_exp_sum_sb if act_fn == common_types.RouterActFnType.SOFTMAX else None,
+                    router_logits_topk_negmax_sb if act_fn == RouterActFnType.SOFTMAX else None,
+                    router_logits_topk_exp_sum_sb if act_fn == RouterActFnType.SOFTMAX else None,
                     complete_activation=True,
-                    return_intermediates=(act_fn == common_types.RouterActFnType.SOFTMAX),
+                    return_intermediates=(act_fn == RouterActFnType.SOFTMAX),
                     input_dtype=input_dtype,
                 )
 
-            elif act_fn == common_types.RouterActFnType.SOFTMAX:
+            elif act_fn == RouterActFnType.SOFTMAX:
                 # Compute partial activation only
                 compute_activation(
                     expert_affinities_topk_sb,
@@ -845,7 +846,7 @@ def router_topk(
                     nisa.activation(
                         dst=router_logits_exp_sb[:t_tile_size, t_tile_idx, :],
                         op=nl.exp,
-                        data=router_logits_sb[:t_tile_size, t_tile_idx, :],
+                        data=router_logits_sb_valid[:t_tile_size, t_tile_idx, :],
                         bias=router_logits_topk_negmax_sb[:t_tile_size, t_tile_idx : t_tile_idx + 1],
                     )
                     # Still use the denominator computed above: router_logits_topk_exp_sum_sb
@@ -993,7 +994,6 @@ def router_topk(
                     pattern=[[1, 1]],
                     offset=offset,
                     channel_multiplier=E,
-                    name=f"IOTA_offset_{offset}",
                 )
 
                 """
@@ -1060,7 +1060,6 @@ def router_topk(
                 nisa.dma_copy(
                     src=expert_affinities_one_hot_scattered_sb[:t_remainder, num_t_whole_tiles, :E],
                     dst=_hbm_remainder_store_view(expert_affinities, T_offset, num_t_whole_tiles, t_p_dim, t_remainder),
-                    name="store_expert_affinities_1hot_scattered_remainder",
                 )
 
             core_barrier(expert_affinities, cores=[0, 1])
@@ -1512,7 +1511,7 @@ def router_topk_input_x_load(x: nl.ndarray, hbm_layout=XHBMLayout_H_T__0, sb_lay
     return x_sb
 
 
-def router_topk_input_w_load(w: nl.ndarray, x_sb_layout, name=''):
+def router_topk_input_w_load(w: nl.ndarray, x_sb_layout):
     """
     Load weight tensor w from HBM to SBUF with layout matching x tensor.
 
@@ -1597,7 +1596,7 @@ def router_topk_input_w_load(w: nl.ndarray, x_sb_layout, name=''):
         # the stride of the corresponding 'x' layout.
 
         w_reshape = w.reshape((P_MAX, num_h_tiles, E))
-        w_sb = nl.ndarray((P_MAX, num_h_tiles, E), dtype=w.dtype, buffer=nl.sbuf, name=name)
+        w_sb = nl.ndarray((P_MAX, num_h_tiles, E), dtype=w.dtype, buffer=nl.sbuf)
         nisa.dma_copy(src=w_reshape, dst=w_sb)
 
     elif x_sb_layout == XSBLayout_tp2013__1:
@@ -1677,7 +1676,7 @@ def router_topk_input_w_load(w: nl.ndarray, x_sb_layout, name=''):
         # As we move down one column of SBUF we get H data with a stride of num_h_tiles_by_2, which matches the
         #   the stride of the corresponding 'x' layout.
 
-        w_sb = nl.ndarray((P_MAX, num_h_tiles, E), dtype=w.dtype, buffer=nl.sbuf, name=name)
+        w_sb = nl.ndarray((P_MAX, num_h_tiles, E), dtype=w.dtype, buffer=nl.sbuf)
         if num_h_tiles % 2 == 0:
             # Balanced: single vectorized reshape+permute DMA
             w_reshape = w.reshape((2, P_MAX, num_h_tiles_by_2, E))
@@ -1750,7 +1749,7 @@ def router_topk_input_w_load(w: nl.ndarray, x_sb_layout, name=''):
         # H-tiles arranged left to right.
         # Therefore each column of SBUF contains H data with a stride of 1 (i.e. consecutive H data).
 
-        w_sb = nl.ndarray((P_MAX, num_h_tiles, E), dtype=w.dtype, buffer=nl.sbuf, name=name)
+        w_sb = nl.ndarray((P_MAX, num_h_tiles, E), dtype=w.dtype, buffer=nl.sbuf)
 
         nisa.dma_copy(
             src=(
@@ -1779,7 +1778,7 @@ def compute_activation(
     Args:
       input_tensor: Input tensor to apply activation to. Shape [P, num_t_tiles, F] where dim-1 is indexed by t_tile_idx.
       t_tile_idx: Tile index for current iteration
-      act_fn: Activation function (common_types.RouterActFnType.SOFTMAX or common_types.RouterActFnType.SIGMOID)
+      act_fn: Activation function (RouterActFnType.SOFTMAX or RouterActFnType.SIGMOID)
       negmax_sb: Output tensor for negative max values (required if complete_activation=False or return_intermediates=True, when act_fn=SOFTMAX)
       exp_sum_sb: Output tensor for exponential sum (required if complete_activation=False or return_intermediates=True, when act_fn=SOFTMAX)
       complete_activation: If True, complete the activation and return final values (ignored for sigmoid)
@@ -1792,12 +1791,12 @@ def compute_activation(
     """
     t_tile_idx = t_tile.index
     t_tile_size = t_tile.size
-    if act_fn == common_types.RouterActFnType.SIGMOID:
+    if act_fn == RouterActFnType.SIGMOID:
         nisa.activation(
             dst=dst_tensor[:t_tile_size, t_tile_idx, :], op=nl.sigmoid, data=input_tensor[:t_tile_size, t_tile_idx, :]
         )
 
-    elif act_fn == common_types.RouterActFnType.SOFTMAX:
+    elif act_fn == RouterActFnType.SOFTMAX:
         # Use provided tensors or create internal ones
         local_negmax_sb = negmax_sb
         local_exp_sum_sb = exp_sum_sb

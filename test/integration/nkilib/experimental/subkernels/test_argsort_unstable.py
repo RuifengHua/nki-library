@@ -94,3 +94,37 @@ class TestArgsortUnstableKernel:
             rtol=0,
             atol=0,
         )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("N", [16, 64])
+    def test_argsort_unstable_1d(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        N: int,
+    ) -> None:
+        """Test argsort_unstable with 1D input (used by permute_routed_tokens)."""
+        np.random.seed(42)
+        data = np.random.randint(0, 10, size=(N,)).astype(np.int32)
+
+        def input_generator(test_config):
+            return {"data": data, "descending": False}
+
+        def output_tensors(kernel_input):
+            return {"out": np.zeros((N,), dtype=np.uint32)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=argsort_unstable,
+            torch_ref=torch_ref_wrapper(argsort_unstable_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(platform_target=platform_target, logical_nc_config=2),
+            inference_args=InferenceArgs(enable_determinism_check=True, num_runs=10),
+            rtol=0,
+            atol=0,
+        )

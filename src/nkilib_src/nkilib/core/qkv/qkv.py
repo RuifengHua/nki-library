@@ -28,6 +28,7 @@ from ..utils.allocator import SbufManager
 
 # NKI Library
 from ..utils.common_types import (
+    DtypeMode,
     NormType,
     QKNormConfig,
     QKVOutputLayout,
@@ -102,6 +103,7 @@ def qkv(
     # --- Block KV Cache Related
     use_block_kv: bool = False,
     transpose_k_cache: bool = False,
+    fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.ndarray] = None,
     # -----------------------------------------
@@ -133,6 +135,7 @@ def qkv(
     strided_input_config: Optional[StridedInputConfig] = None,
     # --- Output
     output_hbm: Optional[nl.ndarray] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> nl.ndarray:
     """
     QKV (Query, Key, Value) projection kernel with multiple (optional) fused operations.
@@ -219,6 +222,12 @@ def qkv(
     transpose_k_cache (bool), Default: False
         Whether to store K in transposed layout [num_blocks*num_kv_heads, d_head, block_size]
         in the block KV cache or [B, kv_dim, max_seq_len] for flat KV cache.
+    fp8_packed (bool), Default: False
+        Enable packed FP8 K cache layout for block KV. Packs 2 consecutive FP8 sequence
+        positions into one row: k_cache shape [num_blocks, block_size // 2, kv_dim, 2] fp8,
+        where dim 3 index 0 = even positions and index 1 = odd positions. Enables DMA
+        transpose on decode. Requires block KV, FP8 quantization, even block_size, and
+        d_head <= 128. Mutually exclusive with transpose_k_cache.
     store_output_in_sbuf : bool, default=False
         Whether to store output in SBUF (currently unsupported, must be False)
     sbm : Optional[SbufManager], default=None
@@ -246,6 +255,14 @@ def qkv(
         When True, input is in transposed HBM layout [H0, n_prgs, H1_shard, BxS] instead of [B, S, H].
         Used for zero-conversion inter-layer data flow in the transformer megakernel.
         Only supported with qkv_tkg (small batch, B*S <= pmax). Requires LNC >= 2.
+    dtype_mode : DtypeMode, default=DtypeMode.NON_OCP
+        Quantization dtype policy for STATIC/ROW weight tiles. Also used for
+        the FP8 KV cache when ``kv_dtype`` is the opaque ``"float8e4"``
+        sentinel; a concrete ``kv_dtype`` (e.g. ``nl.float8_e4m3fn``) is
+        honored as-is.
+        - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+        - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+        - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
     Returns:
     --------
     nl.ndarray
@@ -280,8 +297,13 @@ def qkv(
     # Some features like fused_rope only
     is_input_config_only_available_in_qkv_cte_kernel = False
 
+    # In-kernel KV cache update is only supported by qkv_cte (qkv_tkg has no cache write path).
+    in_kernel_cache_update = k_cache is not None or v_cache is not None
+
     # Extend this variable if future configs become available only in one of the sub-kernels.
-    is_input_config_only_available_in_qkv_cte_kernel = fused_rope or (strided_input_config != None)
+    is_input_config_only_available_in_qkv_cte_kernel = (
+        fused_rope or (strided_input_config != None) or in_kernel_cache_update
+    )
 
     input_in_sbuf = input.buffer == nl.sbuf
     if transposed_in:
@@ -350,6 +372,7 @@ def qkv(
             kv_dtype=kv_dtype,
             use_block_kv=use_block_kv,
             transpose_k_cache=transpose_k_cache,
+            fp8_packed=fp8_packed,
             block_size=block_size,
             slot_mapping=slot_mapping,
             store_output_in_sbuf=store_output_in_sbuf,
@@ -365,6 +388,7 @@ def qkv(
             qk_norm_post_rope=qk_norm_post_rope,
             strided_input_config=strided_input_config,
             output_hbm=output_hbm,
+            dtype_mode=dtype_mode,
         )
 
     else:

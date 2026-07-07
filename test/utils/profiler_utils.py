@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .core_lock_client import DEFAULT_LOCK_TIMEOUT_SECONDS
+from .core_lock_client import INFERENCE_LOCK_TIMEOUT_SECONDS
 
 NEURON_RT_ENABLE_DGE_NOTIFICATIONS: str = "NEURON_RT_ENABLE_DGE_NOTIFICATIONS"
 
@@ -86,6 +86,7 @@ class ProfilerCommands:
         profile_all_ranks: bool = False,
         env_vars: Optional[dict[str, str]] = None,
         perf_analysis_enabled: bool = False,
+        hw_profile_enabled: bool = True,
         save_all_outputs: bool = False,
         force_clean_input_writes: bool = False,
         separation_pass_enabled: bool = False,
@@ -105,26 +106,36 @@ class ProfilerCommands:
             collective_ranks: Number of collective ranks (each rank is a logical NeuronCore). Default 1 = no collectives
             profile_all_ranks: Whether to profile all ranks or just rank 0 (controls --collectives-profile-id)
             env_vars: Optional environment variables to set
+            hw_profile_enabled: Whether HW profile capture runs. When False, `capture_cmd`
+                adds `--disable-profile` (skips NTFF trace, saves ~18-20s/test), `expected_ntff_files`
+                is empty (post-lock show-session/view-JSON/parquet commands become no-ops), and
+                profile-derived metrics (MBU, MFU, cycles, ActiveInferenceTime) are recorded as -1.
             save_all_outputs: Whether to save outputs from all executions or just the last (controls --save-nth-output)
             force_clean_input_writes: Force neuron-profile to re-read all input tensors between N
                 executions, so that tensors from previous runs don't clobber subsequent executions.
                 Useful for kernels with aliased input tensors AND using tensor cache.
             separation_pass_enabled: Whether separation pass is enabled (adds --ignore-exec-errors)
         """
+        self.hw_profile_enabled = hw_profile_enabled
         self.collective_ranks = collective_ranks
-        self.expected_ntff_files = self._generate_expected_ntff_files(num_runs, profile_all_runs, profile_all_ranks)
+        if hw_profile_enabled:
+            self.expected_ntff_files = self._generate_expected_ntff_files(num_runs, profile_all_runs, profile_all_ranks)
+        else:
+            self.expected_ntff_files = []
         profiler_exec_args = self._generate_profiler_exec_args(num_runs, profile_all_runs, save_all_outputs)
         collective_args = self._generate_collective_args(collective_ranks, profile_all_ranks)
 
         # Timeout should be less than lock timeout to avoid hanging past lock expiration
-        timeout_seconds = DEFAULT_LOCK_TIMEOUT_SECONDS - 5
+        timeout_seconds = INFERENCE_LOCK_TIMEOUT_SECONDS - 5
 
-        # Build capture command
         capture_cmd_parts = [
-            "TIMEFORMAT='NEURON_PROFILE_CAPTURE_TIME: %R'; time",
+            "TIMEFORMAT='NEURON_PROFILE_CAPTURE_TIME: %R'; time"
+            if hw_profile_enabled
+            else "TIMEFORMAT='NEFF_EXECUTION_TIME: %R'; time",
             f"timeout {timeout_seconds}",
             profiler_binary_path,
             "capture",
+            "" if hw_profile_enabled else "--disable-profile",
             "--save-output",
             "--neff file.neff",
             "--write-tensors-per-exec alias" if force_clean_input_writes else "",
@@ -133,7 +144,7 @@ class ProfilerCommands:
             collective_args,
             kernel_input_args,
         ]
-        self.capture_cmd = f"({' '.join(capture_cmd_parts)})"
+        self.capture_cmd = f"({' '.join(filter(None, capture_cmd_parts))})"
 
         # Build show-session commands for each ntff file
         # Use -j flag to output JSON to stdout, redirect to file, stderr (logs) goes to console

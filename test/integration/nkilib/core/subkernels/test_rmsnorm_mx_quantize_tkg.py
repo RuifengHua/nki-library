@@ -303,7 +303,7 @@ RMSNORM_MX_QUANTIZE_TKG_PERMS = [
     pytest.param(1, 1, 3072, None, np.float16, nl.float8_e4m3fn_x4, True, False),
     pytest.param(2, 1, 3072, None, np.float16, nl.float8_e4m3fn_x4, True, False),
     pytest.param(3, 1, 3072, None, np.float16, nl.float8_e4m3fn_x4, True, False),
-    pytest.param(7, 1, 3072, None, np.float16, nl.float8_e4m3fn_x4, True, False),
+    pytest.param(7, 1, 3072, None, np.float16, nl.float8_e4m3fn_x4, True, False, marks=pytest.mark.fast),
     pytest.param(32, 1, 512, None, np.float16, nl.float8_e4m3fn_x4, True, False),
     pytest.param(64, 1, 512, None, np.float16, nl.float8_e4m3fn_x4, True, False),
     pytest.param(32, 1, 3072, None, nl.bfloat16, nl.float8_e4m3fn_x4, True, False),
@@ -332,11 +332,11 @@ RMSNORM_MX_QUANTIZE_TKG_PERMS = [
     pytest.param(7, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
     pytest.param(8, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
     pytest.param(16, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
-    pytest.param(32, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
+    pytest.param(32, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True, marks=pytest.mark.fast),
     pytest.param(64, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
     pytest.param(128, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
     pytest.param(256, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
-    pytest.param(384, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
+    pytest.param(384, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True, marks=pytest.mark.fast),
     pytest.param(512, 1, 3072, 2880, np.float16, nl.float8_e5m2, False, True),
 ]
 
@@ -348,15 +348,15 @@ RMSNORM_MX_QUANTIZE_TKG_RESIDUAL_PERMS = [
     pytest.param(256, 1, 1024, None, np.float16, nl.float8_e4m3fn_x4, True, False),
     pytest.param(256, 1, 3072, 2880, np.float16, nl.float8_e4m3fn_x4, True, False),
     # Speculation with residual
-    pytest.param(128, 3, 3072, 2880, np.float16, nl.float8_e4m3fn_x4, True, False),
+    pytest.param(128, 3, 3072, 2880, np.float16, nl.float8_e4m3fn_x4, True, False, marks=pytest.mark.fast),
     pytest.param(64, 5, 3072, 2880, np.float16, nl.float8_e4m3fn_x4, True, False),
     # Residual with HBM output
     pytest.param(256, 1, 3072, 2880, np.float16, nl.float8_e4m3fn_x4, False, False),
     pytest.param(384, 1, 3072, 2880, np.float16, nl.float8_e4m3fn_x4, False, False),
     # Residual with packed HBM output
-    pytest.param(256, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
+    pytest.param(256, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True, marks=pytest.mark.fast),
     pytest.param(384, 1, 3072, 2880, np.float16, nl.float8_e4m3fn, False, True),
-    pytest.param(512, 1, 3072, 2880, np.float16, nl.float8_e5m2, False, True),
+    pytest.param(512, 1, 3072, 2880, np.float16, nl.float8_e5m2, False, True, marks=pytest.mark.fast),
 ]
 
 
@@ -409,13 +409,16 @@ class TestRmsNormQuantizeMxTKGKernel:
         )
         framework.run_test(
             test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=2, platform_target=platform_target),
+            compiler_args=CompilerArgs(
+                logical_nc_config=2,
+                platform_target=platform_target,
+                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+            ),
             rtol=1e-2,
             atol=1e-3,
             inference_args=TKG_INFERENCE_ARGS,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(RMSNORM_MX_QUANTIZE_TKG_PARAMS, RMSNORM_MX_QUANTIZE_TKG_PERMS, abbrevs=_ABBREVS)
     def test_rmsnorm_mx_quantize_tkg(
         self,
@@ -446,7 +449,6 @@ class TestRmsNormQuantizeMxTKGKernel:
             with_residual=False,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(
         RMSNORM_MX_QUANTIZE_TKG_RESIDUAL_PARAMS, RMSNORM_MX_QUANTIZE_TKG_RESIDUAL_PERMS, abbrevs=_ABBREVS
     )

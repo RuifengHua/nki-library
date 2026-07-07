@@ -101,18 +101,35 @@ SWEEP_NUM_VALUES = 50
 
 
 def populate_tests(grid):
+    """Expand each TestConfig into TESTS_PER_SETUP generated subconfigs.
+
+    If a grid entry has `fast_subset` set, the listed sub-indices (relative
+    to that grid entry's autoGenerateRandomSubset output, not flat indices)
+    are wrapped with pytest.mark.fast. Per-entry inline marking is stable
+    to grid reordering and additions; only seed and TESTS_PER_SETUP changes
+    can shift the sub-index assignment.
+    """
     res = []
     for conf in grid:
-        res += conf.autoGenerateRandomSubset(TESTS_PER_SETUP)
+        sub = conf.autoGenerateRandomSubset(TESTS_PER_SETUP)
+        fast = getattr(conf, "fast_subset", frozenset())
+        for i, t in enumerate(sub):
+            if i in fast:
+                res.append(pytest.param(t, marks=pytest.mark.fast))
+            else:
+                res.append(t)
     return res
 
 
 # Base grid
 GRID = [
-    config_helper.TestConfig(M=512, K=512, N=512, description="Edge cases - single block", seed=52),
-    config_helper.TestConfig(M=1024, K=1024, N=512, description="Small matrices, various tile counts", seed=52),
-    config_helper.TestConfig(M=2048, K=2048, N=2048, description="Medium matrices, different tile counts", seed=52),
-    config_helper.TestConfig(M=4096, K=8192, N=4096, description="Large matrices", seed=52),
+    config_helper.TestConfig(M=512, K=512, N=512, description="Edge cases - single block", seed=52, fast_subset={0, 1}),
+    config_helper.TestConfig(
+        M=1024, K=1024, N=512, description="Small matrices, various tile counts", seed=52, fast_subset={2}
+    ),
+    config_helper.TestConfig(
+        M=2048, K=2048, N=2048, description="Medium matrices, different tile counts", seed=52, fast_subset={0}
+    ),
     config_helper.TestConfig(
         M=1024, K=2048, N=512, description="Non-square matrices with different tile counts", seed=52
     ),
@@ -122,6 +139,11 @@ GRID = [
     config_helper.TestConfig(
         M=4096, K=1024, N=2048, description="Non-square matrices with different tile counts", seed=52
     ),
+]
+
+# Large grid (excluded from fast suite due to compile time)
+GRID_LARGE = [
+    config_helper.TestConfig(M=4096, K=8192, N=4096, description="Large matrices", seed=52),
 ]
 
 
@@ -296,6 +318,7 @@ GRID_PACKED_SCALES = [
         seed=52,
         tile_k=512,
         enable_scale_packing=True,
+        fast_subset={1},
     ),
     config_helper.TestConfig(
         M=1056,
@@ -308,6 +331,7 @@ GRID_PACKED_SCALES = [
         seed=52,
         tile_k=512,
         enable_scale_packing=True,
+        fast_subset={0, 1, 2},
     ),
     config_helper.TestConfig(
         M=2048,
@@ -413,6 +437,7 @@ GRID_UNSWIZZLED = [
         TILES_IN_LOAD_N=1,
         description="Square Matrix",
         seed=52,
+        fast_subset={2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -496,6 +521,7 @@ GRID_UNSWIZZLED = [
         description="lhs not swizzled, rhs swizzled",
         seed=52,
         spill_reload=False,
+        fast_subset={1, 2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -516,6 +542,7 @@ GRID_UNSWIZZLED = [
         description="rhs not swizzled, lhs swizzled",
         seed=52,
         spill_reload=False,
+        fast_subset={1, 2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -536,6 +563,7 @@ GRID_UNSWIZZLED = [
         description="lhs pre quantized, rhs not swizzled",
         seed=52,
         spill_reload=False,
+        fast_subset={1, 2},
     ),
     config_helper.TestConfig(
         M=1024,
@@ -625,6 +653,7 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         description="Unswizzled K=128 (min, no full tiles)",
         seed=52,
         spill_reload=False,
+        fast_subset={2},
     ),
     # K=256 (no full 512-tiles, remainder=256)
     config_helper.TestConfig(
@@ -791,6 +820,7 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         description="Unswizzled LHS only, K=640",
         seed=52,
         spill_reload=False,
+        fast_subset={2},
     ),
     # Non divisible N
     config_helper.TestConfig(
@@ -810,6 +840,7 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         description="Unswizzled LHS only, K=640",
         seed=52,
         spill_reload=False,
+        fast_subset={1},
     ),
     # Large M and N
     config_helper.TestConfig(
@@ -848,6 +879,7 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         description="Unswizzled LHS only, K=640",
         seed=52,
         spill_reload=False,
+        fast_subset={0, 1},
     ),
     # Spill reload
     config_helper.TestConfig(
@@ -867,6 +899,7 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         description="Spill reload",
         seed=52,
         spill_reload=True,
+        fast_subset={0, 1},
     ),
     # Scale packing
     config_helper.TestConfig(
@@ -885,7 +918,271 @@ GRID_UNSWIZZLED_K_DIV_128 = [
         TILES_IN_LOAD_N=1,
         description="Enable scale packing",
         enable_scale_packing=True,
+        fast_subset={1},
     ),
+]
+
+GRID_PE_SWIZZLE = [
+    config_helper.TestConfig(
+        M=512,
+        K=512,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="PE swizzle: minimal",
+        seed=52,
+        load_with_PE_swizzle=True,
+        fast_subset={2},
+    ),
+    config_helper.TestConfig(
+        M=2048,
+        K=2048,
+        N=2048,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=4,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=4,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="PE swizzle: square matrix",
+        seed=52,
+        load_with_PE_swizzle=True,
+        fast_subset={2},
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=1536,
+        N=2048,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=True,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=3,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=4,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="PE swizzle: LHS only, RHS swizzled",
+        seed=52,
+        load_with_PE_swizzle=True,
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=768,
+        N=2048,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="PE swizzle: K not divisible by 512",
+        seed=52,
+        load_with_PE_swizzle=True,
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=384,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="PE swizzle: K=384",
+        seed=52,
+        load_with_PE_swizzle=True,
+    ),
+]
+
+GRID_K_BY_F = [
+    config_helper.TestConfig(
+        M=512,
+        K=512,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: both sides",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=1024,
+        N=2048,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=True,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=4,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: LHS only, RHS swizzled",
+        seed=52,
+        lhs_is_f_by_k=False,
+    ),
+    config_helper.TestConfig(
+        M=1024,
+        K=768,
+        N=1024,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: K remainder 256",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    # K%512=384
+    config_helper.TestConfig(
+        M=512,
+        K=896,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: K%512=384",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    # K%512=256
+    config_helper.TestConfig(
+        M=512,
+        K=256,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: K=256 (no full tiles)",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    # K%512=128
+    config_helper.TestConfig(
+        M=512,
+        K=640,
+        N=512,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=1,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: K%512=128",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    # Large shape
+    config_helper.TestConfig(
+        M=4096,
+        K=4096,
+        N=3072,
+        lhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        rhs_dtype=constants.MatrixPrecision.BFLOAT16,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=2,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        description="K-by-F: large 4096x4096x3072",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    # NOTE: K-by-F currently requires F (M for LHS, N for RHS) to be a multiple of 512 (the F
+    # load-tile size) — see the F%512 kernel_assert in matmul_mxfp8(). Non-512 F (e.g. F%128)
+    # is not yet supported by the PE-transpose load and is rejected by that assert; it will be
+    # enabled once the DMA gather-transpose API can mask partial F-tiles. All shapes here keep
+    # M and N multiples of 512.
 ]
 
 
@@ -904,6 +1201,8 @@ def get_output_dtype(conf):
     if conf.output_dtype == constants.MatrixPrecision.FP32:
         return nl.float32
     elif conf.output_dtype == constants.MatrixPrecision.BFLOAT16:
+        return nl.bfloat16
+    elif conf.output_dtype is None:
         return nl.bfloat16
     else:
         raise ValueError(f"Unsupported output dtype: {conf.output_dtype}")
@@ -925,7 +1224,12 @@ def build_matmul_inputs(conf):
     from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import _get_mx_max_exp
 
     lhs_fp32, rhs_fp32 = random_input_generator.get_random_inputs(
-        {"shapes": (conf.M, conf.K, conf.N), "dists": conf.dists, "params": conf.params}, conf.seed
+        {
+            "shapes": (conf.M, conf.K, conf.N),
+            "dists": conf.dists or ["normal", "normal"],
+            "params": conf.params or [{}, {}],
+        },
+        conf.seed,
     )
 
     # Create swizzled versions
@@ -935,11 +1239,17 @@ def build_matmul_inputs(conf):
     # For kernel input, use swizzled or unswizzled based on config
     if conf.lhs_is_swizzled:
         lhs = lhs_swizzled
+    elif getattr(conf, 'lhs_is_f_by_k', True) == False:
+        # K-by-F: [K, M] layout
+        lhs = lhs_fp32.numpy().astype(nl.bfloat16).T
     else:
         lhs = lhs_fp32.numpy().astype(nl.bfloat16)
 
     if conf.rhs_is_swizzled:
         rhs = rhs_swizzled
+    elif getattr(conf, 'rhs_is_f_by_k', True) == False:
+        # K-by-F: [K, N] layout
+        rhs = rhs_fp32.numpy().astype(nl.bfloat16)
     else:
         rhs = rhs_fp32.numpy().astype(nl.bfloat16).T
 
@@ -999,6 +1309,17 @@ def build_matmul_inputs(conf):
         "spill_reload": conf.spill_reload,
         "lhs_is_swizzled": conf.lhs_is_swizzled,
         "rhs_is_swizzled": conf.rhs_is_swizzled,
+        **({"load_with_PE_swizzle": True} if conf.load_with_PE_swizzle else {}),
+        **(
+            {"lhs_is_f_by_k": False}
+            if not conf.lhs_is_swizzled and getattr(conf, 'lhs_is_f_by_k', None) is False
+            else {}
+        ),
+        **(
+            {"rhs_is_f_by_k": False}
+            if not conf.rhs_is_swizzled and getattr(conf, 'rhs_is_f_by_k', None) is False
+            else {}
+        ),
         **({"lnc_2_shard_rhs": conf.lnc_2_shard_rhs} if conf.lnc_2_shard_rhs is not None else {}),
     }
 
@@ -1221,7 +1542,12 @@ def _mxfp8_comparator(conf, output_dtype, gpu_golden_enabled=False):
                 # Supplementary: GPU FP32 threshold validation
                 if gpu_golden_enabled:
                     lhs_fp32, rhs_fp32 = random_input_generator.get_random_inputs(
-                        {"shapes": (conf.M, conf.K, conf.N), "dists": conf.dists, "params": conf.params}, conf.seed
+                        {
+                            "shapes": (conf.M, conf.K, conf.N),
+                            "dists": conf.dists or ["normal", "normal"],
+                            "params": conf.params or [{}, {}],
+                        },
+                        conf.seed,
                     )
                     fp32_golden = lhs_fp32.numpy() @ rhs_fp32.numpy()
                     trn_threshold = np.linalg.norm(
@@ -1294,6 +1620,7 @@ class TestMatmulMxfp8GenericKernel:
         if os.environ.get('TEST_COLLECTION_BENCHMARK') == '1':
             pytest.skip("Benchmark mode - skipping test execution")
 
+        test_manager.collector.set_kernel_params(conf.to_metrics_dict())
         output_dtype = get_output_dtype(conf)
 
         def input_generator(test_config):
@@ -1316,7 +1643,6 @@ class TestMatmulMxfp8GenericKernel:
             custom_comparator=_mxfp8_comparator(conf, output_dtype, gpu_golden_enabled),
         )
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", populate_tests(GRID))
     def test_matmul_mxfp8_base_grid(self, test_manager, conf, platform_target):
         """Test basic MXFP8 matrix multiplication functionality.
@@ -1329,11 +1655,20 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=True)
 
-    @pytest.mark.fast
+    @pytest.mark.parametrize("conf", populate_tests(GRID_LARGE))
+    def test_matmul_mxfp8_base_grid_large(self, test_manager, conf, platform_target):
+        """Test MXFP8 matrix multiplication with large matrix configurations."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+        compiler_args = common_dataclasses.CompilerArgs(
+            logical_nc_config=2 if conf.run_with_lnc2 else 1,
+            platform_target=platform_target,
+        )
+        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=True)
+
     @pytest.mark.parametrize("conf", populate_tests(GRID_NON_DIVISIBLE_FAST))
     def test_matmul_mxfp8_non_divisible_grid_fast(self, test_manager, conf, platform_target):
         """Fast subset of non-divisible grid to cover remainder/masking path (KTK-118)."""
@@ -1342,7 +1677,6 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf)
 
@@ -1363,11 +1697,9 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", populate_tests(GRID_PREQUANTIZED + GRID_FP8_DTYPES))
     def test_matmul_mxfp8_prequantized_grid(self, test_manager, conf, platform_target):
         """Quick validation tests for prequantized inputs."""
@@ -1376,11 +1708,9 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", populate_tests(GRID_LNC))
     def test_matmul_mxfp8_lnc_grid(self, test_manager, conf, platform_target):
         """Quick validation tests for different LNC degree."""
@@ -1389,11 +1719,9 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", populate_tests(GRID_PACKED_SCALES))
     def test_matmul_mxfp8_packed_scales(self, test_manager, conf, platform_target):
         """Test matmul with pre-quantized packed scales inputs."""
@@ -1402,11 +1730,9 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", populate_tests(GRID_BF16_SCALE_PACKING))
     def test_matmul_mxfp8_bf16_scale_packing(self, test_manager, conf, platform_target):
         """Test matmul with bf16 inputs and scale packing enabled."""
@@ -1415,11 +1741,9 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=True)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", populate_tests(GRID_UNSWIZZLED))
     def test_matmul_mxfp8_unswizzled(self, test_manager, conf, platform_target):
         """Test matmul with unswizzled BF16 inputs in [F, K] format."""
@@ -1428,11 +1752,9 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=True)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("conf", populate_tests(GRID_UNSWIZZLED_K_DIV_128))
     def test_matmul_mxfp8_unswizzled_k_div_128(self, test_manager, conf, platform_target):
         """Test matmul with unswizzled BF16 inputs where K is divisible by 128 but not 512."""
@@ -1441,11 +1763,29 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
-            additional_cmd_args=[
-                "--internal-backend-options=--enable-mx-alternative-emax",
-                "--internal-backend-options=--skip-pass=address_rotation_sb",
-            ],
+        )
+        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
+
+    @pytest.mark.parametrize("conf", populate_tests(GRID_PE_SWIZZLE))
+    def test_matmul_mxfp8_pe_swizzle(self, test_manager, conf, platform_target):
+        """Test matmul with unswizzled BF16 inputs using PE swizzle loading instead of DGT."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+        compiler_args = common_dataclasses.CompilerArgs(
+            logical_nc_config=2 if conf.run_with_lnc2 else 1,
+            platform_target=platform_target,
+        )
+        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("conf", populate_tests(GRID_K_BY_F))
+    def test_matmul_mxfp8_k_by_f(self, test_manager, conf, platform_target):
+        """Test matmul with K-by-F unswizzled BF16 inputs (PE swizzle auto-forced)."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+        compiler_args = common_dataclasses.CompilerArgs(
+            logical_nc_config=2 if conf.run_with_lnc2 else 1,
+            platform_target=platform_target,
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
 
@@ -1460,7 +1800,6 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=True)
 
@@ -1475,9 +1814,21 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=True)
+
+    def test_matmul_mxfp8_gpt_oss_kv_proj_defaults(self, test_manager, platform_target):
+        """GPT-OSS-20B TP4 K/V projection (M=2048, K=2880, N=128) with all defaults."""
+        if not platform_target.is_trn3():
+            pytest.skip("MX is only supported on TRN3.")
+
+        np.random.seed(42)
+        conf = config_helper.TestConfig(M=2048, K=2880, N=128)
+        compiler_args = common_dataclasses.CompilerArgs(
+            logical_nc_config=2 if conf.run_with_lnc2 else 1,
+            platform_target=platform_target,
+        )
+        self.run_matmul_mxfp8_generic_test(test_manager, compiler_args, conf, gpu_golden_enabled=False)
 
     @pytest.mark.coverage_parametrize(
         m_chain=generate_chain("M"),
@@ -1571,7 +1922,6 @@ class TestMatmulMxfp8GenericKernel:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
         self.run_matmul_mxfp8_generic_test(
             test_manager, compiler_args, conf, is_negative_test=is_negative_test_case, gpu_golden_enabled=False

@@ -59,13 +59,12 @@ def tp_broadcast_torch(src_hbm, src_offset, broadcast_count, src_select_index):
 _ABBREVS = {"src_shape": "shape", "src_dim_to_broadcast": "dim", "broadcast_count": "bc", "src_select_index": "sel"}
 
 
-@pytest.mark.fast
 @pytest_parametrize(
     "src_shape,src_dim_to_broadcast,broadcast_count,src_select_index",
     [
         ((5, 7), 0, 1, None),
         ((3, 8, 11), 1, 2, 4),
-        ((8, 6), 5, 7, None),
+        pytest.param((8, 6), 5, 7, None, marks=pytest.mark.fast),
         ((13, 3, 13), 9, 12, 2),
     ],
     abbrevs=_ABBREVS,

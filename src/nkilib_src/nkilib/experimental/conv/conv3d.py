@@ -233,11 +233,16 @@ def conv3d(
             dh_group_idx = tile_cfg.dh_start
             while dh_group_idx < tile_cfg.dh_end:
                 dh_positions = []
+                first_d_out = None
                 for dh_stacked_idx in range(tile_cfg.num_dh_stacked):
                     flat_idx = dh_group_idx + dh_stacked_idx
                     if flat_idx >= tile_cfg.dh_end:
                         break
                     d_out_idx, h_out_idx = divmod(flat_idx, cfg.H_out)
+                    if first_d_out == None:
+                        first_d_out = d_out_idx
+                    elif d_out_idx != first_d_out:
+                        break  # don't cross D boundary — avoids window spanning full H
                     dh_positions.append((d_out_idx, h_out_idx))
                 num_dh_positions = len(dh_positions)
 
@@ -340,7 +345,7 @@ def conv3d(
                         )
 
                     w_out_tile_counter += 1
-                dh_group_idx += tile_cfg.num_dh_stacked
+                dh_group_idx += num_dh_positions
 
     # Free all heap allocations
     for _ in range(mem_cfg.stacked_input_interleave):
@@ -759,6 +764,12 @@ def _build_memory_config(cfg: Conv3dConfig, tile_cfg: Conv3dTileConfig, dtype_si
     per_c_out_tile_inner = effective_free_dim * dtype_size
     input_window_memory = tile_cfg.d_window_max * tile_cfg.h_chunk_h_window_max * tile_cfg.w_window_max * dtype_size
     stacked_input_memory = tile_cfg.K_outer_tile_count * effective_free_dim * dtype_size
+    bias_align_waste = _heap_align_waste(_BIAS_DTYPE_SIZE) if cfg.has_bias else 0
+    result_align_waste = _heap_align_waste(effective_free_dim * dtype_size)
+    input_window_align_waste = _heap_align_waste(input_window_memory)
+    stacked_input_align_waste = _heap_align_waste(effective_free_dim * dtype_size)
+    input_window_cost = input_window_memory + input_window_align_waste
+    stacked_input_cost = stacked_input_memory + tile_cfg.K_outer_tile_count * stacked_input_align_waste
 
     c_out_interleave = 1
     w_out_interleave = _NUM_PSUM_BANKS
@@ -772,12 +783,14 @@ def _build_memory_config(cfg: Conv3dConfig, tile_cfg: Conv3dTileConfig, dtype_si
         for try_c_out in range(tile_cfg.c_out_tile_count, 0, -1):
             if found_fit:
                 break
+            c_out_wide_try = try_c_out * tile_cfg.c_out_tile_size_max
+            filter_align_waste_try = _heap_align_waste(c_out_wide_try * dtype_size)
+            fixed_filter_align = tile_cfg.c_in_tile_count * tile_cfg.K_outer_tile_count * filter_align_waste_try
+            outer_cost = try_c_out * per_c_out_tile_outer + try_c_out * bias_align_waste + fixed_filter_align
             for try_w_out in range(_NUM_PSUM_BANKS, 0, -1):
+                inner_cost = try_w_out * try_c_out * (per_c_out_tile_inner + result_align_waste)
                 min_total = (
-                    try_c_out * per_c_out_tile_outer
-                    + try_w_out * try_c_out * per_c_out_tile_inner
-                    + min_buf_count * input_window_memory
-                    + min_buf_count * stacked_input_memory
+                    outer_cost + inner_cost + min_buf_count * input_window_cost + min_buf_count * stacked_input_cost
                 )
                 if min_total <= TOTAL_SBUF:
                     c_out_interleave, w_out_interleave = try_c_out, try_w_out
@@ -786,28 +799,41 @@ def _build_memory_config(cfg: Conv3dConfig, tile_cfg: Conv3dTileConfig, dtype_si
                     found_fit = True
                     break
 
+    kernel_assert(
+        found_fit,
+        f"Failed to find an SBUF-fitting memory configuration for conv3d. "
+        f"TOTAL_SBUF={TOTAL_SBUF}, per_c_out_tile_outer={per_c_out_tile_outer}, "
+        f"per_c_out_tile_inner={per_c_out_tile_inner}, "
+        f"input_window_cost={input_window_cost}, stacked_input_cost={stacked_input_cost}, "
+        f"c_out_tile_count={tile_cfg.c_out_tile_count}",
+    )
+
+    c_out_wide = c_out_interleave * tile_cfg.c_out_tile_size_max
+    filter_align_waste = _heap_align_waste(c_out_wide * dtype_size)
+    fixed_filter_align = tile_cfg.c_in_tile_count * tile_cfg.K_outer_tile_count * filter_align_waste
     baseline = (
         c_out_interleave * per_c_out_tile_outer
-        + w_out_interleave * c_out_interleave * per_c_out_tile_inner
-        + input_window_interleave * input_window_memory
-        + stacked_input_interleave * stacked_input_memory
+        + c_out_interleave * bias_align_waste
+        + fixed_filter_align
+        + w_out_interleave * c_out_interleave * (per_c_out_tile_inner + result_align_waste)
+        + input_window_interleave * input_window_cost
+        + stacked_input_interleave * stacked_input_cost
     )
     remaining = TOTAL_SBUF - baseline
 
-    both_cost = input_window_memory + stacked_input_memory
+    both_cost = input_window_cost + stacked_input_cost
     while remaining >= both_cost and both_cost > 0:
         input_window_interleave += 1
         stacked_input_interleave += 1
         remaining -= both_cost
-    if remaining >= stacked_input_memory and stacked_input_memory > 0:
+    if remaining >= stacked_input_cost and stacked_input_cost > 0:
         stacked_input_interleave += 1
-        remaining -= stacked_input_memory
-    elif remaining >= input_window_memory and input_window_memory > 0:
+        remaining -= stacked_input_cost
+    elif remaining >= input_window_cost and input_window_cost > 0:
         input_window_interleave += 1
-        remaining -= input_window_memory
+        remaining -= input_window_cost
 
     # Account for SBM heap alignment overhead
-    c_out_wide = c_out_interleave * tile_cfg.c_out_tile_size_max
     num_bias_allocs = c_out_interleave if cfg.has_bias else 0
     num_filter_allocs = tile_cfg.c_in_tile_count * tile_cfg.K_outer_tile_count
     num_result_allocs = w_out_interleave * c_out_interleave
@@ -815,12 +841,11 @@ def _build_memory_config(cfg: Conv3dConfig, tile_cfg: Conv3dTileConfig, dtype_si
     num_stacked_input_allocs = stacked_input_interleave * tile_cfg.K_outer_tile_count
 
     alignment_overhead = (
-        num_filter_allocs * _heap_align_waste(c_out_wide * dtype_size)
-        + num_bias_allocs * _heap_align_waste(_BIAS_DTYPE_SIZE)
-        + num_result_allocs * _heap_align_waste(effective_free_dim * dtype_size)
-        + num_input_window_allocs
-        * _heap_align_waste(tile_cfg.d_window_max * tile_cfg.h_chunk_h_window_max * tile_cfg.w_window_max * dtype_size)
-        + num_stacked_input_allocs * _heap_align_waste(effective_free_dim * dtype_size)
+        num_filter_allocs * filter_align_waste
+        + num_bias_allocs * bias_align_waste
+        + num_result_allocs * result_align_waste
+        + num_input_window_allocs * input_window_align_waste
+        + num_stacked_input_allocs * stacked_input_align_waste
     )
 
     total_memory_required = (

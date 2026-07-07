@@ -20,7 +20,7 @@ from typing import Dict, Optional
 
 import torch
 
-from ..utils.common_types import NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
+from ..utils.common_types import DtypeMode, NormType, QKVOutputLayout, QKVWeightLayout, QuantizationType
 from .qkv import SEQLEN_THRESHOLD_FOR_QKV_CTE, _attach_qk_norm_weights
 from .qkv_cte_torch import qkv_cte_torch_ref
 from .qkv_tkg_torch import qkv_tkg_torch_ref
@@ -69,6 +69,7 @@ def qkv_torch_ref(
     # --- Block KV Cache Related
     use_block_kv: bool = False,
     transpose_k_cache: bool = False,
+    fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[torch.Tensor] = None,
     store_output_in_sbuf: bool = False,
@@ -93,6 +94,7 @@ def qkv_torch_ref(
     strided_input_config=None,
     # --- Output
     output_hbm: Optional[torch.Tensor] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> Dict[str, torch.Tensor]:
     """Torch reference matching the qkv() kernel entry signature.
 
@@ -159,6 +161,11 @@ def qkv_torch_ref(
         is_h_dim_4h_transposed (bool): Whether input H-dim is pre-transposed by 4 (MX only). Default: False.
         weight_layout (QKVWeightLayout): Weight layout. Default: CONTIGUOUS.
         transposed_in (bool): When True, input is [H0, n_prgs, H1_shard, BxS]; converted to [B, S, H] internally. Default: False.
+        dtype_mode (DtypeMode): Quantization dtype policy for STATIC/ROW
+            weight tiles. Caller must pre-resolve ``DtypeMode.AUTO`` via
+            ``resolve_dtype_mode_for_torch_ref``.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
 
     Returns:
         Dict with "out" tensor, and "fused_hidden" when fused_residual_add=True.
@@ -210,6 +217,8 @@ def qkv_torch_ref(
             fused_rope=fused_rope,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
+            k_cos_cache=k_cos_cache,
+            k_sin_cache=k_sin_cache,
             d_head=d_head,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
@@ -222,14 +231,23 @@ def qkv_torch_ref(
             kv_dtype=kv_dtype,
             use_block_kv=use_block_kv,
             transpose_k_cache=transpose_k_cache,
+            fp8_packed=fp8_packed,
             block_size=block_size,
             slot_mapping=slot_mapping,
+            store_output_in_sbuf=store_output_in_sbuf,
+            sbm=sbm,
+            use_auto_allocation=use_auto_allocation,
+            load_input_with_DMA_transpose=load_input_with_DMA_transpose,
             quantization_type=quantization_type,
             qkv_w_scale=qkv_w_scale,
             qkv_in_scale=qkv_in_scale,
             is_input_swizzled=is_h_dim_4h_transposed,
+            weight_layout=weight_layout,
             qk_norm_pre_rope=qk_norm_pre_rope,
             qk_norm_post_rope=qk_norm_post_rope,
+            output_hbm=output_hbm,
+            strided_input_config=strided_input_config,
+            dtype_mode=dtype_mode,
         )
 
     return qkv_tkg_torch_ref(
@@ -253,4 +271,5 @@ def qkv_torch_ref(
         qkv_bias=bias,
         norm_bias=layer_norm_bias,
         hidden_actual=hidden_actual,
+        dtype_mode=dtype_mode,
     )

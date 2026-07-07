@@ -27,7 +27,13 @@ import nki.language as nl
 import pytest
 
 from nkilib_src.nkilib.core.mlp.mlp_parameters import TKG_BS_SEQLEN_THRESHOLD
-from nkilib_src.nkilib.core.utils.common_types import ActFnType, NormType, QuantizationType
+from nkilib_src.nkilib.core.utils.common_types import (
+    ActFnType,
+    ComputationMode,
+    MLPGateUpWeightLayout,
+    NormType,
+    QuantizationType,
+)
 from test.integration.nkilib.core.mlp.test_mlp_common import (
     _run_mlp_test,
     build_fused_norm_mlp,
@@ -91,178 +97,184 @@ LAYER_NORM_CONFIG = {
 # Parameters: vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum, rtol, norm_type, quantization_type,
 #             fused_add, store_add, skip_gate, act_fn_type, gate_bias, up_bias, down_bias, norm_bias
 MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_FALSE = [
-    [2, 1, 128, 8192, 896, 238002211, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 1024, 448, 92239439, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 1024, 448, 88019279, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 1024, 448, 92000000, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 1024, 448, 90017692, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 768, 1024, 896, 140496530, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 768, 1024, 896, 107670831, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 8192, 8192, 448, 4296859369, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 8192, 8192, 448, 2520729395, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 16384, 832, 756458068, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 16384, 832, 895261601, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 1024, 16384, 416, 882105371, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 1024, 16384, 416, 1176268151, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 8192, 448, 278000000, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 8192, 8192, 448, 4780395634, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 8192, 8192, 448, 3784829419, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 1024, 16384, 416, 1000000000, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 1024, 16384, 416, 1246253552, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 8192, 8192, 448, 2737231223, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 8192, 8192, 448, 2127094342, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 16384, 416, 595047246, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 1024, 16384, 416, 755884001, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 2, 8192, 8192, 448, 5298071805, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 4, 8192, 8192, 448, 8376700327, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 2, 1024, 16384, 416, 1111000000, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 4, 1024, 16384, 416, 2557272337, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 128, 8192, 896, 258002211, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 128, 8192, 896, 258002211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 2048, 8448, 1408, 1437844003, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 2048, 8448, 1408, 1603737495, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 4096, 8192, 448, 941321030, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 4096, 8192, 448, 1176746495, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 4096, 8192, 448, 1297751306, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 128, 7168, 364, 1.52e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 128, 7168, 364, 1.21e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 256, 7168, 364, 1.59e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 256, 7168, 364, 1.41e8, 2e-2, NormType.RMS_NORM_SKIP_GAMMA, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 256, 7168, 1536, 281286893, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 256, 7168, 1536, 258002211, 2e-2, NormType.RMS_NORM_SKIP_GAMMA, QuantizationType.NONE, True, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 256, 7168, 1536, 258002211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 578, 1408, 352, 66365979, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.SiLU, False, False, False, False],
-    [1, 1, 578, 1408, 352, 66340813, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, False, False, False],
-    [2, 1, 578, 1408, 352, 65561487, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 578, 1408, 352, 66839480, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, False, False, False],
-    [1, 1, 578, 1408, 352, 71063222, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.SiLU, False, True, True, False],
-    [1, 1, 578, 1408, 352, 71242055, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, True, True, False],
-    [2, 1, 578, 1408, 352, 69290891, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.SiLU, False, True, True, False],
-    [2, 1, 578, 1408, 352, 71074390, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, True, True, False],
-    [1, 1, 578, 1408, 352, 81643622, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, True, True, False],
-    [2, 1, 578, 1408, 352, 81231123, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, True, True, False],
-    [1, 1, 578, 1408, 352, 84836617, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.GELU, False, False, False, False],
-    [2, 1, 578, 1408, 352, 81332790, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.GELU, False, False, False, False],
-    [1, 1, 578, 1408, 352, 93398179, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, True, ActFnType.SiLU, False, True, True, False],
-    [2, 1, 578, 1408, 352, 83390954, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, True, ActFnType.SiLU, False, True, True, False],
-    [1, 1, 578, 1408, 352, 97224098, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.GELU, False, True, True, False],
-    [2, 1, 578, 1408, 352, 88505279, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.GELU, False, True, True, False],
-    [1, 1, 578, 1408, 352, 90984235, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU_Tanh_Approx, False, True, True, False],
-    [2, 1, 578, 1408, 352, 83078600, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU_Tanh_Approx, False, True, True, False],
-    [1, 1, 578, 1408, 352, 91208523, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, True, False, False],
-    [2, 1, 578, 1408, 352, 75500049, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, True, ActFnType.GELU, False, True, False, False],
-    [1, 1, 578, 1408, 352, 93929554, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, True, ActFnType.GELU, False, False, True, False],
-    [2, 1, 578, 1408, 352, 79235293, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, False, True, False],
-    [1, 14, 578, 1408, 352, 564325284, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, True, False, False],
-    [2, 14, 578, 1408, 352, 351045201, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, True, False, False],
-    [1, 1, 578, 1408, 352, 105467001, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, True, True, True],
-    [1, 1, 578, 1408, 352, 109600578, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, True, True, True, ActFnType.GELU, False, True, True, True],
-    [2, 1, 578, 1408, 352, 98436096, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, False, False, True, ActFnType.GELU, False, True, True, True],
-    [2, 1, 578, 1408, 352, 105223169, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, True, True, True, ActFnType.GELU, False, True, True, True],
-    [2, 1, 36864, 8192, 512, 8367215426, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.GELU, False, False, False, False],
-    [2, 1, 512, 8192, 3584, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 128, 8192, 896, 238002211, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 1024, 448, 92239439, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 1024, 448, 88019279, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 1024, 448, 92000000, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 1024, 448, 90017692, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 768, 1024, 896, 140496530, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 768, 1024, 896, 107670831, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 8192, 8192, 448, 4296859369, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 8192, 8192, 448, 2520729395, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 16384, 832, 756458068, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 16384, 832, 895261601, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 1024, 16384, 416, 882105371, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 1024, 16384, 416, 1176268151, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 8192, 448, 278000000, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 8192, 8192, 448, 4780395634, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 8192, 8192, 448, 3784829419, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 1024, 16384, 416, 1000000000, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 1024, 16384, 416, 1246253552, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 8192, 8192, 448, 2737231223, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 8192, 8192, 448, 2127094342, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 16384, 416, 595047246, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 16384, 416, 755884001, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [2, 2, 8192, 8192, 448, 5298071805, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [2, 4, 8192, 8192, 448, 8376700327, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [2, 2, 1024, 16384, 416, 1111000000, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [2, 4, 1024, 16384, 416, 2557272337, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 128, 8192, 896, 258002211, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 128, 8192, 896, 258002211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 2048, 8448, 1408, 1437844003, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 2048, 8448, 1408, 1603737495, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 4096, 8192, 448, 941321030, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 4096, 8192, 448, 1176746495, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 4096, 8192, 448, 1297751306, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 128, 7168, 364, 1.52e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 128, 7168, 364, 1.21e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 256, 7168, 364, 1.59e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    pytest.param(2, 1, 256, 7168, 364, 1.41e8, 2e-2, NormType.RMS_NORM_SKIP_GAMMA, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
+    pytest.param(2, 1, 256, 7168, 1536, 281286893, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
+    [2, 1, 256, 7168, 1536, 258002211, 2e-2, NormType.RMS_NORM_SKIP_GAMMA, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 256, 7168, 1536, 258002211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 578, 1408, 352, 66365979, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.SiLU, False, False, False, False],
+    [1, 1, 578, 1408, 352, 66340813, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, False, False, False],
+    [2, 1, 578, 1408, 352, 65561487, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 578, 1408, 352, 66839480, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, False, False, False],
+    [1, 1, 578, 1408, 352, 71063222, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.SiLU, False, True, True, False],
+    [1, 1, 578, 1408, 352, 71242055, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, True, False],
+    [2, 1, 578, 1408, 352, 69290891, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.SiLU, False, True, True, False],
+    [2, 1, 578, 1408, 352, 71074390, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, True, False],
+    pytest.param(1, 1, 578, 1408, 352, 81643622, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, True, True, False, marks=pytest.mark.fast),
+    [2, 1, 578, 1408, 352, 81231123, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, True, True, False],
+    [1, 1, 578, 1408, 352, 84836617, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.GELU, False, False, False, False],
+    [2, 1, 578, 1408, 352, 81332790, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.GELU, False, False, False, False],
+    [1, 1, 578, 1408, 352, 93398179, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, True, ActFnType.SiLU, False, True, True, False],
+    [2, 1, 578, 1408, 352, 83390954, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, True, ActFnType.SiLU, False, True, True, False],
+    [1, 1, 578, 1408, 352, 97224098, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.GELU, False, True, True, False],
+    [2, 1, 578, 1408, 352, 88505279, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.GELU, False, True, True, False],
+    [1, 1, 578, 1408, 352, 90984235, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU_Tanh_Approx, False, True, True, False],
+    [2, 1, 578, 1408, 352, 83078600, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU_Tanh_Approx, False, True, True, False],
+    [1, 1, 578, 1408, 352, 91208523, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, False, False],
+    [2, 1, 578, 1408, 352, 75500049, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, True, ActFnType.GELU, False, True, False, False],
+    pytest.param(1, 1, 578, 1408, 352, 93929554, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, True, ActFnType.GELU, False, False, True, False, marks=pytest.mark.fast),
+    [2, 1, 578, 1408, 352, 79235293, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, False, True, False],
+    [1, 14, 578, 1408, 352, 564325284, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, False, False],
+    [2, 14, 578, 1408, 352, 351045201, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, False, False],
+    pytest.param(1, 1, 578, 1408, 352, 105467001, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, True, True, marks=pytest.mark.fast),
+    [1, 1, 578, 1408, 352, 109600578, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, True, ActFnType.GELU, False, True, True, True],
+    [2, 1, 578, 1408, 352, 98436096, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, True, True],
+    [2, 1, 578, 1408, 352, 105223169, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, True, ActFnType.GELU, False, True, True, True],
+    [2, 1, 36864, 8192, 512, 8367215426, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.GELU, False, False, False, False],
+    [2, 1, 512, 8192, 3584, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
 ]
 
 MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_TRUE = [
-    [2, 1, 10240, 3072, 112, 638_002_211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 10240, 3072, 2160, 6_638_002_211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 128, 8192, 896, 238002211, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 1024, 448, 92239439, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 1024, 448, 88019279, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 1024, 448, 92000000, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 1024, 448, 90017692, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 768, 1024, 896, 140496530, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 768, 1024, 896, 107670831, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 8192, 8192, 448, 4296859369, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 8192, 8192, 448, 2520729395, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 16384, 832, 756458068, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 16384, 832, 895261601, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 1024, 16384, 416, 882105371, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 1024, 16384, 416, 1176268151, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 8192, 448, 278000000, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 8192, 8192, 448, 4780395634, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 8192, 8192, 448, 3784829419, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 1024, 16384, 416, 1140095218, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 1024, 16384, 416, 1246253552, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 8192, 8192, 448, 2737231223, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 8192, 8192, 448, 2127094342, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 16384, 416, 595047246, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 1024, 16384, 416, 755884001, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [2, 2, 8192, 8192, 448, 5298071805, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [2, 4, 8192, 8192, 448, 8376700327, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [2, 2, 1024, 16384, 416, 1118514002, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [2, 4, 1024, 16384, 416, 2557272337, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 128, 8192, 896, 258002211, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 128, 8192, 896, 258002211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, True, True, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 2048, 8448, 1408, 1437844003, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 2048, 8448, 1408, 1603737495, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 4096, 8192, 448, 941321030, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 4096, 8192, 448, 1176746495, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 4096, 8192, 448, 1297751306, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 128, 7168, 364, 1.52e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 128, 7168, 364, 1.21e8, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 256, 7168, 364, 1.59e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [2, 1, 256, 7168, 364, 1.41e8, 2e-2, NormType.RMS_NORM_SKIP_GAMMA, QuantizationType.NONE, True, False, False, ActFnType.SiLU, True, False, False, False],
-    [1, 1, 578, 1408, 352, 81643622, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, True, True, False],
-    [2, 1, 578, 1408, 352, 81231123, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.SiLU, True, True, True, False],
-    [1, 1, 578, 1408, 352, 84836617, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.GELU, True, False, False, False],
-    [2, 1, 578, 1408, 352, 81332790, 2e-2, NormType.NO_NORM, QuantizationType.NONE, False, False, False, ActFnType.GELU, True, False, False, False],
-    [1, 1, 578, 1408, 352, 99168579, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.GELU, True, True, True, False],
-    [2, 1, 578, 1408, 352, 88505279, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, ActFnType.GELU, True, True, True, False],
+    pytest.param(2, 1, 10240, 3072, 112, 638_002_211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
+    [2, 1, 10240, 3072, 2160, 6_638_002_211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 128, 8192, 896, 238002211, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 1024, 448, 92239439, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 1024, 448, 88019279, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 1024, 448, 92000000, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 1024, 448, 90017692, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 768, 1024, 896, 140496530, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 768, 1024, 896, 107670831, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 8192, 8192, 448, 4296859369, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 8192, 8192, 448, 2520729395, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 16384, 832, 756458068, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 16384, 832, 895261601, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 1024, 16384, 416, 882105371, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 1024, 16384, 416, 1176268151, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 8192, 448, 278000000, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 8192, 8192, 448, 4780395634, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 8192, 8192, 448, 3784829419, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 1024, 16384, 416, 1140095218, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 1024, 16384, 416, 1246253552, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 8192, 8192, 448, 2737231223, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 8192, 8192, 448, 2127094342, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 16384, 416, 595047246, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 1024, 16384, 416, 755884001, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [2, 2, 8192, 8192, 448, 5298071805, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [2, 4, 8192, 8192, 448, 8376700327, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [2, 2, 1024, 16384, 416, 1118514002, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [2, 4, 1024, 16384, 416, 2557272337, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 128, 8192, 896, 258002211, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 128, 8192, 896, 258002211, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 512, 1024, 448, 80453957, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 512, 1024, 448, 82809370, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [1, 1, 128, 8192, 896, 210306921, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 2048, 8448, 1408, 1437844003, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 2048, 8448, 1408, 1603737495, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 4096, 8192, 448, 941321030, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 4096, 8192, 448, 1176746495, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 4096, 8192, 448, 1297751306, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 128, 7168, 364, 1.52e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 128, 7168, 364, 1.21e8, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, False, False, False],
+    [2, 1, 256, 7168, 364, 1.59e8, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False],
+    pytest.param(2, 1, 256, 7168, 364, 1.41e8, 2e-2, NormType.RMS_NORM_SKIP_GAMMA, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.SiLU, True, False, False, False, marks=pytest.mark.fast),
+    pytest.param(1, 1, 578, 1408, 352, 81643622, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, True, True, False, marks=pytest.mark.fast),
+    [2, 1, 578, 1408, 352, 81231123, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, True, True, True, False],
+    [1, 1, 578, 1408, 352, 84836617, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.GELU, True, False, False, False],
+    [2, 1, 578, 1408, 352, 81332790, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.GELU, True, False, False, False],
+    [1, 1, 578, 1408, 352, 99168579, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.GELU, True, True, True, False],
+    [2, 1, 578, 1408, 352, 88505279, 2e-2, NormType.RMS_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, False, False, ActFnType.GELU, True, True, True, False],
 ]
 
 ceilalign = lambda n, a: math.ceil(n / a) * a
 
 MLP_CTE_UNIT_TEST_CASES_ROW_QUANT = [
-    [2, 1, 1024, 16384, ceilalign(896, 128), 5.42e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 512, 16384, ceilalign(896, 128), 5.44e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 1, 256, 16384, ceilalign(896, 128), 8.05e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 4, 1024, 16384, ceilalign(896, 128), 1.96e9, 4e-2, NormType.NO_NORM, QuantizationType.ROW, False, False, False, ActFnType.SiLU, False, False, False, False],
-    [2, 2, 1024, 16384, ceilalign(896, 128), 1.01e9, 4e-2, NormType.NO_NORM, QuantizationType.ROW, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 16384, ceilalign(896, 128), 5.42e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 512, 16384, ceilalign(896, 128), 5.44e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    pytest.param(2, 1, 256, 16384, ceilalign(896, 128), 8.05e8, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
+    [2, 4, 1024, 16384, ceilalign(896, 128), 1.96e9, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 2, 1024, 16384, ceilalign(896, 128), 1.01e9, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
 ]
 
 MLP_CTE_UNIT_TEST_CASES_STATIC_QUANT = [
     # Llama 3.3 70B
-    [2, 1, 10240, 8192, ceilalign(1792, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+    [2, 1, 10240, 8192, ceilalign(1792, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
     # Qwen 3 32B
-    [2, 1, 10240, 5120, ceilalign(3200, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
-    [2, 1, 10240, 5120, ceilalign(1600, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+    [2, 1, 10240, 5120, ceilalign(3200, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
+    [2, 1, 10240, 5120, ceilalign(1600, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
 ]
 
 # Slow-compile
 MLP_CTE_UNIT_TEST_CASES_STATIC_QUANT_SLOW = [
     # Llama 3.3 70B
-    [2, 1, 10240, 8192, ceilalign(7168, 256), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP4
-    [2, 1, 10240, 8192, ceilalign(3584, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
+    [2, 1, 10240, 8192, ceilalign(7168, 256), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP4
+    [2, 1, 10240, 8192, ceilalign(3584, 128), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
     # Qwen 3 32B
-    [2, 1, 10240, 5120, ceilalign(6400, 256), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP4
+    [2, 1, 10240, 5120, ceilalign(6400, 256), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP4
 ]
 
 MLP_CTE_UNIT_TEST_CASES_STATIC_MX_QUANT = [
     # Llama 3.3 70B
-    [2, 1, 10240, 8192, ceilalign(7168, 1024), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP4
-    [2, 1, 10240, 8192, ceilalign(3584, 512), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
-    [2, 1, 10240, 8192, ceilalign(1792, 512), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+    [2, 1, 10240, 8192, ceilalign(7168, 1024), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_INNERMOST, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP4
+    [2, 1, 10240, 8192, ceilalign(3584, 512), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_INNERMOST, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
+    [2, 1, 10240, 8192, ceilalign(1792, 512), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_INNERMOST, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
     # Qwen 3 32B
-    [2, 1, 10240, 5120, ceilalign(6400, 1024), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP4
-    [2, 1, 10240, 5120, ceilalign(3200, 512), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
-    [2, 1, 10240, 5120, ceilalign(1600, 512), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+    [2, 1, 10240, 5120, ceilalign(6400, 1024), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_INNERMOST, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP4
+    [2, 1, 10240, 5120, ceilalign(3200, 512), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_INNERMOST, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP8
+    [2, 1, 10240, 5120, ceilalign(1600, 512), None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_INNERMOST, False, False, False, ActFnType.SiLU, False, False, False, False],  # TP16
+
+    # H_X4_MIDDLE
+    [2, 1, 1024, 2048, 2048, None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_MIDDLE, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 1024, 2048, 5120, None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_MIDDLE, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 896, 3584, 2048, None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_MIDDLE, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 768, 3584, 2048, None, 3e-2, NormType.NO_NORM, QuantizationType.STATIC_MX, MLPGateUpWeightLayout.H_X4_MIDDLE, False, False, False, ActFnType.SiLU, False, False, False, False],
 ]
 # fmt: on
 
@@ -271,7 +283,7 @@ MLP_CTE_UNIT_TEST_CASES_STATIC_MX_QUANT = [
 # fmt: off
 CTE_UNIT_PARAM_NAMES = (
     "vnc_degree, batch, seqlen, hidden, intermediate, tpbSgCyclesSum, rtol, "
-    "norm_type, quant_type, fused_add, store_add, skip_gate, act_fn_type, "
+    "norm_type, quant_type, gate_up_w_layout, fused_add, store_add, skip_gate, act_fn_type, "
     "gate_bias, up_bias, down_bias, norm_bias"
 )
 # fmt: on
@@ -285,6 +297,7 @@ _CTE_ABBREVS = {
     "intermediate": "i",
     "norm_type": "n_t",
     "quant_type": "q_t",
+    "gate_up_w_layout": "gu_l",
     "fused_add": "fa",
     "store_add": "sa",
     "skip_gate": "skip_gate",
@@ -307,20 +320,7 @@ _ALL_CTE_UNIT_RAW_VECTORS = (
 # Dedup fast vectors, then combine with full-only vectors (which don't get the fast mark)
 _ALL_CTE_UNIT_RAW_VECTORS = dedup_test_vectors(_ALL_CTE_UNIT_RAW_VECTORS, ignore_indices={0, 5})
 
-# (seqlen, hidden, intermediate) keys for full-only tests (excluded from fast suite)
-_FULL_ONLY_KEYS = {
-    (10240, 8192, 1792),
-    (10240, 5120, 3200),
-    (1024, 16384, 896),
-    (10240, 5120, 1664),
-    (8192, 8192, 448),
-    (36864, 8192, 512),
-}
-
-_ALL_CTE_UNIT_PARAMS = [
-    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[2:5]) not in _FULL_ONLY_KEYS else c
-    for c in _ALL_CTE_UNIT_RAW_VECTORS
-] + MLP_CTE_UNIT_TEST_CASES_STATIC_QUANT_SLOW
+_ALL_CTE_UNIT_PARAMS = list(_ALL_CTE_UNIT_RAW_VECTORS) + MLP_CTE_UNIT_TEST_CASES_STATIC_QUANT_SLOW
 
 
 # ----------------------------------------------------
@@ -396,6 +396,8 @@ class TestMlpCteKernel:
             up_bias=d["up_bias"],
             down_bias=d["down_bias"],
             norm_bias=d["norm_bias"],
+            mode=ComputationMode.PREFILL,
+            gate_up_w_layout=d["gate_up_w_layout"],
             tensor_generator=tensor_generator,
         )
         # Add missing params that mlp() kernel accepts but build_fused_norm_mlp doesn't produce
@@ -418,6 +420,7 @@ class TestMlpCteKernel:
         rtol,
         norm_type,
         quant_type,
+        gate_up_w_layout,
         fused_add,
         store_add,
         skip_gate,
@@ -440,6 +443,7 @@ class TestMlpCteKernel:
             rtol=rtol,
             norm_type=norm_type,
             quant_type=quant_type,
+            gate_up_w_layout=gate_up_w_layout,
             fused_add=fused_add,
             store_add=store_add,
             skip_gate=skip_gate,
@@ -559,6 +563,7 @@ class TestMlpCteKernel:
             up_bias=up_bias,
             down_bias=down_bias,
             norm_bias=norm_bias,
+            gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
             tensor_generator=tensor_generator,
         )
         kernel_input["quant_clipping_bound"] = 0.0
@@ -667,6 +672,7 @@ class TestMlpCteKernel:
             up_bias=up_bias,
             down_bias=down_bias,
             norm_bias=norm_bias,
+            gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
             tensor_generator=tensor_generator,
         )
         kernel_input["quant_clipping_bound"] = 0.0
@@ -735,6 +741,7 @@ class TestMlpCteModel:
         rtol,
         norm_type,
         quant_type,
+        gate_up_w_layout,
         fused_add,
         store_add,
         skip_gate,

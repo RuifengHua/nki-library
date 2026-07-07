@@ -20,7 +20,14 @@ import nki.language as nl
 
 # common utils
 from ..utils.allocator import BufferManager, SbufManager
-from ..utils.common_types import ActFnType, ComputationMode, NormType, QuantizationType
+from ..utils.common_types import (
+    ActFnType,
+    ComputationMode,
+    DtypeMode,
+    MLPGateUpWeightLayout,
+    NormType,
+    QuantizationType,
+)
 from ..utils.kernel_helpers import get_verified_program_sharding_info
 from ..utils.logging import get_logger
 
@@ -71,6 +78,7 @@ def mlp(
     use_tkg_gate_up_proj_column_tiling: bool = True,
     use_tkg_down_proj_column_tiling: bool = True,
     use_tkg_down_proj_optimized_layout: bool = False,
+    use_contiguous_x4_gate_up: bool = False,
     gate_clamp_upper_limit: Optional[float] = None,
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
@@ -81,6 +89,8 @@ def mlp(
     mx_dummy_scale_hbm: Optional[nl.ndarray] = None,
     transposed_in: bool = False,
     transposed_out: bool = False,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    gate_up_w_layout: MLPGateUpWeightLayout = MLPGateUpWeightLayout.CONTIGUOUS,
 ) -> list[nl.ndarray]:
     """
     MLP (Multi-Layer Perceptron) Kernel implementation.
@@ -131,14 +141,10 @@ def mlp(
             - QuantizationType.NONE: No quantization
             - QuantizationType.STATIC: FP8 tensor-wise quantization with 2x perf mode (CTE and TKG)
             - QuantizationType.STATIC_MX: FP8 tensor-wise quantization with 4x perf mode (CTE)
-                - If using STATIC_MX in CTE mode, the up and gate weights should be swizzled as follows:
-                    H, I = w.shape
-                    w.reshape(
-                        (2, ceil(H / 512), 128, 2, ceil(I / 512), 128, 4)
-                    ).transpose(2, 1, 4, 6, 5, 0, 3).reshape((H, I))
-                - It expects the down weights to be swizzled as follows:
+                - If using STATIC_MX in CTE mode, the down weights should be swizzled as follows:
                     I, H = w.shape
-                    w.reshape((ceil(I / 512), 128, 4, H)).transpose(1, 0, 3, 2).reshape((I, H))
+                    w.reshape((ceil(I / 512), 128, 4, H)).transpose(1, 0, 3, 2).to_x4_dtype()
+                - It expects up and gate weights to be swizzled as well. See gate_up_w_layout for details.
             - QuantizationType.ROW: FP8 row-wise quantization (CTE and TKG)
             - QuantizationType.MX: MXFP quantization (MXFP4/MXFP8, TKG only)
         gate_w_scale (nl.ndarray, optional): Dequantization scales for gate weights.
@@ -190,6 +196,19 @@ def mlp(
             instead of [B, S, H]. Each NC DMAs its shard directly without transpose_store.
             Only supported in TKG mode. Not compatible with down_proj column tiling or SBUF output.
             (default: False)
+        dtype_mode (DtypeMode): Explicit FP8 E4M3 dtype selection for TKG STATIC/ROW
+            quantization weight tiles.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3``
+              elsewhere.
+            (default: DtypeMode.NON_OCP)
+        gate_up_w_layout (MLPGateUpWeightLayout): The layout of gate_proj_weights_tensor and up_proj_weights_tensor (default: CONTIGUOUS)
+            This parameter is required if quantization_type is either MX, ROW_MX, or STATIC_MX.
+            Supported values:
+            - CONTIGUOUS: Use if quantization_type is not one of MX, ROW_MX, or STATIC_MX
+            - H_X4_INNERMOST: One of two alternative MX weight layouts. More optimal if hidden_tensor is already quantized.
+            - H_X4_MIDDLE: One of two alternative MX weight layouts. More optimal if hidden_tensor is not quantized.
 
     Returns:
         list:
@@ -253,6 +272,7 @@ def mlp(
         use_tkg_gate_up_proj_column_tiling=use_tkg_gate_up_proj_column_tiling,
         use_tkg_down_proj_column_tiling=use_tkg_down_proj_column_tiling,
         use_tkg_down_proj_optimized_layout=use_tkg_down_proj_optimized_layout,
+        use_contiguous_x4_gate_up=use_contiguous_x4_gate_up,
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         gate_clamp_upper_limit=gate_clamp_upper_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
@@ -262,6 +282,8 @@ def mlp(
         mode=mode,
         transposed_in=transposed_in,
         transposed_out=transposed_out,
+        dtype_mode=dtype_mode,
+        gate_up_w_layout=gate_up_w_layout,
     )
 
     # Validate MLP arguments

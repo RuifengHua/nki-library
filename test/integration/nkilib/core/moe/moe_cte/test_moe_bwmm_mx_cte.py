@@ -21,6 +21,8 @@ from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import map_ski
 from test.integration.nkilib.core.moe.moe_cte.test_utils import (
     build_moe_bwmm_mx_cte,
     build_moe_bwmm_mx_cte_from_model_test_config,
+    gather_from_packed_down,
+    gather_from_packed_gate_up,
     order_kernel_input,
 )
 from test.utils.common_dataclasses import (
@@ -61,10 +63,10 @@ from nkilib_src.nkilib.core.moe.moe_cte.bwmm_shard_on_I_mx_torch import (
     blockwise_mm_shard_intermediate_mx_hybrid_torch_ref,
     blockwise_mm_shard_intermediate_mx_torch_ref,
 )
-from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
+from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode, QuantizationType
 
 # fmt: off
-SHARD_ON_BLOCK_PARAMS = "vnc_degree, hidden, tokens, intermediate, expert, block_size, top_k, act_fn, expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower, use_uint_weights, n_static_blocks"
+SHARD_ON_BLOCK_PARAMS = "vnc_degree, hidden, tokens, intermediate, expert, block_size, top_k, ep_degree, act_fn, expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower, use_uint_weights, unpacked_weights, n_static_blocks, use_packed_scales, quant_type"
 
 MOE_BWMM_MX_CTE_MODEL_PARAMS = "variant, vnc_degree, hidden, tokens, intermediate, expert, block_size, act_fn, expert_affinities_scaling_mode, dtype, weight_dtype, skip_mode, bias, is_dynamic, gate_clamp_upper, gate_clamp_lower, up_clamp_upper, up_clamp_lower, use_uint_weights, skewness_pct, global_top_k, ep_degree"
 
@@ -75,44 +77,56 @@ MOE_BWMM_MX_CTE_MODEL_PARAMS = "variant, vnc_degree, hidden, tokens, intermediat
 # Full-only entries: excluded from fast suite (memory >3000 MB)
 _SHARD_BLOCK_FULL_ONLY = [
     # MXFP4 test cases (blk=256)
-    [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 1536, 32, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 1024, 1536, 32, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
+    [2, 3072, 8192, 1536, 64, 256, 4, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 10240, 1536, 32, 256, 4, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 1536, 32, 256, 4, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    # Scale Packing
+    [2, 3072, 256, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, True, QuantizationType.MX],
     # MXFP4 test cases (blk=512)
-    [2, 3072, 10240, 384, 128, 512, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 384, 128, 512, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 384, 128, 512, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 384, 128, 512, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
+    [2, 3072, 10240, 384, 128, 512, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 512, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 512, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 512, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # MXFP8 e4m3fn test cases
-    [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # MXFP8 e5m2 test cases
-    [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 10240, 384, 128, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, None],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 10240, 384, 128, 256, 4, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 0, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # uint weights test cases (simulates NxD behavior: uint16 for MXFP4, uint32 for MXFP8)
-    [2, 3072, 1024, 384, 128, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, None],
-    [2, 3072, 1024, 384, 128, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, None],
-    [2, 3072, 1024, 384, 128, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, None],
-    [2, 3072, 128, 3072, 2, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, None],
+    [2, 3072, 1024, 384, 128, 256, 2, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 384, 128, 256, 2, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 384, 128, 256, 2, 1, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, False, None, False, QuantizationType.MX],
+    [2, 3072, 128, 3072, 2, 256, 2, 64, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, False, None, False, QuantizationType.MX],
     # No Bias and No Clipping
-    [2, 3072, 1024, 384, 8, 128, 4, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, None, None, None, None, False, None],
+    [2, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, None, None, None, None, False, False, None, False, QuantizationType.MX],
     # weight skipping
-    [2, 3072, 1024, 384, 16, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 1024, 384, 16, 256, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, None],
+    [2, 3072, 1024, 384, 16, 256, 2, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 384, 16, 256, 2, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 3, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    # STATIC_MX large-config
+    [2, 4096, 10240, 1536, 16, 256, 2, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
 ]
+
 
 # Fast entries (run in both fast and full suite)
 _SHARD_BLOCK_FAST_RAW = [
     # No Bias with partial Clipping
-    [2, 3072, 1024, 384, 8, 128, 4, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, None, None, False, None],
-    [2, 3072, 1024, 384, 8, 128, 4, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, False, None, None, 7.0, -7.0, False, None],
+    [2, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, None, None, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 384, 8, 128, 4, 16, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, False, None, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # n_static_blocks test cases
-    [2, 4096, 4096, 1536, 2, 256, 2, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
-    [2, 4096, 4096, 1024, 4, 256, 4, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
-    [2, 3072, 4096, 384, 2, 256, 2, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
+    [2, 4096, 4096, 1536, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, False, 2, False, QuantizationType.MX],
+    [2, 4096, 4096, 1024, 4, 256, 4, 32, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
+    [2, 3072, 4096, 384, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
+    # STATIC_MX coverage (MXFP8 e4m3fn weights, unpacked fp8 carriers, no clamp)
+    [2, 4096, 4096, 1536, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
+    [2, 4096, 4096, 1536, 2, 128, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
+    [2, 4096, 10240, 768, 4, 256, 2, 32, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 3, False, True, None, None, None, None, False, True, None, False, QuantizationType.STATIC_MX],
+    [2, 4096, 4096, 384, 16, 256, 2, 8, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, True, None, False, QuantizationType.STATIC_MX],
 ]
 
 SHARD_ON_BLOCK_UNIT_PERMS = [
@@ -124,23 +138,23 @@ SHARD_ON_BLOCK_UNIT_PERMS = [
 # ============================================================================
 
 SHARD_ON_I_UNIT_PERMS = [
-    [2, 3072, 1024, 2048, 8, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 1024, 2048, 8, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 7168, 1024, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 7168, 1024, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, None],
-    [2, 7168, 10240, 1024, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, None],
+    [2, 3072, 1024, 2048, 8, 256, 4, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 2048, 8, 256, 4, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 7168, 10240, 1024, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 7168, 10240, 1024, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 7168, 1024, 1024, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 7168, 1024, 1024, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 7168, 10240, 1024, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 7168, 10240, 1024, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
     # Alternative dtype weights test cases (simulates NxD behavior: uint16 for MXFP4, uint32 for MXFP8)
-    [2, 3072, 1024, 2048, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, None],
-    [2, 3072, 1024, 2048, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, None],
-    [2, 3072, 1024, 2048, 8, 256, 8, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, None],
-    [2, 3072, 1024, 2048, 8, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, 7.0, -7.0, False, None],
-    [2, 3072, 1024, 2048, 8, 256, 4, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, None, None, False, None],
+    [2, 3072, 1024, 2048, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 2048, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, False, 7.0, None, 7.0, -7.0, True, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 2048, 8, 256, 8, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e5m2_x4, 1, True, True, 7.0, None, 7.0, -7.0, True, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 2048, 8, 256, 4, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, 7.0, -7.0, False, False, None, False, QuantizationType.MX],
+    [2, 3072, 1024, 2048, 8, 256, 4, 16, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float4_e2m1fn_x4, 1, False, True, 7.0, None, None, None, False, False, None, False, QuantizationType.MX],
     # n_static_blocks test case
-    [2, 4096, 4096, 2048, 2, 512, 2, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
-    [2, 4096, 4096, 2048, 2, 256, 2, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, 2],
+    [2, 4096, 4096, 2048, 2, 512, 2, 64, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
+    [2, 4096, 4096, 2048, 2, 256, 2, 64, ActFnType.SiLU, ExpertAffinityScaleMode.POST_SCALE, nl.bfloat16, nl.float8_e4m3fn_x4, 1, True, True, 7.0, None, 7.0, -7.0, False, False, 2, False, QuantizationType.MX],
 ]
 # fmt: on
 
@@ -152,6 +166,7 @@ _ABBREVS = {
     "expert": "exp",
     "block_size": "blk",
     "top_k": "k",
+    "ep_degree": "ep",
     "act_fn": "act",
     "expert_affinities_scaling_mode": "eas_mode",
     "dtype": "dt",
@@ -164,23 +179,43 @@ _ABBREVS = {
     "up_clamp_upper": "ucu",
     "up_clamp_lower": "ucl",
     "use_uint_weights": "uint",
+    "unpacked_weights": "unp",
+    "use_packed_scales": "pack",
 }
 
-# Mapping from MXFP weight dtype to the alternative dtype used by NxD (torch/xla)
-_MXFP_TO_ALTERNATIVE_DTYPE = {
-    nl.float4_e2m1fn_x4: np.uint16,
-    nl.float8_e4m3fn_x4: np.uint32,
-    nl.float8_e5m2_x4: np.uint32,
+# Per-target maps from packed _x4 weight dtype to the framework's carrier dtype.
+#   "uint":         NxD torch/xla simulation (uint16 for MXFP4, uint32 for MXFP8).
+#   "unpacked_fp8": STATIC_MX path that hands the kernel scalar fp8 carriers; the
+#                   kernel's convert_to_mxfp_dtype reinterpret_casts back to _x4.
+_MX_WEIGHT_VIEW_TARGETS = {
+    "uint": {
+        nl.float4_e2m1fn_x4: np.uint16,
+        nl.float8_e4m3fn_x4: np.uint32,
+        nl.float8_e5m2_x4: np.uint32,
+    },
+    "unpacked_fp8": {
+        nl.float8_e4m3fn_x4: nl.float8_e4m3fn,
+        nl.float8_e5m2_x4: nl.float8_e5m2,
+    },
 }
 
 
-def convert_mx_weights_to_uint_dtype(kernel_input: dict, weight_dtype: Any) -> dict:
-    """Convert MX weights to alternative dtype (uint16/uint32) to simulate NxD behavior."""
-    alt_dtype = _MXFP_TO_ALTERNATIVE_DTYPE[weight_dtype]
+def convert_mx_weights_view(kernel_input: dict, weight_dtype: Any, target: str) -> dict:
+    """Reinterpret-view MX weights as the framework's carrier dtype.
+
+    ``target`` selects the dispatch table in ``_MX_WEIGHT_VIEW_TARGETS``. The view
+    aliases the underlying buffer; the kernel's ``convert_to_mxfp_dtype`` reverses
+    it at entry so the same kernel works regardless of carrier.
+    """
+    table = _MX_WEIGHT_VIEW_TARGETS[target]
+    carrier = table.get(weight_dtype)
+    assert carrier is not None, f"target={target!r} unsupported for weight_dtype={weight_dtype}"
+    if target == "unpacked_fp8":
+        carrier = dt.finfo(carrier).dtype
     result = kernel_input.copy()
-    for key in ['gate_up_proj_weight', 'down_proj_weight']:
+    for key in ('gate_up_proj_weight', 'down_proj_weight'):
         if key in result and result[key] is not None:
-            result[key] = result[key].view(alt_dtype)
+            result[key] = result[key].view(carrier)
     return result
 
 
@@ -210,6 +245,10 @@ def filter_moe_bwmm_mx_shard_block_combinations(
         and expert_affinities_scaling_mode != ExpertAffinityScaleMode.POST_SCALE
     ):
         return FilterResult.INVALID
+    # STATIC_MX uses the dummy-127 per-block scale path; the packed per-block scale
+    # layout is unused there, so this combo is rejected by a kernel_assert.
+    if kwargs.get("use_packed_scales") and kwargs.get("quant_type") == QuantizationType.STATIC_MX:
+        return FilterResult.INVALID
     if hidden is not None and (not (512 <= hidden <= 8192) or hidden % 512 != 0):
         return FilterResult.INVALID
     if block_size is not None and block_size % 128 != 0:
@@ -217,12 +256,18 @@ def filter_moe_bwmm_mx_shard_block_combinations(
     if intermediate is not None:
         if intermediate % 16 != 0:
             return FilterResult.INVALID
-        if not (intermediate % 512 == 0 or (intermediate < 512 and intermediate % 32 == 0)):
+        # Kernel supports multiples of 512 (whole I-tiles), partial last I-tile with
+        # alignment % (_q_width * _q_height) = 32, and small I with I % 32 == 0.
+        if not (
+            intermediate % 512 == 0
+            or (intermediate > 512 and intermediate % 32 == 0)
+            or (intermediate < 512 and intermediate % 32 == 0)
+        ):
             return FilterResult.INVALID
 
-    # skip_mode 3 (weight skipping on static blocks) only supported when I_TP <= 512
-    if skip_mode is not None and skip_mode == 3 and intermediate is not None and intermediate > 512:
-        return FilterResult.INVALID
+    # TODO: Add a proper SBUF budget check in the kernel instead of hard-coding this combo.
+    if hidden == 3584 and intermediate == 1536 and block_size == 512:
+        return FilterResult.REDUNDANT
 
     return FilterResult.VALID
 
@@ -256,13 +301,17 @@ def _gen_block_inputs(
     up_clamp_upper: float,
     up_clamp_lower: float,
     use_uint_weights: bool = False,
+    unpacked_weights: bool = False,
     top_k: int = None,
     n_static_blocks: int = None,
     skewness_pct: float = None,
     global_top_k: int = None,
-    ep_degree: int = None,
+    ep_degree: int = 1,
+    use_packed_scales: bool = False,
+    quantization_type: QuantizationType = QuantizationType.MX,
 ) -> dict:
     assert skewness_pct is not None or top_k is not None, "Either skewness_pct or top_k must be provided"
+    assert not (use_uint_weights and unpacked_weights), "use_uint_weights and unpacked_weights are mutually exclusive"
     if skewness_pct is not None:
         ki = build_moe_bwmm_mx_cte_from_model_test_config(
             H=hidden,
@@ -285,6 +334,8 @@ def _gen_block_inputs(
             gate_clamp_lower_limit=gate_clamp_lower,
             up_clamp_upper_limit=up_clamp_upper,
             up_clamp_lower_limit=up_clamp_lower,
+            use_packed_scales=use_packed_scales,
+            quantization_type=quantization_type,
         )
     else:
         ki = build_moe_bwmm_mx_cte(
@@ -302,32 +353,66 @@ def _gen_block_inputs(
             expert_affinities_scaling_mode=expert_affinities_scaling_mode,
             is_dynamic=is_dynamic,
             vnc_degree=vnc_degree,
-            n_dynamic_blocks=55,
+            n_dynamic_blocks=-1,
             gate_clamp_upper_limit=gate_clamp_upper,
             gate_clamp_lower_limit=gate_clamp_lower,
             up_clamp_upper_limit=up_clamp_upper,
             up_clamp_lower_limit=up_clamp_lower,
             n_static_blocks=n_static_blocks,
+            use_packed_scales=use_packed_scales,
+            quantization_type=quantization_type,
         )
     ordered = order_kernel_input(ki, variant='shard_on_block_mx')
+    # Forward routing shape to the kernel for its best-case static-block estimate.
+    ordered['top_k'] = global_top_k if skewness_pct is not None else top_k
+    ordered['ep_degree'] = ep_degree
     if use_uint_weights:
-        ordered = convert_mx_weights_to_uint_dtype(ordered, weight_dtype)
+        ordered = convert_mx_weights_view(ordered, weight_dtype, target="uint")
+    elif unpacked_weights:
+        ordered = convert_mx_weights_view(ordered, weight_dtype, target="unpacked_fp8")
     return ordered
 
 
 def _mx_torch_ref_wrapper(torch_ref_func) -> callable:
-    """Custom torch_ref_wrapper that handles uint16 MX weights (NxD simulation)."""
+    """Custom torch_ref_wrapper that handles uint16 MX weights (NxD simulation).
+
+    When ``use_packed_scales=True`` is in kwargs (forwarded by the test input
+    dict), gather both scale tensors back to the standard 16-partition layout
+    before invoking the reference. The reference is layout-agnostic of packing
+    and never sees the kernel-only flag.
+    """
     base_wrapper = torch_ref_wrapper(torch_ref_func)
     import functools
 
     @functools.wraps(torch_ref_func)
     def wrapped(**kwargs):
-        # Convert uint16/uint32 weights to x4 dtype before base wrapper processes them
+        # View framework-carrier weights (uint16/uint32 NxD or unpacked fp8 STATIC_MX)
+        # back to the packed _x4 dtype before the base wrapper processes them.
+        wdt = kwargs.get('weight_dtype')
+        unpacked_fp8_dtypes = {
+            np.dtype(dt.finfo(unp).dtype) for unp in _MX_WEIGHT_VIEW_TARGETS["unpacked_fp8"].values()
+        }
+        carrier_dtypes = {np.dtype(np.uint16), np.dtype(np.uint32)} | unpacked_fp8_dtypes
         for key in ('gate_up_proj_weight', 'down_proj_weight'):
-            if key in kwargs and isinstance(kwargs[key], np.ndarray) and kwargs[key].dtype in (np.uint16, np.uint32):
-                wdt = kwargs.get('weight_dtype')
-                if wdt is not None:
-                    kwargs[key] = kwargs[key].view(np.dtype(wdt))
+            arr = kwargs.get(key)
+            if isinstance(arr, np.ndarray) and arr.dtype in carrier_dtypes and wdt is not None:
+                kwargs[key] = arr.view(np.dtype(wdt))
+        # Strip the kernel-only flag and gather packed scales back to the standard
+        # layout for the reference.
+        if kwargs.pop('use_packed_scales', False):
+            gup_w = kwargs.get('gate_up_proj_weight')
+            assert gup_w is not None, "need gate_up_proj_weight to determine n_H512_tile"
+            # gate_up_proj_weight shape: (E, _pmax, 2, n_H512_tile, I)
+            n_H512_tile = gup_w.shape[3]
+            kwargs['gate_up_proj_scale'] = gather_from_packed_gate_up(kwargs['gate_up_proj_scale'], n_H512_tile)
+            dwn_w = kwargs.get('down_proj_weight')
+            assert dwn_w is not None, "need down_proj_weight to determine n_I512_tile / p_scale"
+            # down_proj_weight shape: (E, p_I, n_total_I512_tile, H);
+            # standard scale shape: (E, p_I // _q_height, n_total_I512_tile, H)
+            n_I512_tile = dwn_w.shape[2]
+            p_I = dwn_w.shape[1]
+            p_scale = p_I // 8  # _q_height
+            kwargs['down_proj_scale'] = gather_from_packed_down(kwargs['down_proj_scale'], n_I512_tile, p_scale=p_scale)
         return base_wrapper(**kwargs)
 
     return wrapped
@@ -406,6 +491,10 @@ def _gen_I_inputs(
             n_static_blocks=n_static_blocks,
         )
     variant = 'shard_on_I_mx_hybrid' if is_dynamic else 'shard_on_I_mx'
+    # Shard-on-I kernel doesn't accept STATIC_MX kwargs (no STATIC_MX path yet);
+    # build_moe_bwmm_mx_cte always emits these, so strip them here.
+    for k in ('quantization_type', 'gate_up_in_scale', 'down_in_scale'):
+        ki.pop(k, None)
     return order_kernel_input(ki, variant=variant)
 
 
@@ -486,6 +575,7 @@ class TestMoeBwmmMxShardBlockKernel:
         expert: int,
         block_size: int,
         top_k: int,
+        ep_degree: int,
         act_fn: ActFnType,
         expert_affinities_scaling_mode: ExpertAffinityScaleMode,
         dtype: Any,
@@ -498,7 +588,10 @@ class TestMoeBwmmMxShardBlockKernel:
         up_clamp_upper: float,
         up_clamp_lower: float,
         use_uint_weights: bool,
+        unpacked_weights: bool,
         n_static_blocks: int,
+        use_packed_scales: bool,
+        quant_type: QuantizationType,
     ):
         """Unit test for MoE BWMM MX CTE kernel with manual test vectors."""
 
@@ -511,6 +604,7 @@ class TestMoeBwmmMxShardBlockKernel:
                 expert=expert,
                 block_size=block_size,
                 top_k=top_k,
+                ep_degree=ep_degree,
                 act_fn=act_fn,
                 expert_affinities_scaling_mode=expert_affinities_scaling_mode,
                 dtype=dtype,
@@ -523,10 +617,17 @@ class TestMoeBwmmMxShardBlockKernel:
                 up_clamp_upper=up_clamp_upper,
                 up_clamp_lower=up_clamp_lower,
                 use_uint_weights=use_uint_weights,
+                unpacked_weights=unpacked_weights,
                 n_static_blocks=n_static_blocks,
+                use_packed_scales=use_packed_scales,
+                quantization_type=quant_type,
             )
 
-        compiler_args = CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target)
+        compiler_args = CompilerArgs(
+            logical_nc_config=vnc_degree,
+            platform_target=platform_target,
+            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+        )
 
         def out_desc(ki):
             return _block_output(ki, tokens, hidden, dtype, skip_mode, top_k != 1, vnc_degree)
@@ -574,7 +675,7 @@ class TestMoeBwmmMxShardBlockKernel:
         # change back to 6144 upper bound after accuracy issue is resolved. NKI-1582
         hidden=BoundedRange([1536, 3072] + random.sample(range(1024, 4096, 512), 2), boundary_values=[]),
         tokens=BoundedRange([1024, 10240, 32768] + random.sample([2048, 4096, 8192], 2), boundary_values=[]),
-        intermediate=BoundedRange([384, 512, 1536], boundary_values=[100, 15, 768]),
+        intermediate=BoundedRange([384, 512, 768, 1536], boundary_values=[100, 15]),
         expert=BoundedRange([8, 16, 32, 128], boundary_values=[]),
         block_size=BoundedRange([128, 256, 512], boundary_values=[64]),
         top_k=BoundedRange([2, 3, 4, 5], boundary_values=[1]),
@@ -582,9 +683,11 @@ class TestMoeBwmmMxShardBlockKernel:
         expert_affinities_scaling_mode=BoundedRange([ExpertAffinityScaleMode.POST_SCALE], boundary_values=[]),
         dtype=BoundedRange([nl.bfloat16], boundary_values=[]),
         weight_dtype=BoundedRange([nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4, nl.float8_e5m2_x4], boundary_values=[]),
-        skip_mode=BoundedRange([0, 1], boundary_values=[]),
+        skip_mode=BoundedRange([0, 1, 3], boundary_values=[]),
         bias=BoundedRange([True], boundary_values=[]),
         is_dynamic=BoundedRange([False, True], boundary_values=[]),
+        use_packed_scales=BoundedRange([False, True], boundary_values=[]),
+        quant_type=BoundedRange([QuantizationType.MX, QuantizationType.STATIC_MX], boundary_values=[]),
         filter=filter_moe_bwmm_mx_shard_block_combinations,
         coverage="pairs",
         abbrev=_ABBREVS,
@@ -607,6 +710,8 @@ class TestMoeBwmmMxShardBlockKernel:
         skip_mode: int,
         bias: bool,
         is_dynamic: bool,
+        use_packed_scales: bool,
+        quant_type: QuantizationType,
         is_negative_test_case: bool,
     ):
         """Sweep test for MoE BWMM MX CTE kernel using coverage_parametrize."""
@@ -620,6 +725,7 @@ class TestMoeBwmmMxShardBlockKernel:
                 expert=expert,
                 block_size=block_size,
                 top_k=top_k,
+                ep_degree=128 // expert,
                 act_fn=act_fn,
                 expert_affinities_scaling_mode=expert_affinities_scaling_mode,
                 dtype=dtype,
@@ -631,6 +737,8 @@ class TestMoeBwmmMxShardBlockKernel:
                 gate_clamp_lower=None,
                 up_clamp_upper=7.0,
                 up_clamp_lower=-7.0,
+                use_packed_scales=use_packed_scales,
+                quantization_type=quant_type,
             )
 
         def out_desc(ki):
@@ -668,7 +776,11 @@ class TestMoeBwmmMxShardBlockKernel:
             output_tensor_descriptor=out_desc,
         ).run_test(
             test_config=None,
-            compiler_args=CompilerArgs(logical_nc_config=vnc_degree, platform_target=platform_target),
+            compiler_args=CompilerArgs(
+                logical_nc_config=vnc_degree,
+                platform_target=platform_target,
+                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+            ),
             rtol=5e-2,
             atol=1e-5,
             is_negative_test=is_negative_test_case,
@@ -694,6 +806,7 @@ class TestMoeBwmmMxShardIKernel:
         expert: int,
         block_size: int,
         top_k: int,
+        ep_degree: int,
         act_fn: ActFnType,
         expert_affinities_scaling_mode: ExpertAffinityScaleMode,
         dtype: Any,
@@ -706,11 +819,18 @@ class TestMoeBwmmMxShardIKernel:
         up_clamp_upper: float,
         up_clamp_lower: float,
         use_uint_weights: bool,
+        unpacked_weights: bool,
         n_static_blocks: int,
+        use_packed_scales: bool,
+        quant_type: QuantizationType,
     ):
         """Unit test for MoE BWMM MX shard-on-I kernel with manual test vectors."""
+        if quant_type != QuantizationType.MX:
+            pytest.skip("Shard-on-I kernel only supports MX quantization (no STATIC_MX path yet).")
         if vnc_degree != 2:
             pytest.skip("Shard-on-I kernel requires exactly 2 shards.")
+        if use_packed_scales:
+            pytest.skip("Shard-on-I kernel does not yet support scale packing.")
         kf = blockwise_mm_shard_intermediate_mx_hybrid if is_dynamic else blockwise_mm_shard_intermediate_mx
         tr = (
             blockwise_mm_shard_intermediate_mx_hybrid_torch_ref
@@ -975,6 +1095,30 @@ class TestMoeBwmmMxCteModel:
 
             def out_desc(ki):
                 return _block_output(ki, tokens, hidden, dtype, skip_mode, min(expert, global_top_k) > 1, vnc_degree)
+
+            is_accumulating = min(expert, global_top_k) > 1
+            custom_validation = None
+            if is_accumulating:
+                torch_ref = _mx_torch_ref_wrapper(bwmm_shard_on_block_mx_torch_ref)
+                output_placeholder = out_desc(input_gen(None))
+                validator_cls = _make_shard0_validator(
+                    torch_ref,
+                    input_gen,
+                    tokens,
+                    hidden,
+                    vnc_degree,
+                    dtype,
+                    rtol=5e-2,
+                    atol=1e-5,
+                )
+                custom_validation = ValidationArgs(
+                    golden_output={
+                        "output": CustomValidatorWithOutputTensorData(
+                            validator=validator_cls,
+                            output_ndarray=output_placeholder["output"],
+                        ),
+                    },
+                )
 
             is_accumulating = min(expert, global_top_k) > 1
             custom_validation = None

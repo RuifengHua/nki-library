@@ -62,10 +62,10 @@ FULL_PARAM_NAMES = \
     "T, E, top_k, chunk_size, in_dtype"
 FULL_TEST_PARAMS = [
     (4096,  128, 8, 4096,  "int32"),
-    (4096,  128, 8, 4096,  "float32"),
+    pytest.param(4096,  128, 8, 4096,  "float32", marks=pytest.mark.fast),
     (10240, 128, 4, 10240, "int32"),
     (10240, 128, 4, 10240, "float32"),
-    (65536, 128, 4, 16384, "int32"),
+    pytest.param(65536, 128, 4, 16384, "int32", marks=pytest.mark.fast),
     (65536, 128, 4, 16384, "float32"),
 ]
 
@@ -73,10 +73,10 @@ SUBSET_PARAM_NAMES = \
     "T, E, top_k, E_offset, E_local, chunk_size, in_dtype"
 SUBSET_TEST_PARAMS = [
     (4096,  128, 8, 0,   4,  4096,  "int32"),
-    (4096,  128, 8, 0,   4,  4096,  "float32"),
+    pytest.param(4096,  128, 8, 0,   4,  4096,  "float32", marks=pytest.mark.fast),
     (10240, 128, 4, 16,  16, 10240, "int32"),
     (10240, 128, 4, 16,  16, 10240, "float32"),
-    (65536, 128, 4, 32,  16, 16384, "int32"),
+    pytest.param(65536, 128, 4, 32,  16, 16384, "int32", marks=pytest.mark.fast),
     (65536, 128, 4, 32,  16, 16384, "float32"),
     (10240, 128, 4, 120, 8,  10240, "float32"),
 ]
@@ -88,7 +88,6 @@ SUBSET_TEST_PARAMS = [
 class TestFindNonzeroIndicesKernel:
     """Test class for find_nonzero_indices kernel."""
 
-    @pytest.mark.fast
     @pytest_parametrize(FULL_PARAM_NAMES, FULL_TEST_PARAMS)
     def test_find_nonzero_indices_fast(
         self,
@@ -122,7 +121,6 @@ class TestFindNonzeroIndicesKernel:
             rtol=0,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(SUBSET_PARAM_NAMES, SUBSET_TEST_PARAMS)
     def test_find_nonzero_indices_with_col_start_fast(
         self,

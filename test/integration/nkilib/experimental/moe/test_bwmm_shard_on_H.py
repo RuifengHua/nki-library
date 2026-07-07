@@ -133,7 +133,7 @@ def build_bwmm_shard_h_inputs(
     }
 
     if checkpoint_activation:
-        inputs["gate_up_activations_T"] = np.zeros([N, 2, I_TP, B], dtype=dtype)
+        inputs["gate_up_activations_T.must_alias_input"] = np.zeros([N, 2, I_TP, B], dtype=dtype)
         inputs["down_activations"] = np.zeros([N, B, H], dtype=dtype)
 
     return inputs
@@ -156,12 +156,12 @@ TEST_PARAMS = [
 (6144,    4096,   16,     1024,       4,     336,          nl.bfloat16, 1,    ExpertAffinityScaleMode.POST_SCALE,     False),
 # K = 1
 (6144,    4096,   16,     512,        1,     336,          nl.bfloat16, 0,    ExpertAffinityScaleMode.POST_SCALE,     False),
-(5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 2,    ExpertAffinityScaleMode.POST_SCALE,     False),
+pytest.param(5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 2,    ExpertAffinityScaleMode.POST_SCALE,     False, marks=pytest.mark.fast),
 # float32
 (6144,    4096,   16,     512,        4,     336,          nl.float32,  0,    ExpertAffinityScaleMode.POST_SCALE,     False),
 # Llama 4 - OLD TP64
 (5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 0,    ExpertAffinityScaleMode.NO_SCALE,       False),
-(5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 0,    ExpertAffinityScaleMode.PRE_SCALE,      False),
+pytest.param(5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 0,    ExpertAffinityScaleMode.PRE_SCALE,      False, marks=pytest.mark.fast),
 # Llama 4 - OLD TP16
 (5120,    8192,   16,     256,        1,     512,          nl.bfloat16, 0,    ExpertAffinityScaleMode.NO_SCALE,       False),
 (5120,    8192,   16,     256,        1,     512,          nl.bfloat16, 0,    ExpertAffinityScaleMode.PRE_SCALE,      False),
@@ -189,24 +189,6 @@ TEST_PARAMS = [
 ]
 # fmt: on
 
-# (hidden, tokens, expert, block_size, top_k, intermediate) keys for full-only tests (excluded from fast suite)
-_FULL_ONLY_KEYS = {
-    (2880, 8192, 128, 512, 4, 2880),
-    (5120, 8192, 128, 256, 4, 1024),
-    (7168, 1024, 256, 512, 8, 32),
-    (5120, 8192, 16, 256, 4, 1024),
-    (7168, 1024, 256, 256, 8, 32),
-    (5120, 8192, 128, 128, 4, 64),
-    (6144, 4096, 16, 512, 4, 1024),
-    (1536, 4096, 234, 128, 7, 288),
-    (5120, 8192, 128, 256, 1, 128),
-    (5120, 8192, 128, 128, 2, 64),
-    (6144, 4096, 16, 1024, 4, 336),
-    (6144, 4096, 16, 512, 4, 336),
-}
-
-ALL_PARAMS = [pytest.param(*c, marks=pytest.mark.fast) if c[:6] not in _FULL_ONLY_KEYS else c for c in TEST_PARAMS]
-
 _ABBREVS = {
     "hidden": "hid",
     "tokens": "tok",
@@ -227,7 +209,7 @@ _ABBREVS = {
 class TestMoeBlockwiseMatMulShardH:
     """Tests for H-shard blockwise matmul kernel."""
 
-    @pytest_parametrize(PARAM_NAMES, ALL_PARAMS, abbrevs=_ABBREVS)
+    @pytest_parametrize(PARAM_NAMES, TEST_PARAMS, abbrevs=_ABBREVS)
     def test_moe_blockwise_mm_shard_h_lnc2(
         self,
         test_manager: Orchestrator,
@@ -262,6 +244,9 @@ class TestMoeBlockwiseMatMulShardH:
         def output_tensors(kernel_input):
             T_out = tokens if dma_skip.skip_token else tokens + 1
             result = {"output": np.zeros((T_out, hidden), dtype=dtype)}
+            if checkpoint_activation:
+                N = get_n_blocks(tokens, top_k, expert, block_size)
+                result["gate_up_activations_T"] = np.zeros((N, 2, intermediate, block_size), dtype=dtype)
             return result
 
         framework = UnitTestFramework(
@@ -276,8 +261,6 @@ class TestMoeBlockwiseMatMulShardH:
             compiler_args=CompilerArgs(
                 logical_nc_config=2,
                 platform_target=platform_target,
-                # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
-                additional_cmd_args=["--internal-backend-options=--skip-pass=address_rotation_sb"],
             ),
             rtol=2e-2,
             atol=1e-5,

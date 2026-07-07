@@ -142,9 +142,7 @@ def _load_slice_affinities_sbuf(expert_affinities, expert_offset_sbuf, E_L, T, i
         has_partial_tile = last_tile_T != 0
         n_full_tiles = n_T128_tiles - 1 if has_partial_tile else n_T128_tiles
 
-        expert_affinities_masked = nl.ndarray(
-            (T_par, n_T128_tiles, E_L), dtype=io_dtype, buffer=nl.sbuf, name="expert_affinities_masked"
-        )
+        expert_affinities_masked = nl.ndarray((T_par, n_T128_tiles, E_L), dtype=io_dtype, buffer=nl.sbuf)
 
         if n_full_tiles > 0:
             nisa.dma_copy(
@@ -181,9 +179,7 @@ def _slice_affinities_hbm(expert_affinities, expert_offset_sbuf, E_L, T, io_dtyp
     T_shard = T // 2 if n_prgs > 1 else T
     T_offset = T_shard * prg_id
 
-    expert_affinities_masked = nl.ndarray(
-        (T, E_L), dtype=io_dtype, buffer=nl.shared_hbm, name="expert_affinities_masked_after_E_L_slice"
-    )
+    expert_affinities_masked = nl.ndarray((T, E_L), dtype=io_dtype, buffer=nl.shared_hbm)
     nisa.dma_copy(
         src=expert_affinities.ap(
             pattern=[[E, T_shard], [1, E_L]],

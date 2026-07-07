@@ -21,10 +21,10 @@ import nki.isa as nisa
 import nki.language as nl
 
 from ...utils.allocator import BufferManager, SbufManager
-from ...utils.common_types import HiddenLayout
+from ...utils.common_types import ActFnType, NormType, QuantizationType
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
-from ...utils.logging import get_logger
+from ...utils.logging import Logger, get_logger
 from ...utils.tensor_view import TensorView
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import (
@@ -32,8 +32,11 @@ from ..mlp_parameters import (
     MLPParameters,
     mlpp_has_fused_add,
     mlpp_has_normalization,
+    mlpp_has_normalization_bias,
+    mlpp_has_projection_bias,
     mlpp_store_fused_add,
 )
+from .llama3_70b_high_batch import mlp_tkg_llama3_70b_high_batch
 from .mlp_tkg_constants import MLPTKGConstants
 from .mlp_tkg_down_projection import process_down_projection
 from .mlp_tkg_gate_up_projection import process_gate_up_projection
@@ -178,20 +181,7 @@ def _mlp_tkg_impl(
 
     # ---------------- Norm / Input Load ----------------
     if mlpp_has_normalization(params) or (not hidden.is_sbuf()):
-        input_sb_shape = (
-            (dims.H0, dims.H1_shard, dims.T)
-            if dims.hidden_layout == HiddenLayout.H0_H1_T
-            else (dims.H0, dims.T, dims.H1_shard)
-        )
-        input_sb = alloc_tensor_view(
-            sbm,
-            input_sb_shape,
-            dtype=io_dtype,
-            buffer=nl.sbuf,
-            name="input_sbuf",
-            heap=True,
-        )
-        input_norm_load(hidden, input_sb, params, dims, sbm)
+        input_sb = input_norm_load(hidden, params, dims, sbm)
     else:
         # Hidden already in SBUF — use dims.hidden_layout (defaults to H0_T_H1 if caller didn't set it)
         input_sb = hidden
@@ -308,6 +298,10 @@ def mlp_tkg(
     sbm: Optional[BufferManager] = None,
 ) -> list[nl.ndarray]:
     """Wrapper that converts to TensorView, tiles along BxS, and calls _mlp_tkg_impl per tile."""
+
+    # Dispatch to specialized Llama3-70B high-batch kernel for matching configs
+    if _is_llama3_70b_specialized_config(params):
+        return mlp_tkg_llama3_70b_high_batch(params, output_tensor_hbm, output_stored_add_tensor_hbm, sbm=sbm)
 
     # SBM setup
     if sbm is None:
@@ -426,3 +420,48 @@ def mlp_tkg(
     if mlpp_store_fused_add(params):
         output_tensors.append(output_stored_add_tensor_hbm)
     return output_tensors
+
+
+def _is_llama3_70b_specialized_config(params: MLPParameters) -> bool:
+    """Check if config matches the Llama3-70B static FP8 specialization constraints."""
+    if params.hidden_size != 8192:
+        return False
+    if params.intermediate_size != 3584:
+        return False
+    if params.output_dtype != nl.bfloat16:
+        return False
+    if params.quant_params.quantization_type != QuantizationType.STATIC:
+        return False
+    if params.norm_params.normalization_type != NormType.RMS_NORM:
+        return False
+    if params.activation_fn != ActFnType.SiLU:
+        return False
+    if mlpp_has_fused_add(params):
+        return False
+    if params.fused_add_params.store_fused_add_result:
+        return False
+    if mlpp_has_projection_bias(params):
+        return False
+    if mlpp_has_normalization_bias(params):
+        return False
+    if params.skip_gate_proj:
+        return False
+    if params.store_output_in_sbuf:
+        return False
+    if params.input_in_sbuf:
+        return False
+    if params.transposed_in or params.transposed_out:
+        return False
+    if params.use_tkg_down_proj_optimized_layout:
+        return False
+
+    # Runtime guards for the dispatch kernel's hardcoded layout assumptions
+    T = params.batch_size * params.sequence_len
+    _, lnc, _ = get_verified_program_sharding_info("mlp_tkg", (0, 1))
+    if params.shard_on_h_disabled:
+        return False
+    if lnc < 2 or T % lnc != 0:
+        return False
+    if T // lnc != BS_TILE_SIZE:
+        return False
+    return True

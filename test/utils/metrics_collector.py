@@ -66,7 +66,7 @@ class MetricName:
     HOST_LOCK_TIME = "HostLockTime"
     HOST_ARCH_VALIDATION_TIME = "HostArchValidationTime"
     CORE_ALLOCATION_TIME = "CoreAllocationTime"
-    # Core allocation sub-metrics (breakdown of CORE_ALLOCATION_TIME)
+    # Core allocation sub-metrics (components of CORE_ALLOCATION_TIME)
     CORE_LOCK_INIT_TIME = "CoreLockInitTime"
     CORE_LOCK_DEPLOY_TIME = "CoreLockDeployTime"
     CORE_LOCK_ACQUIRE_TIME = "CoreLockAcquireTime"
@@ -76,6 +76,20 @@ class MetricName:
     CORE_LOCK_CONTENTION_WAIT_TIME = "CoreLockContentionWaitTime"
     CORE_LOCK_HOLD_TIME = "CoreLockHoldTime"
     FAILED_HOSTS_COUNT = "FailedHostsCount"
+    INSTANCE_TYPE = "InstanceType"
+    # Core lock FIFO-queue fairness metrics
+    CORE_LOCK_QUEUE_WAIT_TIME = "CoreLockQueueWaitTime"
+    CORE_LOCK_QUEUE_POSITION_AT_ENQUEUE = "CoreLockQueuePositionAtEnqueue"
+    CORE_LOCK_ETA_AT_ENQUEUE = "CoreLockEtaAtEnqueue"
+    # How much longer the caller actually waited in the queue than the
+    # worst-case ETA it was first quoted at enqueue (clamped to >= 0). A
+    # non-zero value signals scheduling inefficiency: the optimistic ETA
+    # under-estimated the real wait.
+    CORE_LOCK_ETA_OVERRUN_TIME = "CoreLockEtaOverrunTime"
+    CORE_LOCK_BUMP_COUNT = "CoreLockBumpCount"
+    CORE_LOCK_REENQUEUE_COUNT = "CoreLockReenqueueCount"
+    CORE_LOCK_HOST_ROTATION_COUNT = "CoreLockHostRotationCount"
+    CORE_LOCK_DRAIN_WAIT_TIME = "CoreLockDrainWaitTime"
 
     # ==========================================================================
     # File transfer metrics
@@ -163,6 +177,13 @@ class MetricName:
     # ==========================================================================
     SEPARATED_MEMORY_TIME = "SeparatedMemoryTime"
     SEPARATED_COMPUTE_TIME = "SeparatedComputeTime"
+
+    # ==========================================================================
+    # BIR-to-NEFF S3 cache metrics
+    # ==========================================================================
+    NEFF_CACHE_LOOKUP_TIME = "NeffCacheLookupTime"
+    NEFF_CACHE_STORE_TIME = "NeffCacheStoreTime"
+    NEFF_CACHE_HIT = "NeffCacheHit"
 
     # ==========================================================================
     # Explorer upload metrics

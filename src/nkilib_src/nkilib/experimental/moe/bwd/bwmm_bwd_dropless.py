@@ -194,6 +194,7 @@ def _initialize_gradient_outputs_shard(
         e_offset = shard_E * shard_id
 
     sbm.open_scope(name="Gradient Initialization")
+    H_SHARD_OFFSET = H_PER_SHARD * shard_id
     zeros = sbm.alloc_stack(
         (T_TILE_SIZE, 1),
         dtype=expert_affinities_masked_grad.dtype,
@@ -211,7 +212,6 @@ def _initialize_gradient_outputs_shard(
                 src=zeros[0:valid_t, :],
             )
 
-    H_SHARD_OFFSET = H_PER_SHARD * shard_id
     zeros = sbm.alloc_stack(
         (H_TILE_SIZE, GATE_OR_UP_WEIGHT_COUNT, I_TP),
         dtype=gate_up_proj_weight_grad.dtype,
@@ -405,6 +405,9 @@ def _compute_down_proj_bias_grad(
     iota_vec=None,
     expert_idx_broadcast=None,
     manage_scope=True,
+    expert_affinities_masked=None,
+    E=None,
+    accumulation_dtype=None,
 ):
     """
     Compute down projection bias gradient with H-dimension sharding.
@@ -431,6 +434,9 @@ def _compute_down_proj_bias_grad(
         block_idx (int): Current block index.
         iota_vec (nl.ndarray, optional): Precomputed [0, 1, ..., TILE_SIZE-1].
         expert_idx_broadcast (nl.ndarray, optional): Precomputed (TILE_SIZE, N) broadcast of expert indices.
+        expert_affinities_masked (nl.ndarray, optional): [(T+1) * E, 1], Per-token expert affinities. When
+            provided (AFFINITY_ON_I), used to affinity-weight the down-bias gradient before reducing over tokens.
+        E (int, optional): Number of experts, used to index expert_affinities_masked (AFFINITY_ON_I only).
 
     Returns:
         None: Bias gradient accumulated in-place into down_proj_bias_grad.
@@ -451,7 +457,9 @@ def _compute_down_proj_bias_grad(
     # Allocate buffers
     grad_tiles = sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES, B_TILE_SIZE), dtype=dtype, buffer=nl.sbuf, align=32)
     reduced = sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES), dtype=nl.float32, buffer=nl.sbuf, align=32)
-    bias_grad_accum = sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES), dtype=dtype, buffer=nl.sbuf, align=32)
+    # Bias-grad accumulator precision: opt-in fp32 via accumulation_dtype (default = dtype, baseline).
+    bias_accum_dtype = accumulation_dtype if accumulation_dtype is not None else dtype
+    bias_grad_accum = sbm.alloc_stack((H_TILE_SIZE, NUM_H_TILES), dtype=bias_accum_dtype, buffer=nl.sbuf, align=32)
     nisa.memset(bias_grad_accum, value=0.0)
 
     if is_indirect:
@@ -524,6 +532,49 @@ def _compute_down_proj_bias_grad(
                     ),
                 )
 
+        if is_indirect and expert_affinities_masked != None:
+            """
+            Affinity-weight the down-bias gradient on the AFFINITY_ON_I path.
+
+            The forward scales the down-projection output (including the bias) by the per-token
+            expert affinity (output += affinity * down_bias), so the down-bias gradient must be
+            affinity-weighted before reducing over tokens. The gate/up and AFFINITY_ON_H paths
+            already receive an affinity-weighted gradient.
+            """
+            expert_idx_tensor = expert_idx_broadcast[0:B_TILE_SIZE, block_idx : block_idx + 1]
+            aff_addr = sbm.alloc_stack((B_TILE_SIZE, 1), dtype=nl.int32, align=32)
+            aff_off = sbm.alloc_stack((B_TILE_SIZE, 1), dtype=nl.int32, align=32)
+            _generate_dynamic_offsets(
+                block_token_pos_to_id_full, expert_idx_tensor, aff_off, aff_addr, b_tile_idx, skip_dma, E
+            )
+            aff_col = sbm.alloc_stack((B_TILE_SIZE, 1), dtype=dtype, align=32)
+            if skip_dma.skip_token:
+                nisa.memset(aff_col, value=0.0)
+            nisa.dma_copy(
+                dst=aff_col,
+                src=expert_affinities_masked.ap(
+                    pattern=[[expert_affinities_masked.shape[1], B_TILE_SIZE], [1, 1]],
+                    offset=0,
+                    vector_offset=aff_off,
+                    indirect_dim=0,
+                ),
+                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            )
+            aff_t_psum = nl.ndarray((1, B_TILE_SIZE), dtype=dtype, buffer=nl.psum)
+            nisa.nc_transpose(data=aff_col[0:B_TILE_SIZE, 0:1], dst=aff_t_psum[0:1, 0:B_TILE_SIZE])
+            aff_row = sbm.alloc_stack((1, B_TILE_SIZE), dtype=dtype, align=32)
+            nisa.tensor_copy(dst=aff_row, src=aff_t_psum)
+            aff_bc = sbm.alloc_stack((H_TILE_SIZE, B_TILE_SIZE), dtype=dtype, align=32)
+            stream_shuffle_broadcast(aff_row, aff_bc)
+            for h_tile_idx in range(NUM_H_TILES):
+                valid_h = min(H_TILE_SIZE, H_PER_SHARD - h_tile_idx * H_TILE_SIZE)
+                nisa.tensor_tensor(
+                    dst=grad_tiles[0:valid_h, h_tile_idx, :],
+                    data1=grad_tiles[0:valid_h, h_tile_idx, :],
+                    data2=aff_bc[0:valid_h, :],
+                    op=nl.multiply,
+                )
+
         # Reduce over B dimension and accumulate for each H tile
         for h_tile_idx in range(NUM_H_TILES):
             valid_h = min(H_TILE_SIZE, H_PER_SHARD - h_tile_idx * H_TILE_SIZE)
@@ -578,7 +629,9 @@ def _compute_down_proj_bias_grad(
                     indirect_dim=0,
                 ),
                 src=bias_grad_accum[0:valid_h, h_tile_idx],
-                dge_mode=dge_mode.hwdge,
+                # HWDGE requires src/dst dtypes to match; use SWDGE only when the fp32
+                # accumulator must cast to a narrower HBM grad dtype on store.
+                dge_mode=dge_mode.hwdge if bias_accum_dtype == down_proj_bias_grad.dtype else dge_mode.swdge,
             )
         else:
             # Subsequent blocks: atomic read-modify-write via dma_compute.
@@ -615,6 +668,7 @@ def _compute_gate_up_proj_bias_grad(
     iota_vec=None,
     expert_idx_broadcast=None,
     manage_scope=True,
+    accumulation_dtype=None,
 ):
     """
     Compute gate and up projection bias gradient.
@@ -654,7 +708,9 @@ def _compute_gate_up_proj_bias_grad(
     # Allocate buffers - transposed layout [I, NUM_I_TILES, B]
     grad_tiles = sbm.alloc_stack((I_TILE_SIZE, NUM_I_TILES, B_TILE_SIZE), dtype=dtype, buffer=nl.sbuf, align=32)
     reduced = sbm.alloc_stack((I_TILE_SIZE, NUM_I_TILES), dtype=nl.float32, buffer=nl.sbuf, align=32)
-    bias_grad_accum = sbm.alloc_stack((I_TILE_SIZE, NUM_I_TILES), dtype=dtype, buffer=nl.sbuf, align=32)
+    # Bias-grad accumulator precision: opt-in fp32 via accumulation_dtype (default = dtype, baseline).
+    bias_accum_dtype = accumulation_dtype if accumulation_dtype is not None else dtype
+    bias_grad_accum = sbm.alloc_stack((I_TILE_SIZE, NUM_I_TILES), dtype=bias_accum_dtype, buffer=nl.sbuf, align=32)
     nisa.memset(bias_grad_accum, value=0.0)
 
     for b_tile_idx in range(NUM_B_TILES):
@@ -730,7 +786,9 @@ def _compute_gate_up_proj_bias_grad(
                     indirect_dim=0,
                 ),
                 src=bias_grad_accum[0:valid_i, i_tile_idx],
-                dge_mode=dge_mode.hwdge,
+                # HWDGE requires src/dst dtypes to match; use SWDGE only when the fp32
+                # accumulator must cast to a narrower HBM grad dtype on store.
+                dge_mode=dge_mode.hwdge if bias_accum_dtype == gate_and_up_proj_bias_grad.dtype else dge_mode.swdge,
             )
         else:
             # Subsequent blocks: atomic read-modify-write via dma_compute.
@@ -3386,6 +3444,9 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
                 block_idx=block_idx,
                 iota_vec=iota_vec,
                 expert_idx_broadcast=expert_idx_broadcast,
+                expert_affinities_masked=params.expert_affinities_masked,
+                E=E,
+                accumulation_dtype=params.accumulation_dtype,
             )
 
         if params.gate_and_up_proj_bias_grad != None:
@@ -3401,6 +3462,7 @@ def blockwise_mm_bwd_dropless(params: "MOEBwdParameters"):
                 block_idx=block_idx,
                 iota_vec=iota_vec,
                 expert_idx_broadcast=expert_idx_broadcast,
+                accumulation_dtype=params.accumulation_dtype,
             )
 
         sbm.close_scope()

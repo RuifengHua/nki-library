@@ -21,7 +21,7 @@ import nki.language as nl
 import numpy as np
 import torch
 
-from ...utils.common_types import QuantizationType
+from ...utils.common_types import DtypeMode, QuantizationType
 from ...utils.mx_torch_common import (
     mx_matmul,
     quantize_to_mx,
@@ -91,21 +91,39 @@ def _perform_static_quant(
     quant_scale: torch.Tensor,
     min_val: float,
     max_val: float,
+    fp8_dtype=None,
 ) -> torch.Tensor:
     """
-    Perform static quantization by scaling and clamping.
+    Perform static quantization: scale, clamp, and (optionally) round-trip
+    through FP8 to match what FP8 hardware does.
+
+    Without the FP8 round-trip the result is only an approximation of static
+    FP8 quantization. Values in the high-magnitude band that hardware rounds
+    to the nearest FP8 grid point stay continuous here, so the reference
+    drifts from FP8 hardware on real-model activation distributions where
+    those values are common.
 
     Args:
         input_tensor (torch.Tensor): Input tensor to quantize.
         quant_scale (torch.Tensor): Quantization scale tensor.
         min_val (float): Minimum value for clamping (FP8 range).
         max_val (float): Maximum value for clamping (FP8 range).
+        fp8_dtype: FP8 ``torch.dtype`` to cast through after clamping.
+            When provided (e.g. ``torch.float8_e4m3fn``), the result is
+            cast to FP8 and back to fp32 to apply the actual grid
+            rounding. When ``None``, only clamping is applied — kept
+            for callers that have not yet been migrated.
 
     Returns:
-        torch.Tensor: Quantized tensor clamped to [min_val, max_val].
+        torch.Tensor: Quantized tensor in fp32, clamped to
+        ``[min_val, max_val]`` and (if ``fp8_dtype`` is set) round-tripped
+        through FP8.
     """
     scaled_tensor = _scale_with_broadcast(input_tensor, 1 / quant_scale)
-    return torch.clamp(scaled_tensor, min_val, max_val)
+    clamped = torch.clamp(scaled_tensor, min_val, max_val)
+    if fp8_dtype is not None:
+        return clamped.to(fp8_dtype).to(torch.float32)
+    return clamped
 
 
 def _perform_projection(
@@ -139,6 +157,8 @@ def output_projection_cte_torch_ref(
     weight_scales: Optional[torch.Tensor] = None,
     quantization_type: QuantizationType = QuantizationType.NONE,
     output_dtype=torch.float32,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    compact_weight_scales: bool = False,  # noqa: ARG001 — accepted for kernel signature parity (only used by MX-compact ref)
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of output projection for CTE.
@@ -180,6 +200,15 @@ def output_projection_cte_torch_ref(
         out = out + bias if bias else out
         return out
     """
+    # AUTO must be pre-resolved by the caller (see resolve_dtype_mode_for_torch_ref);
+    # the torch ref runs on CPU and can't query hardware.
+    assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
+        "output_projection_cte_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+    )
+    # Preserve the caller-supplied weight dtype BEFORE casting to float32 for compute.
+    # `_get_min_max_for_dtype(weight.dtype)` below would otherwise always see float32.
+    weight_orig_dtype = weight.dtype
+
     # Convert to float32 for computation
     attention = attention.float()
     weight = weight.float()
@@ -202,12 +231,32 @@ def output_projection_cte_torch_ref(
             weight = w.permute(0, 2, 1).reshape(nd, weight.shape[1])
 
     if quantization_type == QuantizationType.STATIC:
-        min_val, max_val = _get_min_max_for_dtype(weight.dtype)
-        quantized_input = _perform_static_quant(attn_reshaped, input_scales, min_val, max_val)
+        # STATIC clip mirrors the kernel-allocated FP8 dtype:
+        # caller's concrete OCP weight or dtype_mode=OCP → 448, otherwise → 240.
+        if dtype_mode == DtypeMode.OCP or str(weight_orig_dtype) in ("float8_e4m3fn", str(nl.float8_e4m3fn)):
+            min_val, max_val = (-_FP8_E4M3FN_MAX, _FP8_E4M3FN_MAX)
+        else:
+            min_val, max_val = (-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        # Pass the FP8 dtype so the reference includes the grid rounding,
+        # not just the clamp. The dtype mirrors which FP8 variant the kernel
+        # would allocate (e4m3fn for OCP / max=448, e4m3 otherwise). Some
+        # torch versions don't expose the non-FN ``torch.float8_e4m3``
+        # dtype on CPU; in that case fall back to clamp-only.
+        if max_val == _FP8_E4M3FN_MAX:
+            fp8_dtype = torch.float8_e4m3fn
+        else:
+            fp8_dtype = getattr(torch, "float8_e4m3", None)
+        quantized_input = _perform_static_quant(attn_reshaped, input_scales, min_val, max_val, fp8_dtype=fp8_dtype)
         out = _perform_projection(quantized_input, weight, weight_scales, input_scales)
     elif quantization_type == QuantizationType.STATIC_MX:
         min_val, max_val = _get_min_max_for_dtype(torch.float8_e4m3fn)
-        quantized_input = _perform_static_quant(attn_reshaped, input_scales, min_val, max_val)
+        quantized_input = _perform_static_quant(
+            attn_reshaped,
+            input_scales,
+            min_val,
+            max_val,
+            fp8_dtype=torch.float8_e4m3fn,
+        )
         out = _perform_projection(quantized_input, weight, weight_scales, input_scales)
     elif quantization_type == QuantizationType.ROW_MX:
         # ROW_MX: MXFP4 quantize input on-device, plain matmul with FP8 weight, apply per-row weight dequant
@@ -226,9 +275,10 @@ def output_projection_cte_torch_ref(
         out = torch.stack(results, dim=0)
         out = _scale_with_broadcast(out, weight_scales)
     elif quantization_type == QuantizationType.ROW:
-        # ROW: dynamic per-token FP8 quantization, matmul, two-step dequant
-        # ROW uses float8_e4m3 (max=240), not float8_e4m3fn (max=448)
-        min_val, max_val = (-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        # ROW: dynamic per-token FP8 quantization, matmul, two-step dequant.
+        # Clip must match the kernel's dtype: OCP → 448, NON_OCP → 240.
+        _fp8_max = _FP8_E4M3FN_MAX if dtype_mode == DtypeMode.OCP else _FP8_E4M3_MAX
+        min_val, max_val = (-_fp8_max, _fp8_max)
         # Per-token row quantize: absmax over N*D, scale, clamp
         absmax = attn_reshaped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
         dequant_scale = absmax / max_val
@@ -252,21 +302,29 @@ def output_projection_cte_mx_torch_ref(
     quantization_type: QuantizationType = QuantizationType.MX,
     input_scales=None,
     weight_scales=None,
-    output_dtype=None,
+    output_dtype=None,  # noqa: ARG001 — unused (output is bf16/fp32 to match kernel)
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001 — accepted for framework signature parity (MX is structurally OCP)
+    compact_weight_scales: bool = False,
 ) -> dict[str, np.ndarray]:
-    """PyTorch reference for MX FP4 output projection CTE.
+    """PyTorch reference for MX output projection CTE.
 
-    Handles both online quantization (bf16 attention) and pre-quantized
-    (float8_e4m3fn_x4 attention) paths.
+    Handles three weight/scale combinations:
+
+    - Standard MX FP4 with dense block-32 scales (online or pre-quantized input).
+      ``weight`` is ``float4_e2m1fn_x4 [N*D//4, H]`` and ``weight_scales`` is
+      ``[N*D//32, H]``.
+    - MX FP8 with compact block-128 scales (online input only).
+      ``weight`` is ``float8_e4m3fn_x4 [N*D//4, H]`` and ``weight_scales`` is
+      ``[N*D//128, H//128]``. Selected via ``compact_weight_scales=True``.
 
     Args:
         attention: Online: numpy bf16 [B, N, D, S]. Pre-quantized: numpy uint8 [B, 1, D_packed, S].
-        weight: numpy float4_e2m1fn_x4 [N*D//4, H].
+        weight: numpy float4_e2m1fn_x4 or float8_e4m3fn_x4 [N*D//4, H].
         bias: Optional[numpy bf16 [1, H]], bias tensor.
         quantization_type: must be QuantizationType.MX.
         input_scales: Pre-quantized only: numpy uint8 [B, D_packed//8, S]. None for online.
-        weight_scales: numpy uint8 [N*D//32, H].
-        output_dtype: unused.
+        weight_scales: dense [N*D//32, H] (block-32) or compact [N*D//128, H//128] (block-128).
+        compact_weight_scales: True selects FP8 + compact block-128 scales.
 
     Returns:
         dict with "out": numpy float32 [B, S, H].
@@ -289,9 +347,21 @@ def output_projection_cte_mx_torch_ref(
     if not prequantized:
         n_head, d_head = attention.shape[1], attention.shape[2]
 
-    # Unpack weight: float4_e2m1fn_x4 [N*D//4, H] -> float32 [N*D, H]
-    w_unpacked = unpack_float4_x4(weight.reshape(-1, hidden))
-    w_scale = torch.from_numpy(weight_scales.reshape(-1, hidden)).float()
+    # Unpack weight + materialize the dense [N*D//32, H] block-32 scale that
+    # mx_matmul consumes. Compact block-128 expands to dense via factors
+    # (128/32, 128) = (4, 128).
+    if compact_weight_scales:
+        DS_SCALE_BLOCK = 128
+        w_unpacked = unpack_float8_e4m3fn_x4(weight.reshape(-1, hidden))
+        w_scale_dense = np.repeat(
+            np.repeat(weight_scales, DS_SCALE_BLOCK // 32, axis=0),
+            DS_SCALE_BLOCK,
+            axis=1,
+        )
+        w_scale = torch.from_numpy(w_scale_dense).float()
+    else:
+        w_unpacked = unpack_float4_x4(weight.reshape(-1, hidden))
+        w_scale = torch.from_numpy(weight_scales.reshape(-1, hidden)).float()
 
     results = []
     for b in range(batch):

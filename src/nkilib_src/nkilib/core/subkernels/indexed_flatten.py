@@ -26,13 +26,13 @@ from ..utils.kernel_helpers import div_ceil
 
 @nki.jit
 def indexed_flatten(
-    input_tensor: nl.ndarray,
+    input_tensor: nl.NkiTensor,
     f_len: int,
     output_len: int,
-    row_offsets: nl.ndarray,
-    row_offsets_start: Optional[nl.ndarray] = None,
+    row_offsets: nl.NkiTensor,
+    row_offsets_start: Optional[nl.NkiTensor] = None,
     padding_val: int = -1,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Indexed flatten kernel for MoE blockwise matmul operations.
 
@@ -51,15 +51,15 @@ def indexed_flatten(
         f_len: Block size in free dimension for DMA copies
 
     Args:
-        input_tensor (nl.ndarray): [E, T], Input tensor on HBM
+        input_tensor (nl.NkiTensor): [E, T], Input tensor on HBM
         f_len (int): Number of elements in each DMA copy in the free dimension
         output_len (int): Length of the output array
-        row_offsets (nl.ndarray): [N,], Block offsets for each row on HBM
-        row_offsets_start (Optional[nl.ndarray]): Optional start index for row_offsets
+        row_offsets (nl.NkiTensor): [N,], Block offsets for each row on HBM
+        row_offsets_start (Optional[nl.NkiTensor]): Optional start index for row_offsets
         padding_val (int): Value to fill unwritten positions (default: -1)
 
     Returns:
-        flattened_array (nl.ndarray): [output_len,], Flattened output array on shared HBM
+        flattened_array (nl.NkiTensor): [output_len,], Flattened output array on shared HBM
 
     Notes:
         - Requires LNC2 (2 NeuronCores)

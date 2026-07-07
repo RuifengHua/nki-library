@@ -24,6 +24,7 @@ from nkilib_src.nkilib.experimental.scan.ssd_torch import ssd_torch_ref
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import FilterResult
+from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
@@ -80,19 +81,55 @@ def generate_ssd_inputs(batch, nheads, seqlen, headdim, dstate, chunk_size, use_
 
 def filter_invalid_combinations(batch, nheads, seqlen, headdim, dstate, chunk_size, use_D, use_initial_state):
     """Filter out invalid parameter combinations."""
-    # seqlen must be divisible by chunk_size
     if seqlen % chunk_size != 0:
         return FilterResult.INVALID
-    # dstate must be <= 128
     if dstate > 128:
         return FilterResult.INVALID
-    # headdim must be <= 512
-    if headdim > 512:
-        return FilterResult.INVALID
-    # chunk_size must be <= 128
     if chunk_size > 128:
         return FilterResult.INVALID
     return FilterResult.VALID
+
+
+def _run_ssd_test(
+    test_manager,
+    platform_target,
+    batch,
+    nheads,
+    seqlen,
+    headdim,
+    dstate,
+    chunk_size,
+    use_D,
+    use_initial_state,
+    atol=2e-1,
+    rtol=5e-2,
+    is_negative_test=False,
+):
+    """Run a single SSD test with the given parameters."""
+
+    def input_generator(test_config):
+        return generate_ssd_inputs(batch, nheads, seqlen, headdim, dstate, chunk_size, use_D, use_initial_state)
+
+    def output_tensors(kernel_input):
+        return {
+            "y": np.zeros((batch, nheads, seqlen, headdim), dtype=np.float32),
+            "final_state": np.zeros((batch, nheads, dstate, headdim), dtype=np.float32),
+        }
+
+    framework = UnitTestFramework(
+        test_manager=test_manager,
+        kernel_entry=ssd,
+        torch_ref=torch_ref_wrapper(_ssd_torch_ref_wrapper),
+        kernel_input_generator=input_generator,
+        output_tensor_descriptor=output_tensors,
+    )
+    framework.run_test(
+        test_config=None,
+        compiler_args=CompilerArgs(platform_target=platform_target),
+        atol=atol,
+        rtol=rtol,
+        is_negative_test=is_negative_test,
+    )
 
 
 @pytest_test_metadata(
@@ -132,26 +169,17 @@ class TestSSDKernel:
         is_negative_test_case,
     ):
         """Fast compile-only tests with minimal coverage."""
-
-        def input_generator(test_config):
-            return generate_ssd_inputs(batch, nheads, seqlen, headdim, dstate, chunk_size, use_D, use_initial_state)
-
-        def output_tensors(kernel_input):
-            return {
-                "y": np.zeros((batch, nheads, seqlen, headdim), dtype=np.float32),
-                "final_state": np.zeros((batch, nheads, dstate, headdim), dtype=np.float32),
-            }
-
-        framework = UnitTestFramework(
-            test_manager=test_manager,
-            kernel_entry=ssd,
-            torch_ref=torch_ref_wrapper(_ssd_torch_ref_wrapper),
-            kernel_input_generator=input_generator,
-            output_tensor_descriptor=output_tensors,
-        )
-        framework.run_test(
-            test_config=None,
-            compiler_args=CompilerArgs(platform_target=platform_target),
+        _run_ssd_test(
+            test_manager,
+            platform_target,
+            batch,
+            nheads,
+            seqlen,
+            headdim,
+            dstate,
+            chunk_size,
+            use_D,
+            use_initial_state,
             atol=1e-1,
             rtol=5e-2,
             is_negative_test=is_negative_test_case,
@@ -185,27 +213,70 @@ class TestSSDKernel:
         is_negative_test_case,
     ):
         """Full sweep tests with pairwise coverage."""
-
-        def input_generator(test_config):
-            return generate_ssd_inputs(batch, nheads, seqlen, headdim, dstate, chunk_size, use_D, use_initial_state)
-
-        def output_tensors(kernel_input):
-            return {
-                "y": np.zeros((batch, nheads, seqlen, headdim), dtype=np.float32),
-                "final_state": np.zeros((batch, nheads, dstate, headdim), dtype=np.float32),
-            }
-
-        framework = UnitTestFramework(
-            test_manager=test_manager,
-            kernel_entry=ssd,
-            torch_ref=torch_ref_wrapper(_ssd_torch_ref_wrapper),
-            kernel_input_generator=input_generator,
-            output_tensor_descriptor=output_tensors,
-        )
-        framework.run_test(
-            test_config=None,
-            compiler_args=CompilerArgs(platform_target=platform_target),
+        _run_ssd_test(
+            test_manager,
+            platform_target,
+            batch,
+            nheads,
+            seqlen,
+            headdim,
+            dstate,
+            chunk_size,
+            use_D,
+            use_initial_state,
             atol=2e-1,
             rtol=5e-2,
             is_negative_test=is_negative_test_case,
+        )
+
+    # fmt: off
+    _ssd_model_test_params = \
+        "batch, nheads, seqlen, headdim, dstate, chunk_size, use_D, use_initial_state"
+    _ssd_model_test_vectors = [
+        # mamba2_130m: nheads=24, headdim=24, dstate=64
+        [1, 24, 1024, 24, 64, 128, False, False],
+        [1, 24, 2048, 24, 64, 128, False, False],
+        [1, 24, 4096, 24, 64, 128, False, False],
+        # mamba2_370m: nheads=48, headdim=32, dstate=64
+        [1, 48, 1024, 32, 64, 128, False, False],
+        [1, 48, 2048, 32, 64, 128, False, False],
+        [1, 48, 4096, 32, 64, 128, False, False],
+        # mamba2_1.3b / mamba2_2.7b: nheads=64, headdim=64, dstate=128
+        [1, 64, 1024, 64, 128, 128, False, False],
+        [1, 64, 2048, 64, 128, 128, False, False],
+        [1, 64, 4096, 64, 128, 128, False, False],
+        # large headdim (>512, exercises headdim tiling)
+        [1, 4, 512, 1024, 64, 128, False, False],
+        [1, 4, 512, 1024, 128, 128, False, False],
+    ]
+    # fmt: on
+
+    @pytest_parametrize(_ssd_model_test_params, _ssd_model_test_vectors)
+    def test_ssd_model(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        batch,
+        nheads,
+        seqlen,
+        headdim,
+        dstate,
+        chunk_size,
+        use_D,
+        use_initial_state,
+    ):
+        """Model-driven tests with real Mamba-2 architecture dimensions."""
+        _run_ssd_test(
+            test_manager,
+            platform_target,
+            batch,
+            nheads,
+            seqlen,
+            headdim,
+            dstate,
+            chunk_size,
+            use_D,
+            use_initial_state,
+            atol=2e-1,
+            rtol=5e-2,
         )

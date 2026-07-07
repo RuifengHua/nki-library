@@ -14,6 +14,12 @@
 
 """Integration tests for MoE CTE blockwise matrix multiplication kernels using UnitTestFramework."""
 
+from typing import final
+
+import nki.language as nl
+import pytest
+
+from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
 from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
     BWMMFunc,
     generate_moe_cte_inputs,
@@ -23,16 +29,17 @@ from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_common import (
 )
 
 try:
-    from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_model_config import moe_cte_model_configs
+    from test.integration.nkilib.core.moe.moe_cte.test_moe_cte_model_config import (
+        moe_cte_model_configs,
+    )
 except ImportError:
     moe_cte_model_configs = {}
-from typing import final
-
-import nki.language as nl
-import pytest
-
-from nkilib_src.nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
-from test.utils.common_dataclasses import CompilerArgs, ModelTestType, Platforms, prepare_model_parametrize
+from test.utils.common_dataclasses import (
+    CompilerArgs,
+    ModelTestType,
+    Platforms,
+    prepare_model_parametrize,
+)
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
@@ -41,125 +48,168 @@ from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 # fmt: off
 # Parameter names for pytest.mark.parametrize
 BWMM_LNC2_PARAM_NAMES = \
-    "bwmm_func,                            hidden, tokens, expert, block_size, top_k, intermediate, dtype,       skip, bias,  training, quantize, act_fn,          expert_affinities_scaling_mode,     gate_cl_upper, gate_cl_lower, up_cl_upper, up_cl_lower, expert_affinity_multiply_on_I"
+    "bwmm_func,                            hidden, tokens, expert, block_size, top_k, intermediate, dtype,       skip, bias,  training, quantize, act_fn,          expert_affinities_scaling_mode,     gate_cl_upper, gate_cl_lower, up_cl_upper, up_cl_lower, expert_affinity_multiply_on_I, block_sharding_strategy, is_block_quant, is_per_tensor"
 
 # All test cases
 BWMM_LNC2_TEST_CASES = [
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    4864,   1024,   8,      512,        4,     1216,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    4864,   1024,   8,      512,        4,     1216,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2880,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2880,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     720,          nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     720,          nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    False, False,    None,     ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    True,  False,    None,     ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   10240,  8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          7,             None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          7,           None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        7,           False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   10240,  8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          7,             None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          7,           None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        7,           False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   10240,  8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   10240,  8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   10240,  8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   10240,  8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False),
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     384,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     384,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     192,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     192,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     192,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     192,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    [BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     1536,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,        False],
-    [BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     1536,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,        False],
-    [BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     3072,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,        False],
-    [BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     3072,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,        False],
-    (BWMMFunc.SHARD_ON_BLOCK,              3072,   10240,  128,    256,        4,     192,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
+    # HEAD-only: additional intermediate sizes
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    4864,   1024,   8,      512,        4,     1216,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    4864,   1024,   8,      512,        4,     1216,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2880,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2880,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     720,          nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     720,          nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
     # multiply_on_I with bias test
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish,  ExpertAffinityScaleMode.PRE_SCALE, None,          None,          None,        None,        True),
-    ## 
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    # # E < TOPK test vectors
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       4096,   10240,  4,      512,        8,     768,          nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    4096,   10240,  4,      512,        8,     768,          nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 1536, 8192,  2,      4096,       2,     6144,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 2048, 2048,  2,      1024,       2,     8192,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 4096, 4096,  2,      2048,       8,     1536,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 1536, 8192,  2,      4096,       2,     6144,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 2048, 2048,  2,      1024,       2,     8192,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 4096, 4096,  2,      2048,       8,     1536,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish,  ExpertAffinityScaleMode.PRE_SCALE, None,          None,          None,        None,        True, None, False, False),
+    # Incoming branch cases
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    False, False,    None,     ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,    True,  False,    None,     ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   10240,  8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   False, False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          7,             None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          7,           None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        7,           False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  1,      512,        1,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   10240,  8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          7,             None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          7,           None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        7,           False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   10240,  8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   10240,  8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   10240,  8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   10240,  8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          7,           -7,          False, None, False, False),
+    # Qwen3-235B-A22B FP8 scenario: hits fused gate+up FP8 path in compute_gate_and_up_projections_shard_on_intermediate
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    4096,   2048,   2,      512,        8,     1536,         nl.bfloat16, 0,   False, False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    # Original SHARD_ON_BLOCK kernel tests
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     384,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     384,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     192,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     192,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     384,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     192,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     192,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    [BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     1536,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,        False, None, False, False],
+    [BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     1536,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,        False, None, False, False],
+    [BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      256,        4,     3072,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,        False, None, False, False],
+    [BWMMFunc.SHARD_ON_BLOCK,              3072,   1024,   8,      512,        4,     3072,          nl.bfloat16, 1,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,        False, None, False, False],
+    (BWMMFunc.SHARD_ON_BLOCK,              3072,   10240,  128,    256,        4,     192,          nl.bfloat16, 3,   True,  False,    None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, 7,             None,          8,           -9,          False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    # E < TOPK test vectors
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       4096,   10240,  4,      512,        8,     768,          nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    4096,   10240,  4,      512,        8,     768,          nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 1536, 8192,  2,      4096,       2,     6144,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 2048, 2048,  2,      1024,       2,     8192,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 4096, 4096,  2,      2048,       8,     1536,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 1536, 8192,  2,      4096,       2,     6144,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 2048, 2048,  2,      1024,       2,     8192,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING, 4096, 4096,  2,      2048,       8,     1536,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     1536,         nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, True, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     1536,         nl.bfloat16, 0,   False, False,    nl.float8_e4m3,  ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, True, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 1,   True,  False,    nl.float8_e4m3,  ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, True),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   8,      512,        4,     768,          nl.bfloat16, 0,   False, False,    nl.float8_e4m3,  ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, True),
 ]
 
 # Test cases with expert=64
 BWMM_LNC2_SLOW_CASES = [pytest.param(*case, marks=pytest.mark.slow_simulation) for case in [
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
-    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 0,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.NO_SCALE,   None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    7168,   10240,  64,     512,        8,     2048,         nl.bfloat16, 1,   False, False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.PRE_SCALE,  None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE_HW,    3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   True,  False,    None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        True, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 0,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     2048,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
+    (BWMMFunc.SHARD_ON_INTERMEDIATE,       3072,   1024,   64,     512,        8,     3072,         nl.bfloat16, 1,   False, True,     None,            ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, None,          None,          None,        None,        False, None, False, False),
 ]]
 # fmt: on
 
 
 # (hidden, tokens, expert, block_size, top_k, intermediate) keys for full-only tests (excluded from fast suite)
 _FULL_ONLY_KEYS = {
-    (3072, 10240, 8, 512, 4, 1536),
-    (4096, 10240, 4, 512, 8, 768),
-    (3072, 10240, 128, 256, 4, 192),
-    (7168, 10240, 1, 512, 1, 2048),
+    (3072, 1024, 64, 512, 8, 2048),
+    (3072, 1024, 64, 512, 8, 3072),
+    (3072, 1024, 8, 256, 4, 3072),
+    (3072, 10240, 8, 256, 4, 384),
+    (3072, 10240, 8, 256, 4, 1536),
+    (3072, 10240, 8, 256, 4, 3072),
+    (3072, 10240, 8, 512, 1, 192),
+    (3072, 10240, 8, 512, 4, 192),
+    (3072, 10240, 8, 512, 4, 256),
     (3072, 10240, 8, 512, 4, 768),
+    (3072, 10240, 8, 512, 4, 1536),
+    (3072, 10240, 8, 512, 4, 3072),
+    (3072, 10240, 128, 256, 4, 192),
+    (4096, 10240, 4, 512, 8, 768),
+    # Qwen3-235B-A22B FP8: heavy NEFF compile+cleanup exceeds --cpu-timeout in fast suite.
+    (4096, 2048, 2, 512, 8, 1536),
+    (7168, 10240, 1, 512, 1, 2048),
+    (7168, 10240, 64, 512, 8, 2048),
 }
 
 
@@ -205,7 +255,11 @@ class TestMoeBlockwiseMatMulLnc2:
         up_cl_upper,
         up_cl_lower,
         expert_affinity_multiply_on_I: bool,
+        block_sharding_strategy: str,
+        is_block_quant: bool,
+        is_per_tensor: bool,
         platform_target: Platforms,
+        accumulation_dtype=None,
     ):
         lnc_degree = 2
 
@@ -231,6 +285,10 @@ class TestMoeBlockwiseMatMulLnc2:
                 up_clamp_lower=up_cl_lower,
                 expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
                 lnc_degree=lnc_degree,
+                block_sharding_strategy=block_sharding_strategy,
+                is_block_quant=is_block_quant,
+                is_per_tensor=is_per_tensor,
+                accumulation_dtype=accumulation_dtype,
             )
 
         is_dropping = bwmm_func == BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING
@@ -249,14 +307,13 @@ class TestMoeBlockwiseMatMulLnc2:
                 training=training or is_dropping,
                 expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
                 lnc_degree=lnc_degree,
+                accumulation_dtype=accumulation_dtype,
             )
 
         rtol, atol = (5e-2, 1e-5) if quantize else (2e-2, 1e-5)
-        # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
         compiler_args = CompilerArgs(
             logical_nc_config=lnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--skip-pass=address_rotation_sb"],
         )
 
         framework = UnitTestFramework(
@@ -276,6 +333,142 @@ class TestMoeBlockwiseMatMulLnc2:
             atol=atol,
         )
 
+    FP32_ACCUM_CASES = [
+        pytest.param(*c, marks=pytest.mark.fast)
+        for c in [
+            (
+                BWMMFunc.SHARD_ON_INTERMEDIATE,
+                3072,
+                1024,
+                8,
+                512,
+                4,
+                2048,
+                nl.bfloat16,
+                0,
+                False,
+                True,
+                None,
+                ActFnType.Swish,
+                ExpertAffinityScaleMode.POST_SCALE,
+                None,
+                None,
+                None,
+                None,
+                False,
+                None,
+                False,
+                False,
+            ),
+            (
+                BWMMFunc.SHARD_ON_INTERMEDIATE,
+                3072,
+                1024,
+                8,
+                512,
+                4,
+                2048,
+                nl.bfloat16,
+                0,
+                False,
+                True,
+                None,
+                ActFnType.Swish,
+                ExpertAffinityScaleMode.POST_SCALE,
+                None,
+                None,
+                None,
+                None,
+                True,
+                None,
+                False,
+                False,
+            ),
+            (
+                BWMMFunc.SHARD_ON_INTERMEDIATE_DROPPING,
+                2048,
+                2048,
+                2,
+                1024,
+                2,
+                8192,
+                nl.bfloat16,
+                0,
+                False,
+                True,
+                None,
+                ActFnType.SiLU,
+                ExpertAffinityScaleMode.POST_SCALE,
+                None,
+                None,
+                None,
+                None,
+                False,
+                None,
+                False,
+                False,
+            ),
+        ]
+    ]
+
+    @pytest.mark.parametrize(BWMM_LNC2_PARAM_NAMES, FP32_ACCUM_CASES)
+    def test_moe_blockwise_mm_kernel_lnc2_fp32_accum(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        bwmm_func: BWMMFunc,
+        hidden: int,
+        tokens: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
+        intermediate: int,
+        dtype,
+        skip: int,
+        bias: bool,
+        training: bool,
+        quantize,
+        act_fn: ActFnType,
+        expert_affinities_scaling_mode: ExpertAffinityScaleMode,
+        gate_cl_upper,
+        gate_cl_lower,
+        up_cl_upper,
+        up_cl_lower,
+        expert_affinity_multiply_on_I: bool,
+        block_sharding_strategy: str,
+        is_block_quant: bool,
+        is_per_tensor: bool,
+        platform_target: Platforms,
+    ):
+        self.test_moe_blockwise_mm_kernel_lnc2(
+            test_manager,
+            collector,
+            bwmm_func,
+            hidden,
+            tokens,
+            expert,
+            block_size,
+            top_k,
+            intermediate,
+            dtype,
+            skip,
+            bias,
+            training,
+            quantize,
+            act_fn,
+            expert_affinities_scaling_mode,
+            gate_cl_upper,
+            gate_cl_lower,
+            up_cl_upper,
+            up_cl_lower,
+            expert_affinity_multiply_on_I,
+            block_sharding_strategy,
+            is_block_quant,
+            is_per_tensor,
+            platform_target,
+            accumulation_dtype=nl.float32,
+        )
+
 
 # fmt: off
 MOE_CTE_MODEL_PARAMS = (
@@ -291,6 +484,7 @@ MOE_CTE_MODEL_PARAMS = (
 class TestMoeCteModel:
     """Model-driven tests for MoE CTE kernels, organized by tier."""
 
+    _MODEL_PARAMS = MOE_CTE_MODEL_PARAMS
     _MODEL_PARAMS = MOE_CTE_MODEL_PARAMS
 
     _GENERALITY_PARAMS, _GENERALITY_IDS = (
