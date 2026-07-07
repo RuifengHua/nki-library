@@ -37,7 +37,9 @@ class TestPlatformsGetCompileTarget:
             (Platforms.TRN1, "trn1"),
             (Platforms.TRN2, "trn2"),
             (Platforms.TRN3, "trn3"),
-            (Platforms.TRN3_A0, "trn3"),
+            (Platforms.TRN3_A0, "trn3pre"),
+            (Platforms.TRN3_PDS, "trn3"),
+            (Platforms.TRN3_PDS_A0, "trn3pre"),
         ],
     )
     def test_get_compile_target(self, platform, expected):

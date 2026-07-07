@@ -34,7 +34,7 @@ from nkilib_src.nkilib.experimental.quantize_mxfp8.quantize_mxfp8_torch import (
     _interleave_tensor,
     _pack_scales,
     _quantize_mx_alt_emax,
-    quantize_mxfp8_torch_ref,  # noqa: F401 - re-exported for test_quantize_mxfp8
+    quantize_block_mxfp8_torch_ref,  # noqa: F401 - re-exported for test_quantize_mxfp8
 )
 from test.integration.nkilib.experimental.matmul_mxfp8.random_input_generator import (
     DistributionRegistry,

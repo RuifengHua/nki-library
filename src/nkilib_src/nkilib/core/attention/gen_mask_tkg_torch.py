@@ -265,20 +265,19 @@ def build_full_attention_mask(
     include_active_mask: bool = False,
     transposed: bool = False,
     enable_fa_s_prior_tiling: bool = True,
-    KVDP: int = 1,
+    fuse_rope: bool = False,
 ) -> torch.Tensor:
     """Convenience wrapper: generates causal active mask, calls build_attention_mask,
     then applies block KV reshaping and transpose.
 
     Args:
+        batch: Batch size as seen by the attention kernel (B_attn = B // KVDP for
+            KV data parallelism, or B when KVDP=1).
         enable_fa_s_prior_tiling: Whether flash attention tiling is enabled. Must match
             the value passed to attention_tkg / attention_block_tkg. Default: True.
-        KVDP: KV data parallelism factor. When > 1, the kernel runs per-rank with
-            batch // KVDP, so sharding decisions use that reduced batch size. Default: 1.
 
     Returns [batch, num_heads, s_active, s_ctx] or transposed [s_ctx, batch, num_heads, s_active].
     """
-    kernel_bs = batch // KVDP
 
     # Optionally generate causal active mask (lower triangular)
     active_mask = None
@@ -298,16 +297,19 @@ def build_full_attention_mask(
     # the flat s_ctx dimension is in [n_sprior_tile, P_MAX] row-major order
     # (n_sprior_tile-major), matching the layout produced by gen_mask_tkg_hbm.
     if block_len > 0 and mask.numel() > 0:
-        sprior_n_prgs = lnc if lnc > 1 and is_s_prior_sharded_fn(kernel_bs, num_heads, s_active, s_ctx, P_MAX) else 1
+        sprior_n_prgs = (
+            lnc if lnc > 1 and is_s_prior_sharded_fn(batch, num_heads, s_active, s_ctx, P_MAX, fuse_rope) else 1
+        )
         reduced_block_len, _ = resize_cache_block_len_for_attention_tkg_kernel(
             s_ctx // block_len,
             block_len,
             lnc,
             P_MAX,
-            kernel_bs,
+            batch,
             num_heads,
             s_active,
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+            fuse_rope=fuse_rope,
         )
         mask = mask.reshape(batch, num_heads, s_active, sprior_n_prgs, -1, P_MAX, reduced_block_len)
         # Permute to (..., num_folds, block_len, P_MAX) then flatten
@@ -445,6 +447,7 @@ def _gen_mask_tkg_hbm_torch_ref_impl(
     block_len: int = 0,
     active_mask: Optional[torch.Tensor] = None,
     enable_fa_s_prior_tiling: bool = True,
+    fuse_rope: bool = False,
 ) -> torch.Tensor:
     """Generate mask matching gen_mask_tkg_hbm kernel output format.
 
@@ -457,11 +460,11 @@ def _gen_mask_tkg_hbm_torch_ref_impl(
     strided_mm1 = block_len == 0
 
     # LNC sharding decision (mirrors gen_mask_tkg_hbm kernel logic)
-    cfg = AttnTKGConfig(bs=bs, q_head=q_head, s_active=s_active, curr_sprior=s_prior)
+    cfg = AttnTKGConfig(bs=bs, q_head=q_head, s_active=s_active, curr_sprior=s_prior, fuse_rope=fuse_rope)
 
-    if lnc == 2 and is_s_prior_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+    if lnc == 2 and is_s_prior_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope):
         batch_sharded = False
-    elif lnc == 2 and is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+    elif lnc == 2 and is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope):
         batch_sharded = True
     else:
         batch_sharded = False
@@ -478,6 +481,7 @@ def _gen_mask_tkg_hbm_torch_ref_impl(
             q_head,
             s_active,
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+            fuse_rope=fuse_rope,
         )
 
     n_sprior_tile = s_prior // P_MAX
@@ -550,6 +554,7 @@ class _GenMaskTkgHbmTorchRefFn(Protocol):
         block_len: int = 0,
         active_mask: Optional[torch.Tensor] = None,
         enable_fa_s_prior_tiling: bool = True,
+        fuse_rope: bool = False,
     ) -> torch.Tensor:
         """
         PyTorch reference for NKI kernel gen_mask_tkg_hbm.

@@ -26,12 +26,12 @@ def test_no_warmup_profile_last():
     cmds = ProfilerCommands(
         num_runs=1,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
 
-    assert "neuron-profile capture" in cmds.capture_cmd
+    assert "neuron-explorer capture" in cmds.capture_cmd
     assert "--num-exec=1 --profile-nth-exec=1" in cmds.capture_cmd
     assert cmds.expected_ntff_files == ["profile.ntff"]
     assert cmds.expected_profiler_view_json_files == []
@@ -45,7 +45,7 @@ def test_no_warmup_profile_all():
     cmds = ProfilerCommands(
         num_runs=1,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -61,7 +61,7 @@ def test_warmup_profile_last():
     cmds = ProfilerCommands(
         num_runs=3,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -78,7 +78,7 @@ def test_warmup_profile_all():
     cmds = ProfilerCommands(
         num_runs=3,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -105,7 +105,7 @@ def test_metrics_enabled_generates_json_commands():
     cmds = ProfilerCommands(
         num_runs=3,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=True,
     )
@@ -127,7 +127,7 @@ def test_metrics_disabled_no_json_commands():
     cmds = ProfilerCommands(
         num_runs=3,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -141,7 +141,7 @@ def test_profile_all_runs_single_warmup():
     cmds = ProfilerCommands(
         num_runs=2,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -156,7 +156,7 @@ def test_profile_all_runs_many_warmups():
     cmds = ProfilerCommands(
         num_runs=6,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -179,7 +179,7 @@ def test_profile_all_runs_show_commands():
     cmds = ProfilerCommands(
         num_runs=4,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -206,7 +206,7 @@ def test_profile_all_runs_json_generation():
     cmds = ProfilerCommands(
         num_runs=3,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=True,
     )
@@ -225,7 +225,7 @@ def test_profile_all_false_with_warmup_only_profiles_last():
     cmds = ProfilerCommands(
         num_runs=4,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -372,12 +372,12 @@ def test_timeout_included_in_capture_cmd():
     cmds = ProfilerCommands(
         num_runs=1,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
 
-    assert "timeout 55 neuron-profile capture" in cmds.capture_cmd
+    assert "timeout 55 neuron-explorer capture" in cmds.capture_cmd
 
 
 def test_collectives_profile_all_ranks():
@@ -386,7 +386,7 @@ def test_collectives_profile_all_ranks():
     cmds = ProfilerCommands(
         num_runs=2,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args=f"--multi-input {ranks}rank_inputs.txt",
         metrics_enabled=False,
         collective_ranks=ranks,
@@ -412,7 +412,7 @@ def test_collectives_profile_rank0_only():
     cmds = ProfilerCommands(
         num_runs=3,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args=f"--multi-input {ranks}rank_inputs.txt",
         metrics_enabled=False,
         collective_ranks=ranks,
@@ -432,7 +432,7 @@ def test_collectives_all_runs_rank0_only():
     cmds = ProfilerCommands(
         num_runs=2,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args=f"--multi-input {ranks}rank_inputs.txt",
         metrics_enabled=False,
         collective_ranks=ranks,
@@ -451,7 +451,7 @@ def test_collectives_single_run():
     cmds = ProfilerCommands(
         num_runs=1,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args=f"--multi-input {ranks}rank_inputs.txt",
         metrics_enabled=False,
         collective_ranks=ranks,
@@ -467,7 +467,7 @@ def test_setting_env_vars():
     cmds0 = ProfilerCommands(
         num_runs=1,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
         env_vars={"VAR1": "value1", "VAR2": "value2"},
@@ -476,7 +476,7 @@ def test_setting_env_vars():
     cmds1 = ProfilerCommands(
         num_runs=1,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -491,7 +491,7 @@ def test_save_nth_output():
     cmds_default = ProfilerCommands(
         num_runs=10,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -501,7 +501,7 @@ def test_save_nth_output():
     cmds_save_all = ProfilerCommands(
         num_runs=10,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
         save_all_outputs=True,
@@ -512,7 +512,7 @@ def test_save_nth_output():
     cmds_profile_all = ProfilerCommands(
         num_runs=5,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
     )
@@ -522,7 +522,7 @@ def test_save_nth_output():
     cmds_both = ProfilerCommands(
         num_runs=5,
         profile_all_runs=True,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=False,
         save_all_outputs=True,
@@ -535,7 +535,7 @@ def test_perf_analysis_uses_output_file_flag():
     cmds = ProfilerCommands(
         num_runs=1,
         profile_all_runs=False,
-        profiler_binary_path="neuron-profile",
+        profiler_binary_path="neuron-explorer",
         kernel_input_args="--arg1 val1",
         metrics_enabled=True,
         perf_analysis_enabled=True,

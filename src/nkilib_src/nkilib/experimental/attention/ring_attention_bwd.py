@@ -47,6 +47,8 @@ def ring_attention_spmd_bwd(
     lnc_size: int = 1,
     replica_groups: tuple = None,
     striped_attention: bool = False,
+    bound_min: nl.ndarray = None,
+    bound_max: nl.ndarray = None,
 ):
     """
     Ring Attention Backward SPMD kernel.
@@ -76,6 +78,15 @@ def ring_attention_spmd_bwd(
         lnc_size (int): LNC size (number of logical cores). Default: 1.
         replica_groups (list): Replica groups for collective communication. Default: None.
         striped_attention (bool): Whether to use striped attention layout. Default: False.
+        bound_min (nl.ndarray, optional): Sequence packing lower bound. Shape
+            (bs, seqlen_per_rank), fp32. Per-local-Q-token inclusive lower bound on
+            the local K index of the document this Q token belongs to. Requires
+            use_causal_mask=True and striped_attention=True. Identical across ranks
+            (striped CP invariant with doc length divisible by num_workers).
+            Use test/integration/nkilib/utils/sequence_packing_helpers.py::
+            cu_seqlens_to_striped_bounds() to build it.
+        bound_max (nl.ndarray, optional): Sequence packing upper bound (exclusive).
+            Same shape/dtype/semantics as bound_min. Must be provided together.
 
     Returns:
         out_dq (nl.ndarray): [B, N, D, S], Query gradient in HBM (float32).
@@ -109,7 +120,20 @@ def ring_attention_spmd_bwd(
     bs, nh, dh, sl = q_ref.shape
     kernel_assert(sl % 128 == 0, f"seqlen must be divisible by 128, got {sl}")
 
-    if replica_groups == None:
+    # Sequence packing: bound_min and bound_max must be provided together. Under
+    # striped CP with each padded doc length a multiple of num_workers, the local
+    # document layout is identical across ranks, so the caller produces one pair
+    # of bound tensors and replicates them to every rank.
+    is_sequence_packed = bound_min is not None
+    kernel_assert(
+        is_sequence_packed == (bound_max is not None),
+        "bound_min and bound_max must both be provided or both be None",
+    )
+    if is_sequence_packed:
+        kernel_assert(use_causal_mask, "bound_min/bound_max require use_causal_mask=True")
+        kernel_assert(striped_attention, "bound_min/bound_max require striped_attention=True")
+
+    if replica_groups is None:
         replica_groups = (tuple(range(num_workers)),)
 
     out_dq = nl.ndarray(q_ref.shape, dtype=nl.float32, buffer=nl.shared_hbm, name="out_dq")
@@ -203,6 +227,8 @@ def ring_attention_spmd_bwd(
             striped=striped_attention,
             mp=mixed_precision,
             ss=softmax_scale,
+            bound_min=bound_min,
+            bound_max=bound_max,
         )
 
     return out_dq, out_dk, out_dv
@@ -210,7 +236,7 @@ def ring_attention_spmd_bwd(
 
 def _build_causal_bounds(qts, qnt, striped, recv_rank_sb=None, my_rank_sb=None, gko_sb=None):
     """
-    Build range_select upper/lower bounds for causal masking.
+    Build range_select upper/lower bounds for causal masking (no packing).
 
     For striped: ub = local_q_pos - no_include_diagonal, lb = 0.
     For contiguous: ub = local_q_pos + gko, lb = 0.
@@ -237,12 +263,68 @@ def _build_causal_bounds(qts, qnt, striped, recv_rank_sb=None, my_rank_sb=None, 
         nisa.tensor_scalar(no_diag, no_diag, op0=nl.minimum, operand0=1.0)
         nisa.tensor_scalar(rs_ub, rs_ub, op0=nl.subtract, operand0=no_diag)
     else:
-        if gko_sb != None:
+        if gko_sb is not None:
             nisa.tensor_scalar(rs_ub, rs_ub, nl.add, gko_sb)
 
     rs_lb = nl.ndarray((qts, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(rs_lb, value=0.0)
     return rs_ub, rs_lb
+
+
+def _build_bound_max_clamped(
+    qts,
+    qnt,
+    bound_max_sb,
+    striped,
+    recv_rank_sb=None,
+    my_rank_sb=None,
+    gko_sb=None,
+):
+    """
+    Build bound_max_clamped = min(bound_max, causal_ub_exclusive) for the
+    use_sequence_packing path in recompute_qk_softmax.
+
+    The use_sequence_packing path uses ``comp_op1=nl.less`` with
+    ``bound1=bound_max_clamped``, so ``bound_max_clamped`` is the EXCLUSIVE
+    causal upper bound clamped to the packing upper bound:
+
+        causal_ub_exclusive[p, g] = iota[p, g] + 1 - no_diag   (striped)
+                                  = iota[p, g] + 1 + gko      (contiguous)
+        bound_max_clamped[p, g]   = min(bound_max_sb[p, g], causal_ub_exclusive[p, g])
+
+    This matches the clamp that attention_bwd does in its non-ring sequence_packing
+    code path (see ``_attention_bwd`` where it clamps ``bound_max_sbuf`` with
+    ``iota(offset=1 + cp_offset)``), with ``cp_offset = -no_diag`` for striped CP.
+
+    Args:
+        qts (int): Q sequence tile size.
+        qnt (int): Number of Q sequence tiles.
+        bound_max_sb (nl.ndarray): [qts, qnt] fp32, base packing upper bound (exclusive).
+        striped (bool): Whether striped attention layout is used.
+        recv_rank_sb (nl.ndarray): [qts, 1], Receiver rank ID in SBUF (striped only).
+        my_rank_sb (nl.ndarray): [qts, 1], Current rank ID in SBUF (striped only).
+        gko_sb (nl.ndarray): [qts, 1], Global K offset in SBUF (contiguous only).
+
+    Returns:
+        nl.ndarray: [qts, qnt] fp32, the composed exclusive upper bound.
+    """
+    # iota + 1 gives the exclusive causal upper bound (k < iota + 1 means k <= iota).
+    causal_ub = nl.ndarray((qts, qnt), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(causal_ub, pattern=[[qts, qnt]], offset=1, channel_multiplier=1)
+
+    if striped:
+        no_diag = nl.ndarray((qts, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(no_diag, my_rank_sb, op0=nl.subtract, operand0=recv_rank_sb)
+        nisa.tensor_scalar(no_diag, no_diag, op0=nl.maximum, operand0=0.0)
+        nisa.tensor_scalar(no_diag, no_diag, op0=nl.minimum, operand0=1.0)
+        nisa.tensor_scalar(causal_ub, causal_ub, op0=nl.subtract, operand0=no_diag)
+    else:
+        if gko_sb is not None:
+            nisa.tensor_scalar(causal_ub, causal_ub, nl.add, gko_sb)
+
+    bound_max_clamped = nl.ndarray((qts, qnt), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(bound_max_clamped, bound_max_sb, causal_ub, op=nl.minimum)
+    return bound_max_clamped
 
 
 def _load_rank_sb(iota_nw, scalar_rank, qts):
@@ -332,6 +414,8 @@ def _compute_step(
     dq_shard_off,
     range_select_bounds=None,
     striped=False,
+    bound_min_sbuf=None,
+    bound_max_sbuf=None,
 ):
     """
     Run backward core for all Q tiles against all local K tiles.
@@ -376,11 +460,14 @@ def _compute_step(
             q_ref_hbm_tile=q_buf,
             dy_ref_hbm_tile=dy_buf,
             dtype=kernel_dtype,
-            d_head_n_tiles=d_head_n_tiles,
-            d_head_tile_size=d_head_tile_size,
+            d_head_qk_n_tiles=d_head_n_tiles,
+            d_head_v_n_tiles=d_head_n_tiles,
+            d_head_qk_tile_size=d_head_tile_size,
+            d_head_v_tile_size=d_head_tile_size,
             q_seq_tile_size=group_seqlen,
             seqlen_q=seqlen,
-            offset=q_shard_off + q_tile_idx * q_seq_tile_size,
+            offset_q=q_shard_off + q_tile_idx * q_seq_tile_size,
+            offset_dy=q_shard_off + q_tile_idx * q_seq_tile_size,
         )
 
         trans_q_stride = d_head_tile_size * current_group
@@ -398,7 +485,7 @@ def _compute_step(
         for k_tile_idx in range(k_seq_n_tiles):
             tr, any_r = get_required_tiles_mask(
                 current_group,
-                causal and (range_select_bounds == None or striped),
+                causal and (striped or (range_select_bounds is None and bound_max_sbuf is None)),
                 q_tile_idx,
                 q_seq_tile_size,
                 global_k_offset,
@@ -437,6 +524,8 @@ def _compute_step(
                     q_tile_group_size=current_group,
                     global_k_seq_offset=global_k_offset,
                     range_select_bounds=range_select_bounds,
+                    bound_min_sbuf=bound_min_sbuf,
+                    bound_max_sbuf=bound_max_sbuf,
                 )
 
         dq_st_pat = [[seqlen, d_head_tile_size], [1, group_seqlen]]
@@ -483,6 +572,8 @@ def _ring_bwd_impl(
     striped=False,
     mp=True,
     ss=None,
+    bound_min=None,
+    bound_max=None,
 ):
     """
     Inner implementation for one (batch, head) pair of ring attention backward.
@@ -534,11 +625,27 @@ def _ring_bwd_impl(
     rg = ncc.ReplicaGroup(rgs)
     ch = 0
 
-    cfg = setup_config(q_ref, k_ref, sinks_ref=None, mixed_precision=mp, softmax_scale=ss)
+    # Sequence packing: when bound_min/bound_max are passed, route through
+    # attention_bwd's proven use_sequence_packing path (fused PSUM->SBUF
+    # range_select with bound_min_sbuf / bound_max_sbuf) instead of the
+    # range_select_bounds path. The clamp that attention_bwd does once for
+    # non-ring (min(bound_max, iota+1+cp_offset)) is re-done per ring step here
+    # because cp_offset (encoded via no_diag) changes with my_rank vs recv_rank.
+    is_seq_packed = bound_min is not None
+
+    cfg = setup_config(
+        q_ref,
+        k_ref,
+        v_ref,
+        sinks_ref=None,
+        mixed_precision=mp,
+        softmax_scale=ss,
+        use_sequence_packing=is_seq_packed,
+    )
     qts = cfg.q_seq_tile_size
     qnt = cfg.q_seq_n_tiles
-    dnt = cfg.d_head_n_tiles
-    dts = cfg.d_head_tile_size
+    dnt = cfg.d_head_qk_n_tiles
+    dts = cfg.d_head_qk_tile_size
     kts = cfg.k_seq_tile_size
     knt = cfg.k_seq_n_tiles
 
@@ -557,6 +664,38 @@ def _ring_bwd_impl(
     nisa.dma_copy(dst=seb[0], src=lse_ref.ap(pattern=lse_pat, offset=off_lse))
     nisa.tensor_scalar(seb[0], seb[0], nl.multiply, -1.0)
 
+    # Load sequence-packing bounds once (no rotation needed because the striped CP
+    # invariant makes local bounds identical across ranks). Both shapes (qts, qnt)
+    # in SBUF fp32.
+    bound_min_sb = None
+    bound_max_sb = None
+    if is_seq_packed:
+        # bound_min / bound_max have HBM shape (bs, seqlen_per_rank) fp32 — one row
+        # per batch. Access pattern must match iota's layout so that SBUF element
+        # (partition p, free g) corresponds to LOCAL Q position g*qts + p (group g,
+        # row p within group). Pattern [[1, qts], [qts, qnt]]: partition stride=1
+        # count=qts; free stride=qts count=qnt.
+        bound_offset = bid * sl
+        bound_pat = [[1, qts], [qts, qnt]]
+        bound_min_sb = nl.ndarray((qts, qnt), dtype=nl.float32, buffer=nl.sbuf)
+        bound_max_sb = nl.ndarray((qts, qnt), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=bound_min_sb, src=bound_min.ap(pattern=bound_pat, offset=bound_offset))
+        nisa.dma_copy(dst=bound_max_sb, src=bound_max.ap(pattern=bound_pat, offset=bound_offset))
+
+    # Precompute my_rank_sb once — constant across all ring steps, also needed by
+    # step 0 when packing is on (to build the step-0 bounds tuple).
+    my_rank_sb = None
+    if causal:
+        my_rank_sb = _load_rank_sb(
+            iota_nw,
+            ncc.collective_permute_implicit_current_processing_rank_id(
+                iteration_id=0,
+                channel_id=ch,
+                replica_group=rg,
+            ),
+            qts,
+        )
+
     # Compute dy_o_sum = rowsum(dO * O)
     dos_sb = ndarray((1,), (qts, qnt), dtype=mdt, value=0.0)
     off_q = bid * cfg.offset_q_bs + hid * cfg.offset_q_head
@@ -568,11 +707,14 @@ def _ring_bwd_impl(
             q_ref_hbm_tile=dy_ref,
             dy_ref_hbm_tile=dy_ref,
             dtype=kdt,
-            d_head_n_tiles=dnt,
-            d_head_tile_size=dts,
+            d_head_qk_n_tiles=dnt,
+            d_head_v_n_tiles=dnt,
+            d_head_qk_tile_size=dts,
+            d_head_v_tile_size=dts,
             q_seq_tile_size=group_seqlen,
             seqlen_q=sl,
-            offset=off_q + q_tile_idx * qts,
+            offset_q=off_q + q_tile_idx * qts,
+            offset_dy=off_q + q_tile_idx * qts,
         )
         o_l = ndarray((dnt,), (dts, group_seqlen), kdt)
         for d_tile_idx in range(dnt):
@@ -594,7 +736,7 @@ def _ring_bwd_impl(
                 dy_op,
                 i_d_head_tile=d_tile_idx,
                 q_seq_tile_size=qts,
-                d_head_tile_size=dts,
+                d_head_v_tile_size=dts,
                 num_tiles=current_group,
             )
         for group_idx in range(current_group):
@@ -605,11 +747,14 @@ def _ring_bwd_impl(
         k_ref_hbm_tile=k_ref,
         v_ref_hbm_tile=v_ref,
         dtype=kdt,
-        d_head_n_tiles=dnt,
-        d_head_tile_size=dts,
+        d_head_qk_n_tiles=dnt,
+        d_head_v_n_tiles=dnt,
+        d_head_qk_tile_size=dts,
+        d_head_v_tile_size=dts,
         k_seq_tile_size=sl,
         seqlen_k=sl,
-        offset=bid * cfg.offset_k_bs + hid * cfg.offset_k_head,
+        offset_k=bid * cfg.offset_k_bs + hid * cfg.offset_k_head,
+        offset_v=bid * cfg.offset_v_bs + hid * cfg.offset_v_head,
     )
 
     dk_r = ndarray((dnt,), (dts, sl), mdt, value=0.0)
@@ -637,6 +782,21 @@ def _ring_bwd_impl(
 
     # Step 0: no range_select_bounds needed — gko=0 means affine_select handles causal
     # correctly, and this enables compile-time tile skipping for upper-triangle tiles.
+    # EXCEPTION: when sequence packing is on, we route through the use_sequence_packing
+    # path with bound_min_sbuf / bound_max_sbuf (bound_max clamped per step with the
+    # striped causal rule). At step 0, my_rank == recv_rank => no_diag = 0 =>
+    # causal_ub_exclusive = iota + 1, matching attention_bwd's non-ring packing path.
+    step0_bound_max_sbuf = None
+    if causal and is_seq_packed:
+        step0_bound_max_sbuf = _build_bound_max_clamped(
+            qts,
+            qnt,
+            bound_max_sb=bound_max_sb,
+            striped=striped,
+            recv_rank_sb=my_rank_sb if striped else None,
+            my_rank_sb=my_rank_sb if striped else None,
+            gko_sb=None,
+        )
     _compute_step(
         cfg,
         sq,
@@ -662,6 +822,10 @@ def _ring_bwd_impl(
         0,
         q_so,
         q_so,
+        range_select_bounds=None,
+        striped=striped,
+        bound_min_sbuf=bound_min_sb if is_seq_packed else None,
+        bound_max_sbuf=step0_bound_max_sbuf,
     )
 
     # Copy dQ step0 into send_dq
@@ -686,18 +850,7 @@ def _ring_bwd_impl(
     cur_dos, nxt_dos = rdos, sdos
     cur_dq_recv, cur_dq_send = rdq, sdq
 
-    # Precompute my_rank_sb (constant across all ring steps)
-    my_rank_sb = None
-    if causal:
-        my_rank_sb = _load_rank_sb(
-            iota_nw,
-            ncc.collective_permute_implicit_current_processing_rank_id(
-                iteration_id=0,
-                channel_id=ch,
-                replica_group=rg,
-            ),
-            qts,
-        )
+    # my_rank_sb was precomputed above (before step 0) since step 0 may also need it.
 
     # Ring steps 1..nw-1
     for ring_step_idx in nl.sequential_range(1, nw):
@@ -719,23 +872,45 @@ def _ring_bwd_impl(
         )
 
         rs_bounds = None
+        step_bound_max_sbuf = None
         if causal:
             recv_rank_sb = _load_rank_sb(iota_nw, recv_rank, qts)
 
             if striped:
-                rs_bounds = _build_causal_bounds(
-                    qts,
-                    qnt,
-                    striped=True,
-                    recv_rank_sb=recv_rank_sb,
-                    my_rank_sb=my_rank_sb,
-                )
+                if is_seq_packed:
+                    # Route through use_sequence_packing path: build bound_max_clamped
+                    # with the striped causal rule (iota + 1 - no_diag).
+                    step_bound_max_sbuf = _build_bound_max_clamped(
+                        qts,
+                        qnt,
+                        bound_max_sb=bound_max_sb,
+                        striped=True,
+                        recv_rank_sb=recv_rank_sb,
+                        my_rank_sb=my_rank_sb,
+                    )
+                else:
+                    rs_bounds = _build_causal_bounds(
+                        qts,
+                        qnt,
+                        striped=True,
+                        recv_rank_sb=recv_rank_sb,
+                        my_rank_sb=my_rank_sb,
+                    )
             else:
                 # gko = (recv_rank - my_rank) * sl
                 gko_sb = nl.ndarray((qts, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_scalar(gko_sb, recv_rank_sb, op0=nl.subtract, operand0=my_rank_sb)
                 nisa.tensor_scalar(gko_sb, gko_sb, op0=nl.multiply, operand0=float(sl))
-                rs_bounds = _build_causal_bounds(qts, qnt, striped=False, gko_sb=gko_sb)
+                if is_seq_packed:
+                    step_bound_max_sbuf = _build_bound_max_clamped(
+                        qts,
+                        qnt,
+                        bound_max_sb=bound_max_sb,
+                        striped=False,
+                        gko_sb=gko_sb,
+                    )
+                else:
+                    rs_bounds = _build_causal_bounds(qts, qnt, striped=False, gko_sb=gko_sb)
 
         # No barrier needed: send buffer was written by CC, not NCs
         _permute_all(cur_q, nxt_q, cur_dy, nxt_dy, cur_lse, nxt_lse, cur_dos, nxt_dos, rg, ch, lnc, barrier=False)
@@ -768,6 +943,8 @@ def _ring_bwd_impl(
             q_so,
             range_select_bounds=rs_bounds,
             striped=striped,
+            bound_min_sbuf=bound_min_sb if is_seq_packed else None,
+            bound_max_sbuf=step_bound_max_sbuf,
         )
 
         # dQ reduction: combine local dq_s with incoming cur_dq_recv, write to cur_dq_send

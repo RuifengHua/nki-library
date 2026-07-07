@@ -64,13 +64,13 @@ _ABBREVS = {
 }
 LAYERNORM_TKG_TEST_CASES = [
     # LNC1 / Trn1
-    (1, 1, 1, 8192, False, np.float16),
+    pytest.param(1, 1, 1, 8192, False, np.float16, marks=pytest.mark.fast),
     (1, 1, 8, 8192, False, np.float16),
     # LNC2 batch 1
     (2, 1, 1, 5120, False, np.float16),
     (2, 1, 1, 8192, False, np.float16),
     # LNC2 higher batch
-    (2, 2, 8, 8192, False, np.float16),
+    pytest.param(2, 2, 8, 8192, False, np.float16, marks=pytest.mark.fast),
     (2, 4, 8, 8192, False, np.float16),
     (2, 128, 1, 8192, False, np.float16),
     (2, 128, 1, 8192, True, np.float16),
@@ -86,7 +86,7 @@ LAYERNORM_TKG_TEST_CASES = [
     # Shard on H
     (2, 1, 1, 8192, True, np.float16),
     (2, 2, 8, 8192, True, np.float16),
-    (2, 1, 1, 5120, True, np.float16),
+    pytest.param(2, 1, 1, 5120, True, np.float16, marks=pytest.mark.fast),
     (2, 4, 1, 3072, True, np.float16),
     (2, 1, 1, 16384, True, np.float16),
 ]
@@ -150,7 +150,6 @@ def filter_layernorm_tkg_combinations(lnc_degree, batch=None, seqlen=None, hidde
 class TestLayerNormTKGKernel:
     """Test class for LayerNorm TKG kernel using UnitTestFramework."""
 
-    @pytest.mark.fast
     @pytest_parametrize(LAYERNORM_TKG_PARAMS, LAYERNORM_TKG_TEST_CASES, abbrevs=_ABBREVS)
     def test_layernorm_tkg_unit(
         self,

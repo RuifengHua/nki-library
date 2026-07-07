@@ -20,12 +20,17 @@ import nki.language as nl
 import numpy as np
 import torch
 
+from test.utils.rng import NKITestsRNG
+
+_rng = NKITestsRNG()
+
 from nkilib_src.nkilib.core.router_topk.router_topk import (
     XHBMLayout_T_H__1,
     router_topk,
     router_topk_input_x_load,
 )
 from nkilib_src.nkilib.core.router_topk.router_topk_torch import router_topk_torch_ref
+from nkilib_src.nkilib.core.utils.common_types import RouterActFnType
 
 
 def router_topk_tensor_gen(name: str, shape, dtype):
@@ -41,12 +46,11 @@ def router_topk_tensor_gen(name: str, shape, dtype):
         numpy.ndarray: Generated tensor with uniform random values in [-0.1, 0.1]
 
     Notes:
-        - Uses thread-safe Generator for reproducibility
         - Range chosen because x.T @ w may go into sigmoid activation
     """
-    generator = torch.Generator()
-    generator.manual_seed(0)
-    tensor = torch.empty(shape, dtype=torch.float32).uniform_(-0.1, 0.1, generator=generator)
+    tensor = torch.empty(shape, dtype=torch.float32)
+    _rng.reset()
+    _rng.tensor_uniform_(tensor, -0.1, 0.1)
     return dt.static_cast(tensor.numpy(), dtype)
 
 
@@ -71,9 +75,11 @@ def router_topk_kernel_wrapper(
     shard_on_tokens=False,
     skip_store_expert_index=False,
     skip_store_router_logits=False,
-    x_input_in_sbuf=False,
 ):
     """Wrapper for router_topk that handles SBUF I/O."""
+    # Infer x_input_in_sbuf: if x is (T, H) but x_hbm_layout says (H, T), x was intended for SBUF
+    H = w.shape[0]
+    x_input_in_sbuf = (x.shape[0] != H) and (x_hbm_layout == 0)
     if x_input_in_sbuf:
         x_input = router_topk_input_x_load(x, hbm_layout=XHBMLayout_T_H__1, sb_layout=x_sb_layout)
     else:
@@ -139,9 +145,13 @@ def router_topk_torch_wrapper(
     shard_on_tokens: bool = False,
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
-    x_input_in_sbuf: bool = False,
 ) -> list[torch.Tensor]:
     """Wrapper for router_topk_torch_ref matching router_topk_kernel_wrapper API."""
+    # Infer if x is in T×H layout from shape: w is always (H, E), so w.shape[0] == H.
+    # If x.shape[0] != H, x must be (T, H) — override x_hbm_layout so the torch_ref
+    # handles the transpose correctly.
+    H = w.shape[0]
+    x_in_th_layout = x.shape[0] != H
     return router_topk_torch_ref(
         x=x,
         w=w,
@@ -151,7 +161,7 @@ def router_topk_torch_wrapper(
         expert_index=expert_index,
         act_fn=act_fn,
         k=k,
-        x_hbm_layout=x_hbm_layout,
+        x_hbm_layout=1 if x_in_th_layout else x_hbm_layout,
         x_sb_layout=x_sb_layout,
         router_pre_norm=router_pre_norm,
         norm_topk_prob=norm_topk_prob,
@@ -162,7 +172,6 @@ def router_topk_torch_wrapper(
         shard_on_tokens=shard_on_tokens,
         skip_store_expert_index=skip_store_expert_index,
         skip_store_router_logits=skip_store_router_logits,
-        x_input_in_sbuf=x_input_in_sbuf,
     )
 
 
@@ -209,5 +218,4 @@ def generate_router_topk_inputs(
         "use_PE_broadcast_w_bias": use_PE_broadcast_w_bias,
         "shard_on_tokens": shard_on_tokens,
         "output_in_sbuf": output_in_sbuf,
-        "x_input_in_sbuf": x_input_in_sb,
     }

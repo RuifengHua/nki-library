@@ -22,25 +22,27 @@ Dependency chain:
     gate_pre = hidden_states @ W_gate.T
     gate_act = SiLU(gate_pre)              (requires gate_pre)
     up       = hidden_states @ W_up.T
-    hidden   = gate_act * up               (requires gate_act + up)
+    intermediate = gate_act * up            (requires gate_act + up)
 """
 
 import nki.isa as nisa
 import nki.language as nl
 
 from ....core.utils.kernel_helpers import div_ceil
+from ...matmul_mxfp8.matmul_mxfp8_config import MatmulMxfp8KernelConfig
 from ...matmul_mxfp8.matmul_mxfp8_generic_api import generic_matmul_mxfp8_api
 from ...mxfp_utils.mxfp8_utils.common_dataclasses import TensorDescriptor
 from ...mxfp_utils.mxfp8_utils.common_utils import get_active_sbm
 from ...mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import INTERLEAVE_FACTOR
 from ..common_utils import (
-    MAX_TILES_IN_LOAD_M,
     NUM_LNC2_CORES,
     _allocate_spill_buffer,
     _build_matmul_params,
     _compute_load_tile_shape,
+    apply_activation_clamp,
     get_tile_sizes,
 )
+from .config import ClampLimits
 
 
 def recompute_gate_up_projection(
@@ -51,12 +53,12 @@ def recompute_gate_up_projection(
     s_base_offset: int,
     dtype: type,
     fp8_x4_dtype: type,
-    TILES_IN_BLOCK_M: int = 8,
-    TILES_IN_BLOCK_N: int = 1,
-    TILES_IN_BLOCK_K: int = 8,
+    gate_config: MatmulMxfp8KernelConfig = None,
+    up_config: MatmulMxfp8KernelConfig = None,
     spill_reload: bool = True,
     use_scale_packing: bool = True,
     run_with_lnc2: bool = True,
+    clamp_limits: ClampLimits = None,
 ) -> None:
     """Recompute gate_pre and up projections using generic_matmul_mxfp8_api.
 
@@ -97,10 +99,27 @@ def recompute_gate_up_projection(
     I = gate_up_td.sharded_logical_shape[1]
     S_local = hidden_td.sharded_logical_shape[1]
 
-    rc_tiles = get_tile_sizes(H, S_local, I)
-    tile_m = rc_tiles['tile_m']
-    tile_n = rc_tiles['tile_n']
-    l_tile_k = rc_tiles['l_tile_k']
+    # Use gate_config for shared M/K loop structure (validated compatible with up_config)
+    tile_m = gate_config.tile_m
+    tile_n = gate_config.tile_n
+    l_tile_k = gate_config.tile_k
+    TILES_IN_BLOCK_M = gate_config.TILES_IN_BLOCK_M
+    TILES_IN_BLOCK_N = gate_config.TILES_IN_BLOCK_N
+    TILES_IN_BLOCK_K = gate_config.TILES_IN_BLOCK_K
+
+    matmul_tile_k_physical = l_tile_k // INTERLEAVE_FACTOR
+    rc_tiles = {
+        'tile_m': tile_m,
+        'tile_n': tile_n,
+        'l_tile_k': l_tile_k,
+        'matmul_tile_k_physical': matmul_tile_k_physical,
+        'lhs_matmul_tile_physical': gate_config.lhs_matmul_tile_shape_physical,
+        'rhs_matmul_tile_physical': gate_config.rhs_matmul_tile_shape_physical,
+        'lhs_load_tile': gate_config.lhs_load_tile_shape,
+        'rhs_load_tile': gate_config.rhs_load_tile_shape,
+        'lhs_quantize_tile': gate_config.lhs_quantize_tile_shape,
+        'rhs_quantize_tile': gate_config.rhs_quantize_tile_shape,
+    }
 
     NUM_S_TILES_LOCAL = div_ceil(S_local, tile_m)
 
@@ -193,8 +212,8 @@ def recompute_gate_up_projection(
                     lhs_sbuf_td=hidden_sbuf_td,
                     lhs_m_offset=s_base_physical,
                     rhs_n_offset=0,
-                    TILES_IN_LOAD_M=min(TILES_IN_BLOCK_M, MAX_TILES_IN_LOAD_M),
-                    TILES_IN_LOAD_N=1,
+                    TILES_IN_LOAD_M=gate_config.TILES_IN_LOAD_M,
+                    TILES_IN_LOAD_N=gate_config.TILES_IN_LOAD_N,
                     lhs_matmul_tile_shape_physical=rc_tiles['lhs_matmul_tile_physical'],
                     rhs_matmul_tile_shape_physical=rc_tiles['rhs_matmul_tile_physical'],
                     lhs_load_tile_shape=lhs_load_tile_shape or rc_tiles['lhs_load_tile'],
@@ -220,8 +239,8 @@ def recompute_gate_up_projection(
                     lhs_sbuf_td=hidden_sbuf_td,
                     lhs_m_offset=s_base_physical,
                     rhs_n_offset=rhs_n_offset_up,
-                    TILES_IN_LOAD_M=min(TILES_IN_BLOCK_M, MAX_TILES_IN_LOAD_M),
-                    TILES_IN_LOAD_N=1,
+                    TILES_IN_LOAD_M=up_config.TILES_IN_LOAD_M,
+                    TILES_IN_LOAD_N=up_config.TILES_IN_LOAD_N,
                     lhs_matmul_tile_shape_physical=rc_tiles['lhs_matmul_tile_physical'],
                     rhs_matmul_tile_shape_physical=rc_tiles['rhs_matmul_tile_physical'],
                     lhs_load_tile_shape=lhs_load_tile_shape or rc_tiles['lhs_load_tile'],
@@ -252,14 +271,36 @@ def recompute_gate_up_projection(
                     gate_tile = gate_sbuf.ap(pattern=[[sbuf_step_p, actual_m], [1, actual_n]], offset=sbuf_offset)
                     up_tile = up_sbuf.ap(pattern=[[sbuf_step_p, actual_m], [1, actual_n]], offset=sbuf_offset)
 
-                    nisa.dma_copy(
-                        dst=gate_pre_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n],
-                        src=gate_tile,
-                    )
-                    nisa.dma_copy(
-                        dst=up_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n],
-                        src=up_tile,
-                    )
+                    if clamp_limits is not None:
+                        gate_tile_buf = sbm.alloc_stack(shape=(actual_m, actual_n), dtype=nl.float32, buffer=nl.sbuf)
+                        nisa.tensor_copy(dst=gate_tile_buf, src=gate_tile)
+                        apply_activation_clamp(
+                            gate_tile_buf,
+                            clamp_limits.non_linear_clamp_upper_limit,
+                            clamp_limits.non_linear_clamp_lower_limit,
+                        )
+                        up_tile_buf = sbm.alloc_stack(shape=(actual_m, actual_n), dtype=nl.float32, buffer=nl.sbuf)
+                        nisa.tensor_copy(dst=up_tile_buf, src=up_tile)
+                        apply_activation_clamp(
+                            up_tile_buf, clamp_limits.linear_clamp_upper_limit, clamp_limits.linear_clamp_lower_limit
+                        )
+                        nisa.dma_copy(
+                            dst=gate_pre_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n],
+                            src=gate_tile_buf,
+                        )
+                        nisa.dma_copy(
+                            dst=up_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n],
+                            src=up_tile_buf,
+                        )
+                    else:
+                        nisa.dma_copy(
+                            dst=gate_pre_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n],
+                            src=gate_tile,
+                        )
+                        nisa.dma_copy(
+                            dst=up_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n],
+                            src=up_tile,
+                        )
 
 
 def recompute_gate_act(
@@ -325,17 +366,17 @@ def recompute_gate_act(
             nisa.dma_copy(dst=gate_act_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n], src=silu_out)
 
 
-def recompute_hidden(
+def recompute_intermediate(
     gate_act_td: TensorDescriptor,
     up_td: TensorDescriptor,
-    hidden_td: TensorDescriptor,
+    intermediate_td: TensorDescriptor,
     s_base_offset: int,
     dtype: type,
     run_with_lnc2: bool = True,
 ) -> None:
-    """Recompute hidden = gate_act * up from checkpointed or recomputed gate_act and up.
+    """Recompute intermediate = gate_act * up from checkpointed or recomputed gate_act and up.
 
-    Tile-by-tile element-wise multiply. Used when hidden (the gated intermediate)
+    Tile-by-tile element-wise multiply. Used when intermediate (the gated activation)
     was not checkpointed but gate_act and up are available.
 
     Dimensions derived from tensor descriptors:
@@ -344,13 +385,13 @@ def recompute_hidden(
     Args:
         gate_act_td (TensorDescriptor): [S, I], SiLU(gate_pre) (input).
         up_td (TensorDescriptor): [S, I], up projection (input).
-        hidden_td (TensorDescriptor): [S, I], output buffer for gate_act * up.
+        intermediate_td (TensorDescriptor): [S, I], output buffer for gate_act * up.
         s_base_offset (int): Row offset for LNC sharding.
         dtype: Compute dtype (nl.bfloat16).
         run_with_lnc2 (bool): Whether running with LNC2.
 
     Returns:
-        None. Results are written to hidden_td.data.
+        None. Results are written to intermediate_td.data.
 
     Pseudocode:
         for each s_tile in S tiles:
@@ -358,7 +399,7 @@ def recompute_hidden(
                 gate_act_tile = load(gate_act_td)
                 up_tile = load(up_td)
                 result = gate_act_tile * up_tile
-                store result to hidden_td
+                store result to intermediate_td
     """
     sbm = get_active_sbm()
 
@@ -391,4 +432,6 @@ def recompute_hidden(
             result = sbm.alloc_stack(shape=(actual_m, actual_n), dtype=dtype, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=result, data1=gate_act_tile, data2=up_tile, op=nl.multiply)
 
-            nisa.dma_copy(dst=hidden_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n], src=result)
+            nisa.dma_copy(
+                dst=intermediate_td.data[global_s : global_s + actual_m, i_off : i_off + actual_n], src=result
+            )

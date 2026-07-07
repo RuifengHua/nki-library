@@ -68,20 +68,20 @@ class RelevantTestFinder:
         self._reverse_deps: dict[str, set[str]] | None = None
 
     def get_relevant_test_dirs(self, commit_ids: str = "HEAD") -> set[str] | None:
-        """Get test directories relevant to one or more commits' changes.
+        """Get test file paths relevant to one or more commits' changes.
 
         Args:
             commit_ids: Comma-separated commit IDs or a git range
                 (e.g., "abc123,def456", "HEAD", or "abc123..def456").
 
         Returns:
-            set[str]: Absolute paths of relevant test directories.
+            set[str]: Absolute paths of relevant test files.
             None: If all tests should run (infrastructure change detected).
 
         Raises:
             subprocess.CalledProcessError: If git diff fails for a commit ID.
             ValueError: If the commit ID format is invalid.
-            RuntimeError: If no changed files or no relevant test directories are found.
+            RuntimeError: If no changed files or no relevant test paths are found.
         """
         changed_files: list[str] = []
         for commit_id in self._parse_commit_ids(commit_ids):
@@ -144,13 +144,13 @@ class RelevantTestFinder:
 
         if not test_dirs:
             logger.warning(
-                "No relevant test directories found for commit(s) %s (changed files: %s), running all tests",
+                "No relevant test files found for commit(s) %s (changed files: %s), running all tests",
                 commit_ids,
                 changed_files,
             )
             return None
 
-        logger.info("Relevant test directories: %s", test_dirs)
+        logger.info("Relevant test paths: %s", test_dirs)
         return test_dirs
 
     @staticmethod
@@ -214,13 +214,14 @@ class RelevantTestFinder:
         return fpath.suffix == ".py" and _is_under(fpath, _TEST_PREFIX)
 
     def _test_file_to_test_dir(self, fpath: Path) -> str | None:
-        """Map a test file path to its kernel-level test directory (absolute)."""
-        rel = fpath.relative_to(_TEST_PREFIX)
-        parts = rel.parts  # e.g., ("core", "mlp", "test_mlp_tkg.py")
-        if len(parts) >= 2:
-            test_dir = self.test_root / parts[0] / parts[1]
-            if test_dir.is_dir():
-                return str(test_dir)
+        """Map a test file path to its absolute file path for filtering.
+
+        Returns the absolute path of the test file itself (not the directory),
+        enabling file-level precision in test selection.
+        """
+        abs_path = self.repo_root / fpath
+        if abs_path.is_file():
+            return str(abs_path)
         return None
 
     def _build_reverse_import_index(self):
@@ -357,10 +358,20 @@ class RelevantTestFinder:
         return None
 
     def _get_transitive_dependents(self, changed_files: list[str]) -> set[str]:
-        """BFS over reverse dependency graph to find all transitive dependents."""
+        """BFS over reverse dependency graph to find all transitive dependents.
+
+        Stops propagation at test-to-test edges: when a test file is reached
+        via the import graph, it is included in the result but its own dependents
+        (other test files that import from it) are NOT traversed. This prevents
+        shared test utilities from causing unrelated test files to be selected.
+
+        Test-to-test propagation only happens when the test file itself is in
+        the initial changed_files list (i.e., it was directly modified).
+        """
         if not self._reverse_deps:
             return set(changed_files)
 
+        changed_set = set(changed_files)
         visited: set[str] = set()
         queue = deque(changed_files)
 
@@ -369,6 +380,13 @@ class RelevantTestFinder:
             if current in visited:
                 continue
             visited.add(current)
+
+            # If current is a test file that was NOT directly changed,
+            # don't propagate further (test→test edge stop)
+            current_is_test = _is_under(Path(current), _TEST_PREFIX)
+            if current_is_test and current not in changed_set:
+                continue
+
             for dependent in self._reverse_deps.get(current, set()):
                 if dependent not in visited:
                     queue.append(dependent)
@@ -376,34 +394,27 @@ class RelevantTestFinder:
         return visited
 
     def _map_to_test_dirs(self, affected_files: set[str]) -> set[str]:
-        """Map affected source or test files to their corresponding test directories."""
-        test_dirs: set[str] = set()
+        """Map affected files to relevant test file paths.
+
+        Instead of mapping to kernel-group directories (which over-selects),
+        returns only the test files that are actually in the affected set.
+        The BFS already traced imports transitively, so any test file that
+        imports (directly or transitively) from a changed source file will
+        already be in affected_files.
+
+        Returns absolute paths of individual test files, compatible with the
+        startswith() filter in pytest_collection_modifyitems.
+        """
+        test_paths: set[str] = set()
 
         for f in affected_files:
             fpath = Path(f)
+            if _is_under(fpath, _TEST_PREFIX) and fpath.suffix == ".py":
+                abs_path = self.repo_root / fpath
+                if abs_path.is_file():
+                    test_paths.add(str(abs_path))
 
-            if _is_under(fpath, _SRC_PREFIX):
-                rel = fpath.relative_to(_SRC_PREFIX)
-            elif _is_under(fpath, _TEST_PREFIX):
-                rel = fpath.relative_to(_TEST_PREFIX)
-            else:
-                continue
-
-            parts = rel.parts  # e.g., ("core", "mlp", ..., "file.py")
-
-            if len(parts) < 2:
-                continue
-
-            module = parts[0]  # core, experimental, private
-            kernel_group = parts[1]  # mlp, moe, attention, etc.
-
-            test_dir = self.test_root / module / kernel_group
-            if test_dir.is_dir():
-                test_dirs.add(str(test_dir))
-            else:
-                logger.warning("No matching test directory for affected file: %s (expected %s)", f, test_dir)
-
-        return test_dirs
+        return test_paths
 
 
 def _is_under(path: Path, prefix: Path) -> bool:

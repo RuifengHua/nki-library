@@ -62,8 +62,10 @@ def generate_inputs(
     sink_value: float = None,
     active_seqlen: int = None,
     k_pre_transposed: bool = False,
+    fp8_packed: bool = False,
     k_scale_val: float = None,
     v_scale_val: float = None,
+    kv_dtype=None,
 ):
     """Generate input tensors for segmented attention test.
 
@@ -77,6 +79,8 @@ def generate_inputs(
         head_dim, block_size) layout — exercises the kernel's transposed-K path.
     k_scale_val / v_scale_val: if not None, populate k_scale / v_scale
         dequantization tensors ((128, 1) fp32) for the FP8 KV path.
+    kv_dtype: if not None, use this dtype for K/V cache tensors (e.g.
+        nl.float8_e4m3 for true fp8 KV cache). Q remains in `dtype`.
     """
     np.random.seed(42)
     random_gen = np_random_sample()
@@ -117,8 +121,9 @@ def generate_inputs(
 
     # Generate block-based KV cache with enough blocks
     # KV cache layout: (num_blocks, num_kv_head, block_size, head_dim)
-    k_cache = random_gen(shape=(total_blocks, num_kv_heads, block_size, head_dim), dtype=dtype)
-    v_cache = random_gen(shape=(total_blocks, num_kv_heads, block_size, head_dim), dtype=dtype)
+    cache_dtype = kv_dtype if kv_dtype is not None else dtype
+    k_cache = random_gen(shape=(total_blocks, num_kv_heads, block_size, head_dim), dtype=cache_dtype)
+    v_cache = random_gen(shape=(total_blocks, num_kv_heads, block_size, head_dim), dtype=cache_dtype)
 
     # Generate block tables: [prior_blocks..., active_blocks..., duplicate-block-0 padding]
     # Format: [0, 1, ..., prior_blocks-1, prior_blocks, ..., total_blocks-1, 0, 0, ...]
@@ -149,11 +154,22 @@ def generate_inputs(
         sink = None
 
     # Transposed K cache layout for the fused KV-dequant / pre-transposed path.
-    if k_pre_transposed:
+    if fp8_packed:
+        # Pack K cache head-major: (num_blocks, num_kv_heads, block_size, head_dim) fp8
+        # -> (num_blocks, num_kv_heads, block_size//2, head_dim, 2) fp8
+        # Position 2i goes to [..., 0], position 2i+1 goes to [..., 1].
+        k_flat = k_cache.reshape(total_blocks, num_kv_heads, block_size, head_dim)
+        # Split even/odd positions along block_size: (num_blocks, num_kv_heads, block_size//2, head_dim)
+        k_even = k_flat[:, :, 0::2, :]  # positions 0, 2, 4, ...
+        k_odd = k_flat[:, :, 1::2, :]  # positions 1, 3, 5, ...
+        # Stack on new last axis: (num_blocks, num_kv_heads, block_size//2, head_dim, 2)
+        k_packed = np.stack([k_even, k_odd], axis=-1)
+        k_cache = dt.static_cast(k_packed, cache_dtype)
+    elif k_pre_transposed:
         num_blocks_k = k_cache.shape[0]
         k_tp = k_cache.reshape(num_blocks_k * num_kv_heads, block_size, head_dim)
         k_tp = np.transpose(k_tp, (0, 2, 1))
-        k_cache = dt.static_cast(k_tp, dtype)
+        k_cache = dt.static_cast(k_tp, cache_dtype)
 
     k_scale = np.full((128, 1), k_scale_val, dtype=np.float32) if k_scale_val is not None else None
     v_scale = np.full((128, 1), v_scale_val, dtype=np.float32) if v_scale_val is not None else None
@@ -173,6 +189,7 @@ def generate_inputs(
         "sink": sink,
         "num_q_heads": num_q_heads,
         "k_pre_transposed": k_pre_transposed,
+        "fp8_packed": fp8_packed,
         "k_scale": k_scale,
         "v_scale": v_scale,
     }
@@ -264,8 +281,10 @@ def _build_perms(
     use_sink=False,
     sink_value=None,
     extra_cols=None,
+    extra_col_variants=None,
+    extra_col_names=(),
     skip=_default_skip,
-    is_fast=lambda **_: True,
+    is_fast=lambda **_: False,
 ):
     """Cartesian product over the provided axes with constraint-based skipping.
 
@@ -274,9 +293,17 @@ def _build_perms(
         bs, num_q_heads, num_kv_heads, block_size, prior_seg_size,
         head_dim, prior_tokens, tp_q, tp_out, dtype, q_active[, *extra]
 
-    where `extra` comes from `extra_cols` (e.g., sliding_window, attn_mode).
+    where `extra` comes from either `extra_cols` (a single fixed tuple
+    appended to every row) or `extra_col_variants` (a list of tuples;
+    each tuple is its own row, expanding the cartesian product). Pass
+    `extra_col_names` so `is_fast` receives the variant values as
+    kwargs (e.g., `extra_col_names=("k_scale_val", "v_scale_val")`).
     Rows that pass `is_fast(**kwargs)` are wrapped with the fast pytest mark.
+    Default: no rows are marked fast — opt in per callsite via `is_fast=`.
     """
+    if extra_cols is not None and extra_col_variants is not None:
+        raise ValueError("pass either extra_cols or extra_col_variants, not both")
+    variants = extra_col_variants if extra_col_variants is not None else [extra_cols]
     rows = []
     for q_active in q_actives:
         for prior_seg_size in prior_seg_sizes:
@@ -297,7 +324,7 @@ def _build_perms(
                             )
                             if skip(**ctx):
                                 continue
-                            row = [
+                            base_row = [
                                 1,  # bs
                                 num_q_heads,
                                 num_kv_heads,
@@ -310,12 +337,15 @@ def _build_perms(
                                 dtype,
                                 q_active,
                             ]
-                            if extra_cols is not None:
-                                row.extend(extra_cols)
-                            if is_fast(**ctx):
-                                rows.append(pytest.param(*row, marks=pytest.mark.fast))
-                            else:
-                                rows.append(pytest.param(*row))
+                            for extra in variants:
+                                row = list(base_row)
+                                if extra is not None:
+                                    row.extend(extra)
+                                variant_ctx = ctx | dict(zip(extra_col_names, extra)) if extra else ctx
+                                if is_fast(**variant_ctx):
+                                    rows.append(pytest.param(*row, marks=pytest.mark.fast))
+                                else:
+                                    rows.append(pytest.param(*row))
     return rows
 
 
@@ -329,50 +359,43 @@ _MATRIX_PARAMS_BASE = (
 # --- Fast-slice predicates -------------------------------------------------
 # Predicates are module-level so they can be referenced inside class-body
 # _build_perms() calls (class locals aren't visible inside such expressions).
+# _build_perms defaults to no-fast; methods opt in via `is_fast=<predicate>`.
 
 
-def _llama3_is_fast(*, q_active, prior_seg_size, prior_tokens, block_size, num_q_heads, num_kv_heads, **_):
-    return (
-        (num_q_heads, num_kv_heads) == (8, 1)
-        and block_size == 128
-        and q_active in {512, 2048}
-        and prior_seg_size in {2048, 4096}
-        and prior_tokens in {0, 131072 - q_active}
-    )
+def _lnc1_slice_min_set_is_fast(*, num_q_heads, num_kv_heads, prior_seg_size, q_active, prior_tokens, **_):
+    return (num_q_heads, num_kv_heads) == (1, 1) and prior_seg_size == 2048 and q_active == 512 and prior_tokens == 2048
 
 
-def _gpt_oss_is_fast(*, q_active, prior_seg_size, prior_tokens, block_size, num_q_heads, num_kv_heads, **_):
-    return (
-        (num_q_heads, num_kv_heads) == (8, 1)
-        and block_size == 128
-        and q_active in {512, 2048}
-        and prior_seg_size in {512, 2048}
-        and prior_tokens in {0, 131072 - q_active}
-    )
+def _remainder_batch_min_set_is_fast(*, num_q_heads, num_kv_heads, q_active, prior_tokens, **_):
+    return (num_q_heads, num_kv_heads) == (1, 1) and q_active == 128 and prior_tokens == 2048
 
 
-def _general_matrix_is_fast(
-    *, q_active, prior_seg_size, prior_tokens, block_size, num_q_heads, num_kv_heads, head_dim, **_
+def _swa_k_pre_transposed_min_set_is_fast(*, num_q_heads, num_kv_heads, head_dim, q_active, prior_tokens, **_):
+    return (num_q_heads, num_kv_heads) == (3, 1) and head_dim == 128 and q_active == 2048 and prior_tokens == 0
+
+
+def _tp_out_false_slice_min_set_is_fast(*, num_q_heads, num_kv_heads, q_active, prior_tokens, **_):
+    return (num_q_heads, num_kv_heads) == (2, 1) and q_active == 512 and prior_tokens == 0
+
+
+def _fp8_kv_min_set_is_fast(*, num_q_heads, num_kv_heads, k_scale_val, v_scale_val, **_):
+    return (num_q_heads, num_kv_heads) == (3, 1) and (k_scale_val, v_scale_val) == (1.5, 0.5)
+
+
+def _swa_fp8_kv_min_set_is_fast(*, head_dim, k_scale_val, v_scale_val, **_):
+    return head_dim == 64 and (k_scale_val, v_scale_val) == (1.67, 1.67)
+
+
+def _large_d_min_set_is_fast(
+    *, num_q_heads, num_kv_heads, head_dim, q_active, prior_seg_size, prior_tokens, block_size, **_
 ):
-    return (
-        (num_q_heads, num_kv_heads) == (8, 1)
-        and block_size == 128
-        and head_dim == 128
-        and q_active == 2048
-        and prior_seg_size == 2048
-    )
-
-
-def _num_q_heads_is_fast(*, q_active, prior_seg_size, num_q_heads, num_kv_heads, **_):
-    return (num_q_heads, num_kv_heads) in {(1, 1), (8, 1)} and q_active == 2048 and prior_seg_size == 2048
-
-
-def _swa_sink_is_fast(*, q_active, num_q_heads, num_kv_heads, **_):
-    return (num_q_heads, num_kv_heads) == (8, 1) and q_active in {512, 2048}
-
-
-def _sink_is_fast(*, q_active, prior_seg_size, num_q_heads, num_kv_heads, head_dim, **_):
-    return (num_q_heads, num_kv_heads) == (8, 1) and head_dim == 128 and q_active == 2048 and prior_seg_size == 2048
+    if (num_q_heads, num_kv_heads) != (1, 1) or head_dim != 256 or q_active != 2048:
+        return False
+    return (block_size, prior_seg_size, prior_tokens) in {
+        (16, 2048, 3072),
+        (16, 4096, 30720),
+        (128, 2048, 3072),
+    }
 
 
 def _output_tensor_for_q_active(bs_q, q_active, head_dim, tp_out, dtype):
@@ -424,11 +447,14 @@ class TestSegmentedAttentionCTE:
         use_sink=False,
         sink_value=None,
         k_pre_transposed=False,
+        fp8_packed=False,
         k_scale_val=None,
         v_scale_val=None,
+        prescale_q=False,
+        kv_dtype=None,
     ):
         def _gen(test_config, input_tensor_def=None):
-            return generate_inputs(
+            inputs = generate_inputs(
                 bs=bs,
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
@@ -444,9 +470,20 @@ class TestSegmentedAttentionCTE:
                 use_sink=use_sink,
                 sink_value=sink_value,
                 k_pre_transposed=k_pre_transposed,
+                fp8_packed=fp8_packed,
                 k_scale_val=k_scale_val,
                 v_scale_val=v_scale_val,
+                kv_dtype=kv_dtype,
             )
+            if prescale_q:
+                # Multiply Q by 1/sqrt(head_dim) and pass scale=1.0 — caller
+                # has already absorbed the softmax scale into Q.
+                inv_sqrt_d = 1.0 / np.sqrt(head_dim)
+                q_fp = dt.static_cast(inputs["q"], np.float32)
+                q_fp = q_fp * inv_sqrt_d
+                inputs["q"] = dt.static_cast(q_fp, dtype)
+                inputs["scale"] = 1.0
+            return inputs
 
         return _gen
 
@@ -477,8 +514,11 @@ class TestSegmentedAttentionCTE:
         use_sink=False,
         sink_value=None,
         k_pre_transposed=False,
+        fp8_packed=False,
         k_scale_val=None,
         v_scale_val=None,
+        prescale_q=False,
+        kv_dtype=None,
         rtol=1e-2,
         atol=1e-2,
     ):
@@ -499,8 +539,11 @@ class TestSegmentedAttentionCTE:
             use_sink=use_sink,
             sink_value=sink_value,
             k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
             k_scale_val=k_scale_val,
             v_scale_val=v_scale_val,
+            prescale_q=prescale_q,
+            kv_dtype=kv_dtype,
         )
         output_desc = self._matrix_output_descriptor(
             bs_q=bs_q,
@@ -536,9 +579,9 @@ class TestSegmentedAttentionCTE:
         tp_out=True,
         dtype=nl.bfloat16,
         lnc=2,
-        is_fast=_llama3_is_fast,
     )
 
+    @pytest_marks(["model", "optimal"])
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, llama3_perms)
     def test_attention_segmented_cte_llama3(
         self,
@@ -590,7 +633,6 @@ class TestSegmentedAttentionCTE:
         lnc=2,
         use_sink=True,
         sink_value=2.0,
-        is_fast=_gpt_oss_is_fast,
     )
 
     gpt_oss_swa_perms = _build_perms(
@@ -607,9 +649,9 @@ class TestSegmentedAttentionCTE:
         sliding_window=128,
         use_sink=True,
         sink_value=2.0,
-        is_fast=_gpt_oss_is_fast,
     )
 
+    @pytest_marks(["model", "optimal"])
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, gpt_oss_full_perms)
     def test_attention_segmented_cte_gpt_oss_full(
         self,
@@ -648,6 +690,7 @@ class TestSegmentedAttentionCTE:
             sink_value=2.0,
         )
 
+    @pytest_marks(["model", "optimal"])
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, gpt_oss_swa_perms)
     def test_attention_segmented_cte_gpt_oss_swa(
         self,
@@ -687,6 +730,187 @@ class TestSegmentedAttentionCTE:
             sink_value=2.0,
         )
 
+    # --- #7c. Prescaled-Q small q_active regression ------------------------
+    # Covers the regime that previously triggered an SBUF address collision
+    # between extra_kv_used_len (allocated by the seg_cte caller) and
+    # _attention_cte's internal kv_used_len_sb. q_active in {256, 512} forces
+    # the Core 1 extra-iteration path (q_active < 2 * _K_TILE_SZ, partial last
+    # K tile). Q is multiplied by 1/sqrt(head_dim) at the call site with
+    # scale=1.0, mirroring how production callers absorb the softmax scale
+    # into Q.
+
+    llama3_prescale_perms = _build_perms(
+        q_actives=[256, 512],
+        prior_seg_sizes=[1024, 2048],
+        block_sizes=[128],
+        head_ratios=GQA_HEAD_RATIOS,
+        head_dims=[128],
+        prior_fn=_prior_tokens_full,
+        tp_q=True,
+        tp_out=True,
+        dtype=nl.bfloat16,
+        lnc=2,
+    )
+
+    @pytest_marks(["model", "optimal"])
+    @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, llama3_prescale_perms)
+    def test_attention_segmented_cte_llama3_prescaled_q(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+    ):
+        """Llama3 small-q_active prescaled-Q: head_dim=128, q_active in {256, 512}."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+            prescale_q=True,
+        )
+
+    gpt_oss_prescale_perms = _build_perms(
+        q_actives=[256, 512],
+        prior_seg_sizes=[1024, 2048],
+        block_sizes=[128],
+        head_ratios=GQA_HEAD_RATIOS,
+        head_dims=[64],
+        prior_fn=_prior_tokens_full,
+        tp_q=True,
+        tp_out=True,
+        dtype=nl.bfloat16,
+        lnc=2,
+        use_sink=True,
+        sink_value=2.0,
+    )
+
+    @pytest_marks(["model", "optimal"])
+    @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, gpt_oss_prescale_perms)
+    def test_attention_segmented_cte_gpt_oss_prescaled_q(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+    ):
+        """gpt-oss small-q_active prescaled-Q with sink=2.0: head_dim=64, q_active in {256, 512}."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+            use_sink=True,
+            sink_value=2.0,
+            prescale_q=True,
+        )
+
+    # --- #7d. d>128 (d-tiled K/V SBUF, e.g. Gemma4/Qwen3.6) ---------------
+    # d=512 with prior_seg_size>2048 exceeds SBUF budget (K tiles alone need 4MB).
+    # A kernel_assert guards this at runtime. See TODO in attention_segmented_cte.py.
+
+    large_d_perms = _build_perms(
+        q_actives=[2048],
+        prior_seg_sizes=[2048, 4096],
+        block_sizes=[16, 128],
+        head_ratios=[(2, 1), (1, 1)],
+        head_dims=[256],
+        prior_fn=_prior_tokens_full,
+        tp_q=True,
+        tp_out=True,
+        dtype=nl.bfloat16,
+        lnc=2,
+        is_fast=_large_d_min_set_is_fast,
+    ) + _build_perms(
+        q_actives=[2048],
+        prior_seg_sizes=[2048],
+        block_sizes=[16, 128],
+        head_ratios=[(2, 1), (1, 1)],
+        head_dims=[512],
+        prior_fn=_prior_tokens_full,
+        tp_q=True,
+        tp_out=True,
+        dtype=nl.bfloat16,
+        lnc=2,
+    )
+
+    @pytest_marks(["model", "optimal"])
+    @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, large_d_perms)
+    def test_attention_segmented_cte_large_d(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+    ):
+        """Test segmented attention with head_dim > 128 (d-tiled K/V SBUF)."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+        )
+
     # --- #2. General matrix (non-model head ratios / dims) ----------------
 
     general_matrix_perms = _build_perms(
@@ -700,7 +924,6 @@ class TestSegmentedAttentionCTE:
         tp_out=True,
         dtype=nl.bfloat16,
         lnc=2,
-        is_fast=_general_matrix_is_fast,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, general_matrix_perms)
@@ -752,7 +975,6 @@ class TestSegmentedAttentionCTE:
         tp_out=True,
         dtype=nl.bfloat16,
         lnc=2,
-        is_fast=_num_q_heads_is_fast,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, num_q_heads_perms)
@@ -821,7 +1043,7 @@ class TestSegmentedAttentionCTE:
         dtype=nl.bfloat16,
         lnc=2,
         skip=_remainder_skip,
-        is_fast=lambda **_: True,
+        is_fast=_remainder_batch_min_set_is_fast,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, remainder_perms)
@@ -876,7 +1098,6 @@ class TestSegmentedAttentionCTE:
         sliding_window=128,
         use_sink=True,
         sink_value=2.0,
-        is_fast=_swa_sink_is_fast,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, swa_sink_perms)
@@ -933,7 +1154,6 @@ class TestSegmentedAttentionCTE:
         lnc=2,
         use_sink=True,
         sink_value=2.0,
-        is_fast=_sink_is_fast,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, sink_perms)
@@ -974,6 +1194,60 @@ class TestSegmentedAttentionCTE:
             sink_value=2.0,
         )
 
+    # --- #5c. Multi-batch sink (bs>1) — exercises per-batch sink slicing ---
+
+    @pytest.mark.parametrize(
+        "bs, num_q_heads, num_kv_heads, block_size, prior_seg_size, head_dim, prior_tokens, tp_q, tp_out, dtype, q_active, sliding_window",
+        [
+            # Non-SWA, bs=2, GQA 8:1, with prior
+            pytest.param(2, 8, 1, 128, 2048, 128, 2048, True, True, nl.bfloat16, 512, None),
+            # Non-SWA, bs=2, GQA 8:1, no prior
+            pytest.param(2, 8, 1, 128, 2048, 128, 0, True, True, nl.bfloat16, 512, None),
+            # SWA, bs=2, GQA 8:1, with prior
+            pytest.param(2, 8, 1, 128, 512, 64, 512, True, True, nl.bfloat16, 512, 128),
+            # SWA, bs=2, GQA 8:1, no prior
+            pytest.param(2, 8, 1, 128, 512, 64, 0, True, True, nl.bfloat16, 512, 128),
+        ],
+    )
+    def test_attention_segmented_cte_multi_batch_sink(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+        sliding_window,
+    ):
+        """Multi-batch (bs>1) with sink=2.0 — verifies per-batch sink slicing correctness."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+            sliding_window=sliding_window,
+            use_sink=True,
+            sink_value=2.0,
+        )
+
     # --- #6a. tp_out=False slice ------------------------------------------
 
     tp_out_false_perms = _build_perms(
@@ -987,7 +1261,7 @@ class TestSegmentedAttentionCTE:
         tp_out=False,
         dtype=nl.bfloat16,
         lnc=2,
-        is_fast=lambda **_: True,
+        is_fast=_tp_out_false_slice_min_set_is_fast,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, tp_out_false_perms)
@@ -1039,7 +1313,7 @@ class TestSegmentedAttentionCTE:
         tp_out=True,
         dtype=nl.bfloat16,
         lnc=1,
-        is_fast=lambda **_: True,
+        is_fast=_lnc1_slice_min_set_is_fast,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, lnc1_slice_perms)
@@ -1093,7 +1367,6 @@ class TestSegmentedAttentionCTE:
         tp_out=True,
         dtype=nl.bfloat16,
         lnc=2,
-        is_fast=lambda **_: True,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, k_pre_transposed_perms)
@@ -1137,27 +1410,27 @@ class TestSegmentedAttentionCTE:
     # Covers both identity-scale (must match non-scaled result) and non-
     # identity scales. Parametrized over (k_scale_val, v_scale_val) × base
     # config slice. ~14 tests.
-    fp8_kv_perms = [
-        pytest.param(*base.values, k_scale_val, v_scale_val, marks=pytest.mark.fast)
-        for base in _build_perms(
-            q_actives=[2048],
-            prior_seg_sizes=[2048],
-            block_sizes=[128],
-            head_ratios=[(2, 1), (3, 1)],
-            head_dims=[128],
-            prior_fn=lambda seg, q: [0, seg],
-            tp_q=True,
-            tp_out=True,
-            dtype=nl.bfloat16,
-            lnc=2,
-            is_fast=lambda **_: True,
-        )
-        for k_scale_val, v_scale_val in [
+    # Compile-time-weighted minimum set: only the (3,1)-heads × (1.5, 0.5)-scales
+    # combo adds branch coverage.
+    fp8_kv_perms = _build_perms(
+        q_actives=[2048],
+        prior_seg_sizes=[2048],
+        block_sizes=[128],
+        head_ratios=[(2, 1), (3, 1)],
+        head_dims=[128],
+        prior_fn=lambda seg, q: [0, seg],
+        tp_q=True,
+        tp_out=True,
+        dtype=nl.bfloat16,
+        lnc=2,
+        extra_col_variants=[
             (1.0, 1.0),  # identity
             (1.67, 1.67),  # symmetric non-identity
             (1.5, 0.5),  # asymmetric
-        ]
-    ]
+        ],
+        extra_col_names=("k_scale_val", "v_scale_val"),
+        is_fast=_fp8_kv_min_set_is_fast,
+    )
 
     @pytest.mark.parametrize(
         _MATRIX_PARAMS_BASE + ", k_scale_val, v_scale_val",
@@ -1203,6 +1476,151 @@ class TestSegmentedAttentionCTE:
             v_scale_val=v_scale_val,
         )
 
+    # --- #8b. True FP8 KV cache dtype (k_pre_transposed=True + fp8 dtype + scales) -
+    # Exercises actual float8_e4m3 k_cache/v_cache tensors loaded into fp8 SBUF tiles.
+    fp8_kv_dtype_perms = [
+        pytest.param(*base.values, k_scale_val, v_scale_val, marks=pytest.mark.fast)
+        for base in _build_perms(
+            q_actives=[2048],
+            prior_seg_sizes=[2048],
+            block_sizes=[128],
+            head_ratios=[(2, 1)],
+            head_dims=[128],
+            prior_fn=lambda seg, q: [0, seg],
+            tp_q=True,
+            tp_out=True,
+            dtype=nl.bfloat16,
+            lnc=2,
+            is_fast=lambda **_: True,
+        )
+        for k_scale_val, v_scale_val in [
+            (1.0, 1.0),
+            (1.5, 0.5),
+        ]
+    ]
+
+    @pytest.mark.parametrize(
+        _MATRIX_PARAMS_BASE + ", k_scale_val, v_scale_val",
+        fp8_kv_dtype_perms,
+    )
+    def test_attention_segmented_cte_fp8_kv_dtype(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+        k_scale_val,
+        v_scale_val,
+    ):
+        """True FP8 KV cache: k_cache/v_cache are float8_e4m3 with k_pre_transposed=True."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+            k_pre_transposed=True,
+            k_scale_val=k_scale_val,
+            v_scale_val=v_scale_val,
+            kv_dtype=nl.float8_e4m3,
+            rtol=5e-2,
+            atol=5e-2,
+        )
+
+    # --- #8c. FP8 packed KV cache (fp8_packed=True + scales) ----------------
+    # Exercises both the batched dma_transpose path (16-aligned block counts: 2048)
+    # and the per-block fallback path (non-16-aligned: 1920->15, 640->5, 1408->11).
+    # head_ratios includes GQA (8,2) and (4,2) so the head-major packed K addressing
+    # (per-head row offset, block index scaled by num_kv_heads) is exercised with
+    # num_kv_heads > 1 — (2,1) alone leaves that addressing a no-op.
+    fp8_packed_perms = [
+        pytest.param(*base.values, k_scale_val, v_scale_val, marks=pytest.mark.fast)
+        for base in _build_perms(
+            q_actives=[2048],
+            prior_seg_sizes=[2048, 1920, 640, 1408],
+            block_sizes=[128],
+            head_ratios=[(2, 1), (8, 2), (4, 2)],
+            head_dims=[64, 128],
+            prior_fn=lambda seg, q: [0, seg],
+            tp_q=True,
+            tp_out=True,
+            dtype=nl.bfloat16,
+            lnc=2,
+            is_fast=lambda **_: True,
+        )
+        for k_scale_val, v_scale_val in [
+            (1.0, 1.0),
+            (1.67, 1.67),
+            (1.5, 0.5),
+        ]
+    ]
+
+    @pytest.mark.parametrize(
+        _MATRIX_PARAMS_BASE + ", k_scale_val, v_scale_val",
+        fp8_packed_perms,
+    )
+    def test_attention_segmented_cte_fp8_packed(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        bs,
+        num_q_heads,
+        num_kv_heads,
+        block_size,
+        prior_seg_size,
+        head_dim,
+        prior_tokens,
+        tp_q,
+        tp_out,
+        dtype,
+        q_active,
+        k_scale_val,
+        v_scale_val,
+    ):
+        """FP8 packed KV cache path — batched transpose and per-block fallback."""
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=bs,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            block_size=block_size,
+            prior_seg_size=prior_seg_size,
+            head_dim=head_dim,
+            prior_tokens=prior_tokens,
+            tp_q=tp_q,
+            tp_out=tp_out,
+            dtype=dtype,
+            q_active=q_active,
+            lnc=2,
+            fp8_packed=True,
+            k_scale_val=k_scale_val,
+            v_scale_val=v_scale_val,
+            kv_dtype=nl.float8_e4m3,
+            rtol=5e-2,
+            atol=5e-2,
+        )
+
     # --- #9. SWA + transposed K cache ------------------------------------
     swa_k_pre_transposed_perms = _build_perms(
         q_actives=[2048],
@@ -1216,7 +1634,7 @@ class TestSegmentedAttentionCTE:
         dtype=nl.bfloat16,
         lnc=2,
         sliding_window=1024,
-        is_fast=lambda **_: True,
+        is_fast=_swa_k_pre_transposed_min_set_is_fast,
     )
 
     @pytest.mark.parametrize(_MATRIX_PARAMS_BASE, swa_k_pre_transposed_perms)
@@ -1258,24 +1676,24 @@ class TestSegmentedAttentionCTE:
         )
 
     # --- #10. SWA + FP8 KV cache ------------------------------------------
-    swa_fp8_kv_perms = [
-        pytest.param(*base.values, k_scale_val, v_scale_val, marks=pytest.mark.fast)
-        for base in _build_perms(
-            q_actives=[2048],
-            prior_seg_sizes=[2048],
-            block_sizes=[128],
-            head_ratios=[(2, 1)],
-            head_dims=[64, 128],
-            prior_fn=lambda seg, q: [0, seg],
-            tp_q=True,
-            tp_out=True,
-            dtype=nl.bfloat16,
-            lnc=2,
-            sliding_window=1024,
-            is_fast=lambda **_: True,
-        )
-        for k_scale_val, v_scale_val in [(1.0, 1.0), (1.67, 1.67), (1.5, 0.5)]
-    ]
+    # Compile-time-weighted minimum set: only head_dim=64 × (1.67, 1.67) scales
+    # adds branch coverage.
+    swa_fp8_kv_perms = _build_perms(
+        q_actives=[2048],
+        prior_seg_sizes=[2048],
+        block_sizes=[128],
+        head_ratios=[(2, 1)],
+        head_dims=[64, 128],
+        prior_fn=lambda seg, q: [0, seg],
+        tp_q=True,
+        tp_out=True,
+        dtype=nl.bfloat16,
+        lnc=2,
+        sliding_window=1024,
+        extra_col_variants=[(1.0, 1.0), (1.67, 1.67), (1.5, 0.5)],
+        extra_col_names=("k_scale_val", "v_scale_val"),
+        is_fast=_swa_fp8_kv_min_set_is_fast,
+    )
 
     @pytest.mark.parametrize(
         _MATRIX_PARAMS_BASE + ", k_scale_val, v_scale_val",
@@ -1365,6 +1783,48 @@ class TestSegmentedAttentionCTE:
             tp_out=True,
             dtype=nl.bfloat16,
             q_active=16384,
+            lnc=2,
+        )
+
+    # --- LNC2 extra iteration K/V tile zeroing ----------------------------
+
+    @pytest.mark.fast
+    @pytest.mark.simulation
+    @pytest.mark.parametrize(
+        "q_active, prior_seg_size",
+        [
+            (256, 1024),
+            (256, 2048),
+        ],
+    )
+    def test_lnc2_extra_iter_kv_tile_zeroing(
+        self,
+        test_manager: Orchestrator,
+        collector: IMetricsCollector,
+        platform_target: Platforms,
+        q_active,
+        prior_seg_size,
+    ):
+        """Verify all K/V tiles are zeroed in the LNC2 extra iteration path.
+
+        In LNC2, Core 1 runs one extra iteration to attend over Core 0's active
+        KV segment. This test ensures the K/V tiles are fully zeroed before that
+        load, preventing stale NaN data from being visible to the matmul.
+        """
+        self._run_matrix_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            bs=1,
+            num_q_heads=1,
+            num_kv_heads=1,
+            block_size=128,
+            prior_seg_size=prior_seg_size,
+            head_dim=128,
+            prior_tokens=0,
+            tp_q=True,
+            tp_out=True,
+            dtype=nl.bfloat16,
+            q_active=q_active,
             lnc=2,
         )
 

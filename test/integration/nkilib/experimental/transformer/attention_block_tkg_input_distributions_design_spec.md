@@ -262,6 +262,33 @@ happens in the weight scale of the output projection.
 | RoPE cos/sin | Uniform[-1, 1] | Bounded by definition |
 | Biases | Uniform[-0.1, 0.1] | Small relative to projection output |
 | KV cache | N(0, FP8_MAX/coverage) clipped to FP8 | Matches K_active × kv_scale |
+| Attention sink | Uniform[0, 1], shape `[q_heads_attn, 1]` | See below |
+
+### Attention sink
+
+The optional `sink` tensor (one scalar per query head, KVDP-expanded to
+`q_heads_attn`) is concatenated onto the score (logit) dimension inside
+`attention_tkg`, *after* Q has been scaled by `softmax_scale`/`1/√d`, and is
+**not** itself rescaled:
+
+```
+score = K_prior @ Q          # Q already scaled → std(score) ≈ 0.33–1.0
+score = cat([score, sink])   # sink competes as a raw logit
+probs = softmax(score)
+```
+
+So the sink must live on the same scale as the post-scale scores. With
+`std(score) ≈ O(1)` (see Softmax Stability), an O(1) sink participates
+meaningfully in the softmax — neither vanishing nor saturating it to argmax —
+which is what exercises the sink path. `Uniform[0, 1]` (mean 0.5, std ≈ 0.29)
+is O(1) and matches the distribution used by the standalone `attention_tkg`
+test, keeping the two test suites consistent.
+
+> **Note:** the sink configs use the default `softmax_scale`. A custom
+> `softmax_scale` (e.g. Gemma's 0.05) shrinks the scores while the sink stays
+> O(1), so the sink would dominate the softmax. That is still a valid test, but
+> to keep the sink *comparable* to the scores under a custom scale the sink
+> magnitude would need to scale with it.
 
 ## Kernel vs. Torch Reference: Sources of Divergence
 

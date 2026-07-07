@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
-from typing import Optional
+from typing import Literal, Optional
 
 import nki.dtype as nt
 import nki.language as nl
@@ -21,17 +21,20 @@ import numpy as np
 from nkilib_src.nkilib.core.qkv.qkv import qkv
 from nkilib_src.nkilib.core.qkv.qkv_torch import qkv_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import (
+    DtypeMode,
     NormType,
     QKNormConfig,
     QKVOutputLayout,
     QKVWeightLayout,
     QuantizationType,
 )
+from nkilib_src.nkilib.core.utils.kernel_helpers import get_max_positive_value_for_dtype
 from test.integration.nkilib.utils.tensor_generators import (
     gaussian_tensor_generator,
     generate_stabilized_mx_data,
     update_func_str,
 )
+from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 DUMMY_TENSOR_NAME = "dummy"
@@ -50,6 +53,35 @@ QUANTIZATION_TYPE_DIM_NAME = "quantization_type"
 
 _q_width = 4
 p_max = 128
+
+
+def build_noncontiguous_slot_mapping(seqlen: int, batch: int, block_size: int, num_blocks: int):
+    """Build a shuffled slot_mapping where consecutive logical blocks map to scattered physical blocks.
+
+    Handles partial last block: if seqlen is not a multiple of block_size, the remaining
+    tokens are assigned to sequential slots within an additional physical block.
+
+    Note: Caller is responsible for setting np.random.seed before calling this function.
+    """
+    num_full_blocks = seqlen // block_size
+    remainder = seqlen % block_size
+    num_seq_blocks = num_full_blocks + (1 if remainder > 0 else 0)
+    # Create a shuffled physical block index array
+    physical_blocks = np.random.choice(num_blocks, size=num_seq_blocks, replace=False)
+    # Build slot_mapping: for logical block i, physical slots are
+    # physical_blocks[i] * block_size + 0, 1, ..., block_size-1
+    slot_mapping = np.zeros(seqlen, dtype=np.int32)
+    for i in range(num_full_blocks):
+        start = i * block_size
+        slot_mapping[start : start + block_size] = physical_blocks[i] * block_size + np.arange(
+            block_size, dtype=np.int32
+        )
+    if remainder > 0:
+        start = num_full_blocks * block_size
+        slot_mapping[start : start + remainder] = physical_blocks[num_full_blocks] * block_size + np.arange(
+            remainder, dtype=np.int32
+        )
+    return slot_mapping.reshape(batch, seqlen)
 
 
 def build_qkv_input(
@@ -82,19 +114,25 @@ def build_qkv_input(
     fp8_max: float = 240.0,
     fp8_min: float = -240.0,
     use_block_kv: bool = False,
+    fp8_packed: bool = False,
     num_blocks: Optional[int] = None,
     block_size: Optional[int] = None,
     slot_mapping: Optional[np.ndarray] = None,
     is_h_dim_4h_transposed: bool = False,
     qk_norm_pre_rope_config: Optional[dict] = None,
     qk_norm_post_rope_config: Optional[dict] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ):
     qkv_w_scale = None
     qkv_in_scale = None
     if quantization_type in (QuantizationType.MX, QuantizationType.STATIC_MX, QuantizationType.ROW_MX):
         np.random.seed(0)
-        dequant_weights, fused_qkv_weights, qkv_w_scale = generate_stabilized_mx_data(
+        dequant_weights, fused_qkv_weights_x4, qkv_w_scale = generate_stabilized_mx_data(
             nl.float8_e4m3fn_x4, (hidden_dim // _q_width, fused_qkv_dim * _q_width), val_range=5
+        )
+        # Convert x4-packed [H//4, I] to unpacked fp8 [H//4, I, 4]
+        fused_qkv_weights = fused_qkv_weights_x4.view(nl.float8_e4m3fn).reshape(
+            hidden_dim // _q_width, fused_qkv_dim, _q_width
         )
 
         if quantization_type == QuantizationType.STATIC_MX:
@@ -119,7 +157,10 @@ def build_qkv_input(
             )
     else:
         input_tensor = tensor_gen(shape=(batch, seqlen, hidden_dim), dtype=dtype, name="input")
-        weight_dtype = dtype if quantization_type == QuantizationType.NONE else nt.float8_e4m3
+        # FP8 weight dtype: nl.float8_e4m3fn when DtypeMode.OCP,
+        # nl.float8_e4m3 otherwise.
+        _fp8_weight_dtype = nl.float8_e4m3fn if dtype_mode == DtypeMode.OCP else nl.float8_e4m3
+        weight_dtype = dtype if quantization_type == QuantizationType.NONE else _fp8_weight_dtype
         fused_qkv_weights = tensor_gen(shape=(hidden_dim, fused_qkv_dim), dtype=weight_dtype, name="fused_qkv_weights")
         if quantization_type == QuantizationType.STATIC:
             # Clip input and weights to [-1, 1] for proper quantization.
@@ -138,12 +179,12 @@ def build_qkv_input(
             ).copy()
         elif quantization_type == QuantizationType.ROW:
             # For row quantization: per-output-channel weight scales, no input quantization
-            FP8_E4M3_MAX = 240.0
+            FP8_E4M3_MAX = get_max_positive_value_for_dtype(_fp8_weight_dtype)
             # Compute per-column (per-output-channel) scale from weight magnitudes
             w_max = np.abs(fused_qkv_weights).max(axis=0, keepdims=True)
             w_scale = (w_max / FP8_E4M3_MAX).astype(np.float32)
             # Quantize weights to FP8
-            fused_qkv_weights = (fused_qkv_weights / w_scale).astype(nt.float8_e4m3)
+            fused_qkv_weights = (fused_qkv_weights / w_scale).astype(_fp8_weight_dtype)
             # Broadcast scale to (128, fused_qkv_dim) shape
             qkv_w_scale = np.broadcast_to(w_scale, (128, fused_qkv_dim)).astype(np.float32)
             qkv_in_scale = None
@@ -194,11 +235,17 @@ def build_qkv_input(
             k_scale = np.full((128, 1), k_scale_val, dtype=np.float32)
             v_scale = np.full((128, 1), v_scale_val, dtype=np.float32)
         if use_block_kv:
-            if transpose_k_cache:
+            if fp8_packed:
+                k_cache = np.zeros((num_blocks, num_kv_heads, block_size // 2, d_head, 2), dtype=cache_np_dtype)
+            elif transpose_k_cache:
                 k_cache = np.zeros((num_blocks * num_kv_heads, d_head, block_size), dtype=cache_np_dtype)
             else:
                 k_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_np_dtype)
-            v_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_np_dtype)
+            if fp8_packed:
+                # Head-split V cache: [num_blocks, num_kv_heads, block_size, d_head].
+                v_cache = np.zeros((num_blocks, num_kv_heads, block_size, d_head), dtype=cache_np_dtype)
+            else:
+                v_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_np_dtype)
         else:
             if transpose_k_cache:
                 k_cache = np.zeros((batch, kv_dim, max_seq_len), dtype=cache_np_dtype)
@@ -242,6 +289,7 @@ def build_qkv_input(
         result["v_cache.must_alias_input"] = v_cache
         result["kv_dtype"] = kv_dtype
         result["transpose_k_cache"] = transpose_k_cache
+        result["fp8_packed"] = fp8_packed
         if not bf16_kv_cache:
             result["k_scale"] = k_scale
             result["v_scale"] = v_scale
@@ -271,6 +319,229 @@ def build_qkv_input(
         result["qk_norm_post_rope_k_gamma"] = qk_norm_post_rope_config.get("k_gamma")
 
     return result
+
+
+def _swizzle_mla_cols(arr, dim):
+    # Reorder columns from [I//512, 4, 128] to [4, I//512, 128] so the matmul
+    # output has layout [S, 4_I, I//512, 128_I] enabling contiguous nc_transpose
+    # reads (pre-swizzled transpose optimization).
+    num_512_tiles = dim // (p_max * _q_width)
+    idx = np.arange(dim).reshape(num_512_tiles, p_max, _q_width).transpose(2, 0, 1).reshape(dim)
+    return arr[..., idx]
+
+
+_DS_SCALE_BLOCK = 128
+
+
+def _reduce_mx_scale_to_compact_block128(mx_scale, K, N):
+    """Reduce an MX-format ``[K//32, N]`` scale to DeepSeek compact ``[K//128, ceil(N/128)]``.
+
+    Picks the top-left value of each 4-row x 128-col block as the canonical
+    block-128 scale. Callers should subsequently re-broadcast this to the MX
+    format if they want a "uniform within 128x128 block" full-MX scale.
+    """
+    K_blocks = K // _DS_SCALE_BLOCK
+    N_blocks = (N + _DS_SCALE_BLOCK - 1) // _DS_SCALE_BLOCK
+    compact = np.empty((K_blocks, N_blocks), dtype=np.uint8)
+    for ki in range(K_blocks):
+        for ni in range(N_blocks):
+            n_start = ni * _DS_SCALE_BLOCK
+            compact[ki, ni] = mx_scale[ki * 4, n_start]
+    return compact
+
+
+def build_qkv_mla_input(
+    batch: int,
+    seqlen: int,
+    hidden_dim: int,
+    qk_lora_rank: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    n_heads: int,
+    *,
+    variant: Literal["v32", "v4"] = "v32",
+    qk_nope_head_dim: Optional[int] = None,
+    v_head_dim: Optional[int] = None,
+    head_dim: Optional[int] = None,
+):
+    """Build kernel inputs for an MLA QKV CTE kernel.
+
+    Two variants are supported:
+        - ``v32``: matches :func:`qkv_mla_mx`. Requires ``qk_nope_head_dim`` and
+          ``v_head_dim``. Returns ``wqkv_a_hbm``/``wkv_b_hbm`` for the two-stage
+          KV path.
+        - ``v4``: matches :func:`qkv_mla_v4_mx`. Requires ``head_dim``. Returns
+          a single fused ``wqkv_hbm`` (no wkv_b second matmul).
+    """
+    if variant == "v32":
+        if qk_nope_head_dim is None or v_head_dim is None:
+            raise ValueError("variant='v32' requires qk_nope_head_dim and v_head_dim")
+    elif variant == "v4":
+        if head_dim is None:
+            raise ValueError("variant='v4' requires head_dim")
+    else:
+        raise ValueError(f"Unknown variant: {variant!r}")
+
+    np.random.seed(42)
+    tensor_gen = rope_gaussian_tensor_generator()
+
+    # ---- Common: input tensor x ----
+    x = tensor_gen((batch, seqlen, hidden_dim), nl.bfloat16, "input")
+    x = (
+        x.reshape(batch * seqlen, hidden_dim // (p_max * _q_width), p_max, _q_width)
+        .transpose(0, 3, 1, 2)
+        .reshape(batch, seqlen, hidden_dim)
+    )
+
+    # ---- Common: wq_a (first Q projection) and wq_b (second Q projection) ----
+    if variant == "v32":
+        q_out_dim = n_heads * (qk_nope_head_dim + qk_rope_head_dim)
+    else:
+        q_out_dim = n_heads * head_dim
+
+    _, wq_a, wq_a_scale = generate_stabilized_mx_data(
+        nl.float8_e4m3fn_x4, (hidden_dim // 4, qk_lora_rank * 4), val_range=5
+    )
+    _, wq_b, wq_b_scale = generate_stabilized_mx_data(
+        nl.float8_e4m3fn_x4, (qk_lora_rank // 4, q_out_dim * 4), val_range=5
+    )
+
+    # ---- Common: norm gammas and RoPE caches ----
+    q_norm_gamma = tensor_gen((1, qk_lora_rank), nl.bfloat16, "q_norm")
+    cos_cache = tensor_gen((batch, seqlen, qk_rope_head_dim), nl.bfloat16, "cos_cache")
+    sin_cache = tensor_gen((batch, seqlen, qk_rope_head_dim), nl.bfloat16, "sin_cache")
+
+    if variant == "v32":
+        kv_a_out_dim = kv_lora_rank + qk_rope_head_dim
+        kv_b_out_dim = n_heads * (qk_nope_head_dim + v_head_dim)
+        fused_qkv_dim = qk_lora_rank + kv_a_out_dim
+
+        _, wkv_a, wkv_a_scale = generate_stabilized_mx_data(
+            nl.float8_e4m3fn_x4, (hidden_dim // 4, kv_a_out_dim * 4), val_range=5
+        )
+        _, wkv_b, wkv_b_scale = generate_stabilized_mx_data(
+            nl.float8_e4m3fn_x4, (kv_lora_rank // 4, kv_b_out_dim * 4), val_range=5
+        )
+
+        wqkv_a = np.concatenate([wq_a, wkv_a], axis=-1)
+        wqkv_a_scale = np.concatenate([wq_a_scale, wkv_a_scale], axis=-1)
+
+        # Swizzle qr and kv portions, leave k_pe unswizzled (k_pe goes to RoPE, not matmul).
+        wqkv_a_qr = wqkv_a[..., :qk_lora_rank]
+        wqkv_a_kv = wqkv_a[..., qk_lora_rank : qk_lora_rank + kv_lora_rank]
+        wqkv_a_kpe = wqkv_a[..., qk_lora_rank + kv_lora_rank :]
+        wqkv_a = np.concatenate(
+            [_swizzle_mla_cols(wqkv_a_qr, qk_lora_rank), _swizzle_mla_cols(wqkv_a_kv, kv_lora_rank), wqkv_a_kpe],
+            axis=-1,
+        )
+        wqkv_a_scale_qr = wqkv_a_scale[..., :qk_lora_rank]
+        wqkv_a_scale_kv = wqkv_a_scale[..., qk_lora_rank : qk_lora_rank + kv_lora_rank]
+        wqkv_a_scale_kpe = wqkv_a_scale[..., qk_lora_rank + kv_lora_rank :]
+        wqkv_a_scale = np.concatenate(
+            [
+                _swizzle_mla_cols(wqkv_a_scale_qr, qk_lora_rank),
+                _swizzle_mla_cols(wqkv_a_scale_kv, kv_lora_rank),
+                wqkv_a_scale_kpe,
+            ],
+            axis=-1,
+        ).reshape(-1, fused_qkv_dim)
+
+        kv_norm_gamma = tensor_gen((1, kv_lora_rank), nl.bfloat16, "kv_norm")
+
+        # Reduce to DeepSeek compact block-128 scales. The kernel consumes the
+        # compact form directly; the torch reference broadcasts it back to MX
+        # layout before its mx_matmul.
+        wqkv_a_scale_compact = _reduce_mx_scale_to_compact_block128(wqkv_a_scale, hidden_dim, fused_qkv_dim)
+        wq_b_scale_compact = _reduce_mx_scale_to_compact_block128(
+            wq_b_scale.reshape(-1, q_out_dim), qk_lora_rank, q_out_dim
+        )
+        wkv_b_scale_compact = _reduce_mx_scale_to_compact_block128(
+            wkv_b_scale.reshape(-1, kv_b_out_dim), kv_lora_rank, kv_b_out_dim
+        )
+
+        return {
+            "x_hbm": x,
+            "wqkv_a_hbm": wqkv_a,
+            "wqkv_a_scale_hbm": wqkv_a_scale_compact,
+            "wq_b_hbm": wq_b,
+            "wq_b_scale_hbm": wq_b_scale_compact,
+            "q_norm_gamma_hbm": q_norm_gamma,
+            "wkv_b_hbm": wkv_b,
+            "wkv_b_scale_hbm": wkv_b_scale_compact,
+            "kv_norm_gamma_hbm": kv_norm_gamma,
+            "cos_cache_hbm": cos_cache,
+            "sin_cache_hbm": sin_cache,
+            "n_heads": n_heads,
+            "qk_nope_head_dim": qk_nope_head_dim,
+            "qk_rope_head_dim": qk_rope_head_dim,
+            "v_head_dim": v_head_dim,
+            "kv_lora_rank": kv_lora_rank,
+            "qk_lora_rank": qk_lora_rank,
+            "norm_eps": 1e-6,
+        }
+
+    # variant == "v4"
+    kv_dim = kv_lora_rank + qk_rope_head_dim
+    fused_out_dim = qk_lora_rank + kv_dim
+
+    _, wkv, wkv_scale = generate_stabilized_mx_data(nl.float8_e4m3fn_x4, (hidden_dim // 4, kv_dim * 4), val_range=5)
+
+    wq_a = _swizzle_mla_cols(wq_a, qk_lora_rank)
+    wq_a_scale = _swizzle_mla_cols(wq_a_scale, qk_lora_rank)
+
+    # Fuse wq_a and wkv into single weight matrix (qr cols pre-swizzled, kv cols as-is).
+    wqkv = np.concatenate([wq_a, wkv], axis=-1)
+    wqkv_scale = np.concatenate([wq_a_scale, wkv_scale], axis=-1).reshape(-1, fused_out_dim)
+
+    kv_norm_gamma = tensor_gen((1, kv_dim), nl.bfloat16, "kv_norm")
+
+    # Reduce to DeepSeek compact block-128 scales (kernel consumes compact;
+    # torch ref broadcasts internally).
+    wqkv_scale_compact = _reduce_mx_scale_to_compact_block128(wqkv_scale, hidden_dim, fused_out_dim)
+    wq_b_scale_compact = _reduce_mx_scale_to_compact_block128(
+        wq_b_scale.reshape(-1, q_out_dim), qk_lora_rank, q_out_dim
+    )
+
+    return {
+        "x_hbm": x,
+        "wqkv_hbm": wqkv,
+        "wqkv_scale_hbm": wqkv_scale_compact,
+        "wq_b_hbm": wq_b,
+        "wq_b_scale_hbm": wq_b_scale_compact,
+        "q_norm_gamma_hbm": q_norm_gamma,
+        "kv_norm_gamma_hbm": kv_norm_gamma,
+        "cos_cache_hbm": cos_cache,
+        "sin_cache_hbm": sin_cache,
+        "n_heads": n_heads,
+        "head_dim": head_dim,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_lora_rank": qk_lora_rank,
+        "norm_eps": 1e-6,
+    }
+
+
+def build_qkv_mla_v4_input(
+    batch: int,
+    seqlen: int,
+    hidden_dim: int,
+    qk_lora_rank: int,
+    head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    n_heads: int,
+):
+    return build_qkv_mla_input(
+        batch=batch,
+        seqlen=seqlen,
+        hidden_dim=hidden_dim,
+        qk_lora_rank=qk_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        n_heads=n_heads,
+        variant="v4",
+        head_dim=head_dim,
+    )
 
 
 def rope_gaussian_tensor_generator(mean=0.0, std=1.0):
@@ -377,6 +648,7 @@ def run_qkv_test(
     fp8_max: float = 240.0,
     fp8_min: float = -240.0,
     use_block_kv: bool = False,
+    fp8_packed: bool = False,
     num_blocks: int | None = None,
     block_size: int | None = None,
     slot_mapping: np.ndarray | None = None,
@@ -392,6 +664,8 @@ def run_qkv_test(
     is_negative_test: bool = False,
     inference_args=None,
     expect_fused_hidden_output: bool = False,
+    # --- FP8 E4M3 dtype mode. See DtypeMode enum.
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ):
     """Shared test helper for QKV CTE and TKG tests using UnitTestFramework.
 
@@ -406,6 +680,15 @@ def run_qkv_test(
     """
     if tensor_gen is None:
         tensor_gen = gaussian_tensor_generator()
+
+    # Pre-resolve DtypeMode.AUTO once and use it for:
+    #   (1) the weight allocator in build_qkv_input → ensures the HBM weight
+    #       tensor has a concrete FP8 dtype matching the platform.
+    #   (2) the torch ref → torch ref runs on CPU and can't query hardware.
+    # The kernel itself receives the original dtype_mode (possibly AUTO).
+    # It uses weight.dtype (always concrete) for STATIC/ROW allocations,
+    # so AUTO becomes a no-op there.
+    torch_ref_dtype_mode = resolve_dtype_mode_for_torch_ref(dtype_mode, compiler_args.platform_target)
 
     def input_generator(test_config):
         kernel_input = build_qkv_input(
@@ -437,6 +720,7 @@ def run_qkv_test(
             fp8_max=fp8_max,
             fp8_min=fp8_min,
             use_block_kv=use_block_kv,
+            fp8_packed=fp8_packed,
             num_blocks=num_blocks,
             block_size=block_size,
             transpose_k_cache=transpose_k_cache,
@@ -444,6 +728,7 @@ def run_qkv_test(
             is_h_dim_4h_transposed=is_h_dim_4h_transposed,
             qk_norm_pre_rope_config=qk_norm_pre_rope_config,
             qk_norm_post_rope_config=qk_norm_post_rope_config,
+            dtype_mode=torch_ref_dtype_mode,
         )
         kernel_input["is_h_dim_4h_transposed"] = is_h_dim_4h_transposed
         # Only pass transposed_in when True to avoid signature mismatch with torch refs
@@ -461,6 +746,11 @@ def run_qkv_test(
             kernel_input["qkv_in_scale"] = qkv_in_scale_for_mx
         if qkv_w_scale_for_mx is not None:
             kernel_input["qkv_w_scale"] = qkv_w_scale_for_mx
+        # Pass the original (possibly AUTO) dtype_mode to the kernel. The
+        # kernel uses the caller-allocated weight dtype as the source of
+        # truth and only resolves dtype_mode if the caller passed an opaque
+        # "float8e4" sentinel.
+        kernel_input["dtype_mode"] = dtype_mode
         return kernel_input
 
     def output_tensor_descriptor(kernel_input):
@@ -469,14 +759,20 @@ def run_qkv_test(
             kv_dim = n_kv_heads * d_head
             cache_dtype = nl.bfloat16 if bf16_kv_cache else nl.float8_e4m3
             if use_block_kv:
-                if not transpose_k_cache:
+                if fp8_packed:
+                    k_cache = np.zeros((num_blocks, n_kv_heads, block_size // 2, d_head, 2), dtype=cache_dtype)
+                elif not transpose_k_cache:
                     k_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_dtype)
                 else:
                     k_cache = np.zeros((num_blocks * n_kv_heads, d_head, block_size), dtype=cache_dtype)
+                if fp8_packed:
+                    v_cache = np.zeros((num_blocks, n_kv_heads, block_size, d_head), dtype=cache_dtype)
+                else:
+                    v_cache = np.zeros((num_blocks, block_size, kv_dim), dtype=cache_dtype)
                 return {
                     "q_tensor_hbm": np.zeros((B, S, q_dim), dtype=dtype),
                     "k_cache": k_cache,
-                    "v_cache": np.zeros((num_blocks, block_size, kv_dim), dtype=cache_dtype),
+                    "v_cache": v_cache,
                 }
             else:
                 if not transpose_k_cache:
@@ -488,15 +784,34 @@ def run_qkv_test(
                     "k_cache": k_cache,
                     "v_cache": np.zeros((B, max_seq_len, kv_dim), dtype=cache_dtype),
                 }
-        result = {"out": np.zeros((B * S, fused_qkv_dim) if transposed_in else (B, S, fused_qkv_dim), dtype=dtype)}
+        output_dtype = nl.bfloat16 if dtype in (nl.float8_e4m3, nl.float8_e4m3fn) else dtype
+        result = {
+            "out": np.zeros((B * S, fused_qkv_dim) if transposed_in else (B, S, fused_qkv_dim), dtype=output_dtype)
+        }
         if fused_add and expect_fused_hidden_output:
-            result["fused_hidden"] = np.zeros((B, S, H), dtype=dtype)
+            result["fused_hidden"] = np.zeros((B, S, H), dtype=output_dtype)
         return result
+
+    _is_fp8_dtype = dtype in (nl.float8_e4m3, nl.float8_e4m3fn)
+
+    @functools.wraps(qkv_torch_ref)
+    def _qkv_torch_ref_with_resolved_dtype_mode(**kwargs):
+        kwargs["dtype_mode"] = torch_ref_dtype_mode
+        if _is_fp8_dtype and quantization_type == QuantizationType.STATIC:
+            # FP8 input is already quantized. The torch ref will divide by in_scale,
+            # so pre-multiply input to compensate: hidden * in_scale / in_scale = hidden.
+            in_scale = kwargs["qkv_in_scale"]
+            if in_scale is not None:
+                scale_scalar = float(in_scale.flatten()[0])
+                kwargs["input"] = kwargs["input"] * scale_scalar
+        return qkv_torch_ref(**kwargs)
 
     framework = UnitTestFramework(
         test_manager=test_manager,
         kernel_entry=qkv,
-        torch_ref=torch_ref_wrapper(qkv_torch_ref, preserve_lower_precision=preserve_lower_precision),
+        torch_ref=torch_ref_wrapper(
+            _qkv_torch_ref_with_resolved_dtype_mode, preserve_lower_precision=preserve_lower_precision
+        ),
         kernel_input_generator=input_generator,
         output_tensor_descriptor=output_tensor_descriptor,
         check_unused_params=True,

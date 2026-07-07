@@ -21,18 +21,17 @@ import nki.language as nl
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
-from ..utils.tensor_view import TensorView
 
 
 @nki.jit
 def RoPE(
-    x_in: nl.ndarray,
-    cos: nl.ndarray,
-    sin: nl.ndarray,
+    x_in: nl.NkiTensor,
+    cos: nl.NkiTensor,
+    sin: nl.NkiTensor,
     lnc_shard: bool = False,
     contiguous_layout: bool = True,
     relayout_in_sbuf: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Apply Rotary Position Embedding (RoPE) to input embeddings.
 
@@ -47,9 +46,9 @@ def RoPE(
         S: Sequence length (divisible by n_prgs if lnc_shard=True)
 
     Args:
-        x_in (nl.ndarray): [d_head, B, n_heads, S] @ HBM, Input embeddings
-        cos (nl.ndarray): [d_head//2, B, S] @ HBM, Cosine frequencies
-        sin (nl.ndarray): [d_head//2, B, S] @ HBM, Sine frequencies
+        x_in (nl.NkiTensor): [d_head, B, n_heads, S] @ HBM, Input embeddings
+        cos (nl.NkiTensor): [d_head//2, B, S] @ HBM, Cosine frequencies
+        sin (nl.NkiTensor): [d_head//2, B, S] @ HBM, Sine frequencies
         lnc_shard (bool): Parallelize across LNC cores by tiling sequence dimension
         contiguous_layout (bool): Memory layout in d_head dimension.
             True: [first_half, second_half] (default, more efficient).
@@ -57,7 +56,7 @@ def RoPE(
         relayout_in_sbuf (bool): Use SBUF matmul for layout conversion (only for small tensors)
 
     Returns:
-        output (nl.ndarray): [d_head, B, n_heads, S] @ HBM, RoPE applied output
+        output (nl.NkiTensor): [d_head, B, n_heads, S] @ HBM, RoPE applied output
 
     Notes:
         - SBUF size constraint (for bf16): B * n_heads * S <= 73728 (approximately 72K).
@@ -121,17 +120,11 @@ def RoPE(
         # Gather even/odd indices with stride=2 in d_head dimension
         nisa.dma_copy(
             dst=x_in_sb[:half_d, :, :, :],
-            src=TensorView(x_in)
-            .slice(dim=0, start=0, end=d_head, step=2)
-            .slice(dim=3, start=tile_start, end=tile_start + tile_size)
-            .get_view(),
+            src=x_in.slice(0, 0, d_head, 2).slice(3, tile_start, tile_start + tile_size),
         )
         nisa.dma_copy(
             dst=x_in_sb[half_d:, :, :, :],
-            src=TensorView(x_in)
-            .slice(dim=0, start=1, end=d_head, step=2)
-            .slice(dim=3, start=tile_start, end=tile_start + tile_size)
-            .get_view(),
+            src=x_in.slice(0, 1, d_head, 2).slice(3, tile_start, tile_start + tile_size),
         )
     else:
         nisa.dma_copy(dst=x_in_sb, src=x_in[:, :, :, tile_start : tile_start + tile_size])
@@ -151,17 +144,11 @@ def RoPE(
     if is_dma_relayout:
         # Scatter even/odd indices with stride=2 in d_head dimension
         nisa.dma_copy(
-            dst=TensorView(x_out)
-            .slice(dim=0, start=0, end=d_head, step=2)
-            .slice(dim=3, start=tile_start, end=tile_start + tile_size)
-            .get_view(),
+            dst=x_out.slice(0, 0, d_head, 2).slice(3, tile_start, tile_start + tile_size),
             src=x_out_sb[:half_d, :, :, :],
         )
         nisa.dma_copy(
-            dst=TensorView(x_out)
-            .slice(dim=0, start=1, end=d_head, step=2)
-            .slice(dim=3, start=tile_start, end=tile_start + tile_size)
-            .get_view(),
+            dst=x_out.slice(0, 1, d_head, 2).slice(3, tile_start, tile_start + tile_size),
             src=x_out_sb[half_d:, :, :, :],
         )
     else:
@@ -171,12 +158,12 @@ def RoPE(
 
 
 def RoPE_sbuf(
-    x_in_sb: nl.ndarray,
-    cos_sb: nl.ndarray,
-    sin_sb: nl.ndarray,
-    x_out_sb: nl.ndarray,
+    x_in_sb: nl.NkiTensor,
+    cos_sb: nl.NkiTensor,
+    sin_sb: nl.NkiTensor,
+    x_out_sb: nl.NkiTensor,
     convert_from_interleaved: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Apply RoPE on tensors in SBUF (for megakernel fusion).
     Helper function that operates entirely in SBUF without HBM I/O.
@@ -186,14 +173,15 @@ def RoPE_sbuf(
         out[odd] = x[odd]*cos + x[even]*sin
 
     Args:
-        x_in_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - input embeddings
-        cos_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - cosine frequencies
-        sin_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - sine frequencies
-        x_out_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - output buffer
+        x_in_sb (nl.NkiTensor): [d_head, B, n_heads, S] @ SBUF - input embeddings.
+            Can equal x_out_sb for in-place operation.
+        cos_sb (nl.NkiTensor): [d_head//2, B, S] @ SBUF - cosine frequencies.
+        sin_sb (nl.NkiTensor): [d_head//2, B, S] @ SBUF - sine frequencies.
+        x_out_sb (nl.NkiTensor): [d_head, B, n_heads, S] @ SBUF - output buffer
         convert_from_interleaved (bool): convert from interleaved to contiguous layout
 
     Returns:
-        nl.ndarray: x_out_sb with RoPE applied (modified in-place)
+        nl.NkiTensor: x_out_sb with RoPE applied (modified in-place)
 
     Notes:
         - Assumes contiguous layout unless convert_from_interleaved=True
@@ -222,31 +210,14 @@ def RoPE_sbuf(
     odd_sin = nl.ndarray((half_d, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
 
     # Compute RoPE: out_even = even*cos - odd*sin, out_odd = odd*cos + even*sin
-    # Use access patterns to broadcast cos/sin across n_heads dimension
-    nisa.tensor_tensor(
-        even_cos,
-        x_in_sb[:half_d, :, :, :],
-        TensorView(cos_sb).expand_dim(2).broadcast(dim=2, size=n_heads).get_view(),
-        nl.multiply,
-    )
-    nisa.tensor_tensor(
-        odd_cos,
-        sb_odd[:half_d, :, :, :],
-        TensorView(cos_sb).expand_dim(2).broadcast(dim=2, size=n_heads).get_view(),
-        nl.multiply,
-    )
-    nisa.tensor_tensor(
-        even_sin,
-        x_in_sb[:half_d, :, :, :],
-        TensorView(sin_sb).expand_dim(2).broadcast(dim=2, size=n_heads).get_view(),
-        nl.multiply,
-    )
-    nisa.tensor_tensor(
-        odd_sin,
-        sb_odd[:half_d, :, :, :],
-        TensorView(sin_sb).expand_dim(2).broadcast(dim=2, size=n_heads).get_view(),
-        nl.multiply,
-    )
+    # Use view ops to broadcast cos/sin across n_heads dimension
+    cos_broadcast = cos_sb.expand_dim(2).broadcast(2, n_heads)
+    sin_broadcast = sin_sb.expand_dim(2).broadcast(2, n_heads)
+
+    nisa.tensor_tensor(even_cos, x_in_sb[:half_d, :, :, :], cos_broadcast, nl.multiply)
+    nisa.tensor_tensor(odd_cos, sb_odd[:half_d, :, :, :], cos_broadcast, nl.multiply)
+    nisa.tensor_tensor(even_sin, x_in_sb[:half_d, :, :, :], sin_broadcast, nl.multiply)
+    nisa.tensor_tensor(odd_sin, sb_odd[:half_d, :, :, :], sin_broadcast, nl.multiply)
 
     nisa.tensor_tensor(x_out_sb[:half_d, :, :, :], even_cos, odd_sin, nl.subtract)
     nisa.tensor_tensor(x_out_sb[half_d:, :, :, :], odd_cos, even_sin, nl.add)
@@ -258,7 +229,7 @@ def RoPE_sbuf(
     return x_out_sb
 
 
-def _compute_convert_to_interleaved_mat(x_sb: nl.ndarray) -> nl.ndarray:
+def _compute_convert_to_interleaved_mat(x_sb: nl.NkiTensor) -> nl.NkiTensor:
     """
     Generate permutation matrix for RoPE layout conversion.
 
@@ -267,15 +238,15 @@ def _compute_convert_to_interleaved_mat(x_sb: nl.ndarray) -> nl.ndarray:
     P^T @ X transforms [e0,o0,e1,o1,...] to [e0,e1,...,o0,o1,...].
 
     Args:
-        x_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF, Input tensor for shape info
+        x_sb (nl.NkiTensor): [d_head, B, n_heads, S] @ SBUF, Input tensor for shape info
 
     Returns:
-        nl.ndarray: [d_head, d_head] @ SBUF, Permutation matrix
+        nl.NkiTensor: [d_head, d_head] @ SBUF, Permutation matrix
 
     Notes:
-        - Only supports tensors where B*n_heads*S ≤ gemm_moving_fmax
+        - Only supports tensors where B*n_heads*S <= gemm_moving_fmax
         - d_head must be even
-        - Uses strided access on identity matrix to build permutation
+        - Uses reshape_dim + permute on identity matrix to build permutation
     """
     d_head, B, n_heads, S = x_sb.shape
     half_d = d_head // 2
@@ -283,37 +254,32 @@ def _compute_convert_to_interleaved_mat(x_sb: nl.ndarray) -> nl.ndarray:
 
     identity_sb = nl.shared_identity_matrix(d_head, dtype=x_sb.dtype)
 
-    """
-    Extract permutation via strided access pattern.
-    
-    Pattern [[d_head, d_head], [1, 2], [2, half_d]] reads identity with stride=2 in innermost dim.
-    For each row i: reads [i[0], i[2], i[4], ...] then [i[1], i[3], i[5], ...].
-    Destination reshape (d_head, 2, half_d) writes: row i -> [[even_cols], [odd_cols]].
-    Result: even rows get 1 in first half, odd rows get 1 in second half.
-    This creates P where P@X transforms [e0,e1,...,o0,o1,...] -> [e0,o0,e1,o1,...].
-    """
+    # Reshape identity's free dim into (half_d, 2) then permute to (2, half_d).
+    # This reads columns in stride-2 order: [0,2,4,...,1,3,5,...] per row.
+    # Result: even rows get 1 in first half, odd rows get 1 in second half.
+    # This creates P where P@X transforms [e0,e1,...,o0,o1,...] -> [e0,o0,e1,o1,...].
     convert_to_interleaved_mat = nl.ndarray((d_head, d_head), dtype=x_sb.dtype, buffer=nl.sbuf)
     nisa.tensor_copy(
         dst=convert_to_interleaved_mat.reshape((d_head, 2, half_d)),
-        src=identity_sb.ap(pattern=[[d_head, d_head], [1, 2], [2, half_d]]),
+        src=identity_sb.reshape_dim(1, (half_d, 2)).permute((0, 2, 1)),
         engine=nisa.scalar_engine,
     )
 
     return convert_to_interleaved_mat
 
 
-def _convert_from_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.ndarray) -> nl.ndarray:
+def _convert_from_interleaved(x_sb: nl.NkiTensor, convert_to_interleaved_mat: nl.NkiTensor) -> nl.NkiTensor:
     """
     Convert interleaved to contiguous layout using matrix multiplication.
 
     Transforms [e0,o0,e1,o1,...] to [e0,e1,...,o0,o1,...] via P^T @ x_sb.
 
     Args:
-        x_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF, Input in interleaved layout
-        convert_to_interleaved_mat (nl.ndarray): [d_head, d_head] @ SBUF, Permutation matrix
+        x_sb (nl.NkiTensor): [d_head, B, n_heads, S] @ SBUF, Input in interleaved layout
+        convert_to_interleaved_mat (nl.NkiTensor): [d_head, d_head] @ SBUF, Permutation matrix
 
     Returns:
-        nl.ndarray: [d_head, B, n_heads, S] @ SBUF, Output in contiguous layout
+        nl.NkiTensor: [d_head, B, n_heads, S] @ SBUF, Output in contiguous layout
 
     Notes:
         - Returns new buffer (does not modify input)
@@ -334,18 +300,18 @@ def _convert_from_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.n
     return x_converted_sb
 
 
-def _convert_to_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.ndarray) -> nl.ndarray:
+def _convert_to_interleaved(x_sb: nl.NkiTensor, convert_to_interleaved_mat: nl.NkiTensor) -> nl.NkiTensor:
     """
     Convert contiguous to interleaved layout using matrix multiplication.
 
     Transforms [e0,e1,...,o0,o1,...] to [e0,o0,e1,o1,...] via P @ x_sb.
 
     Args:
-        x_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF, Input in contiguous layout
-        convert_to_interleaved_mat (nl.ndarray): [d_head, d_head] @ SBUF, Permutation matrix
+        x_sb (nl.NkiTensor): [d_head, B, n_heads, S] @ SBUF, Input in contiguous layout
+        convert_to_interleaved_mat (nl.NkiTensor): [d_head, d_head] @ SBUF, Permutation matrix
 
     Returns:
-        nl.ndarray: [d_head, B, n_heads, S] @ SBUF, Output in interleaved layout
+        nl.NkiTensor: [d_head, B, n_heads, S] @ SBUF, Output in interleaved layout
 
     Notes:
         - Pre-transposes matrix to compensate for nc_matmul's implicit transpose
@@ -371,14 +337,19 @@ def _convert_to_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.nda
     return x_sb
 
 
-def _validate_rope_inputs(x_in: nl.ndarray, cos: nl.ndarray, sin: nl.ndarray, func_name: str) -> None:
+def _validate_rope_inputs(
+    x_in: nl.NkiTensor,
+    cos: nl.NkiTensor,
+    sin: nl.NkiTensor,
+    func_name: str,
+) -> None:
     """
     Validate RoPE input tensor shapes and constraints.
 
     Args:
-        x_in (nl.ndarray): [d_head, B, n_heads, S], Input embeddings
-        cos (nl.ndarray): [d_head//2, B, S], Cosine frequencies
-        sin (nl.ndarray): [d_head//2, B, S], Sine frequencies
+        x_in (nl.NkiTensor): [d_head, B, n_heads, S], Input embeddings
+        cos (nl.NkiTensor): [d_head//2, B, S], Cosine frequencies
+        sin (nl.NkiTensor): [d_head//2, B, S], Sine frequencies
         func_name (str): Name of calling function for error messages
 
     Returns:

@@ -177,7 +177,7 @@ def _profile_neff(key, neff_path):
 
     # Capture
     r = subprocess.run(
-        ["neuron-profile", "capture", "-n", neff_path, "-s", ntff_path],
+        ["neuron-explorer", "capture", "-n", neff_path, "-s", ntff_path],
         capture_output=True,
         text=True,
         timeout=120,
@@ -194,7 +194,7 @@ def _profile_neff(key, neff_path):
 
     # Summary JSON
     r = subprocess.run(
-        ["neuron-profile", "view", "-n", neff_path, "-s", ntff_path, "--output-format=summary-json"],
+        ["neuron-explorer", "view", "-n", neff_path, "-s", ntff_path, "--output-format=summary-json"],
         capture_output=True,
         text=True,
         timeout=300,
@@ -217,7 +217,7 @@ def _profile_neff(key, neff_path):
     # Detailed JSON (for active inference time)
     subprocess.run(
         [
-            "neuron-profile",
+            "neuron-explorer",
             "view",
             "-n",
             neff_path,

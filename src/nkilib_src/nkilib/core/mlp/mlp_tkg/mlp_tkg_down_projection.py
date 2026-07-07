@@ -19,8 +19,7 @@ import nki.language as nl
 
 from ...utils.allocator import SbufManager
 from ...utils.interleave_copy import interleave_copy
-from ...utils.kernel_helpers import div_ceil
-from ...utils.tensor_view import TensorView
+from ...utils.kernel_helpers import div_ceil, resolve_fp8_e4m3_dtype
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import MLPParameters, mlpp_has_down_projection_bias
 from .mlp_tkg_constants import (
@@ -37,12 +36,12 @@ _DGE_MODE_NONE = 3  # Use STATIC DMA mode
 
 
 def down_projection(
-    hidden: TensorView,
-    weight: TensorView,
-    output_tile: TensorView,
-    weight_tiles: list[TensorView],
-    bias_tile: TensorView,
-    dequant_tile: TensorView,
+    hidden: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    output_tile: nl.NkiTensor,
+    weight_tiles: list[nl.NkiTensor],
+    bias_tile: nl.NkiTensor,
+    dequant_tile: nl.NkiTensor,
     dims: MLPTKGConstantsDimensionSizes,
     tiles: MLPTKGConstantsDownTileCounts,
     params: MLPParameters,
@@ -51,7 +50,7 @@ def down_projection(
     """
     Performs a single Down projection shard on the H.
 
-    All weight/bias inputs are pre-sharded TensorView instances — callers handle LNC/shard slicing.
+    All weight/bias inputs are pre-sharded NkiTensor instances — callers handle LNC/shard slicing.
 
     Computes: Hidden[I, T] @ Weight[I, H_per_shard] + Optional(bias_tile) → [T, H_per_shard]
     - Hidden is the stationary tensor, Weight is the moving tensor.
@@ -83,9 +82,9 @@ def down_projection(
     - Column tiling improves PE utilization for small T
 
     Args:
-        hidden (nl.ndarray): [I0, I1, T] — hidden activations in SBUF
-        weight (TensorView): [I, H_per_shard] — pre-sharded weight matrix
-        output_tile (nl.ndarray): [T, H_per_shard] — output buffer in SBUF
+        hidden (nl.NkiTensor): [I0, I1, T] — hidden activations in SBUF
+        weight (NkiTensor): [I, H_per_shard] — pre-sharded weight matrix
+        output_tile (nl.NkiTensor): [T, H_per_shard] — output buffer in SBUF
 
     Returns:
         Output tensor with shape [T, H_per_shard]
@@ -139,8 +138,8 @@ def down_projection(
                 dim=1, start=h_offset, end=h_offset + hidden_tiles.size
             )
             nisa.dma_copy(
-                dst=weight_sb_tile_slice.get_view(),
-                src=weight_view.get_view(),
+                dst=weight_sb_tile_slice,
+                src=weight_view,
                 dge_mode=_DGE_MODE_NONE,
             )
 
@@ -153,10 +152,10 @@ def down_projection(
                         nl.ds(dims.column_tiling_dim * column_tile_index, T),
                         0 : compute_tile.size,
                     ],
-                    stationary=hidden_sb_tile_slice.get_view(),
+                    stationary=hidden_sb_tile_slice,
                     moving=weight_sb_tile_slice.slice(
                         dim=1, start=compute_tile.start_offset, end=compute_tile.end_offset
-                    ).get_view(),
+                    ),
                     tile_position=(0, dims.column_tiling_dim * column_tile_index),
                     tile_size=(I0, dims.column_tiling_dim),
                 )
@@ -168,7 +167,7 @@ def down_projection(
             dst_offset = h_offset + compute_tile.index * dims._psum_fmax
             interleave_copy(
                 index=column_tile_index,
-                dst=output_tile.slice(dim=1, start=dst_offset, end=dst_offset + compute_tile.size).get_view(),
+                dst=output_tile.slice(dim=1, start=dst_offset, end=dst_offset + compute_tile.size),
                 src=result_psums[psum_bank_index][
                     nl.ds(dims.column_tiling_dim * column_tile_index, T),
                     0 : compute_tile.size,
@@ -183,16 +182,16 @@ def down_projection(
     is_bias = bias_tile is not None
     if is_bias:
         nisa.tensor_tensor(
-            dst=output_tile.get_view(),
-            data1=output_tile.get_view(),
-            data2=bias_tile.get_view(),
+            dst=output_tile,
+            data1=output_tile,
+            data2=bias_tile,
             op=nl.add,
         )
 
 
 def process_down_projection(
-    hidden: TensorView,
-    output: TensorView,
+    hidden: nl.NkiTensor,
+    output: nl.NkiTensor,
     params: MLPParameters,
     dims: MLPTKGConstantsDimensionSizes,
     gate_tile_info: MLPTKGConstantsGateUpTileCounts,
@@ -248,8 +247,8 @@ def process_down_projection(
             buffer=nl.sbuf,
         )
         nisa.dma_copy(
-            dst=bias_tile.get_view(),
-            src=down_b.get_view(),
+            dst=bias_tile,
+            src=down_b,
             dge_mode=adaptive_dge_mode(down_b),
         )
 
@@ -264,13 +263,15 @@ def process_down_projection(
             align=4,
         )
         nisa.dma_copy(
-            dst=dequant_tile.get_view(),
-            src=down_w_scale.get_view(),
+            dst=dequant_tile,
+            src=down_w_scale,
             dge_mode=adaptive_dge_mode(down_w_scale),
         )
 
     # ---------------- Allocate Weight Tiles ----------------
     tiles = MLPTKGConstants.calculate_down_tiles(params, dims, gate_tile_info, sbm)
+
+    _fp8_e4m3_tile_dtype = resolve_fp8_e4m3_dtype(params.dtype_mode)
 
     weight_tiles = []
     for w_tile_idx in range(tiles.num_allocated_w_tile):
@@ -278,7 +279,7 @@ def process_down_projection(
             sbm,
             (dims.I0, tiles.HTile),
             name=f"down_w_tile_{w_tile_idx}",
-            dtype=nl.float8_e4m3 if str(down_w.dtype) == "float8e4" else down_w.dtype,
+            dtype=_fp8_e4m3_tile_dtype if str(down_w.dtype) == "float8e4" else down_w.dtype,
             buffer=nl.sbuf,
         )
         weight_tiles.append(weight_tile)

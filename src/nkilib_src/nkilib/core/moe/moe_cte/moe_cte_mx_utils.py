@@ -39,7 +39,6 @@ from ...utils.kernel_helpers import (
     get_program_sharding_info,
     reduce,
 )
-from ...utils.tensor_view import TensorView
 from .moe_cte_utils import SkipMode, div_ceil
 
 # --- HARDWARE CONSTANTS ---
@@ -60,21 +59,35 @@ _q_width = 4  # Free dimension elements per quantization block
 # SBUF quadrant size (32 partitions per quadrant)
 SBUF_QUADRANT_SIZE = 32
 
+# PE-transpose view dtypes for sub-32-bit data. The PE (nc_transpose) cannot take fp8x4 or
+# uint8 inputs directly, so we bitcast to a 32-bit / 8-bit float view that the engine accepts:
+#   - fp8x4 hidden is viewed as fp32 (4 fp8 bytes ride inside one fp32 element, preserving 4_H).
+#   - uint8 MX scales are viewed as fp8_e5m2 (same byte width, transposes element-wise).
+_FP8X4_TP_VIEW_DTYPE = nl.float32
+_UINT8_TP_VIEW_DTYPE = nl.float8_e5m2
+_FP8_PER_FP32 = 4
+# PE FP8 transpose mode requires the output to have an element step of 2; the uint8 scale
+# transpose writes into a PSUM buffer with this trailing interleave dim and reads back slot 0.
+_FP8_TP_OUT_STEP = 2
+# Packed MX scales: rmsnorm_mx_prefill folds 4 H512 tiles' scales into one 128-wide block (one
+# scale per 32-element quadrant occupies only 4 of 32 columns, so 4 tiles share a 128-wide block).
+_SCALES_PER_PACK = 4
+
 
 # Alternative dtypes for MXFP weights — torch/xla doesn't support passing mxfp tensors directly
-# Mapping from alternative dtypes to their MXFP target dtype
+# Mapping from alternative dtypes to their MXFP target dtype.
 _ALTERNATIVE_DTYPE_TO_MXFP = {
     nl.uint16: nl.float4_e2m1fn_x4,
     nl.int16: nl.float4_e2m1fn_x4,
     nl.uint32: nl.float8_e4m3fn_x4,
     nl.int32: nl.float8_e4m3fn_x4,
+    nl.float8_e4m3fn: nl.float8_e4m3fn_x4,
+    nl.float8_e5m2: nl.float8_e5m2_x4,
 }
 
 
 # --- DTYPE CONVERSION UTILITIES ---
-
-
-def convert_to_mxfp_dtype(tensor: nl.ndarray, weight_dtype: Any = None) -> tuple:
+def convert_to_mxfp_dtype(tensor: nl.NkiTensor, weight_dtype: Any = None) -> tuple:
     """
     Convert weight tensor to appropriate MXFP dtype.
 
@@ -83,7 +96,7 @@ def convert_to_mxfp_dtype(tensor: nl.ndarray, weight_dtype: Any = None) -> tuple
     for MXFP8) and converted here.
 
     Args:
-        tensor (nl.ndarray): Weight tensor that may need dtype conversion.
+        tensor (nl.NkiTensor): Weight tensor that may need dtype conversion.
         weight_dtype: Target MXFP dtype. If None, auto-detects based on input dtype:
             - MXFP4 alternatives -> nl.float4_e2m1fn_x4
             - MXFP8 alternatives -> nl.float8_e4m3fn_x4
@@ -101,11 +114,8 @@ def convert_to_mxfp_dtype(tensor: nl.ndarray, weight_dtype: Any = None) -> tuple
         target_dtype = weight_dtype
 
     if mxfp_target != None:
-        # wrap with TensorView and view as target dtype
-        tensor = TensorView(tensor).reinterpret_cast(target_dtype)
-    else:
-        # wrap with Tensor view if already in correct dtype
-        tensor = TensorView(tensor)
+        # view as the target MXFP dtype
+        tensor = tensor.view(target_dtype)
 
     return tensor, target_dtype
 
@@ -121,38 +131,49 @@ class InputTensors(nl.NKIObject):
     Tensors are organized by their role: token mapping, weights, scales, and biases.
 
     Attributes:
-        token_position_to_id (nl.ndarray): [N*B], Maps block positions to token IDs in HBM.
-        block_to_expert (nl.ndarray): [N, 1], Expert assignment per block in HBM.
-        hidden_states (nl.ndarray): [T, H], Input hidden states in HBM.
-        gate_up_proj_weight (nl.ndarray): [E, 128, 2, n_H512_tile, I], MXFP4 gate/up weights.
-        gate_and_up_proj_bias (nl.ndarray): [E, 128, 2, n_I512_tile, 4], Gate/up biases.
-        down_proj_bias (nl.ndarray): [E, H], Down projection biases.
-        down_proj_weight (nl.ndarray): [E, p_I, n_I512_tile, H], MXFP4 down weights.
-        expert_affinities_masked (nl.ndarray): [(T+1)*E, 1], Expert affinities per token.
-        gate_up_proj_scale (nl.ndarray): [E, 16, 2, n_H512_tile, I], Gate/up dequant scales.
-        down_proj_scale (nl.ndarray): [E, 16, n_I512_tile, H], Down projection dequant scales.
-        p_gup_idx_vector (nl.ndarray): [128, 1], Reusable index vector for gate/up scale DGE.
-        p_down_idx_vector (nl.ndarray): [128, 1], Reusable index vector for down scale DGE.
-        gup_scales_sb (nl.ndarray): [128, 2, n_H512_tile, I], Gate/up scales buffer in SBUF.
-        activation_bias (nl.ndarray): [128, 1], Activation bias buffer in SBUF.
-        conditions (nl.ndarray): [N+1], Block validity conditions for dynamic loops.
+        token_position_to_id (nl.NkiTensor): [N*B], Maps block positions to token IDs in HBM.
+        block_to_expert (nl.NkiTensor): [N, 1], Expert assignment per block in HBM.
+        hidden_states (nl.NkiTensor): [T, H], Input hidden states in HBM.
+        gate_up_proj_weight (nl.NkiTensor): [E, 128, 2, n_H512_tile, I], MXFP4 gate/up weights.
+        gate_and_up_proj_bias (nl.NkiTensor): [E, 128, 2, n_I512_tile, 4], Gate/up biases.
+        down_proj_bias (nl.NkiTensor): [E, H], Down projection biases.
+        down_proj_weight (nl.NkiTensor): [E, p_I, n_I512_tile, H], MXFP4 down weights.
+        expert_affinities_masked (nl.NkiTensor): [(T+1)*E, 1], Expert affinities per token.
+        gate_up_proj_scale (nl.NkiTensor): [E, 16, 2, n_H512_tile, I], Gate/up dequant scales.
+        down_proj_scale (nl.NkiTensor): [E, 16, n_I512_tile, H], Down projection dequant scales.
+        p_gup_idx_vector (nl.NkiTensor): [128, 1], Reusable index vector for gate/up scale DGE.
+        p_gup_idx_vector_int32 (nl.NkiTensor): [128, 1], Persistent int32 cache of gate/up index vector.
+        p_down_idx_vector (nl.NkiTensor): [128, 1], Reusable index vector for down scale DGE.
+        gup_scales_sb (nl.NkiTensor): [128, 2, n_H512_tile, I], Gate/up scales buffer in SBUF.
+        activation_bias (nl.NkiTensor): [128, 1], Activation bias buffer in SBUF.
+        conditions (nl.NkiTensor): [N+1], Block validity conditions for dynamic loops.
     """
 
-    token_position_to_id: nl.ndarray
-    block_to_expert: nl.ndarray
-    hidden_states: nl.ndarray
-    gate_up_proj_weight: nl.ndarray
-    gate_and_up_proj_bias: nl.ndarray
-    down_proj_bias: nl.ndarray
-    down_proj_weight: nl.ndarray
-    expert_affinities_masked: nl.ndarray
-    gate_up_proj_scale: nl.ndarray
-    down_proj_scale: nl.ndarray
-    p_gup_idx_vector: nl.ndarray = None
-    p_down_idx_vector: nl.ndarray = None
-    gup_scales_sb: nl.ndarray = None
-    activation_bias: nl.ndarray = None
-    conditions: nl.ndarray = None
+    token_position_to_id: nl.NkiTensor
+    block_to_expert: nl.NkiTensor
+    hidden_states: nl.NkiTensor
+    gate_up_proj_weight: nl.NkiTensor
+    gate_and_up_proj_bias: nl.NkiTensor
+    down_proj_bias: nl.NkiTensor
+    down_proj_weight: nl.NkiTensor
+    expert_affinities_masked: nl.NkiTensor
+    gate_up_proj_scale: nl.NkiTensor
+    down_proj_scale: nl.NkiTensor
+    p_gup_idx_vector: nl.NkiTensor = None
+    p_gup_idx_vector_int32: nl.NkiTensor = None
+    p_down_idx_vector: nl.NkiTensor = None
+    gup_scales_sb: nl.NkiTensor = None
+    activation_bias: nl.NkiTensor = None
+    conditions: nl.NkiTensor = None
+    # Persistent [0,1,2,3] vector for H-folding in compute_hidden_index_vector,
+    # hoisted once at kernel entry to avoid per-block iota allocation.
+    arange_4H: nl.NkiTensor = None
+    # STATIC_MX: per-expert packed tables loaded once at top of kernel, broadcast across partitions.
+    # gup_scale_lut_sb [_pmax, E, 3]: per expert e, slot 0 = 1/gate_up_in_scale[e], slot 1 = in_scale[e]*gate_w_scale[e,0],
+    #   slot 2 = in_scale[e]*gate_w_scale[e,1]. One scalar_offset gather pulls all three for a block in one tensor_copy.
+    # down_scale_lut_sb [_pmax, E, 2]: per expert e, slot 0 = 1/down_in_scale[e], slot 1 = down_in_scale[e]*down_w_scale[e].
+    gup_scale_lut_sb: nl.NkiTensor = None  # fp32 [_pmax, E, 3]
+    down_scale_lut_sb: nl.NkiTensor = None  # fp32 [_pmax, E, 2]
 
 
 @dataclass
@@ -164,30 +185,34 @@ class SharedBuffers(nl.NKIObject):
     quantization, and intermediate results.
 
     Attributes:
-        block_hidden_states (nl.ndarray): [128, B/32, n_H512_tile, 128], Pre-transpose hidden states.
-        block_hidden_states_T (nl.ndarray): [128, n_H512_tile, B/32, 128], Transposed hidden states.
-        token_4_H_indices_on_p (nl.ndarray): [128, B/32], Token indices with H-folding on partitions.
-        hidden_qtz_sb (nl.ndarray): [128, n_H512_tile, B], Quantized hidden states (FP8).
-        hidden_scale_sb (nl.ndarray): [128, n_H512_tile, B], Quantization scales (uint8).
-        down_weight_qtz (nl.ndarray): [128, n_I512_tile, H], Down projection weights in SBUF.
-        block_old (nl.ndarray): [128, n_B128_tiles, H], Previous output for accumulation.
-        cond (nl.ndarray): Condition buffer for dynamic loop control.
-        index (nl.ndarray): Index buffer for dynamic loop control.
-        down_scale_sb (nl.ndarray): Down projection scales in SBUF.
+        block_hidden_states (nl.NkiTensor): [128, B/32, n_H512_tile, 128], Pre-transpose hidden states.
+        block_hidden_states_T (nl.NkiTensor): [128, n_H512_tile, B/32, 128], Transposed hidden states.
+        token_4_H_indices_on_p (nl.NkiTensor): [128, B/32], Token indices with H-folding on partitions.
+        hidden_qtz_sb (nl.NkiTensor): [128, n_H512_tile, B], Quantized hidden states (FP8).
+        hidden_scale_sb (nl.NkiTensor): [128, n_H512_tile, B], Quantization scales (uint8).
+        down_weight_qtz (nl.NkiTensor): [128, n_I512_tile, H], Down projection weights in SBUF.
+        block_old (nl.NkiTensor): [128, n_B128_tiles, H], Previous output for accumulation.
+        cond (nl.NkiTensor): Condition buffer for dynamic loop control.
+        index (nl.NkiTensor): Index buffer for dynamic loop control.
+        down_scale_sb (nl.NkiTensor): Down projection scales in SBUF.
     """
 
-    block_hidden_states: nl.ndarray
-    block_hidden_states_T: nl.ndarray
-    token_4_H_indices_on_p: nl.ndarray
-    hidden_qtz_sb: nl.ndarray
-    hidden_scale_sb: nl.ndarray
-    down_weight_qtz: nl.ndarray
-    block_old: nl.ndarray
-    cond: nl.ndarray = None
-    index: nl.ndarray = None
-    down_scale_sb: nl.ndarray = None
-    broadcast_stationary: nl.ndarray = None
-    gup_tile_buf_a: nl.ndarray = None
+    block_hidden_states: nl.NkiTensor
+    block_hidden_states_T: nl.NkiTensor
+    token_4_H_indices_on_p: nl.NkiTensor
+    hidden_qtz_sb: nl.NkiTensor
+    hidden_scale_sb: nl.NkiTensor
+    down_weight_qtz: nl.NkiTensor
+    block_old: nl.NkiTensor
+    cond: nl.NkiTensor = None
+    index: nl.NkiTensor = None
+    down_scale_sb: nl.NkiTensor = None
+    # fp8 pre-quantized path: gathered [_pmax, B//_pmax, H_load] concat rows
+    # ([hidden_quant | hidden_scale]) awaiting transpose into hidden_qtz_sb / hidden_scale_sb.
+    block_hidden_concat: nl.NkiTensor = None
+    broadcast_stationary: nl.NkiTensor = None
+    gup_tile_buf_a: nl.NkiTensor = None
+    dummy_inter_scale_sb: nl.NkiTensor = None
 
 
 # --- CONFIGURATION CLASSES ---
@@ -450,9 +475,206 @@ class BWMMMXConfigs(nl.NKIObject):
     up_clamp_upper_limit: Optional[float]
     up_clamp_lower_limit: Optional[float]
     qtz_dtype: Any
+    # When True, gate_up_proj_scale and down_proj_scale are passed in PACKED HBM layout:
+    #   gate_up_proj_scale: uint8[E, _pmax=128, n_packed_gup, 2, I]
+    #   down_proj_scale:    uint8[E, _pmax=128, n_packed_down, H]
+    # The kernel dispatches to packed code paths in the projection sub-kernels.
+    # The flag is supplied by the caller; the kernel does not infer it from shape.
+    use_packed_scales: bool = False
+    # When True, gate_up_proj_scale and down_proj_scale are passed in DeepSeek-style
+    # block-128 HBM layout (one uint8 per 128(K) x 128(N) weight block):
+    #   gate_up_proj_scale: uint8[E, 4, 2, n_H512_tile, ceil(I / 128)]
+    #   down_proj_scale:    uint8[E, 4, n_I512_tile, ceil(H / 128)]
+    # The scale loaders materialize this into the same SBUF layout nc_matmul_mx
+    # consumes (one scale per 8(p) x 4(f) block) via a two-stage broadcast load,
+    # so the matmul and projection compute are identical to the native MX path.
+    # This is a distinct option from use_packed_scales (partition-slot repacking).
+    use_block128_scales: bool = False
+    is_static_quant: bool = False
+    # When True (only relevant under is_static_quant), silu cannot be fused into the gate
+    # projection's STATIC_MX activation — clamp must run between (dequant+bias) and silu.
+    has_gate_clamp: bool = False
+    # When True, the persistent gup buffer holds the FULL gate+up weights (full I dim)
+    # resident across blocks. The tiled compute reads I-tile slices from it directly
+    # instead of streaming each tile. Cross-block prefetch OOB-skips on same-expert →
+    # 100% gup DMAs avoided. Activated only under STATIC_MX with skip_weight enabled
+    # and dims.I > _I_TILE_SZ.
+    gup_full_persistent: bool = False
+    # When True, hidden states arrive PRE-QUANTIZED (fp8 + uint8 MX scales) in a concatenated
+    # [T, H_concat] tensor. The kernel gathers + PE-transposes both regions (no on-device
+    # quantize_mx) via load_fp8_hidden_states_mx. Only supported with QuantizationType.MX.
+    is_fp8_hidden: bool = False
+    # When True (only with is_fp8_hidden), the concat row also carries the dense [T, E] expert
+    # affinities (bf16) after the scale region. Each block extracts its expert's affinity column from packed hidden
+    # affinities_col_offset is the fp8 column where the affinity region begins.
+    is_affinities_packed: bool = False
+    affinities_col_offset: int = 0
 
 
 # --- HIDDEN STATE LOADING AND TRANSFORMATION ---
+
+
+def load_fp8_hidden_states_mx(
+    inps: InputTensors,
+    dims: BWMMMXDimensionSizes,
+    skip_dma: SkipMode,
+    token_indices_on_p: nl.NkiTensor,
+    block_hidden_concat: nl.NkiTensor,
+):
+    """Prefetch (gather only) PRE-QUANTIZED fp8 hidden states for one block.
+
+    Indirect-gathers the per-block tokens' concatenated rows from HBM into block_hidden_concat.
+    This is a pure DMA stage (no PE), so it overlaps the prior block's compute — mirroring the
+    bf16 load_hidden_states_mx prefetch. The matching transpose_fp8_hidden_states does the PE work.
+
+    HBM layout: hidden_states [T, H_concat], each row = [hidden_quant (H fp8) | hidden_scale
+    (packed scale_region uint8)]; scale_region = ceil((H/512)/4)*128.
+
+    Args:
+        inps (InputTensors): inps.hidden_states is the concat HBM tensor [T, H_concat].
+        dims (BWMMMXDimensionSizes): Dimension configuration (H, B).
+        skip_dma (SkipMode): Padding tokens are skipped via oob_mode.skip.
+        token_indices_on_p (nl.NkiTensor): [_pmax, B//_pmax] int32 token ids on partitions for this block.
+        block_hidden_concat (nl.NkiTensor): Dest [_pmax, B//_pmax, H_load] gathered concat rows.
+    """
+    B = dims.B
+    H_concat = inps.hidden_states.shape[-1]
+    n_B_tiles = div_ceil(B, _pmax)
+    blk_T = min(B, _pmax)
+    # Gather the FULL concat row. H_concat = H + scale_region [+ affin_region when the producer fused
+    # expert affinities into the row]. Loading the whole row pulls the (optional) affinity tail with
+    # hidden+scale in one indirect DMA. Affinities region is extracted later.
+    row_load = H_concat
+
+    for b_tile_idx in range(n_B_tiles):
+        nisa.dma_copy(
+            src=inps.hidden_states.ap(
+                pattern=[[H_concat, blk_T], [1, row_load]],
+                offset=0,
+                vector_offset=token_indices_on_p.ap(
+                    pattern=[[n_B_tiles, blk_T], [1, 1]],
+                    offset=b_tile_idx,
+                ),
+                indirect_dim=0,
+            ),
+            dst=block_hidden_concat[0:blk_T, b_tile_idx, 0:row_load],
+            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            dge_mode=dge_mode.swdge,
+        )
+
+
+def transpose_fp8_hidden_states(
+    dims: BWMMMXDimensionSizes,
+    prj_cfg,
+    block_hidden_concat: nl.NkiTensor,
+    hidden_qtz_sb: nl.NkiTensor,
+    hidden_scale_sb: nl.NkiTensor,
+    sbm=None,
+):
+    """PE-transpose prefetched fp8 hidden + uint8 MX scales into the matmul-ready layout.
+
+    Reads the gathered block_hidden_concat (filled by load_fp8_hidden_states_mx) and transposes
+    the quant region into hidden_qtz_sb [128_H, n_H512_tile, B] and the PACKED scale region into
+    hidden_scale_sb [128_H, n_packed, B] (n_packed = ceil(n_H512_tile/4); 4 H512 tiles fold into one
+    128-wide block). No quantization — the data is already MX-quantized. This is the deferred PE stage
+    (mirrors the bf16 sbuf_layout_adapter), run after the projections so nc_transpose doesn't contend
+    with the matmuls. The matmul consumes the packed scales via is_packed_moving_scale addressing.
+
+    PE transpose cannot take fp8x4/uint8 directly: the fp8 region rides through an fp32 view (4_H
+    packed inside one fp32) and the uint8 scales through an fp8_e5m2 view
+    """
+    H = dims.H
+    B = dims.B
+    n_H512_tile = prj_cfg.n_H512_tile
+    n_packed = div_ceil(n_H512_tile, _SCALES_PER_PACK)  # packed scale blocks (4 H512 tiles each)
+    tile_H = _pmax  # 128 H-partitions per H512 tile
+    H_load = block_hidden_concat.shape[-1]
+    n_B_tiles = div_ceil(B, _pmax)
+    blk_T = min(B, _pmax)
+
+    # Per-partition (per-token-row) free size of block_hidden_concat, in fp8 bytes and fp32 elements.
+    row_stride_fp8 = n_B_tiles * H_load
+    row_stride_fp32 = row_stride_fp8 // _FP8_PER_FP32
+
+    # Batch the copy-out: pack several H512 transposes into one PSUM bank at distinct free offsets,
+    # then do ONE strided tensor_copy per group.
+    # A PSUM bank holds 512 (_psum_fmax) fp32 elements; the scale view is uint8 with a x2 interleave (HW constraint),
+    # so it packs 2x as many tiles per bank.
+    quant_tiles_per_group = max(1, _psum_fmax // blk_T)
+    scale_tiles_per_group = max(1, _psum_fmax * _FP8_TP_OUT_STEP // blk_T)
+    n_quant_groups = div_ceil(n_H512_tile, quant_tiles_per_group)
+    n_scale_groups = div_ceil(n_packed, scale_tiles_per_group)
+
+    # Double-buffer PSUM (like sbuf_layout_adapter): one bank copies out (DVE) while the next fills
+    # (TE). Separate bank pairs for quant (fp32-view) and scale (fp8-view) so they don't serialize.
+    quant_psum_bufs = [
+        _psum_alloc((tile_H, quant_tiles_per_group, blk_T), _FP8X4_TP_VIEW_DTYPE, sbm, 0 * PSUM_BANK_SIZE),
+        _psum_alloc((tile_H, quant_tiles_per_group, blk_T), _FP8X4_TP_VIEW_DTYPE, sbm, 1 * PSUM_BANK_SIZE),
+    ]
+    scale_psum_bufs = [
+        _psum_alloc(
+            (tile_H, scale_tiles_per_group, blk_T, _FP8_TP_OUT_STEP), _UINT8_TP_VIEW_DTYPE, sbm, 2 * PSUM_BANK_SIZE
+        ),
+        _psum_alloc(
+            (tile_H, scale_tiles_per_group, blk_T, _FP8_TP_OUT_STEP), _UINT8_TP_VIEW_DTYPE, sbm, 3 * PSUM_BANK_SIZE
+        ),
+    ]
+
+    for b_tile_idx in range(n_B_tiles):
+        # Transpose fp8 hidden region [blk_T, H] -> [128_H, n_H512_tile, blk_T] via fp32 view.
+        for group_idx in range(n_quant_groups):  # how many psum bank fills we will have
+            first_tile = group_idx * quant_tiles_per_group
+            tiles_in_group = min(quant_tiles_per_group, n_H512_tile - first_tile)
+            quant_psum = quant_psum_bufs[group_idx % 2]
+            for tile_in_group in range(tiles_in_group):
+                nisa.nc_transpose(
+                    data=block_hidden_concat.ap(
+                        pattern=[[row_stride_fp32, blk_T], [1, tile_H]],
+                        offset=(b_tile_idx * H_load) // _FP8_PER_FP32
+                        + (first_tile + tile_in_group)
+                        * tile_H,  # (start of the B-tile) + (H512-tile offset inside hidden)
+                        dtype=_FP8X4_TP_VIEW_DTYPE,
+                    ),
+                    dst=quant_psum[:, tile_in_group, :],
+                )
+            # One strided copy lands the whole group's tiles into hidden_qtz_sb.
+            nisa.tensor_copy(
+                src=quant_psum[:, :tiles_in_group, :],
+                dst=hidden_qtz_sb.ap(
+                    pattern=[[n_H512_tile * B, tile_H], [B, tiles_in_group], [1, blk_T]],
+                    offset=first_tile * B + b_tile_idx * blk_T,
+                    dtype=_FP8X4_TP_VIEW_DTYPE,
+                ),
+            )
+
+        """
+        Transpose the PACKED uint8 scale region [blk_T, n_packed*128] -> [128_H, n_packed, blk_T]
+        via fp8_e5m2 view. Each pack block is a contiguous 128-wide region in HBM (4 H512 tiles
+        already folded by the producer), so we transpose n_packed contiguous-128 blocks. FP8
+        transpose mode requires the PE output to have an element step of 2, so the PSUM dst carries
+        a trailing interleave dim of size 2 and we read back slot 0
+        """
+        for group_idx in range(n_scale_groups):  # how many psum bank fill iterations we need
+            first_tile = group_idx * scale_tiles_per_group
+            tiles_in_group = min(scale_tiles_per_group, n_packed - first_tile)
+            scale_psum = scale_psum_bufs[group_idx % 2]  # double buffered
+            for tile_in_group in range(tiles_in_group):  # how many tiles fit into one psum bank to evict out at once
+                nisa.nc_transpose(
+                    data=block_hidden_concat.ap(
+                        pattern=[[row_stride_fp8, blk_T], [1, tile_H]],
+                        offset=b_tile_idx * H_load + H + (first_tile + tile_in_group) * tile_H,
+                        dtype=_UINT8_TP_VIEW_DTYPE,
+                    ),
+                    dst=scale_psum[:, tile_in_group, :, 0],
+                )
+            nisa.tensor_copy(
+                src=scale_psum[:, :tiles_in_group, :, 0],
+                dst=hidden_scale_sb.ap(
+                    pattern=[[n_packed * B, tile_H], [B, tiles_in_group], [1, blk_T]],
+                    offset=first_tile * B + b_tile_idx * blk_T,
+                    dtype=_UINT8_TP_VIEW_DTYPE,  # Scale Dtype fp8_e5m2
+                ),
+            )
 
 
 def load_hidden_states_mx(
@@ -460,9 +682,9 @@ def load_hidden_states_mx(
     dims: BWMMMXDimensionSizes,
     skip_dma: SkipMode,
     block_idx: int = None,
-    token_4_H_indices_on_p: nl.ndarray = None,
-    block_hidden_states: nl.ndarray = None,
-    block_hidden_states_T: nl.ndarray = None,
+    token_4_H_indices_on_p: nl.NkiTensor = None,
+    block_hidden_states: nl.NkiTensor = None,
+    block_hidden_states_T: nl.NkiTensor = None,
     use_dma_transpose: bool = False,
     sbm=None,
 ):
@@ -480,16 +702,19 @@ def load_hidden_states_mx(
         PE mode output: block_hidden_states [128, B/32, H/512, 128]
         DMA mode output: block_hidden_states_T [128, H/512, B/32, 128] (transposed)
 
+    Both modes consume token_4_H_indices_on_p [128, B/32] (uint32), which must be
+    populated by compute_hidden_index_vector() prior to calling this function.
+
     Args:
         inps (InputTensors): Input tensors containing hidden_states [T, H] in HBM.
         dims (BWMMMXDimensionSizes): Dimension configuration.
         skip_dma (SkipMode): DMA skip configuration for debugging.
-        block_idx (int): Current block index (required for DMA mode).
-        token_4_H_indices_on_p (nl.ndarray): Precomputed indices [128, B/32] with
-            H-folded token positions (required for PE mode).
-        block_hidden_states (nl.ndarray): Destination buffer [128, B/32, H/512, 128]
+        block_idx (int): Unused (kept for backward compatibility).
+        token_4_H_indices_on_p (nl.NkiTensor): Precomputed indices [128, B/32] (uint32)
+            with H-folded token positions on partitions. Required for both modes.
+        block_hidden_states (nl.NkiTensor): Destination buffer [128, B/32, H/512, 128]
             in SBUF (required for PE mode).
-        block_hidden_states_T (nl.ndarray): Destination buffer [128, H/512, B/32, 128]
+        block_hidden_states_T (nl.NkiTensor): Destination buffer [128, H/512, B/32, 128]
             in SBUF for transposed output (required for DMA mode).
         use_dma_transpose (bool): If True, use DMA transpose; if False, use PE mode.
 
@@ -497,17 +722,17 @@ def load_hidden_states_mx(
         None: Modifies block_hidden_states or block_hidden_states_T in-place.
 
     Notes:
-        - PE mode: Processes B/32 tiles sequentially using precomputed indices
-        - DMA mode: Uses nisa.dma_transpose with axes=(2,1,0)
+        - PE mode: Uses vector_offset-based dma_copy per B/32 tile
+        - DMA mode: Single vector_offset-based dma_transpose with axes=(3,1,2,0)
         - Uses oob_mode.skip when skip_dma.skip_token == True for padding tokens
 
     Pseudocode:
         if use_dma_transpose:
-            token_indices = load token_position_to_id[block_idx*B:(block_idx+1)*B]
-            all_token_4_H_indices = token_indices * 4 + [0, 1, 2, 3]
-            for b_tile_idx in range(B/32):
-                indices_on_p = transpose(all_token_4_H_indices[:, b_tile_idx*128:(b_tile_idx+1)*128])
-                block_hidden_states_T[:, :, b_tile_idx, :] = dma_transpose(hidden_states[indices_on_p], axes=(2,1,0))
+            # Single DMA transpose with gather via vector_offset
+            src = hidden_states.reshape(T*4, 1, H/512, 128).ap(
+                      pattern=..., vector_offset=token_4_H_indices_on_p[:128, :N])
+            dst = block_hidden_states_T.reshape(128, 1, H/512, N*128).ap(pattern=...)
+            dma_transpose(src, dst, axes=(3,1,2,0))
         else:
             hidden_view = reshape hidden_states to [T*4, H/512, 128]
             for b_tile_idx in range(B/32):
@@ -519,79 +744,44 @@ def load_hidden_states_mx(
     B_div_32 = B // SBUF_QUADRANT_SIZE
 
     if use_dma_transpose:
-        kernel_assert(block_idx != None, "block_idx required for DMA transpose mode")
         kernel_assert(block_hidden_states_T != None, "block_hidden_states_T required for DMA transpose mode")
+        kernel_assert(token_4_H_indices_on_p != None, "token_4_H_indices_on_p required for DMA transpose mode")
 
         hidden_states = inps.hidden_states
-        token_position_to_id = inps.token_position_to_id
+        N = B_div_32  # N = (B * 4) // 128 = B // 32
 
-        # Load token indices for current block
-        token_indices = _sbm_alloc(
-            sbm, (1, dims.B), dtype=token_position_to_id.dtype, name="hs_token_indices", align=SBUF_QUADRANT_SIZE
-        )
-        nisa.dma_copy(
-            dst=token_indices,
-            src=token_position_to_id.reshape((1, token_position_to_id.shape[0]))[
-                :, block_idx * dims.B : dims.B * (block_idx + 1)
-            ],
-            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-        )
-        kernel_assert(token_indices.shape == (1, dims.B), f"token_indices.shape = {token_indices.shape}")
-
-        # Create [0, 1, 2, 3] offset vector for H-folding
-        arange_4H = _sbm_alloc(sbm, (1, _q_width), dtype=nl.float32, name="hs_arange_4H", align=SBUF_QUADRANT_SIZE)
-        nisa.iota(arange_4H, [[1, _q_width]], offset=0)
-
-        # Compute 4H-folded indices: token_indices * 4 + [0,1,2,3]
-        all_token_4_H_indices = _sbm_alloc(
-            sbm, (1, dims.B, _q_width), dtype=nl.float32, name="hs_all_token_4H", align=SBUF_QUADRANT_SIZE
-        )
-
-        nisa.scalar_tensor_tensor(
-            dst=all_token_4_H_indices,
-            data=token_indices.ap(pattern=[[dims.B, 1], [1, dims.B], [0, _q_width]], offset=0),
-            op0=nl.multiply,
-            operand0=float(_q_width),
-            op1=nl.add,
-            operand1=arange_4H.ap(pattern=[[_q_width, 1], [0, dims.B], [1, _q_width]], offset=0),
-        )
-
-        all_token_4_H_indices = all_token_4_H_indices.reshape((1, dims.B * _q_width))
-        kernel_assert(all_token_4_H_indices.shape == (1, dims.B * _q_width), f"got {all_token_4_H_indices.shape}")
-
-        # Process each B/32 tile with DMA transpose
-        for b_tile_idx in range(B_div_32):
-            token_4_H_indices = all_token_4_H_indices[:, b_tile_idx * _pmax, b_tile_idx * _pmax + _pmax]
-            token_4_H_indices_psum = _psum_alloc(
-                (token_4_H_indices.shape[1], token_4_H_indices.shape[0]),
-                token_4_H_indices.dtype,
-                sbm,
-                (b_tile_idx % NUM_HW_PSUM_BANKS) * PSUM_BANK_SIZE,
-            )
-            nisa.nc_transpose(dst=token_4_H_indices_psum, data=token_4_H_indices)
-
-            token_4_H_indices_on_p_local = _sbm_alloc(
-                sbm,
-                token_4_H_indices_psum.shape,
-                dtype=nl.uint32,
-                name=f"hs_token_4H_p_{b_tile_idx}",
-                align=SBUF_QUADRANT_SIZE,
-            )
-            nisa.tensor_copy(dst=token_4_H_indices_on_p_local, src=token_4_H_indices_psum, engine=nisa.scalar_engine)
-
-            kernel_assert(
-                token_4_H_indices_on_p_local.shape == (_pmax, 1),
-                f"token_4_H_indices.shape = {token_4_H_indices_on_p_local.shape}",
-            )
-
-            nisa.dma_transpose(
-                dst=block_hidden_states_T[: (SBUF_QUADRANT_SIZE * _q_width), :H_div_512, b_tile_idx, : (16 * 8)],
-                src=hidden_states.reshape((dims.T * _q_width, H_div_512, _pmax))[
-                    token_4_H_indices_on_p_local[:, 0], :H_div_512, : (16 * 8)
+        # Single dma_transpose with vector_offset gather: write all N B/32-tiles at once.
+        # _pmax*N rows are gathered from hidden_states via token_4_H_indices_on_p[:_pmax, :N];
+        # the transpose places those rows on the free axis of block_hidden_states_T while the
+        # original 128-element free axis becomes the partition axis.
+        #
+        # 4D reshape with dummy dim=1 satisfies the HW constraint that one of the
+        # non-partition transpose dimensions must be padding (size 1).
+        # src (_pmax*N, 1, H_div_512, 128) --axes=(3,1,2,0)--> dst (128, 1, H_div_512, _pmax*N)
+        nisa.dma_transpose(
+            src=hidden_states.reshape((dims.T * _q_width, 1, H_div_512, _pmax)).ap(
+                pattern=[
+                    [H_div_512 * _pmax, _pmax * N],  # dim0: _pmax*N rows gathered via vector_offset
+                    [1, 1],  # dim1: dummy padding dimension
+                    [_pmax, H_div_512],  # dim2: H_div_512 tiles
+                    [1, _pmax],  # dim3: 128 free elements per tile
                 ],
-                axes=(2, 1, 0),
-                oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
-            )
+                offset=0,
+                vector_offset=token_4_H_indices_on_p[:_pmax, :N].view(nl.uint32),
+            ),
+            dst=block_hidden_states_T.reshape((_pmax, 1, H_div_512, N * _pmax)).ap(
+                pattern=[
+                    [H_div_512 * N * _pmax, _pmax],  # dim0: _pmax partitions
+                    [1, 1],  # dim1: dummy padding dimension
+                    [N * _pmax, H_div_512],  # dim2: H_div_512 tiles
+                    [1, N * _pmax],  # dim3: N*128 free elements (all N tiles)
+                ],
+            ),
+            axes=(3, 1, 2, 0),
+            oob_mode=oob_mode.skip if skip_dma.skip_token else oob_mode.error,
+            priority=0,
+        )
+
     else:
         kernel_assert(token_4_H_indices_on_p != None, "token_4_H_indices_on_p required for PE mode")
         kernel_assert(block_hidden_states != None, "block_hidden_states required for PE mode")
@@ -653,7 +843,7 @@ def compute_hidden_index_vector(
     Args:
         inps (InputTensors): Input tensors with token_position_to_id mapping.
         buffers (SharedBuffers): Buffers including token_4_H_indices_on_p output.
-        block_idx: Current block index (int for static, nl.ndarray for dynamic).
+        block_idx: Current block index (int for static, nl.NkiTensor for dynamic).
         dims (BWMMMXDimensionSizes): Dimension configuration.
         skip_dma (SkipMode): DMA skip configuration.
         is_block_idx_dynamic (bool): True if block_idx is from dynamic loop.
@@ -709,11 +899,9 @@ def compute_hidden_index_vector(
 
     kernel_assert(token_indices.shape == (1, num_tokens), f"token_indices.shape = {token_indices.shape}")
 
-    # Create [0, 1, 2, 3] offset vector for H-folding
-    arange_4H = _sbm_alloc(
-        sbm, (1, _q_width), dtype=nl.float32, name=f"hiv_arange_4H_{block_idx}", align=SBUF_QUADRANT_SIZE
-    )
-    nisa.iota(arange_4H, [[1, _q_width]], offset=0)
+    # [0, 1, 2, 3] offset vector for H-folding; hoisted once at kernel entry
+    # (inps.arange_4H) to avoid per-block iota allocation.
+    arange_4H = inps.arange_4H
 
     # Compute 4H-folded indices: token_indices * 4 + [0,1,2,3]
     # This broadcasts token_indices across the 4 H-fold dimension
@@ -799,11 +987,38 @@ def quantize_block_hidden_state_T(buffers: SharedBuffers, prj_cfg: ProjConfig, d
     )
 
 
-def sbuf_layout_adapter(
-    src: nl.ndarray,
-    dst: nl.ndarray,
+def quantize_block_hidden_state_T_static_mx(
+    buffers: SharedBuffers,
+    prj_cfg: ProjConfig,
     dims: BWMMMXDimensionSizes,
-    use_dma_tp: bool = False,
+    in_quant_recip: nl.NkiTensor,
+):
+    """STATIC_MX variant: software-quant block_hidden_states_T (bf16) → hidden_qtz_sb (fp8_x4).
+
+    Caller passes the per-block reciprocal (= 1 / gate_up_in_scale[block_expert]) gathered
+    from the [_pmax, E, 3] gup table. The matmul-side moving_scale reuses buffers.hidden_scale_sb,
+    which the kernel pre-fills with 0x7F7F7F7F (uint8 = all 127) at top of kernel for STATIC_MX.
+
+    Mirrors MoE TKG selective_expert_mx_impl.py STATIC_MX pattern:
+      1. tensor_scalar to scale bf16 hidden, writing into a separately-allocated fp8 buffer
+         (saturation cast handles the ±448 clip).
+      2. tensor_copy via uint32 view to land bytes in hidden_qtz_sb (fp8_x4).
+    """
+    num_b_tiles = dims.B // SBUF_QUADRANT_SIZE
+
+    hidden_qtz_fp8 = buffers.hidden_qtz_sb.view(nl.float8_e4m3fn)
+    nisa.tensor_scalar(
+        dst=hidden_qtz_fp8,
+        data=buffers.block_hidden_states_T[:_pmax, : prj_cfg.n_H512_tile, :num_b_tiles, :_pmax],
+        op0=nl.multiply,
+        operand0=in_quant_recip,
+    )
+
+
+def sbuf_layout_adapter(
+    src: nl.NkiTensor,
+    dst: nl.NkiTensor,
+    dims: BWMMMXDimensionSizes,
     sbm=None,
 ):
     """
@@ -823,17 +1038,15 @@ def sbuf_layout_adapter(
     3. This transpose reorders data to match matmul input requirements
 
     Args:
-        src (nl.ndarray): Source tensor [32*4, B/32, H/512, 16*8] in SBUF.
-        dst (nl.ndarray): Destination tensor [128, H/512, B/32, 128] in SBUF.
+        src (nl.NkiTensor): Source tensor [32*4, B/32, H/512, 16*8] in SBUF.
+        dst (nl.NkiTensor): Destination tensor [128, H/512, B/32, 128] in SBUF.
         dims (BWMMMXDimensionSizes): Dimension configuration.
-        use_dma_tp (bool): If True, use DMA transpose; if False, use nc_transpose.
 
     Returns:
         None: Modifies dst tensor in-place.
 
     Notes:
-        - nc_transpose method uses PSUM multi-buffering (8 transposes per bank)
-        - DMA transpose is faster but may have hardware limitations
+        - Uses nc_transpose with PSUM multi-buffering (8 transposes per bank)
         - Each 128x128 transpose moves one B/32 tile for one H/512 tile
 
     Pseudocode:
@@ -842,17 +1055,13 @@ def sbuf_layout_adapter(
         transposes_per_bank = min(8, B_div_32)
         num_banks = B_div_32 // transposes_per_bank
 
-        if use_dma_tp:
-            tmp = dma_transpose(src, axes=(3,1,2,0))
-            copy tmp to dst with dimension reordering
-        else:
-            for h_tile_idx in range(H_div_512):
-                for bank_idx in range(num_banks):
-                    psum_buffer = allocate PSUM
-                    for tp_idx in range(transposes_per_bank):
-                        b_tile_idx = bank_idx * transposes_per_bank + tp_idx
-                        psum_buffer[:, tp_idx*128:(tp_idx+1)*128] = nc_transpose(src[:, b_tile_idx, h_tile_idx, :])
-                    dst[:, h_tile_idx, bank_idx, :] = psum_buffer
+        for h_tile_idx in range(H_div_512):
+            for bank_idx in range(num_banks):
+                psum_buffer = allocate PSUM
+                for tp_idx in range(transposes_per_bank):
+                    b_tile_idx = bank_idx * transposes_per_bank + tp_idx
+                    psum_buffer[:, tp_idx*128:(tp_idx+1)*128] = nc_transpose(src[:, b_tile_idx, h_tile_idx, :])
+                dst[:, h_tile_idx, bank_idx, :] = psum_buffer
     """
     src_sbuf = src
 
@@ -863,52 +1072,41 @@ def sbuf_layout_adapter(
     transposes_per_bank = min(_psum_bmax, B_div_32)
     num_banks = B_div_32 // transposes_per_bank
 
-    if use_dma_tp:
-        tmp_sbuf = _sbm_alloc(
-            sbm, (_pmax, B_div_32, H_div_512, _pmax), dtype=src_sbuf.dtype, name="layout_tmp", align=SBUF_QUADRANT_SIZE
-        )
-        nisa.dma_transpose(dst=tmp_sbuf[:, :, :, :], src=src_sbuf[:, :, :, :], axes=(3, 1, 2, 0))
+    # Reshape dst for efficient bank-based access
+    dst = dst.reshape((_pmax, H_div_512, num_banks, transposes_per_bank * SBUF_QUADRANT_SIZE * _q_width))
 
-        for h_tile_idx in range(H_div_512):
-            for b_tile_idx in range(B_div_32):
-                dst[0:_pmax, h_tile_idx, b_tile_idx, :_pmax] = tmp_sbuf[0:_pmax, b_tile_idx, h_tile_idx, :_pmax]
+    # Double-buffer: 2 pre-allocated PSUM banks, alternate across H tiles
+    # While one bank copies out (DVE), the next fills with transposes (TE)
+
+    if sbm != None:
+        psum_bufs = [
+            _psum_alloc((_pmax, transposes_per_bank * _pmax), src_sbuf.dtype, sbm, 0 * PSUM_BANK_SIZE),
+            _psum_alloc((_pmax, transposes_per_bank * _pmax), src_sbuf.dtype, sbm, 1 * PSUM_BANK_SIZE),
+        ]
     else:
-        # Reshape dst for efficient bank-based access
-        dst = dst.reshape((_pmax, H_div_512, num_banks, transposes_per_bank * SBUF_QUADRANT_SIZE * _q_width))
+        psum_bufs = [
+            _psum_alloc((_pmax, transposes_per_bank * _pmax), src_sbuf.dtype, None),
+            _psum_alloc((_pmax, transposes_per_bank * _pmax), src_sbuf.dtype, None),
+        ]
 
-        # Double-buffer: 2 pre-allocated PSUM banks, alternate across H tiles
-        # While one bank copies out (DVE), the next fills with transposes (TE)
+    for h_tile_idx in nl.affine_range(H_div_512):
+        for bank_idx in range(num_banks):
+            psum_buffer = psum_bufs[(h_tile_idx * num_banks + bank_idx) % 2]
 
-        if sbm != None:
-            psum_bufs = [
-                _psum_alloc((_pmax, transposes_per_bank * _pmax), src_sbuf.dtype, sbm, 0 * PSUM_BANK_SIZE),
-                _psum_alloc((_pmax, transposes_per_bank * _pmax), src_sbuf.dtype, sbm, 1 * PSUM_BANK_SIZE),
-            ]
-        else:
-            psum_bufs = [
-                _psum_alloc((_pmax, transposes_per_bank * _pmax), src_sbuf.dtype, None),
-                _psum_alloc((_pmax, transposes_per_bank * _pmax), src_sbuf.dtype, None),
-            ]
-
-        for h_tile_idx in nl.affine_range(H_div_512):
-            for bank_idx in range(num_banks):
-                psum_buffer = psum_bufs[(h_tile_idx * num_banks + bank_idx) % 2]
-
-                for tp_idx in range(transposes_per_bank):
-                    b_tile_idx = bank_idx * transposes_per_bank + tp_idx
-                    nisa.nc_transpose(
-                        dst=psum_buffer[:_pmax, tp_idx * _pmax : (tp_idx + 1) * _pmax],
-                        data=src_sbuf[0:_pmax, b_tile_idx, h_tile_idx, 0:_pmax],
-                    )
-
-                nisa.tensor_copy(
-                    dst[0:_pmax, h_tile_idx, bank_idx, 0 : transposes_per_bank * _pmax],
-                    psum_buffer[:_pmax, : transposes_per_bank * _pmax],
-                    engine=nisa.scalar_engine,
+            for tp_idx in range(transposes_per_bank):
+                b_tile_idx = bank_idx * transposes_per_bank + tp_idx
+                nisa.nc_transpose(
+                    dst=psum_buffer[:_pmax, tp_idx * _pmax : (tp_idx + 1) * _pmax],
+                    data=src_sbuf[0:_pmax, b_tile_idx, h_tile_idx, 0:_pmax],
                 )
 
-        # Restore original shape
-        dst = dst.reshape((_pmax, H_div_512, B_div_32, SBUF_QUADRANT_SIZE * _q_width))
+            nisa.tensor_copy(
+                dst[0:_pmax, h_tile_idx, bank_idx, 0 : transposes_per_bank * _pmax],
+                psum_buffer[:_pmax, : transposes_per_bank * _pmax],
+            )
+
+    # Restore original shape
+    dst = dst.reshape((_pmax, H_div_512, B_div_32, SBUF_QUADRANT_SIZE * _q_width))
 
 
 def load_and_quantize_hidden_states(
@@ -922,6 +1120,7 @@ def load_and_quantize_hidden_states(
     use_dma_transpose: bool = False,
     use_fp32_transpose: bool = False,
     sbm=None,
+    in_quant_recip: Optional[nl.NkiTensor] = None,
 ):
     """
     Load, transpose, and quantize hidden states for current block.
@@ -948,11 +1147,11 @@ def load_and_quantize_hidden_states(
         - Called once per block during processing
 
     Pseudocode:
+        compute_hidden_index_vector(inps, buffers, block_idx, dims, skip_dma, is_block_idx_dynamic)
         if use_dma_transpose:
-            load_hidden_states_mx(inps, dims, skip_dma, block_idx=block_idx,
+            load_hidden_states_mx(inps, dims, skip_dma, token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
                                   block_hidden_states_T=buffers.block_hidden_states_T, use_dma_transpose=True)
         else:
-            compute_hidden_index_vector(inps, buffers, block_idx, dims, skip_dma, is_block_idx_dynamic)
             load_hidden_states_mx(inps, dims, skip_dma, token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
                                   block_hidden_states=buffers.block_hidden_states, use_dma_transpose=False)
             sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims)
@@ -961,18 +1160,19 @@ def load_and_quantize_hidden_states(
         reshape buffers.hidden_scale_sb to [128, n_H512_tile, B//32, 32]
         quantize_block_hidden_state_T(buffers, prj_cfg, dims)
     """
+    # Both DMA and PE paths consume buffers.token_4_H_indices_on_p via vector_offset.
+    compute_hidden_index_vector(inps, buffers, block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic, sbm=sbm)
     if use_dma_transpose:
         load_hidden_states_mx(
             inps,
             dims,
             kernel_cfg.skip_dma,
-            block_idx=block_idx,
+            token_4_H_indices_on_p=buffers.token_4_H_indices_on_p,
             block_hidden_states_T=buffers.block_hidden_states_T,
             use_dma_transpose=True,
             sbm=sbm,
         )
     else:
-        compute_hidden_index_vector(inps, buffers, block_idx, dims, kernel_cfg.skip_dma, is_block_idx_dynamic, sbm=sbm)
         load_hidden_states_mx(
             inps,
             dims,
@@ -985,21 +1185,28 @@ def load_and_quantize_hidden_states(
         sbuf_layout_adapter(buffers.block_hidden_states, buffers.block_hidden_states_T, dims, sbm=sbm)
 
     buffers.hidden_qtz_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
-    buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
+    if not kernel_cfg.is_static_quant:
+        buffers.hidden_scale_sb.reshape((_pmax, prj_cfg.n_H512_tile, dims.B // 32, 32))
 
-    # quantize. Note that online quantize can only quantize to fp8
-    quantize_block_hidden_state_T(buffers, prj_cfg, dims)
+    # Quantize block_hidden_states_T → hidden_qtz_sb. STATIC_MX uses software tensor_scalar
+    # (saturation cast handles the fp8 clip); MX uses HW quantize_mx.
+    if kernel_cfg.is_static_quant:
+        kernel_assert(in_quant_recip is not None, "STATIC_MX path requires caller-supplied in_quant_recip")
+        quantize_block_hidden_state_T_static_mx(buffers, prj_cfg, dims, in_quant_recip)
+    else:
+        quantize_block_hidden_state_T(buffers, prj_cfg, dims)
 
 
 def _generate_expert_index_vector(
-    expert_index: nl.ndarray,
-    dst_idx_vector: nl.ndarray,
+    expert_index: nl.NkiTensor,
+    dst_idx_vector: nl.NkiTensor,
     scale_factor: int,
     n_quadrants_needed: int,
     n_remaining_partition: int = 0,
     name_prefix: str = "eiv",
     sbm=None,
-) -> nl.ndarray:
+    dst_int32: nl.NkiTensor = None,
+) -> nl.NkiTensor:
     """
     Generate padded index vector for expert-based DGE scale loading.
 
@@ -1008,14 +1215,14 @@ def _generate_expert_index_vector(
     with -1 padding for unused positions.
 
     Args:
-        expert_index (nl.ndarray): Expert index scalar, shape [1, 1].
-        dst_idx_vector (nl.ndarray): Destination buffer for index vector, shape [128, 1].
+        expert_index (nl.NkiTensor): Expert index scalar, shape [1, 1].
+        dst_idx_vector (nl.NkiTensor): Destination buffer for index vector, shape [128, 1].
         scale_factor (int): Multiplier for expert index (typically 16 for E*16 folding).
         n_quadrants_needed (int): Number of full 32-element quadrants to fill.
         n_remaining_partition (int): Extra partitions beyond full quadrants (0-3).
 
     Returns:
-        nl.ndarray: Index vector in SBUF with shape [128, 1], dtype int32.
+        nl.NkiTensor: Index vector in SBUF with shape [128, 1], dtype int32.
 
     Notes:
         - Output pattern for expert=0: [0,1,2,3,-1...,-1, 4,5,6,7,-1...,-1, ...]
@@ -1054,8 +1261,16 @@ def _generate_expert_index_vector(
     nisa.nc_transpose(dst=padded_index_psum, data=padded_index)
     nisa.tensor_copy(dst=dst_idx_vector, src=padded_index_psum)
 
-    token_indices_on_p = _sbm_alloc(
-        sbm, dst_idx_vector.shape, dtype=nl.int32, name=f"{name_prefix}_token_indices_on_p", align=SBUF_QUADRANT_SIZE
+    token_indices_on_p = (
+        dst_int32
+        if dst_int32 != None
+        else _sbm_alloc(
+            sbm,
+            dst_idx_vector.shape,
+            dtype=nl.int32,
+            name=f"{name_prefix}_token_indices_on_p",
+            align=SBUF_QUADRANT_SIZE,
+        )
     )
     nisa.tensor_copy(dst=token_indices_on_p, src=dst_idx_vector, engine=nisa.scalar_engine)
     return token_indices_on_p

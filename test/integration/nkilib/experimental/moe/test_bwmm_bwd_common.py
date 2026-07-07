@@ -120,6 +120,7 @@ def _generate_fwd_golden(
     gate_up_proj_bias,
     down_proj_bias,
     clamp_limits,
+    skip_gate_proj: bool = False,
 ):
     output_np = np.zeros([T + 1, H]).astype(dtype)
     token_position_to_id = token_position_to_id.reshape(N, B)
@@ -173,12 +174,21 @@ def _generate_fwd_golden(
 
         gate_up_activations_T[b] = gate_up_activation.transpose(1, 2, 0)
 
-        if activation_function == ActFnType.SiLU:
-            act_res = silu(gate_activation)
-        elif activation_function == ActFnType.Swish:
-            act_res = gelu_apprx_sigmoid(gate_activation)
-
-        multiply_1 = act_res * up_activation
+        if skip_gate_proj:
+            if activation_function == ActFnType.SiLU:
+                multiply_1 = silu(up_activation)
+            elif activation_function == ActFnType.Swish:
+                multiply_1 = gelu_apprx_sigmoid(up_activation)
+            elif activation_function == ActFnType.SquaredReLU:
+                multiply_1 = np.maximum(up_activation, 0) ** 2
+        else:
+            if activation_function == ActFnType.SiLU:
+                act_res = silu(gate_activation)
+            elif activation_function == ActFnType.Swish:
+                act_res = gelu_apprx_sigmoid(gate_activation)
+            elif activation_function == ActFnType.SquaredReLU:
+                act_res = np.maximum(gate_activation, 0) ** 2
+            multiply_1 = act_res * up_activation
         down_activation = np.matmul(multiply_1, down_weights)
 
         if down_proj_bias is not None:
@@ -210,6 +220,7 @@ def _generate_bwd_golden(
     gate_up_bias,
     down_bias,
     affinity_option=AffinityOption.AFFINITY_ON_H,
+    skip_gate_proj: bool = False,
 ):
     E, I, H = down_weight.shape
     T, _ = hidden_states.shape
@@ -242,12 +253,21 @@ def _generate_bwd_golden(
         gate_activation_T, up_activation_T = np.split(gate_up_activation_T, 2, axis=0)
         gate_activation, up_activation = gate_activation_T.squeeze(0).T, up_activation_T.squeeze(0).T
 
-        if activation_function == ActFnType.SiLU:
-            silu_activation = silu(gate_activation)
-        elif activation_function == ActFnType.Swish:
-            silu_activation = gelu_apprx_sigmoid(gate_activation)
-
-        first_dot_activation = silu_activation * up_activation
+        if skip_gate_proj:
+            if activation_function == ActFnType.SiLU:
+                first_dot_activation = silu(up_activation)
+            elif activation_function == ActFnType.Swish:
+                first_dot_activation = gelu_apprx_sigmoid(up_activation)
+            elif activation_function == ActFnType.SquaredReLU:
+                first_dot_activation = np.maximum(up_activation, 0) ** 2
+        else:
+            if activation_function == ActFnType.SiLU:
+                silu_activation = silu(gate_activation)
+            elif activation_function == ActFnType.Swish:
+                silu_activation = gelu_apprx_sigmoid(gate_activation)
+            elif activation_function == ActFnType.SquaredReLU:
+                silu_activation = np.maximum(gate_activation, 0) ** 2
+            first_dot_activation = silu_activation * up_activation
         ea = expert_affinities_masked[token_position_to_id, block_expert_idx][:, np.newaxis]
 
         if is_affinity_i:
@@ -262,7 +282,8 @@ def _generate_bwd_golden(
             block_down_weight_grad = first_dot_activation.T @ down_out_grad
 
         if down_bias_grad is not None:
-            block_down_bias_grad = np.sum(down_out_grad.astype(np.float32), axis=0)
+            bias_grad_src = block_grad * ea if is_affinity_i else down_out_grad
+            block_down_bias_grad = np.sum(bias_grad_src.astype(np.float32), axis=0)
             down_bias_grad[block_expert_idx] += block_down_bias_grad
 
         down_weight_grad[block_expert_idx] += block_down_weight_grad
@@ -274,53 +295,67 @@ def _generate_bwd_golden(
             )
             first_dot_grad = first_dot_grad * ea
 
-        silu_grad = first_dot_grad * up_activation
-
-        if (
-            clamp_limits.non_linear_clamp_lower_limit is not None
-            or clamp_limits.non_linear_clamp_upper_limit is not None
-        ):
-            mask_lower = (
-                gate_activation > clamp_limits.non_linear_clamp_lower_limit
-                if clamp_limits.non_linear_clamp_lower_limit is not None
-                else np.ones_like(gate_activation, dtype=bool)
-            )
-            mask_upper = (
-                gate_activation < clamp_limits.non_linear_clamp_upper_limit
-                if clamp_limits.non_linear_clamp_upper_limit is not None
-                else np.ones_like(gate_activation, dtype=bool)
-            )
-            gate_activation_clamp_grad = (mask_lower & mask_upper).astype(np.float32)
+        if skip_gate_proj:
+            if activation_function == ActFnType.SiLU:
+                up_output_grad = first_dot_grad * (
+                    expit(up_activation) * (1 + up_activation * (1 - expit(up_activation)))
+                )
+            elif activation_function == ActFnType.Swish:
+                up_output_grad = first_dot_grad * gelu_apprx_sigmoid_dx(up_activation)
+            elif activation_function == ActFnType.SquaredReLU:
+                up_output_grad = first_dot_grad * 2 * np.maximum(up_activation, 0)
+            gate_output_grad = np.zeros_like(up_output_grad)
+            gate_up_out_grad = np.concatenate([gate_output_grad, up_output_grad], axis=-1)
         else:
-            gate_activation_clamp_grad = np.ones_like(gate_activation)
+            silu_grad = first_dot_grad * up_activation
 
-        if clamp_limits.linear_clamp_lower_limit is not None or clamp_limits.linear_clamp_upper_limit is not None:
-            mask_lower = (
-                up_activation > clamp_limits.linear_clamp_lower_limit
-                if clamp_limits.linear_clamp_lower_limit is not None
-                else np.ones_like(up_activation, dtype=bool)
-            )
-            mask_upper = (
-                up_activation < clamp_limits.linear_clamp_upper_limit
-                if clamp_limits.linear_clamp_upper_limit is not None
-                else np.ones_like(up_activation, dtype=bool)
-            )
-            up_activation_clamp_grad = (mask_lower & mask_upper).astype(np.float32)
-        else:
-            up_activation_clamp_grad = np.ones_like(up_activation)
+            if (
+                clamp_limits.non_linear_clamp_lower_limit is not None
+                or clamp_limits.non_linear_clamp_upper_limit is not None
+            ):
+                mask_lower = (
+                    gate_activation > clamp_limits.non_linear_clamp_lower_limit
+                    if clamp_limits.non_linear_clamp_lower_limit is not None
+                    else np.ones_like(gate_activation, dtype=bool)
+                )
+                mask_upper = (
+                    gate_activation < clamp_limits.non_linear_clamp_upper_limit
+                    if clamp_limits.non_linear_clamp_upper_limit is not None
+                    else np.ones_like(gate_activation, dtype=bool)
+                )
+                gate_activation_clamp_grad = (mask_lower & mask_upper).astype(np.float32)
+            else:
+                gate_activation_clamp_grad = np.ones_like(gate_activation)
 
-        if activation_function == ActFnType.SiLU:
-            gate_output_grad = (
-                silu_grad
-                * expit(gate_activation)
-                * (1 + gate_activation * (1 - expit(gate_activation)))
-                * gate_activation_clamp_grad
-            )
-        elif activation_function == ActFnType.Swish:
-            gate_output_grad = silu_grad * gelu_apprx_sigmoid_dx(gate_activation) * gate_activation_clamp_grad
+            if clamp_limits.linear_clamp_lower_limit is not None or clamp_limits.linear_clamp_upper_limit is not None:
+                mask_lower = (
+                    up_activation > clamp_limits.linear_clamp_lower_limit
+                    if clamp_limits.linear_clamp_lower_limit is not None
+                    else np.ones_like(up_activation, dtype=bool)
+                )
+                mask_upper = (
+                    up_activation < clamp_limits.linear_clamp_upper_limit
+                    if clamp_limits.linear_clamp_upper_limit is not None
+                    else np.ones_like(up_activation, dtype=bool)
+                )
+                up_activation_clamp_grad = (mask_lower & mask_upper).astype(np.float32)
+            else:
+                up_activation_clamp_grad = np.ones_like(up_activation)
 
-        up_output_grad = first_dot_grad * silu_activation * up_activation_clamp_grad
-        gate_up_out_grad = np.concatenate([gate_output_grad, up_output_grad], axis=-1)
+            if activation_function == ActFnType.SiLU:
+                gate_output_grad = (
+                    silu_grad
+                    * expit(gate_activation)
+                    * (1 + gate_activation * (1 - expit(gate_activation)))
+                    * gate_activation_clamp_grad
+                )
+            elif activation_function == ActFnType.Swish:
+                gate_output_grad = silu_grad * gelu_apprx_sigmoid_dx(gate_activation) * gate_activation_clamp_grad
+            elif activation_function == ActFnType.SquaredReLU:
+                gate_output_grad = silu_grad * 2 * np.maximum(gate_activation, 0) * gate_activation_clamp_grad
+
+            up_output_grad = first_dot_grad * silu_activation * up_activation_clamp_grad
+            gate_up_out_grad = np.concatenate([gate_output_grad, up_output_grad], axis=-1)
 
         block_gate_up_grad = block_hidden_states.T @ gate_up_out_grad
         if gate_up_bias_grad is not None:
@@ -366,6 +401,7 @@ def build_bwmm_bwd_inputs(
     affinity_option=AffinityOption.AFFINITY_ON_H,
     blocking_params=None,
     shard_option=ShardOption.SHARD_ON_FREE,
+    skip_gate_proj: bool = False,
 ):
     """Build kernel inputs and return (inputs_dict, gate_up_proj_bias, down_proj_bias)."""
     N = get_n_blocks(tokens, top_k, expert, block_size)
@@ -418,6 +454,7 @@ def build_bwmm_bwd_inputs(
         gate_up_proj_bias,
         down_proj_bias,
         clamp_limits,
+        skip_gate_proj=skip_gate_proj,
     )
 
     inputs = {
@@ -440,6 +477,7 @@ def build_bwmm_bwd_inputs(
         "affinity_option": affinity_option,
         "blocking_params": blocking_params,
         "shard_option": shard_option,
+        "skip_gate_proj": skip_gate_proj,
     }
 
     if affinity_option == AffinityOption.AFFINITY_ON_I:
@@ -471,6 +509,12 @@ def blockwise_mm_bwd_torch_ref(
     activation_type: ActFnType = ActFnType.SiLU,
     block_tile_size: int = None,
     blocking_params=None,
+    hidden_states_grad_out=None,
+    expert_affinities_masked_grad_out=None,
+    gate_up_proj_weight_grad_out=None,
+    down_proj_weight_grad_out=None,
+    accumulation_dtype=None,
+    skip_gate_proj: bool = False,
 ) -> dict:
     """Torch reference for blockwise_mm_bwd. Converts to numpy, runs golden, returns dict of torch tensors."""
     if skip_dma is None:
@@ -520,6 +564,7 @@ def blockwise_mm_bwd_torch_ref(
         gate_up_bias=gate_up_bias,
         down_bias=down_bias,
         affinity_option=affinity_option,
+        skip_gate_proj=skip_gate_proj,
     )
 
     result = {

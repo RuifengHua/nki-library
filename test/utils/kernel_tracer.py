@@ -21,6 +21,7 @@ from nki.compiler.driver import compile_to_bir
 from nki.compiler.frontend import ParserFrontend, TracerFrontend
 from nki.compiler.ncc_driver import CompileOptions, compile_bir_to_neff
 
+from .bir_neff_cache import compute_cache_key, lookup_cache, store_cache
 from .common_dataclasses import (
     CompilerArgs,
     CustomValidatorWithOutputTensorData,
@@ -33,6 +34,7 @@ from .common_dataclasses import (
     ValidationArgs,
     normalize_golden_output,
 )
+from .metrics_collector import IMetricsCollector
 
 DEFAULT_COMPILER_DEBUG_FLAGS = [
     "--internal-backend-options=--print-format=condensed",
@@ -128,42 +130,6 @@ def construct_kernel_IO_from_kernel_args(kernel_under_test: KernelArgs):
     return kernel_input_dict, kernel_outputs
 
 
-def trace_kernel_only(kernel_under_test: KernelArgs, output_directory: str):
-    kernel_input_dict, kernel_outputs = construct_kernel_IO_from_kernel_args(kernel_under_test)
-
-    ir_module, _ = _compile_nki_ir_to_tensorizer_ir(
-        kernel_under_test.kernel_func,
-        str(kernel_under_test.compiler_input.platform_target.get_compile_target()),
-        kernel_under_test.compiler_input.logical_nc_config,
-        kernel_input_dict,
-        kernel_outputs,
-        NKI_IR_VERSION.beta2,
-    )
-
-    _write_tensorizer_ir(ir_module, output_directory)
-
-
-def compile_kernel_to_neff(kernel_under_test: KernelArgs, output_directory: str):
-    # Prepare to call compiler utility to construct the NEFF from kernels
-    additional_compiler_args = __construct_additional_arguments__(
-        kernel_under_test.compiler_input, kernel_under_test.validation_args
-    )
-
-    kernel_input_dict, kernel_outputs = construct_kernel_IO_from_kernel_args(kernel_under_test)
-
-    compile_nki_ir_kernel_to_neff(
-        kernel_under_test.kernel_func,
-        kernel_input_dict,
-        kernel_outputs,
-        str(kernel_under_test.compiler_input.platform_target.get_compile_target()),
-        kernel_under_test.compiler_input.logical_nc_config,
-        output_directory,
-        NKI_IR_VERSION.beta2,
-        additional_compiler_args,
-        kernel_under_test.compiler_input.enable_device_dump,
-    )
-
-
 def trace_kernel(
     kernel_under_test: KernelArgs,
     mode: TraceMode,
@@ -171,6 +137,8 @@ def trace_kernel(
     *,
     frontendMode,
     output_names: list[str] | None = None,
+    neuronx_cc_cache_path: str | None = None,
+    collector: IMetricsCollector | None = None,
 ) -> Optional[object]:
     """Compile NKI kernel to MLIR, and optionally to NEFF.
 
@@ -238,7 +206,20 @@ def trace_kernel(
     argument_names = [s.name for s in result.descriptor.input_specs]
     output_arg_names = [s.name for s in result.descriptor.output_specs]
 
-    compiled = compile_bir_to_neff(compile_opts, result, [], argument_names, output_arg_names)
+    compiled = None
+    cache_key = None
+
+    if neuronx_cc_cache_path and collector:
+        cache_key = compute_cache_key(result, compile_opts)
+        if cache_key:
+            compiled = lookup_cache(neuronx_cc_cache_path, cache_key, compile_opts.output_path, collector)
+            if compiled is not None:
+                compiled.mlir_time = result.mlir_time
+
+    if compiled is None:
+        compiled = compile_bir_to_neff(compile_opts, result, [], argument_names, output_arg_names)
+        if neuronx_cc_cache_path and cache_key and collector:
+            store_cache(neuronx_cc_cache_path, cache_key, compiled, collector)
 
     logging.info("MLIR to BIR compiled in %.2fs", compiled.mlir_time)
     logging.info("BIR to NEFF compiled in %.2fs", compiled.neuronx_cc_time)

@@ -76,10 +76,12 @@ def generate_inputs(
     transpose_dv: bool = False,
     cp_offset: int = 0,
     seq_len_k: Optional[int] = None,
+    head_dim_v: Optional[int] = None,
 ) -> dict:
     import torch
 
     generate_tensor = gaussian_tensor_generator()
+    head_dim_v = head_dim_v if head_dim_v is not None else head_dim
 
     # Sequence packing: derive seq_len and bound vectors from seqlens_list
     bound_min, bound_max = None, None
@@ -96,8 +98,8 @@ def generate_inputs(
 
     q = generate_tensor(name="q", shape=(batch_size, num_q_heads, head_dim, seq_len), dtype=dtype)
     k = generate_tensor(name="k", shape=(batch_size, num_kv_heads, head_dim, actual_seq_len_k), dtype=dtype)
-    v = generate_tensor(name="v", shape=(batch_size, num_kv_heads, head_dim, actual_seq_len_k), dtype=dtype)
-    dy = generate_tensor(name="dy", shape=(batch_size, num_q_heads, head_dim, seq_len), dtype=dtype)
+    v = generate_tensor(name="v", shape=(batch_size, num_kv_heads, head_dim_v, actual_seq_len_k), dtype=dtype)
+    dy = generate_tensor(name="dy", shape=(batch_size, num_q_heads, head_dim_v, seq_len), dtype=dtype)
 
     sinks = None
     if num_sinks > 0:
@@ -193,7 +195,7 @@ class TestAttentionBwdKernel:
         (1, 8, 1, 4096, 128, nl.bfloat16, True, None, 0),    # qwen3-moe TP=4
         (1, 8, 2, 4096, 128, nl.bfloat16, True, None, 0),    # qwen3-8b TP=4
         (1, 16, 2, 4096, 128, nl.bfloat16, True, None, 0),   # qwen3-32b TP=4
-        (1, 32, 32, 4096, 128, nl.bfloat16, True, None, 0),  # deepseek-v3.2 TP=4
+        (1, 32, 32, 4096, (192, 128), nl.bfloat16, True, None, 0),  # deepseek-v3 MLA TP=4
         (1, 64, 8, 4096, 64, nl.bfloat16, True, None, 0),    # gpt-oss-20b
         (1, 64, 8, 4096, 64, nl.bfloat16, True, None, 1),    # gpt-oss-20b (sinks=1)
     ]
@@ -216,6 +218,7 @@ class TestAttentionBwdKernel:
         (1, 8, 1, 8192, 96, nl.bfloat16, True, None, 0),      # (head_dim=96, MQA)
         (1, 16, 8, 8192, 256, nl.float32, True, None, 0),     # gemma2-9b (dtype=float32)
         pytest.param(1, 8, 2, 16384, 128, nl.bfloat16, True, None, 0, marks=_heavy_mark),    # phi-4 (16K seqlen, reduced heads)
+        pytest.param(1, 2, 2, 8704, 128, nl.bfloat16, True, None, 0, marks=_heavy_mark),     # seqlen_k not a multiple of k_seq_section_len (8192 + 512 tail): regression for double-buffered KV prefetch dma_copy size mismatch
     ]
 
     # ===== Sliding window configs (4) =====
@@ -233,10 +236,24 @@ class TestAttentionBwdKernel:
     ]
 
     attention_bwd_test_cases = test_cases_4K + test_cases_8K + test_cases_misc + test_cases_sliding_window + test_cases_ring_baseline
-    # fmt: on
 
     base_test_cases = [
-        pytest.param(batch_size, num_heads, num_heads, 2048, 128, dtype, causal, None, num_sinks)
+        pytest.param(
+            batch_size,
+            num_heads,
+            num_heads,
+            2048,
+            128,
+            dtype,
+            causal,
+            None,
+            num_sinks,
+            marks=(
+                pytest.mark.fast
+                if (batch_size, num_heads, dtype, causal, num_sinks) == (1, 1, nl.float32, True, 2)
+                else ()
+            ),
+        )
         for batch_size in [1, 2]
         for num_heads in [1, 3]
         for dtype in [nl.bfloat16, nl.float32]
@@ -246,14 +263,11 @@ class TestAttentionBwdKernel:
     negative_test_cases = [
         pytest.param(1, 2, 2, 2040, 128, nl.bfloat16, True, None, 0),  # seq_len should be multiple of 128
         pytest.param(1, 3, 2, 2048, 128, nl.bfloat16, True, None, 0),  # num_q_heads should be divisible by num_heads_kv
-        pytest.param(
-            1, 2, 2, 2048, 260, nl.bfloat16, True, None, 0
-        ),  # head_dim can't be tiled equally among minimum number of tiles (here 3)
-        pytest.param(
-            1, 2, 2, 2048, 128, nl.bfloat16, False, 128, 0
-        ),  # Sliding window is supported for causal attn only
+        pytest.param(1, 2, 2, 2048, 260, nl.bfloat16, True, None, 0, marks=pytest.mark.fast),  # head_dim can't be tiled equally among minimum number of tiles (here 3)
+        pytest.param(1, 2, 2, 2048, 128, nl.bfloat16, False, 128, 0, marks=pytest.mark.fast),  # Sliding window is supported for causal attn only
     ]
-    fast_test_cases = base_test_cases + negative_test_cases
+    unit_test_cases = base_test_cases + negative_test_cases
+    # fmt: on
 
     def _run_test(
         self,
@@ -273,6 +287,12 @@ class TestAttentionBwdKernel:
     ) -> None:
         np.random.seed(0)
 
+        # Support asymmetric head dims: head_dim can be (d_qk, d_v) tuple
+        if isinstance(head_dim, tuple):
+            head_dim, head_dim_v = head_dim
+        else:
+            head_dim_v = head_dim
+
         is_negative, _ = is_negative_test_case(num_q_heads, num_kv_heads, seq_len, head_dim, causal, sliding_window)
 
         def input_generator(test_config, input_tensor_def=None):
@@ -288,6 +308,7 @@ class TestAttentionBwdKernel:
                 num_sinks=num_sinks,
                 softmax_scale=softmax_scale,
                 transpose_dv=transpose_dv,
+                head_dim_v=head_dim_v,
             )
 
         def output_tensors(kernel_input):
@@ -323,8 +344,7 @@ class TestAttentionBwdKernel:
             is_negative_test=is_negative,
         )
 
-    @pytest.mark.fast
-    @pytest_parametrize(attention_bwd_params, fast_test_cases, abbrevs=_ABBREVS)
+    @pytest_parametrize(attention_bwd_params, unit_test_cases, abbrevs=_ABBREVS)
     def test_attention_bwd_fast(
         self,
         test_manager: Orchestrator,
@@ -401,10 +421,7 @@ class TestAttentionBwdKernel:
     }
 
     transpose_dv_fast_test_cases = [
-        pytest.param(1, 1, 1, 2048, 128, nl.bfloat16, True, None, 0, marks=pytest.mark.fast),
         pytest.param(1, 1, 1, 2048, 128, nl.float32, True, None, 0, marks=pytest.mark.fast),
-        pytest.param(2, 3, 3, 2048, 128, nl.bfloat16, True, None, 0, marks=pytest.mark.fast),
-        pytest.param(1, 1, 1, 2048, 128, nl.bfloat16, False, None, 0, marks=pytest.mark.fast),
     ]
 
     transpose_dv_test_cases = [
@@ -417,6 +434,9 @@ class TestAttentionBwdKernel:
         (1, 32, 16, 8192, 128, nl.bfloat16, True, 4096, 0),    # sliding window=4096
         (1, 64, 8, 4096, 64, nl.bfloat16, True, None, 1),      # sinks=1
         (1, 64, 8, 4096, 64, nl.bfloat16, True, 128, 1),       # sliding window + sinks
+        (1, 1, 1, 2048, 128, nl.bfloat16, True, None, 0),
+        (1, 1, 1, 2048, 128, nl.bfloat16, False, None, 0),
+        (2, 3, 3, 2048, 128, nl.bfloat16, True, None, 0),
     ]
     # fmt: on
 
@@ -467,18 +487,18 @@ class TestAttentionBwdKernel:
 
     sequence_packing_test_cases = [
         # Basic (bs=1)
-        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 128],       True,  0, None, None, marks=pytest.mark.fast),  # two equal seqs, causal
-        pytest.param(1, 1, 1, 128, nl.bfloat16, [256, 256],       True,  0, None, None, marks=pytest.mark.fast),  # larger equal seqs
-        pytest.param(1, 1, 1, 64,  nl.bfloat16, [128, 256, 128],  True,  0, None, None, marks=pytest.mark.fast),  # three seqs, varying lengths
-        pytest.param(1, 1, 1, 128, nl.bfloat16, [512],            True,  0, None, None, marks=pytest.mark.fast),  # single seq
-        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 384],       True,  0, None, None, marks=pytest.mark.fast),  # unequal lengths
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 128],       True,  0, None, None),  # two equal seqs, causal
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [256, 256],       True,  0, None, None),  # larger equal seqs
+        pytest.param(1, 1, 1, 64,  nl.bfloat16, [128, 256, 128],  True,  0, None, None),  # three seqs, varying lengths
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [512],            True,  0, None, None),  # single seq
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 384],       True,  0, None, None),  # unequal lengths
         pytest.param(1, 1, 1, 128, nl.float32, [128, 128],       False, 0, None, None, marks=pytest.mark.fast),  # non-causal, float32
-        pytest.param(1, 1, 1, 64,  nl.bfloat16, [128, 256, 128],  False, 0, None, None, marks=pytest.mark.fast),  # non-causal, varying lengths
+        pytest.param(1, 1, 1, 64,  nl.bfloat16, [128, 256, 128],  False, 0, None, None),  # non-causal, varying lengths
         # Sink
         (1, 2, 2, 64, nl.bfloat16, [2048, 2000, 48], True, 1, None, None),  # sink + sequence packing
         # GQA (bs=1)
-        pytest.param(1, 8, 1, 128, nl.bfloat16, [256, 256], True,  0, None, None, marks=pytest.mark.fast),   # GQA factor 8
-        pytest.param(1, 4, 2, 128, nl.bfloat16, [512, 512], True,  0, None, None, marks=pytest.mark.fast),   # GQA factor 2
+        pytest.param(1, 8, 1, 128, nl.bfloat16, [256, 256], True,  0, None, None),   # GQA factor 8
+        pytest.param(1, 4, 2, 128, nl.bfloat16, [512, 512], True,  0, None, None),   # GQA factor 2
         (1, 8, 8, 128, nl.bfloat16, [256, 256], True,  0, None, None),   # MHA
         # Seqlen stress (bs=1)
         (1, 1, 1, 128, nl.bfloat16, [128] * 16,           True, 0, None, None),   # many short seqs, total=2048
@@ -491,17 +511,17 @@ class TestAttentionBwdKernel:
         (1, 16, 8, 256, nl.float32,  [1000]*8+[192],         True, 0, None, None),   # gemma2-9b (dtype=float32), 8192
         # Sliding window + sequence packing (bs=1)
         pytest.param(1, 1, 1, 128, nl.bfloat16, [256, 256], True, 0, 128, None, marks=pytest.mark.fast),   # SWA=128, two seqs
-        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 384], True, 0, 64,  None, marks=pytest.mark.fast),   # SWA=64, unequal
+        pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 384], True, 0, 64,  None),   # SWA=64, unequal
         (1, 1, 1, 128, nl.bfloat16, [512, 512],             True, 0, 256, None),   # SWA=256, equal seqs
         (1, 1, 1, 128, nl.bfloat16, [2048] * 4,             True, 0, 512, None),   # SWA=512, multi-section
         # Multi-batch (bs>1) — each batch gets rotated seqlens for different masks
-        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 384],       True,  0, None, None, marks=pytest.mark.fast),  # bs=2, basic causal
-        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 256, 128],  False, 0, None, None, marks=pytest.mark.fast),  # bs=2, non-causal
-        pytest.param(3, 1, 1, 128, nl.bfloat16, [768, 256],       True,  0, None, None, marks=pytest.mark.fast),  # bs=3
-        pytest.param(2, 8, 1, 128, nl.bfloat16, [256, 768],       True,  0, None, None, marks=pytest.mark.fast),  # bs=2, GQA factor 8
+        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 384],       True,  0, None, None),  # bs=2, basic causal
+        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 256, 128],  False, 0, None, None),  # bs=2, non-causal
+        pytest.param(3, 1, 1, 128, nl.bfloat16, [768, 256],       True,  0, None, None),  # bs=3
+        pytest.param(2, 8, 1, 128, nl.bfloat16, [256, 768],       True,  0, None, None),  # bs=2, GQA factor 8
         pytest.param(2, 4, 2, 128, nl.bfloat16, [512, 512],       True,  0, None, None, marks=pytest.mark.fast),  # bs=2, GQA factor 2
-        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 896],       True, 0, 128, None, marks=pytest.mark.fast),   # bs=2, SWA
-        pytest.param(4, 1, 1, 128, nl.bfloat16, [128, 256, 128],  True, 0, None, None, marks=pytest.mark.fast),  # bs=4, three seqs
+        pytest.param(2, 1, 1, 128, nl.bfloat16, [128, 896],       True, 0, 128, None),   # bs=2, SWA
+        pytest.param(4, 1, 1, 128, nl.bfloat16, [128, 256, 128],  True, 0, None, None),  # bs=4, three seqs
         (4, 2, 2, 64,  nl.bfloat16, [2048, 2000, 48], True, 1, None, None),  # bs=4, sink + seq packing
         # Negative
         pytest.param(1, 1, 1, 128, nl.bfloat16, [128, 128], True, 0, None, "only_bound_min", marks=pytest.mark.fast, id="only_bound_min"),
@@ -553,18 +573,21 @@ class TestAttentionBwdKernel:
     cp_offset_test_cases = [
         # Simulates CP shard 1 in sliding window ring attention:
         # Q is local chunk (512 tokens), K is prev_window + local (1024 tokens), cp_offset=512
-        pytest.param(1, 1, 1, 512, 1024, 128, nl.bfloat16, 512, 512, marks=pytest.mark.fast),
-        pytest.param(1, 2, 2, 512, 1024, 128, nl.bfloat16, 512, 512, marks=pytest.mark.fast),
-        pytest.param(1, 8, 2, 512, 1024, 128, nl.bfloat16, 512, 512, marks=pytest.mark.fast),   # GQA
+        pytest.param(1, 1, 1, 512, 1024, 128, nl.bfloat16, 512, 512),
+        pytest.param(1, 2, 2, 512, 1024, 128, nl.bfloat16, 512, 512),
+        pytest.param(1, 8, 2, 512, 1024, 128, nl.bfloat16, 512, 512),   # GQA
         # Larger sequence chunks
         (1, 4, 2, 1024, 2048, 128, nl.bfloat16, 1024, 1024),
         (1, 8, 2, 2048, 4096, 128, nl.bfloat16, 2048, 2048),
         # Different cp_offset values
         pytest.param(1, 1, 1, 512, 1024, 128, nl.bfloat16, 512, 256, marks=pytest.mark.fast),
         # Multi-batch
-        pytest.param(2, 2, 2, 512, 1024, 128, nl.bfloat16, 512, 512, marks=pytest.mark.fast),
+        pytest.param(2, 2, 2, 512, 1024, 128, nl.bfloat16, 512, 512),
         # Equal Q/K lengths with offset — use smaller cp_offset so sliding window still covers valid K range
-        pytest.param(1, 1, 1, 512, 512, 128, nl.bfloat16, 512, 256, marks=pytest.mark.fast),
+        pytest.param(1, 1, 1, 512, 512, 128, nl.bfloat16, 512, 256),
+        # seqlen_k (8704 = 8192 + 512 tail) not a multiple of k_seq_section_len: regression for
+        # double-buffered KV prefetch dma_copy size mismatch in ring sliding-window backward.
+        pytest.param(1, 1, 1, 512, 8704, 128, nl.bfloat16, 512, 512, id="prefetch_tail_8704"),
     ]
     # fmt: on
 

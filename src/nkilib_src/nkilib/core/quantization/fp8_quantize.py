@@ -30,7 +30,6 @@ from ..utils.allocator import BufferManager
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ..utils.tensor_view import TensorView
 from .constants import MINVAL
 
 
@@ -249,9 +248,9 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
     Vectorized approach — eliminates the BxS serial loop:
       Scale computation (NO per-token loop):
         1. tensor_scalar(abs) on full [P0, BxS, F0]
-        2. tensor_reduce(max, axis=[2]) on [P0, BxS, F0] → [P0, BxS]
+        2. tensor_reduce(maximum, axis=[2]) on [P0, BxS, F0] → [P0, BxS]
            Per-partition per-token absmax in ONE instruction instead of BxS iterations.
-        3. tensor_partition_reduce(max) on [P0, BxS] → [P0, BxS] (p0 only)
+        3. tensor_partition_reduce(maximum) on [P0, BxS] → [P0, BxS] (p0 only)
         4. tensor_scalar(multiply 1/MAXVAL, maximum MINVAL) on [P0, BxS]
         5. stream_shuffle_broadcast on [P0, BxS] — broadcast p0 → all partitions
         6. reciprocal on [P0, BxS] → quant_scale
@@ -290,7 +289,7 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
     partial_max_all = _alloc((P0, BxS), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(
         dst=partial_max_all,
-        op=nl.max,
+        op=nl.maximum,
         data=abs_3d,
         axis=[2],
     )
@@ -326,11 +325,11 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
 
     # ── Phase 3: Vectorized quantize via broadcast scale ──
     """
-    Use TensorView.broadcast to create a stride-0 view of quant_scale that
+    Use NkiTensor.broadcast to create a stride-0 view of quant_scale that
     expands [P0, BxS, 1] → [P0, BxS, F0] without materializing the expansion.
     This eliminates the F0-copy loop + permute + tensor_copy.
     """
-    quant_scale_3d = TensorView(quant_scale_all.reshape((P0, BxS, 1))).broadcast(dim=2, size=F0)
+    quant_scale_3d = quant_scale_all.reshape((P0, BxS, 1)).broadcast(2, F0)
     # Work in 3D [P0, BxS, F0] to avoid reshape on non-contiguous broadcast view.
     input_3d = hidden_state  # already [P0, BxS, F0]
 
@@ -339,7 +338,7 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
         nisa.tensor_tensor(
             dst=scaled_3d,
             data1=input_3d,
-            data2=quant_scale_3d.get_view(),
+            data2=quant_scale_3d,
             op=nl.multiply,
         )
         if quantized == None:
@@ -358,7 +357,7 @@ def _row_quantization_3d(hidden_state, dtype, sbm, output_dtype=None, quantized=
         nisa.tensor_tensor(
             dst=quantized,
             data1=input_3d,
-            data2=quant_scale_3d.get_view(),
+            data2=quant_scale_3d,
             op=nl.multiply,
         )
 

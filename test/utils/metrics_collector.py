@@ -66,7 +66,7 @@ class MetricName:
     HOST_LOCK_TIME = "HostLockTime"
     HOST_ARCH_VALIDATION_TIME = "HostArchValidationTime"
     CORE_ALLOCATION_TIME = "CoreAllocationTime"
-    # Core allocation sub-metrics (breakdown of CORE_ALLOCATION_TIME)
+    # Core allocation sub-metrics (components of CORE_ALLOCATION_TIME)
     CORE_LOCK_INIT_TIME = "CoreLockInitTime"
     CORE_LOCK_DEPLOY_TIME = "CoreLockDeployTime"
     CORE_LOCK_ACQUIRE_TIME = "CoreLockAcquireTime"
@@ -76,6 +76,20 @@ class MetricName:
     CORE_LOCK_CONTENTION_WAIT_TIME = "CoreLockContentionWaitTime"
     CORE_LOCK_HOLD_TIME = "CoreLockHoldTime"
     FAILED_HOSTS_COUNT = "FailedHostsCount"
+    INSTANCE_TYPE = "InstanceType"
+    # Core lock FIFO-queue fairness metrics
+    CORE_LOCK_QUEUE_WAIT_TIME = "CoreLockQueueWaitTime"
+    CORE_LOCK_QUEUE_POSITION_AT_ENQUEUE = "CoreLockQueuePositionAtEnqueue"
+    CORE_LOCK_ETA_AT_ENQUEUE = "CoreLockEtaAtEnqueue"
+    # How much longer the caller actually waited in the queue than the
+    # worst-case ETA it was first quoted at enqueue (clamped to >= 0). A
+    # non-zero value signals scheduling inefficiency: the optimistic ETA
+    # under-estimated the real wait.
+    CORE_LOCK_ETA_OVERRUN_TIME = "CoreLockEtaOverrunTime"
+    CORE_LOCK_BUMP_COUNT = "CoreLockBumpCount"
+    CORE_LOCK_REENQUEUE_COUNT = "CoreLockReenqueueCount"
+    CORE_LOCK_HOST_ROTATION_COUNT = "CoreLockHostRotationCount"
+    CORE_LOCK_DRAIN_WAIT_TIME = "CoreLockDrainWaitTime"
 
     # ==========================================================================
     # File transfer metrics
@@ -165,9 +179,41 @@ class MetricName:
     SEPARATED_COMPUTE_TIME = "SeparatedComputeTime"
 
     # ==========================================================================
+    # BIR-to-NEFF S3 cache metrics
+    # ==========================================================================
+    NEFF_CACHE_LOOKUP_TIME = "NeffCacheLookupTime"
+    NEFF_CACHE_STORE_TIME = "NeffCacheStoreTime"
+    NEFF_CACHE_HIT = "NeffCacheHit"
+
+    # ==========================================================================
     # Explorer upload metrics
     # ==========================================================================
     EXPLORER_PROFILE_URL = "ExplorerProfileURL"
+
+
+# Truncate the captured failure reason to keep it queryable as a doc field.
+MAX_FAILURE_REASON_LEN = 240
+
+
+def add_rerun_dimensions(
+    collector: "IMetricsCollector",
+    attempt_number: int,
+    failed: bool,
+    failure_reason: str | None = None,
+) -> None:
+    """Record per-attempt rerun dimensions on the metrics record.
+
+    Adds AttemptNumber (1-based; a rerun is AttemptNumber > 1) and, on a failed
+    attempt, a short FailureReason.
+
+    Takes primitives (not pytest objects) so this stays free of pytest types;
+    the makereport hook extracts attempt_number/failed/failure_reason.
+    """
+    collector.add_dimension({"AttemptNumber": str(attempt_number)})
+    if failed:
+        reason = (failure_reason or "").replace("\n", " ")[:MAX_FAILURE_REASON_LEN]
+        if reason:
+            collector.add_dimension({"FailureReason": reason})
 
 
 class IMetricsCollector(ABC):
@@ -564,7 +610,7 @@ class MetricsCollector(IMetricsCollector):
             with open(log_path, "r") as f:
                 log_content = f.read()
 
-            # Parse timing metrics from neuron-profile commands
+            # Parse timing metrics from neuron-explorer commands
             timing_metrics = [
                 (MetricName.PROFILE_JSON_GENERATION_TIME, "PROFILE_JSON_GENERATION_TIME"),
                 (MetricName.NEURON_PROFILE_CAPTURE_TIME, "NEURON_PROFILE_CAPTURE_TIME"),
@@ -744,7 +790,7 @@ class MetricsCollector(IMetricsCollector):
             if not active_times:
                 self.logger.warning(
                     "total_exec_time not found in ntff summary-json; "
-                    "ActiveInferenceTime requires neuron-profile with summary-json v2+"
+                    "ActiveInferenceTime requires neuron-explorer with summary-json v2+"
                 )
                 return
 

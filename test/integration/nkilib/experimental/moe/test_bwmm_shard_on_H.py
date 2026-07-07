@@ -28,7 +28,9 @@ from nkilib_src.nkilib.experimental.moe.forward.bwmm_shard_on_H import (
     SkipMode,
     blockwise_mm_baseline_shard_hidden,
 )
-from nkilib_src.nkilib.experimental.moe.forward.bwmm_shard_on_H_torch import bwmm_shard_h_torch_ref
+from nkilib_src.nkilib.experimental.moe.forward.bwmm_shard_on_H_torch import (
+    blockwise_mm_baseline_shard_hidden_torch_ref,
+)
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -92,7 +94,18 @@ def generate_token_position_to_id_and_experts(T, TOPK, E, B, N, dma_skip):
 
 
 def build_bwmm_shard_h_inputs(
-    tokens, hidden, intermediate, expert, block_size, top_k, dtype, dma_skip, scaling_mode, checkpoint_activation=False
+    tokens,
+    hidden,
+    intermediate,
+    expert,
+    block_size,
+    top_k,
+    dtype,
+    dma_skip,
+    scaling_mode,
+    checkpoint_activation=False,
+    activation_dtype=None,
+    accum_dtype=None,
 ):
     """Build input tensors for the H-shard kernel."""
     T, H, I_TP, E, B = tokens, hidden, intermediate, expert, block_size
@@ -132,8 +145,14 @@ def build_bwmm_shard_h_inputs(
         "expert_affinities_scaling_mode": scaling_mode,
     }
 
+    # Optional mixed-precision knobs (default to kernel defaults when unset).
+    if activation_dtype is not None:
+        inputs["activation_dtype"] = activation_dtype
+    if accum_dtype is not None:
+        inputs["accum_dtype"] = accum_dtype
+
     if checkpoint_activation:
-        inputs["gate_up_activations_T"] = np.zeros([N, 2, I_TP, B], dtype=dtype)
+        inputs["gate_up_activations_T.must_alias_input"] = np.zeros([N, 2, I_TP, B], dtype=dtype)
         inputs["down_activations"] = np.zeros([N, B, H], dtype=dtype)
 
     return inputs
@@ -156,12 +175,12 @@ TEST_PARAMS = [
 (6144,    4096,   16,     1024,       4,     336,          nl.bfloat16, 1,    ExpertAffinityScaleMode.POST_SCALE,     False),
 # K = 1
 (6144,    4096,   16,     512,        1,     336,          nl.bfloat16, 0,    ExpertAffinityScaleMode.POST_SCALE,     False),
-(5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 2,    ExpertAffinityScaleMode.POST_SCALE,     False),
+pytest.param(5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 2,    ExpertAffinityScaleMode.POST_SCALE,     False, marks=pytest.mark.fast),
 # float32
 (6144,    4096,   16,     512,        4,     336,          nl.float32,  0,    ExpertAffinityScaleMode.POST_SCALE,     False),
 # Llama 4 - OLD TP64
 (5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 0,    ExpertAffinityScaleMode.NO_SCALE,       False),
-(5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 0,    ExpertAffinityScaleMode.PRE_SCALE,      False),
+pytest.param(5120,    8192,   16,     256,        1,     128,          nl.bfloat16, 0,    ExpertAffinityScaleMode.PRE_SCALE,      False, marks=pytest.mark.fast),
 # Llama 4 - OLD TP16
 (5120,    8192,   16,     256,        1,     512,          nl.bfloat16, 0,    ExpertAffinityScaleMode.NO_SCALE,       False),
 (5120,    8192,   16,     256,        1,     512,          nl.bfloat16, 0,    ExpertAffinityScaleMode.PRE_SCALE,      False),
@@ -189,24 +208,6 @@ TEST_PARAMS = [
 ]
 # fmt: on
 
-# (hidden, tokens, expert, block_size, top_k, intermediate) keys for full-only tests (excluded from fast suite)
-_FULL_ONLY_KEYS = {
-    (2880, 8192, 128, 512, 4, 2880),
-    (5120, 8192, 128, 256, 4, 1024),
-    (7168, 1024, 256, 512, 8, 32),
-    (5120, 8192, 16, 256, 4, 1024),
-    (7168, 1024, 256, 256, 8, 32),
-    (5120, 8192, 128, 128, 4, 64),
-    (6144, 4096, 16, 512, 4, 1024),
-    (1536, 4096, 234, 128, 7, 288),
-    (5120, 8192, 128, 256, 1, 128),
-    (5120, 8192, 128, 128, 2, 64),
-    (6144, 4096, 16, 1024, 4, 336),
-    (6144, 4096, 16, 512, 4, 336),
-}
-
-ALL_PARAMS = [pytest.param(*c, marks=pytest.mark.fast) if c[:6] not in _FULL_ONLY_KEYS else c for c in TEST_PARAMS]
-
 _ABBREVS = {
     "hidden": "hid",
     "tokens": "tok",
@@ -215,10 +216,30 @@ _ABBREVS = {
     "top_k": "k",
     "intermediate": "int",
     "dtype": "dt",
+    "activation_dtype": "act_dt",
+    "accum_dtype": "accum_dt",
     "skip": "sk",
     "scaling_mode": "sm",
     "checkpoint_activation": "ca",
 }
+
+
+# fmt: off
+# Mixed-precision combinations: compute_dtype x activation_dtype x accum_dtype.
+# Covers the bf16-io + fp32 cross-expert accumulation opt-in path (exercises the HBM->HBM down-cast).
+PARAM_NAMES_COMBO = \
+    "hidden, tokens, expert, block_size, top_k, intermediate, dtype, activation_dtype, accum_dtype, scaling_mode"
+DTYPE_COMBO_PARAMS = [
+# bf16 io: default (fp32 SwiGLU activation, bf16 accumulation == baseline)
+(5120, 8192, 16, 256, 1, 512, nl.bfloat16, nl.float32,  nl.bfloat16, ExpertAffinityScaleMode.POST_SCALE),
+# bf16 io + fp32 cross-expert/cross-block accumulation (opt-in; exercises fp32->bf16 HBM down-cast)
+(5120, 8192, 16, 256, 1, 512, nl.bfloat16, nl.float32,  nl.float32,  ExpertAffinityScaleMode.POST_SCALE),
+# bf16 io + bf16 SwiGLU activation (legacy all-bf16, no precision promotion)
+(5120, 8192, 16, 256, 1, 512, nl.bfloat16, nl.bfloat16, nl.bfloat16, ExpertAffinityScaleMode.POST_SCALE),
+# fp32 io (full precision)
+(6144, 4096, 16, 512, 4, 336, nl.float32,  nl.float32,  nl.float32,  ExpertAffinityScaleMode.POST_SCALE),
+]
+# fmt: on
 
 
 @pytest_test_metadata(name="MoE Blockwise MatMul H-Shard LNC2")
@@ -227,7 +248,7 @@ _ABBREVS = {
 class TestMoeBlockwiseMatMulShardH:
     """Tests for H-shard blockwise matmul kernel."""
 
-    @pytest_parametrize(PARAM_NAMES, ALL_PARAMS, abbrevs=_ABBREVS)
+    @pytest_parametrize(PARAM_NAMES, TEST_PARAMS, abbrevs=_ABBREVS)
     def test_moe_blockwise_mm_shard_h_lnc2(
         self,
         test_manager: Orchestrator,
@@ -262,12 +283,15 @@ class TestMoeBlockwiseMatMulShardH:
         def output_tensors(kernel_input):
             T_out = tokens if dma_skip.skip_token else tokens + 1
             result = {"output": np.zeros((T_out, hidden), dtype=dtype)}
+            if checkpoint_activation:
+                N = get_n_blocks(tokens, top_k, expert, block_size)
+                result["gate_up_activations_T"] = np.zeros((N, 2, intermediate, block_size), dtype=dtype)
             return result
 
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=blockwise_mm_baseline_shard_hidden,
-            torch_ref=torch_ref_wrapper(bwmm_shard_h_torch_ref),
+            torch_ref=torch_ref_wrapper(blockwise_mm_baseline_shard_hidden_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
         )
@@ -277,7 +301,64 @@ class TestMoeBlockwiseMatMulShardH:
                 logical_nc_config=2,
                 platform_target=platform_target,
                 # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
-                additional_cmd_args=["--internal-backend-options=--skip-pass=address_rotation_sb"],
+                additional_cmd_args=[],
+            ),
+            rtol=2e-2,
+            atol=1e-5,
+        )
+
+    @pytest_parametrize(PARAM_NAMES_COMBO, DTYPE_COMBO_PARAMS, abbrevs=_ABBREVS)
+    def test_moe_blockwise_mm_shard_h_dtype_combos_lnc2(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        hidden: int,
+        tokens: int,
+        expert: int,
+        block_size: int,
+        top_k: int,
+        intermediate: int,
+        dtype,
+        activation_dtype,
+        accum_dtype,
+        scaling_mode: ExpertAffinityScaleMode,
+    ):
+        """compute_dtype x activation_dtype x accum_dtype coverage (incl. bf16-io + fp32 accum)."""
+        dma_skip = map_skip_mode(0)
+
+        def input_generator(test_config):
+            return build_bwmm_shard_h_inputs(
+                tokens=tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                expert=expert,
+                block_size=block_size,
+                top_k=top_k,
+                dtype=dtype,
+                dma_skip=dma_skip,
+                scaling_mode=scaling_mode,
+                checkpoint_activation=False,
+                activation_dtype=activation_dtype,
+                accum_dtype=accum_dtype,
+            )
+
+        def output_tensors(kernel_input):
+            # accum_dtype output is cast back to the io dtype, so output is always `dtype`.
+            T_out = tokens + 1
+            return {"output": np.zeros((T_out, hidden), dtype=dtype)}
+
+        framework = UnitTestFramework(
+            test_manager=test_manager,
+            kernel_entry=blockwise_mm_baseline_shard_hidden,
+            torch_ref=torch_ref_wrapper(blockwise_mm_baseline_shard_hidden_torch_ref),
+            kernel_input_generator=input_generator,
+            output_tensor_descriptor=output_tensors,
+        )
+        framework.run_test(
+            test_config=None,
+            compiler_args=CompilerArgs(
+                logical_nc_config=2,
+                platform_target=platform_target,
             ),
             rtol=2e-2,
             atol=1e-5,

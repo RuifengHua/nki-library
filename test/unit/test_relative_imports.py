@@ -49,6 +49,14 @@ EXCLUDED_DIR_PATTERNS = {
     "nkilib/__init__.py",
 }
 
+# Path-substring patterns matched on the posix path string. Used for deeply-nested
+# carve-outs that Path.match cannot express because Path.match has no ** glob support.
+EXCLUDED_PATH_SUBSTRINGS = (
+    # neurotile tutorials use absolute imports for standalone runnability
+    # (they're scripts under examples/, not importable package modules).
+    "/neurotile/examples/",
+)
+
 
 class AbsoluteImportViolation(NamedTuple):
     """Represents a single absolute import violation."""
@@ -61,7 +69,10 @@ class AbsoluteImportViolation(NamedTuple):
 
 def should_skip_path(path: Path) -> bool:
     """Check if a path should be skipped based on excluded patterns."""
-    return any(path.match(pattern) for pattern in EXCLUDED_DIR_PATTERNS)
+    if any(path.match(pattern) for pattern in EXCLUDED_DIR_PATTERNS):
+        return True
+    posix = path.as_posix()
+    return any(needle in posix for needle in EXCLUDED_PATH_SUBSTRINGS)
 
 
 def get_import_statement(node: Union[ast.ImportFrom, ast.Import]) -> str:

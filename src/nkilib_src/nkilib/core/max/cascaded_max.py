@@ -28,7 +28,7 @@ from .cascaded_max_utils import predicated_folded_load, reduce
 
 
 @nki.jit
-def cascaded_max(input_tensor: nl.ndarray) -> Tuple[nl.ndarray, nl.ndarray]:
+def cascaded_max(input_tensor: nl.NkiTensor) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Find global maximum value and its index across input tensor using cascaded reduction.
 
@@ -42,10 +42,10 @@ def cascaded_max(input_tensor: nl.ndarray) -> Tuple[nl.ndarray, nl.ndarray]:
         V: Vocabulary size (dimension to reduce over)
 
     Args:
-        input_tensor (nl.ndarray): [B, S, V] or [BxS, V], Input tensor in HBM
+        input_tensor (nl.NkiTensor): [B, S, V] or [BxS, V], Input tensor in HBM
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - max_values: [B, S, 1], Maximum values with original shape preserved
             - max_indices: [B, S, 1], Global indices of maximum values
 
@@ -84,11 +84,9 @@ def cascaded_max(input_tensor: nl.ndarray) -> Tuple[nl.ndarray, nl.ndarray]:
     max_values = nl.ndarray(output_shape_t, dtype=val.dtype, buffer=nl.shared_hbm, name="max_values")
     max_indices = nl.ndarray(output_shape_t, dtype=config.index_dtype, buffer=nl.shared_hbm, name="max_indices")
     unpadded_bxs_size = min(BxS_size, BxS_global - BxS_size * program_id)
-    src_ap = [[BxS_size, 1], [1, unpadded_bxs_size]]
-    dst_ap = [[BxS_global, 1], [1, unpadded_bxs_size]]
     offset = program_id * BxS_size
-    nisa.dma_copy(dst=max_values.ap(dst_ap, offset=offset), src=val.ap(src_ap))
-    nisa.dma_copy(dst=max_indices.ap(dst_ap, offset=offset), src=indx.ap(src_ap))
+    nisa.dma_copy(dst=max_values[:, offset : offset + unpadded_bxs_size], src=val[:, 0:unpadded_bxs_size])
+    nisa.dma_copy(dst=max_indices[:, offset : offset + unpadded_bxs_size], src=indx[:, 0:unpadded_bxs_size])
 
     return max_values.reshape(config.out_shape), max_indices.reshape(config.out_shape)
 
@@ -137,7 +135,7 @@ class CascadedMaxConfig(nl.NKIObject):
 
         """
         Handle LNC sharding configuration.
-        
+
         Eventually hope to remove LNC info from config once NKI support allows
         for helper functions to be LNC agnostic.
         """
@@ -184,9 +182,9 @@ class CascadedMaxConfig(nl.NKIObject):
 
 
 def cascaded_max_core(
-    inp: nl.ndarray,
+    inp: nl.NkiTensor,
     config: CascadedMaxConfig,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Compute global maximum value and its index from input tensor using cascaded reduction.
 
@@ -201,11 +199,11 @@ def cascaded_max_core(
         n_stages: Number of reduction stages
 
     Args:
-        inp (nl.ndarray): [BxS, V], Input tensor in HBM to find maximum from
+        inp (nl.NkiTensor): [BxS, V], Input tensor in HBM to find maximum from
         config (CascadedMaxConfig): Configuration object containing algorithm parameters
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - max_values: [BxS_size * n_programs, 1], Maximum values found by each program
             - max_indices: [BxS_size * n_programs, 1], Global indices of maximum values
 
@@ -251,45 +249,78 @@ def cascaded_max_core(
 
     value = nl.ndarray((total_partition_dim, 1), dtype=inp.dtype)
     ind_buf = nl.ndarray((total_partition_dim, 8), dtype=config.index_dtype)
-    broadcast_ap = [[1, total_partition_dim], [0, 8]]
 
     nisa.tensor_reduce(op=nl.maximum, data=values[i_p, i_f], dst=value[...], axis=1)
 
-    nisa.nc_find_index8(data=values[:, :], vals=value.ap(broadcast_ap), dst=ind_buf[...])
+    nisa.nc_find_index8(data=values[:, :], vals=value.broadcast(1, 8), dst=ind_buf[...])
 
     ind_offset = _repeat(n_stages, stage_free_size, BxS_size)
 
+    """
+    The index path MUST run in fp32, never the logit dtype.
+
+    A vocab index can reach vocab_size-1 (e.g. 16383 per shard / 262143 global).
+    bf16 has an 8-bit mantissa and only represents integers exactly up to 256;
+    near a 16384-wide shard its spacing is 128, so a true argmax at the top of a
+    shard (e.g. 16383) rounds UP to 16384 == shard width, one past the last valid
+    index -> out-of-range token. fp32 (23-bit mantissa) is exact through 2^24.
+    """
+    idx_dtype = nl.float32
+
     i_identity_nx1_p, i_identity_nx1_x = nl.ds(0, total_partition_dim), nl.ds(0, total_partition_dim)
-    identity_load = nl.ndarray((total_partition_dim, total_partition_dim), dtype=value.dtype, buffer=nl.sbuf)
-    nisa.memset(dst=identity_load, value=1.0)
+    # Separate identities so the value transpose keeps the logit dtype while the
+    # index transpose runs in fp32.
+    identity_val = nl.ndarray((total_partition_dim, total_partition_dim), dtype=value.dtype, buffer=nl.sbuf)
+    identity_idx = nl.ndarray((total_partition_dim, total_partition_dim), dtype=idx_dtype, buffer=nl.sbuf)
+    nisa.memset(dst=identity_val, value=1.0)
+    nisa.memset(dst=identity_idx, value=1.0)
     pattern = [[1, total_partition_dim]]
     nisa.affine_select(
-        dst=identity_load[...],
+        dst=identity_val[...],
         pattern=pattern,
         channel_multiplier=-1,
         cmp_op=nl.equal,
-        on_true_tile=identity_load[i_identity_nx1_p, i_identity_nx1_x],
+        on_true_tile=identity_val[i_identity_nx1_p, i_identity_nx1_x],
         on_false_value=0.0,
     )
-    ind_t = nl.ndarray((1, total_partition_dim), dtype=value.dtype, buffer=nl.psum)
-    ind_buf_float = nl.ndarray((total_partition_dim, 1), dtype=value.dtype, buffer=nl.sbuf)
+    nisa.affine_select(
+        dst=identity_idx[...],
+        pattern=pattern,
+        channel_multiplier=-1,
+        cmp_op=nl.equal,
+        on_true_tile=identity_idx[i_identity_nx1_p, i_identity_nx1_x],
+        on_false_value=0.0,
+    )
+    ind_t = nl.ndarray((1, total_partition_dim), dtype=idx_dtype, buffer=nl.psum)
+    ind_buf_float = nl.ndarray((total_partition_dim, 1), dtype=idx_dtype, buffer=nl.sbuf)
     nisa.tensor_copy(src=ind_buf[:, 0:1], dst=ind_buf_float)
-    nisa.nc_matmul(dst=ind_t[...], stationary=ind_buf_float, moving=identity_load, is_transpose=True)
+    nisa.nc_matmul(dst=ind_t[...], stationary=ind_buf_float, moving=identity_idx, is_transpose=True)
 
-    ind_shifted = nl.ndarray((1, total_partition_dim), dtype=value.dtype, buffer=nl.sbuf)
+    ind_shifted = nl.ndarray((1, total_partition_dim), dtype=idx_dtype, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=ind_shifted, data1=ind_t, op=nl.add, data2=ind_offset)
 
     value_psum = nl.ndarray((1, total_partition_dim), dtype=value.dtype, buffer=nl.psum)
-    nisa.nc_matmul(dst=value_psum, stationary=value[:, 0:1], moving=identity_load, is_transpose=True)
-    final_max, global_index = _grouped_reduce_max(value_psum, ind_shifted, fold_factor=BxS_size)
+    nisa.nc_matmul(dst=value_psum, stationary=value[:, 0:1], moving=identity_val, is_transpose=True)
+    final_max, global_index_f = _grouped_reduce_max(value_psum, ind_shifted, fold_factor=BxS_size)
+
+    """
+    Value-cast the fp32 index to the integer index dtype before the HBM output.
+
+    The main entry dma_copy's this into a uint32 buffer; a dma_copy across
+    mismatched dtypes bit-reinterprets rather than value-casts, so a float index
+    slot would surface as a garbage signed int. tensor_copy performs a true numeric
+    cast; fp32 holds every vocab index exactly, so this is lossless.
+    """
+    global_index = nl.ndarray(global_index_f.shape, dtype=config.index_dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(src=global_index_f, dst=global_index)
     return final_max, global_index
 
 
 def _grouped_reduce_max(
-    input_tensor: nl.ndarray,
-    index: nl.ndarray,
+    input_tensor: nl.NkiTensor,
+    index: nl.NkiTensor,
     fold_factor: int,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Compute grouped maximum values and their corresponding indices from input tensor.
 
@@ -297,12 +328,12 @@ def _grouped_reduce_max(
     value within each group along with the index of that maximum value.
 
     Args:
-        input_tensor (nl.ndarray): [b, n], Input tensor containing values to find maximums from
-        index (nl.ndarray): [b, n], Index tensor with indices corresponding to each element
+        input_tensor (nl.NkiTensor): [b, n], Input tensor containing values to find maximums from
+        index (nl.NkiTensor): [b, n], Index tensor with indices corresponding to each element
         fold_factor (int): Number of groups to divide each batch into (must evenly divide n)
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - reduced_max: [b, fold_factor], Maximum value from each group
             - final_index: [b, fold_factor], Index of maximum value in each group
 
@@ -315,7 +346,6 @@ def _grouped_reduce_max(
     b, n = input_tensor.shape
     elts_per_fold = n // fold_factor
     reshaped_shape = (b, fold_factor, elts_per_fold)
-    repeat_interleave_ap = [[fold_factor, b], [1, fold_factor], [0, elts_per_fold]]
     mask = nl.ndarray((reshaped_shape), dtype=nl.uint8, buffer=nl.sbuf)
     reduced_max = nl.ndarray((b, fold_factor), dtype=input_tensor.dtype, buffer=nl.sbuf)
     masked_index = nl.ndarray((b, n), dtype=index.dtype, buffer=nl.sbuf)
@@ -323,14 +353,17 @@ def _grouped_reduce_max(
 
     nisa.tensor_reduce(dst=reduced_max, op=nl.maximum, data=input_tensor.reshape(reshaped_shape), axis=2)
     nisa.tensor_tensor(
-        dst=mask, data1=input_tensor.reshape(reshaped_shape), op=nl.equal, data2=reduced_max.ap(repeat_interleave_ap)
+        dst=mask,
+        data1=input_tensor.reshape(reshaped_shape),
+        op=nl.equal,
+        data2=reduced_max.reshape((b, fold_factor, 1)).broadcast(2, elts_per_fold),
     )
     nisa.tensor_tensor(dst=masked_index, data1=mask.reshape((b, n)), data2=index, op=nl.multiply)
     nisa.tensor_reduce(dst=final_index, op=nl.maximum, data=masked_index.reshape(reshaped_shape), axis=2)
     return reduced_max, final_index
 
 
-def _repeat(n_stages: int, stage_size: int, repeat_count: int) -> nl.ndarray:
+def _repeat(n_stages: int, stage_size: int, repeat_count: int) -> nl.NkiTensor:
     """
     Generate offset pattern for index calculation.
 
@@ -340,7 +373,7 @@ def _repeat(n_stages: int, stage_size: int, repeat_count: int) -> nl.ndarray:
         repeat_count (int): Repeat count
 
     Returns:
-        nl.ndarray: [1, repeat_count * n_stages], Offset tensor with iota pattern
+        nl.NkiTensor: [1, repeat_count * n_stages], Offset tensor with iota pattern
 
     Notes:
         - Uses iota instruction to generate sequential offsets

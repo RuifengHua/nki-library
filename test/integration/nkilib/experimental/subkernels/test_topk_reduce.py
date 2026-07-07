@@ -27,45 +27,78 @@ from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 
-def generate_topk_reduce_inputs(T, K, H, src_ranks):
-    """Generate scattered input buffer with packed global token indices."""
+def generate_topk_reduce_inputs(T, K, H, src_ranks, variable_rows=False):
+    """Generate scattered input buffer with packed 1-indexed global token indices.
+
+    Args:
+        T, K, H: token count, top-K, hidden dim.
+        src_ranks: source rank count; padded input has src_ranks * T rows.
+        variable_rows: if True, each token has a random row count in [1, K] instead
+            of exactly K. Simulates the case where multiple experts for the same
+            token sit on the same rank and are pre-reduced on that rank, so fewer
+            than K rows survive into the scattered buffer.
+    """
     np.random.seed(42)
     padded_input_size = src_ranks * T
+
+    # Determine row count per token: [1, K] when variable_rows, else exactly K.
+    if variable_rows:
+        rows_per_token = np.random.randint(1, K + 1, size=T).astype(np.int32)
+        # Pin deterministic edge cases: at least one token with 1 row and one with K.
+        rows_per_token[0] = 1
+        rows_per_token[-1] = K
+    else:
+        rows_per_token = np.full(T, K, dtype=np.int32)
+
+    total_rows = int(rows_per_token.sum())
 
     # Padded input buffer filled with -1
     input_buf = np.full((padded_input_size, H + 2), -1, dtype=np.dtype('bfloat16'))
 
     # Real hidden values
-    real_values = np.random.randn(T * K, H).astype(np.dtype('bfloat16'))
+    real_values = np.random.randn(total_rows, H).astype(np.dtype('bfloat16'))
 
-    # Pack global token index as int32 viewed as 2 bf16 columns
-    token_ids = np.arange(T, dtype=np.int32).repeat(K).reshape(T * K, 1)
-    token_ids_bf16 = token_ids.view(np.dtype('bfloat16'))  # (T*K, 2)
+    # Pack 1-indexed global token index as int32 viewed as 2 bf16 columns.
+    # Token t (0-indexed) appears in the buffer with packed id t+1.
+    token_ids = np.repeat(np.arange(1, T + 1, dtype=np.int32), rows_per_token).reshape(total_rows, 1)
+    token_ids_bf16 = token_ids.view(np.dtype('bfloat16'))  # (total_rows, 2)
 
     real_with_idx = np.concatenate([real_values, token_ids_bf16], axis=1)
 
     # Randomly scatter into padded buffer
-    scatter_indices = np.random.permutation(padded_input_size)[: T * K]
+    scatter_indices = np.random.permutation(padded_input_size)[:total_rows]
     input_buf[scatter_indices] = real_with_idx
 
     return input_buf
 
 
 # fmt: off
-TOPK_REDUCE_PARAM_NAMES = "lnc_degree, src_ranks, T, K, H"
+TOPK_REDUCE_PARAM_NAMES = "lnc_degree, src_ranks, T, K, H, variable_rows"
 TOPK_REDUCE_PARAMS = [
+    # Exactly K rows per token (every routed expert on a distinct rank).
     # 8r, lnc1
-    (1, 8, 4, 4, 2880),
+    (1, 8, 4, 4, 2880, False),
     # 8r, 32 - 1K global tokens
-    (2, 8, 4, 4, 2880),
-    (2, 8, 4, 8, 4096),
-    (2, 8, 128, 4, 2880),
-    (2, 8, 128, 8, 4096),
+    (2, 8, 4, 4, 2880, False),
+    (2, 8, 4, 8, 4096, False),
+    (2, 8, 128, 4, 2880, False),
+    (2, 8, 128, 8, 4096, False),
     # 128r, 512 - 16K global tokens
-    (2, 128, 4, 4, 2880),
-    (2, 128, 4, 8, 4096),
-    (2, 128, 128, 4, 2880),
-    (2, 128, 128, 8, 4096),
+    (2, 128, 4, 4, 2880, False),
+    (2, 128, 4, 8, 4096, False),
+    (2, 128, 128, 4, 2880, False),
+    (2, 128, 128, 8, 4096, False),
+    # Fewer than K rows per token (multiple routed experts share a rank and get
+    # pre-reduced on that rank before landing in the scattered buffer).
+    (1, 8, 4, 4, 2880, True),
+    (2, 8, 4, 4, 2880, True),
+    (2, 8, 4, 8, 4096, True),
+    (2, 8, 128, 4, 2880, True),
+    (2, 8, 128, 8, 4096, True),
+    (2, 128, 4, 4, 2880, True),
+    (2, 128, 4, 8, 4096, True),
+    (2, 128, 128, 4, 2880, True),
+    (2, 128, 128, 8, 4096, True),
 ]
 # fmt: on
 
@@ -87,8 +120,9 @@ class TestTopkReduceKernel:
         T: int,
         K: int,
         H: int,
+        variable_rows: bool,
     ) -> None:
-        input_buf = generate_topk_reduce_inputs(T, K, H, src_ranks)
+        input_buf = generate_topk_reduce_inputs(T, K, H, src_ranks, variable_rows=variable_rows)
 
         def input_generator(test_config):
             return {

@@ -22,6 +22,7 @@ from typing import Optional, Protocol, Tuple
 import torch
 
 from ..utils.allocator import SbufManager
+from ..utils.common_types import DtypeMode
 from ..utils.kernel_assert import kernel_assert
 from ..utils.lnc_subscriptable import LncSubscriptable
 from .attention_tkg import INACTIVE_BLOCK_IDX
@@ -58,6 +59,8 @@ Args:
     active_blocks_table: Block table for block KV cache
     k_out: Output tensor for RoPE'd keys (modified in-place)
     DBG_TENSORS: Debug tensors tuple
+    max_context_len: Optional int32 array [1] for dynamic FA early exit. Limits KV context processed.
+    dtype_mode: Quantization dtype policy (accepted for kernel signature parity; unused on CPU).
 
 Returns:
     Tuple of (out, k_out) tensors
@@ -81,6 +84,8 @@ def _attention_tkg_torch_ref_impl(
     active_blocks_table: Optional[torch.Tensor] = None,
     k_out: Optional[torch.Tensor] = None,
     DBG_TENSORS: Optional[tuple] = None,
+    max_context_len=None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001 — accepted for kernel signature parity (no FP8 tile allocations on CPU)
 ) -> Tuple[torch.Tensor, torch.Tensor | None]:
     LNC = attention_tkg_torch_ref.lnc
     # Currently hardcoding P_MAX to 128, the kernel determines P_MAX through nl.tile_size.pmax
@@ -123,6 +128,10 @@ def _attention_tkg_torch_ref_impl(
     if is_block_kv:
         kernel_assert(s_prior % block_len == 0, "s_prior must be divisible by block_len")
         kernel_assert(active_blocks_table is not None, "active_blocks_table must be provided for block KV")
+        # fp8_packed: unpack [num_blocks, block_len//2, d_head, 2] -> [num_blocks, block_len, d_head]
+        if cfg.fp8_packed and k_prior.dim() == 4:
+            num_blocks, half_bl, d_head_k, _ = k_prior.shape
+            k_prior = k_prior.permute(0, 1, 3, 2).reshape(num_blocks, half_bl * 2, d_head_k)
         k_prior = _gather_block_kv_to_flat(k_prior, active_blocks_table, batch, s_prior_full, d_head, block_len)
         v_prior = _gather_block_kv_to_flat(v_prior, active_blocks_table, batch, s_prior_full, d_head, block_len)
         k_prior = k_prior.unsqueeze(1)
@@ -138,6 +147,7 @@ def _attention_tkg_torch_ref_impl(
             cfg.s_active,
             full_sprior=s_prior_full,
             enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
+            fuse_rope=cfg.fuse_rope,
         )
 
         # Only reshape mask if NOT using use_pos_id (i.e., pre-computed full cache mask)
@@ -200,7 +210,7 @@ def _attention_tkg_torch_ref_impl(
         k_out.copy_(attn_k_out)
 
     if DBG_TENSORS:
-        n_prgs = get_total_n_prgs(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, LNC, P_MAX)
+        n_prgs = get_total_n_prgs(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, LNC, P_MAX, cfg.fuse_rope)
         DBG_QK = _reshape_debug_tensor(DBG_QK, cfg, P_MAX, n_prgs, is_block_kv, reduced_blk_len)
         DBG_QK_EXP = _reshape_debug_tensor(DBG_QK_EXP, cfg, P_MAX, n_prgs, is_block_kv, reduced_blk_len)
 
@@ -387,7 +397,8 @@ def _attention_tkg_fwd_ref(
 
     # Pad sink to the end of s_prior dimension.
     if sink is not None:
-        sink = sink.reshape((q_head, 1))[None, :, :, None].expand(batch, q_head, 1, s_active)
+        kv_heads = sink.numel() // q_head
+        sink = sink.reshape(kv_heads, q_head, 1, 1).repeat(batch // kv_heads, 1, 1, s_active)
         score = torch.cat([score, sink], axis=2)
 
     # Take column wise max
@@ -431,8 +442,10 @@ def _reshape_debug_tensor(
     reduced_blk_len: int = None,
 ):
     batch, q_head, s_prior, s_active = cfg.bs, cfg.q_head, cfg.curr_sprior, cfg.s_active
-    batch_sharded = is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max)
-    sprior_n_prgs = n_prgs if is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max) else 1
+    batch_sharded = is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max, cfg.fuse_rope)
+    sprior_n_prgs = (
+        n_prgs if is_s_prior_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max, cfg.fuse_rope) else 1
+    )
     if is_block_kv:
         kernel_assert(reduced_blk_len is not None, "reduced_blk_len must be provided for block KV")
         return tensor.reshape(
@@ -482,6 +495,8 @@ class _AttentionTkgTorchRefFn(Protocol):
         active_blocks_table: Optional[torch.Tensor] = None,
         k_out: Optional[torch.Tensor] = None,
         DBG_TENSORS: Optional[tuple] = None,
+        max_context_len=None,
+        dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch reference for NKI kernel attention.attention_tkg.attention_tkg.
@@ -506,6 +521,8 @@ class _AttentionTkgTorchRefFn(Protocol):
             active_blocks_table: Block table for block KV cache
             k_out: Output tensor for RoPE'd keys (modified in-place)
             DBG_TENSORS: Debug tensors tuple
+            max_context_len: Optional int32 array [1] for dynamic FA early exit. Limits KV context processed.
+            dtype_mode: Quantization dtype policy (accepted for kernel signature parity; unused on CPU).
 
         Returns:
             Tuple of (out, k_out) tensors

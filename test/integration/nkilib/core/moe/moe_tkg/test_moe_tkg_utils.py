@@ -20,6 +20,7 @@ import nki.language as nl
 import numpy as np
 
 from nkilib_src.nkilib.core.utils.common_types import (
+    DtypeMode,
     ExpertAffinityScaleMode,
     MoEAllToAllVStrategy,
     QuantizationType,
@@ -57,6 +58,7 @@ def build_moe_tkg(
     routed_token_ratio: float = 1.0,
     block_size: int = None,
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ):
     """Build input tensors for MoE TKG kernel testing.
 
@@ -94,9 +96,7 @@ def build_moe_tkg(
     if is_mx_quant:
         mx_weights = gen_moe_mx_weights(hidden, intermediate, expert, quant_dtype)
     else:
-        assert all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED, (
-            "all_to_all_v not supported when is_mx_quant=False"
-        )
+        pass  # Non-MX with A2AV is supported for bf16/fp16 DLoC path
 
     # Use custom tensor generator if not provided
     if tensor_generator is None:
@@ -157,8 +157,8 @@ def build_moe_tkg(
                     # NOTE: this test generates pre-sliced expert affinities. If build_moe_tkg ever distinguishes between global/local E, we need to use rank_id to slice here.
                     expert_affinities_local = expert_affinities.view(mx_unpacked_dtype)
 
-                    # Initialize token indices, bitcast to [T, 4] fp8
-                    token_indices = np.arange(tokens, dtype=np.int32).reshape(tokens, 1).view(mx_unpacked_dtype)
+                    # Initialize token indices (1-based so 0 can indicate padding), bitcast to [T, 4] fp8
+                    token_indices = np.arange(1, tokens + 1, dtype=np.int32).reshape(tokens, 1).view(mx_unpacked_dtype)
 
                     # Concat to [T, H + H/4 + 2 * E_L + 4]
                     hidden_input = np.concatenate(
@@ -220,7 +220,22 @@ def build_moe_tkg(
     down_bias_shape = (expert, hidden)
 
     # Create input tensors
-    hidden_input = tensor_generator(TensorTemplate((tokens, hidden), hidden_dtype, "hidden_input"))
+    if all_to_all_v_strategy != MoEAllToAllVStrategy.DISABLED and not is_mx_quant:
+        # Non-MX A2AV: build concatenated [T, H + E_L + 2] bf16 buffer
+        # Layout: [hidden_bf16 | affinities_bf16 | token_index_as_2xbf16]
+        hidden_raw = tensor_generator(TensorTemplate((tokens, hidden), hidden_dtype, "hidden_input"))
+        # Affinities: [T, E_L] in bf16
+        affinities_bf16 = expert_affinities.astype(hidden_dtype)
+        # Token indices: [T, 1] int32 → [T, 2] bf16 via bitcast
+        token_indices_int32 = np.arange(1, tokens + 1, dtype=np.int32).reshape(tokens, 1)
+        token_indices_bf16 = token_indices_int32.view(hidden_dtype)
+        # Concatenate
+        hidden_input = np.concatenate((hidden_raw, affinities_bf16, token_indices_bf16), axis=1)
+        # Zero out unrouted rows
+        unrouted_mask = np.all(expert_affinities == 0, axis=1)
+        hidden_input[unrouted_mask] = 0
+    else:
+        hidden_input = tensor_generator(TensorTemplate((tokens, hidden), hidden_dtype, "hidden_input"))
     # expert_index is always required now
     expert_index = tensor_generator(TensorTemplate((tokens, effective_top_k), nl.int32, "expert_index"))
 
@@ -275,6 +290,7 @@ def build_moe_tkg(
         "is_all_expert_dynamic": is_all_expert_dynamic,
         "block_size": block_size,
         "all_to_all_v_strategy": all_to_all_v_strategy,
+        "dtype_mode": dtype_mode,
     }
     return kernel_input
 

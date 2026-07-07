@@ -32,14 +32,13 @@ from nki.collectives import ReplicaGroup
 
 from ...core.utils.allocator import SbufManager
 from ...core.utils.kernel_assert import kernel_assert
-from ...core.utils.tensor_view import TensorView
 
 
 class KVDPCollectiveMode(Enum):
     """Collective operation mode for KVDP input/output redistribution.
 
     ALL_TO_ALL: single all_to_all collective (default, runtime requires ≥4 ranks lnc2 or ≥8 ranks lnc1)
-    ALL_GATHER_SLICE: all_gather on heads/batch + rank_id slice (works with any rank count)
+    ALL_GATHER_SLICE: all_gather on heads/batch + KVDP_rank slice (works with any rank count)
     """
 
     ALL_TO_ALL = 1
@@ -47,9 +46,9 @@ class KVDPCollectiveMode(Enum):
 
 
 def _KVDP_attention_input_collectives(
-    Q_tkg_sb: nl.ndarray,
-    K_tkg_sb: nl.ndarray,
-    V_tkg_hbm: nl.ndarray,
+    Q_tkg_sb: nl.NkiTensor,
+    K_tkg_sb: nl.NkiTensor,
+    V_tkg_hbm: nl.NkiTensor,
     q_heads: int,
     kv_heads: int,
     d_head: int,
@@ -60,6 +59,7 @@ def _KVDP_attention_input_collectives(
     replica_group: ReplicaGroup,
     sbm: SbufManager,
     collective_mode: KVDPCollectiveMode,
+    dynamic_KVDP_rank_sb: nl.NkiTensor,
 ):
     """Input collectives for KV data parallelism.
 
@@ -69,8 +69,8 @@ def _KVDP_attention_input_collectives(
     Pseudocode:
 
         # Q: (d, B*q*S) @SBUF -> _KVDP_Q_input_{mode} -> (d, B_attn*KVDP*q*S) @SBUF
-        # K: (d, B*S) @SBUF -> rank_id slice batch -> (d, B_attn*S) @SBUF
-        # V: (B, kv, S, d) @HBM -> rank_id slice batch -> (B_attn, kv, S, d) @HBM
+        # K: (d, B*S) @SBUF -> dynamic_KVDP_rank_sb slice batch -> (d, B_attn*S) @SBUF
+        # V: (B, kv, S, d) @HBM -> dynamic_KVDP_rank_sb slice batch -> (B_attn, kv, S, d) @HBM
 
     Example: TP64 QKV projection → TP8 KVDP8 attention for GPT-OSS (64 q_heads, 8 k_heads) for B=16
         - 64 ranks compute QKV projection, each with q_heads=1, B=16
@@ -78,9 +78,9 @@ def _KVDP_attention_input_collectives(
         - Each rank now has 8 Q heads for 2 batches for 1 K head (TP8)
 
     Args:
-        Q_tkg_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF - Q after RoPE
-        K_tkg_sb (nl.ndarray): [d_head, B * S_tkg] @ SBUF - K after RoPE
-        V_tkg_hbm (nl.ndarray): [B, kv_heads=1, S_tkg, d_head] @ HBM - V from QKV extraction
+        Q_tkg_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF - Q after RoPE
+        K_tkg_sb (nl.NkiTensor): [d_head, B * S_tkg] @ SBUF - K after RoPE
+        V_tkg_hbm (nl.NkiTensor): [B, kv_heads=1, S_tkg, d_head] @ HBM - V from QKV extraction
         q_heads (int): Number of query heads per rank (before gather)
         kv_heads (int): Number of KV heads
         d_head (int): Head dimension
@@ -90,15 +90,16 @@ def _KVDP_attention_input_collectives(
         S_tkg (int): Token generation sequence length
         replica_group (ReplicaGroup): Replica group for collective ops
         sbm: SBUF memory manager
+        dynamic_KVDP_rank_sb (nl.NkiTensor): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
 
     Returns:
-        Q_tkg_sb (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF - gathered Q
-        K_tkg_sb (nl.ndarray): [d_head, B_attn * S_tkg] @ SBUF - sliced K
-        V_tkg_hbm (nl.ndarray): [B_attn, kv_heads, S_tkg, d_head] @ HBM - sliced V for attention_tkg
+        Q_tkg_sb (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF - gathered Q
+        K_tkg_sb (nl.NkiTensor): [d_head, B_attn * S_tkg] @ SBUF - sliced K
+        V_tkg_hbm (nl.NkiTensor): [B_attn, kv_heads, S_tkg, d_head] @ HBM - sliced V for attention_tkg
 
     Notes:
         - V is returned in HBM because attention_tkg loads V tile-by-tile during P*V matmul
-        - Batch selection uses reshape to (KVDP, rest) + dynamic select with rank_id
+        - Batch selection uses reshape to (KVDP, rest) + select with dynamic_KVDP_rank_sb
     """
     dtype = Q_tkg_sb.dtype
     kv_dtype = K_tkg_sb.dtype
@@ -110,16 +111,13 @@ def _KVDP_attention_input_collectives(
         f"Q_tkg_sb shape mismatch: {Q_tkg_sb.shape} != {(d_head, B * q_heads * S_tkg)}",
     )
     kernel_assert(
-        K_tkg_sb.shape == (d_head, B * S_tkg),
-        f"K_tkg_sb shape mismatch: {K_tkg_sb.shape} != {(d_head, B * S_tkg)}",
+        K_tkg_sb.shape == (d_head, B * kv_heads * S_tkg),
+        f"K_tkg_sb shape mismatch: {K_tkg_sb.shape} != {(d_head, B * kv_heads * S_tkg)}",
     )
     kernel_assert(
         V_tkg_hbm.shape == (B, kv_heads, S_tkg, d_head),
         f"V_tkg_hbm shape mismatch: {V_tkg_hbm.shape} != {(B, kv_heads, S_tkg, d_head)}",
     )
-
-    # Get dynamic rank_id for batch selection
-    dynamic_rank_id = ncc.rank_id()
 
     # ========== Q: collective redistribution ==========
 
@@ -148,39 +146,36 @@ def _KVDP_attention_input_collectives(
             dtype,
             replica_group,
             sbm,
-            dynamic_rank_id,
+            dynamic_KVDP_rank_sb,
         )
 
     # ========== K: slice batch ==========
-    # Dynamic DMA only supports DRAM (HBM), so: SBUF -> HBM -> slice -> SBUF
-    K_full = nl.ndarray((d_head, B * S_tkg), dtype=kv_dtype, buffer=nl.shared_hbm, name="K_full")
+    # Compiler restriction (NCC_ILDM008): dynamic-AP DMA can only access DRAM, so route
+    # through HBM. Stage K to HBM once, then do a single dynamic-AP DMA from the strided
+    # HBM view directly into SBUF.
+    K_full = nl.ndarray((d_head, B * kv_heads * S_tkg), dtype=kv_dtype, buffer=nl.shared_hbm, name="K_full")
     nisa.dma_copy(K_full, K_tkg_sb)
 
-    # Slice K batch: (d_head, B*S_tkg) -> (d_head, KVDP, B_attn*S_tkg) -> select -> (d_head, B_attn*S_tkg)
-    K_full_view = TensorView(K_full.reshape((d_head, KVDP, B_attn * S_tkg))).select(dim=1, index=dynamic_rank_id)
-    K_local = nl.ndarray(K_full_view.shape, dtype=kv_dtype, buffer=nl.shared_hbm, name="K_local")
-    nisa.dma_copy(dst=K_local, src=K_full_view.get_view())
-
-    # DMA back to SBUF
-    K_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * S_tkg), dtype=kv_dtype, buffer=nl.sbuf)
-    nisa.dma_copy(K_tkg_sb_out, K_local)
+    K_full_view = (K_full.reshape((d_head, KVDP, B_attn * kv_heads * S_tkg))).select(dim=1, index=dynamic_KVDP_rank_sb)
+    K_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * kv_heads * S_tkg), dtype=kv_dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=K_tkg_sb_out, src=K_full_view)
 
     # ========== V: slice batch ==========
     # (B, kv_heads=1, S_tkg, d_head) -> (KVDP, B_attn, kv_heads=1, S_tkg, d_head) -> select -> (B_attn, kv_heads=1, S_tkg, d_head)
-    V_tkg_hbm_batch_slice_view = TensorView(V_tkg_hbm.reshape((KVDP, B_attn, kv_heads, S_tkg, d_head))).select(
-        dim=0, index=dynamic_rank_id
+    V_tkg_hbm_batch_slice_view = (V_tkg_hbm.reshape((KVDP, B_attn, kv_heads, S_tkg, d_head))).select(
+        dim=0, index=dynamic_KVDP_rank_sb
     )
     V_tkg_hbm_out = nl.ndarray(
         V_tkg_hbm_batch_slice_view.shape, dtype=kv_dtype, buffer=nl.shared_hbm, name="V_tkg_hbm_out"
     )
-    nisa.dma_copy(dst=V_tkg_hbm_out, src=V_tkg_hbm_batch_slice_view.get_view())
+    nisa.dma_copy(dst=V_tkg_hbm_out, src=V_tkg_hbm_batch_slice_view)
 
     return Q_tkg_sb_out, K_tkg_sb_out, V_tkg_hbm_out
 
 
 def _KVDP_attention_output_collectives(
-    attn_sb: nl.ndarray,
-    V_tkg_hbm: nl.ndarray,
+    attn_sb: nl.NkiTensor,
+    V_tkg_hbm: nl.NkiTensor,
     KVDP: int,
     B_attn: int,
     q_heads: int,
@@ -189,6 +184,7 @@ def _KVDP_attention_output_collectives(
     replica_group: ReplicaGroup,
     sbm: SbufManager,
     collective_mode: KVDPCollectiveMode,
+    dynamic_KVDP_rank_sb: nl.NkiTensor,
 ):
     """Output collectives for KV data parallelism.
 
@@ -202,8 +198,8 @@ def _KVDP_attention_output_collectives(
 
     Args:
 
-        attn_sb (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF - attention output
-        V_tkg_hbm (nl.ndarray): [B_attn, kv_heads=1, S_tkg, d_head] @ HBM - V for this rank's batch slice
+        attn_sb (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF - attention output
+        V_tkg_hbm (nl.NkiTensor): [B_attn, kv_heads=1, S_tkg, d_head] @ HBM - V for this rank's batch slice
         KVDP (int): KV data parallelism degree (number of ranks)
         B_attn (int): Batch size per rank for attention (B / KVDP)
         q_heads (int): Number of query heads per rank (after slice)
@@ -211,10 +207,12 @@ def _KVDP_attention_output_collectives(
         S_tkg (int): Token generation sequence length
         replica_group (ReplicaGroup): Replica group for collective ops
         sbm: SBUF memory manager
+        dynamic_KVDP_rank_sb (nl.NkiTensor): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
+            Unused when collective_mode is ALL_TO_ALL.
 
     Returns:
-        attn_out (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF - gathered attention output
-        V_tkg_sb (nl.ndarray): [B_attn * S_tkg, d_head] @ SBUF - V for KV cache update
+        attn_out (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF - gathered attention output
+        V_tkg_sb (nl.NkiTensor): [B_attn * S_tkg, d_head] @ SBUF - V for KV cache update
 
     Notes:
         - V is copied back to SBUF for KV cache update which requires SBUF input
@@ -256,14 +254,14 @@ def _KVDP_attention_output_collectives(
             S_tkg,
             replica_group,
             sbm,
+            dynamic_KVDP_rank_sb,
         )
 
     # ========== V: copy from HBM to SBUF for KV cache update ==========
-    # When B_attn*S_tkg > pmax, V stays on HBM (cache update handles this via V_tkg_hbm)
-    if B_attn * S_tkg <= nl.tile_size.pmax:
-        V_tkg_sb = nl.ndarray((B_attn * S_tkg, d_head), dtype=V_tkg_hbm.dtype, buffer=nl.sbuf)
-        kernel_assert(kv_heads == 1, f"kv_heads must be 1 for V reshape, got {kv_heads}")
-        nisa.dma_copy(V_tkg_sb, V_tkg_hbm.reshape((B_attn * S_tkg, d_head)))
+    # When B_attn*kv_heads*S_tkg > pmax, V stays on HBM (cache update handles this via V_tkg_hbm).
+    if B_attn * kv_heads * S_tkg <= nl.tile_size.pmax:
+        V_tkg_sb = nl.ndarray((B_attn * kv_heads * S_tkg, d_head), dtype=V_tkg_hbm.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(V_tkg_sb, V_tkg_hbm.reshape((B_attn * kv_heads * S_tkg, d_head)))
     else:
         V_tkg_sb = None
 
@@ -294,10 +292,10 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
     dma_copy to HBM, dma_copy rearrange in HBM, all_to_all, dma_copy rearrange to SBUF.
 
     Args:
-        Q_tkg_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF
+        Q_tkg_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF
 
     Returns:
-        Q_tkg_sb_out (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        Q_tkg_sb_out (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
     """
     q_heads_attn = q_heads * KVDP
     nBS = q_heads_attn * B_attn * S_tkg
@@ -312,10 +310,8 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
         # Rearrange: (d, B, q, S) -> (d, KVDP, q, B_attn, S)
         # tensor_copy materializes the rearranged view into contiguous SBUF memory for nc_transpose
         Q_tkg_sb_rearranged = nl.ndarray((d_head, q_heads * B * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        Q_tkg_sb_view = TensorView(Q_tkg_sb.reshape((d_head, KVDP, B_attn, q_heads, S_tkg))).rearrange(
-            ("d", "KVDP", "B", "n", "S"), ("d", "KVDP", "n", "B", "S"), {}
-        )
-        nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view.get_view())
+        Q_tkg_sb_view = Q_tkg_sb.reshape((d_head, KVDP, B_attn, q_heads, S_tkg)).permute((0, 1, 3, 2, 4))
+        nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view)
         # Tiled transpose + dma_copy: (d, KVDP*q*B_attn*S) -> (KVDP*q*B_attn*S, d) -> HBM
         tile_sz = nl.tile_size.pmax
         Q_src_hbm_flat = Q_src_hbm.reshape((nBS, d_head))
@@ -330,11 +326,7 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
 
     # Step 3: dma_copy SBUF -> HBM (q_heads == 1 only; q>1 fused in tiled loop above)
     if q_heads == 1:
-        Q_src_hbm_view = (
-            TensorView(Q_src_hbm.reshape((KVDP, d_head, B_attn * S_tkg)))
-            .rearrange(("KVDP", "d", "B"), ("d", "KVDP", "B"), {})
-            .get_view()
-        )
+        Q_src_hbm_view = Q_src_hbm.reshape((KVDP, d_head, B_attn * S_tkg)).permute((1, 0, 2))
         nisa.dma_copy(Q_src_hbm_view, Q_tkg_sb.reshape((d_head, KVDP, B_attn * S_tkg)))
 
     # Step 4: all_to_all
@@ -343,20 +335,18 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
 
     # Step 5: dma_copy HBM -> SBUF
     if q_heads == 1:
-        # HBM src view: (q_attn, d, B_attn, S) presented as (d, B_attn, q_attn, S) for SBUF layout
-        Q_hbm_src = (
-            TensorView(Q_dst_hbm.reshape((q_heads_attn, d_head, B_attn, S_tkg)))
-            .rearrange(("n", "d", "B", "S"), ("d", "B", "n", "S"), {})
-            .get_view()
-        )
-        Q_sbuf_dst = Q_tkg_sb_out.reshape((d_head, B_attn, q_heads_attn, S_tkg))
-    else:
-        Q_hbm_src = Q_dst_hbm.reshape((nBS, d_head))
+        # Load Q_dst_hbm into SBUF in native (d, q_attn, B_attn, S) layout where
+        # B_attn is innermost-contiguous on both sides, then rearrange in SBUF to
+        # the (d, B_attn, q_attn, S) layout the downstream kernel expects.
+        Q_tkg_sb_qBS = sbm.alloc_stack((d_head, nBS), dtype=dtype, buffer=nl.sbuf)
+        Q_hbm_native = Q_dst_hbm.reshape((q_heads_attn, d_head, B_attn, S_tkg)).permute((1, 0, 2, 3))
+        nisa.dma_copy(Q_tkg_sb_qBS.reshape((d_head, q_heads_attn, B_attn, S_tkg)), Q_hbm_native)
 
-    if q_heads == 1:
-        nisa.dma_copy(Q_sbuf_dst, Q_hbm_src)
+        Q_sbuf_rearranged = Q_tkg_sb_qBS.reshape((d_head, q_heads_attn, B_attn, S_tkg)).permute((0, 2, 1, 3))
+        nisa.tensor_copy(Q_tkg_sb_out, Q_sbuf_rearranged)
     else:
         # Step 6-7: dma_copy + tiled transpose + rearrange (q_heads > 1)
+        Q_hbm_src = Q_dst_hbm.reshape((nBS, d_head))
         tile_sz = nl.tile_size.pmax
         Q_transposed = sbm.alloc_stack((d_head, nBS), dtype=dtype, buffer=nl.sbuf)
         for t_start in range(0, nBS, tile_sz):
@@ -367,18 +357,16 @@ def _KVDP_Q_input_all_to_all(Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, 
             nisa.nc_transpose(Q_psum, Q_tile_sb)
             nisa.tensor_copy(Q_transposed[:, nl.ds(t_start, t_size)], Q_psum)
         # Rearrange: (d, q_attn, B_attn, S) -> (d, B_attn, q_attn, S)
-        Q_view = TensorView(Q_transposed.reshape((d_head, q_heads_attn, B_attn, S_tkg))).rearrange(
-            ('d', 'n', 'B', 'S'), ('d', 'B', 'n', 'S'), {}
-        )
-        nisa.tensor_copy(Q_tkg_sb_out, Q_view.get_view())
+        Q_view = Q_transposed.reshape((d_head, q_heads_attn, B_attn, S_tkg)).permute((0, 2, 1, 3))
+        nisa.tensor_copy(Q_tkg_sb_out, Q_view)
 
     return Q_tkg_sb_out
 
 
 def _KVDP_Q_input_all_gather_slice(
-    Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, dtype, replica_group, sbm: SbufManager, dynamic_rank_id
+    Q_tkg_sb, q_heads, d_head, KVDP, B, B_attn, S_tkg, dtype, replica_group, sbm: SbufManager, dynamic_KVDP_rank_sb
 ):
-    """Q input redistribution using all_gather + rank_id slice.
+    """Q input redistribution using all_gather + KVDP_rank slice.
 
     Pseudocode:
 
@@ -388,7 +376,7 @@ def _KVDP_Q_input_all_gather_slice(
 
         3. dma_copy: (q, B, S, d) @SBUF -> @HBM
         4. all_gather dim=0: (q, B, S, d) @HBM -> (KVDP*q, B, S, d) @HBM
-        5. dma_copy rank_id slice: (KVDP*q, B, S, d) @HBM -> (KVDP*q, B_attn, S, d) @HBM
+        5. dma_copy KVDP_rank slice: (KVDP*q, B, S, d) @HBM -> (KVDP*q, B_attn, S, d) @HBM
 
         if q_heads > 1:
             6. dma_copy: (KVDP*q, B_attn, S, d) @HBM -> @SBUF
@@ -396,13 +384,14 @@ def _KVDP_Q_input_all_gather_slice(
             8. tensor_copy rearrange: (d, q_attn, B_attn, S) @SBUF -> (d, B_attn, q_attn, S) @SBUF
 
     When q_heads==1, skips steps 1, 2, 6, 7, 8 (no tensor_copy or nc_transpose needed):
-    dma_copy to HBM, all_gather on d dim, dma_copy rank_id slice, dma_copy rearrange to SBUF.
+    dma_copy to HBM, all_gather on d dim, dma_copy KVDP_rank slice, dma_copy rearrange to SBUF.
 
     Args:
-        Q_tkg_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF
+        Q_tkg_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF
+        dynamic_KVDP_rank_sb (nl.NkiTensor): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
 
     Returns:
-        Q_tkg_sb_out (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        Q_tkg_sb_out (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
     """
     q_heads_attn = q_heads * KVDP
     nBS = q_heads_attn * B_attn * S_tkg
@@ -417,22 +406,16 @@ def _KVDP_Q_input_all_gather_slice(
         )
         ncc.all_gather(dsts=[Q_gathered_hbm], srcs=[Q_hbm], replica_group=replica_group, collective_dim=0)
 
-        # Slice Q batch
-        # Reshape to (q_heads_attn, d_head, KVDP, B_attn*S_tkg)
-        #                                    ^---- select batch using rank_id on dim=2
-        Q_gathered_view = TensorView(Q_gathered_hbm.reshape((q_heads_attn, d_head, KVDP, B_attn * S_tkg))).select(
-            dim=2, index=dynamic_rank_id
-        )
-        Q_sliced_hbm = nl.ndarray(Q_gathered_view.shape, dtype=dtype, buffer=nl.shared_hbm, name="Q_sliced_hbm")
-        nisa.dma_copy(dst=Q_sliced_hbm, src=Q_gathered_view.get_view())
-
-        # See explanation below on why we can't combine this dma_copy with the slice dma_copy above
-        # DMA to SBUF and rearrange (q_heads_attn, d_head, B_attn, S_tkg) -> (d_head, B_attn, q_heads_attn, S_tkg)
-        Q_sliced_view = TensorView(Q_sliced_hbm.reshape((q_heads_attn, d_head, B_attn, S_tkg))).rearrange(
-            ("n", "d", "B", "S"), ("d", "B", "n", "S"), {}
+        # Slice Q batch + rearrange into SBUF in one DMA.
+        # (q_heads_attn, d_head, KVDP, B_attn, S_tkg) -> select(dim=2) -> (q_heads_attn, d_head, B_attn, S_tkg)
+        #                                                                  -> rearrange -> (d_head, B_attn, q_heads_attn, S_tkg)
+        Q_gathered_view = (
+            (Q_gathered_hbm.reshape((q_heads_attn, d_head, KVDP, B_attn, S_tkg)))
+            .select(dim=2, index=dynamic_KVDP_rank_sb)
+            .permute((1, 2, 0, 3))
         )
         Q_tkg_sb_out = sbm.alloc_stack((d_head, B_attn * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        nisa.dma_copy(Q_tkg_sb_out.reshape((d_head, B_attn, q_heads_attn, S_tkg)), Q_sliced_view.get_view())
+        nisa.dma_copy(Q_tkg_sb_out.reshape((d_head, B_attn, q_heads_attn, S_tkg)), Q_gathered_view)
     else:
         # General path: transpose to get q_heads on dim=0 for all_gather
         # Transpose Q to HBM: (d_head, B*q_heads*S) -> (q_heads, B, S_tkg, d_head)
@@ -441,10 +424,8 @@ def _KVDP_Q_input_all_gather_slice(
         # Rearrange q_heads to first dim of free dim before transpose:
         #   (d_head, B, q_heads, S) -> (d_head, q_heads, B, S)
         Q_tkg_sb_rearranged = nl.ndarray((d_head, q_heads * B * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        Q_tkg_sb_view = TensorView(Q_tkg_sb.reshape((d_head, B, q_heads, S_tkg))).rearrange(
-            ("d", "B", "n", "S"), ("d", "n", "B", "S"), {}
-        )
-        nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view.get_view())
+        Q_tkg_sb_view = Q_tkg_sb.reshape((d_head, B, q_heads, S_tkg)).permute((0, 2, 1, 3))
+        nisa.tensor_copy(Q_tkg_sb_rearranged, Q_tkg_sb_view)
         # Tiled transpose + dma_copy: (d_head, q_heads*B*S) -> (q_heads*B*S, d_head) -> HBM
         tile_sz = nl.tile_size.pmax
         Q_hbm = nl.ndarray((q_heads, B, S_tkg, d_head), dtype=dtype, buffer=nl.shared_hbm, name="Q_hbm")
@@ -483,13 +464,13 @@ def _KVDP_Q_input_all_gather_slice(
         # We can't flatten this non-contiguous view to 2D for SBUF load.
         # Additionally, dynamic DMA requires src/dst to have same number of dimensions (4D view -> 2D SBUF fails).
         # The DMA to Q_sliced_hbm materializes the slice into contiguous memory, enabling the reshape in step 5.
-        Q_gathered_hbm_batch_slice_view = TensorView(
-            Q_gathered_hbm.reshape((q_heads_attn, KVDP, B_attn, S_tkg, d_head))
-        ).select(dim=1, index=dynamic_rank_id)
+        Q_gathered_hbm_batch_slice_view = (Q_gathered_hbm.reshape((q_heads_attn, KVDP, B_attn, S_tkg, d_head))).select(
+            dim=1, index=dynamic_KVDP_rank_sb
+        )
         Q_sliced_hbm = nl.ndarray(
             Q_gathered_hbm_batch_slice_view.shape, dtype=dtype, buffer=nl.shared_hbm, name="Q_sliced_hbm"
         )
-        nisa.dma_copy(dst=Q_sliced_hbm, src=Q_gathered_hbm_batch_slice_view.get_view())
+        nisa.dma_copy(dst=Q_sliced_hbm, src=Q_gathered_hbm_batch_slice_view)
 
         # dma_copy + tiled transpose: (q_heads_attn, B_attn, S_tkg, d_head) -> (d_head, B_attn*q_heads_attn*S_tkg)
         tile_sz = nl.tile_size.pmax
@@ -505,10 +486,8 @@ def _KVDP_Q_input_all_gather_slice(
             nisa.tensor_copy(Q_tkg_sb_out[:, nl.ds(t_start, t_size)], Q_psum)
         # Rearrange: (d_head, q_heads_attn, B_attn, S_tkg) -> (d_head, B_attn, q_heads_attn, S_tkg)
         Q_tkg_sb_rearranged_out = sbm.alloc_stack((d_head, B_attn * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
-        Q_out_view = TensorView(Q_tkg_sb_out.reshape((d_head, q_heads_attn, B_attn, S_tkg))).rearrange(
-            ('d', 'n', 'B', 'S'), ('d', 'B', 'n', 'S'), {}
-        )
-        nisa.tensor_copy(Q_tkg_sb_rearranged_out, Q_out_view.get_view())
+        Q_out_view = Q_tkg_sb_out.reshape((d_head, q_heads_attn, B_attn, S_tkg)).permute((0, 2, 1, 3))
+        nisa.tensor_copy(Q_tkg_sb_rearranged_out, Q_out_view)
         Q_tkg_sb_out = Q_tkg_sb_rearranged_out
 
     return Q_tkg_sb_out
@@ -528,10 +507,10 @@ def _KVDP_attn_output_all_to_all(attn_sb, q_heads, d_head, KVDP, B_attn, S_tkg, 
         7. tensor_copy rearrange: (d, KVDP, q, B_attn, S) @SBUF -> (d, B, q, S) @SBUF
 
     Args:
-        attn_sb (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        attn_sb (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
 
     Returns:
-        attn_final_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF
+        attn_final_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF
     """
     q_heads_attn = q_heads * KVDP
     nBS = q_heads_attn * B_attn * S_tkg
@@ -541,10 +520,8 @@ def _KVDP_attn_output_all_to_all(attn_sb, q_heads, d_head, KVDP, B_attn, S_tkg, 
     kernel_assert(KVDP >= 4, f"ALL_TO_ALL requires KVDP >= 4, got {KVDP}")
     # Rearrange in SBUF: (d, B_attn, q_heads_attn, S) -> (d, q_heads_attn, B_attn, S)
     attn_sb_rearranged = nl.ndarray((d_head, B_attn * q_heads_attn * S_tkg), dtype=dtype, buffer=nl.sbuf)
-    attn_sb_view = TensorView(attn_sb.reshape((d_head, B_attn, q_heads_attn, S_tkg))).rearrange(
-        ("d", "B", "n", "S"), ("d", "n", "B", "S"), {}
-    )
-    nisa.tensor_copy(attn_sb_rearranged, attn_sb_view.get_view())
+    attn_sb_view = attn_sb.reshape((d_head, B_attn, q_heads_attn, S_tkg)).permute((0, 2, 1, 3))
+    nisa.tensor_copy(attn_sb_rearranged, attn_sb_view)
 
     # Tiled transpose + dma_copy to HBM: (d, q_attn*B_attn*S) -> (q_attn*B_attn*S, d) -> HBM
     tile_sz = nl.tile_size.pmax
@@ -575,30 +552,39 @@ def _KVDP_attn_output_all_to_all(attn_sb, q_heads, d_head, KVDP, B_attn, S_tkg, 
 
     # Rearrange: (d, KVDP, q_heads, B_attn, S) -> (d, KVDP, B_attn, q_heads, S) = (d, B, q_heads, S)
     attn_final_sb = nl.ndarray((d_head, nBS), dtype=dtype, buffer=nl.sbuf)
-    attn_view = TensorView(attn_transposed_back.reshape((d_head, KVDP, q_heads, B_attn, S_tkg))).rearrange(
-        ('d', 'KVDP', 'n', 'B', 'S'), ('d', 'KVDP', 'B', 'n', 'S'), {}
-    )
-    nisa.tensor_copy(attn_final_sb, attn_view.get_view())
+    attn_view = attn_transposed_back.reshape((d_head, KVDP, q_heads, B_attn, S_tkg)).permute((0, 1, 3, 2, 4))
+    nisa.tensor_copy(attn_final_sb, attn_view)
     return attn_final_sb
 
 
-def _KVDP_attn_output_all_gather_slice(attn_sb, q_heads, d_head, KVDP, B_attn, S_tkg, replica_group, sbm: SbufManager):
-    """Attention output redistribution using all_gather + rank_id slice.
+def _KVDP_attn_output_all_gather_slice(
+    attn_sb,
+    q_heads,
+    d_head,
+    KVDP,
+    B_attn,
+    S_tkg,
+    replica_group,
+    sbm: SbufManager,
+    dynamic_KVDP_rank_sb,
+):
+    """Attention output redistribution using all_gather + KVDP_rank slice.
 
     Pseudocode:
 
         1. Tiled nc_transpose: (d, B_attn*q_attn*S) @SBUF -> (B_attn, q_attn, d, S) @SBUF
         2. dma_copy: (B_attn, q_attn, d, S) @SBUF -> @HBM
         3. all_gather dim=0: (B_attn, q_attn, d, S) @HBM -> (B, q_attn, d, S) @HBM
-        4. dma_copy rank_id slice: (B, q_attn, d, S) @HBM -> (B, q, d, S) @HBM
+        4. dma_copy KVDP_rank slice: (B, q_attn, d, S) @HBM -> (B, q, d, S) @HBM
         5. dma_copy: (B, q, d, S) @HBM -> @SBUF
         6. Tiled nc_transpose: (B, q, d, S) @SBUF -> (d, B*q*S) @SBUF
 
     Args:
-        attn_sb (nl.ndarray): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        attn_sb (nl.NkiTensor): [d_head, B_attn * q_heads * KVDP * S_tkg] @ SBUF
+        dynamic_KVDP_rank_sb (nl.NkiTensor): [1, 1] @ SBUF, this rank's position within its KVDP replica group (0 to KVDP-1).
 
     Returns:
-        attn_final_sb (nl.ndarray): [d_head, B * q_heads * S_tkg] @ SBUF
+        attn_final_sb (nl.NkiTensor): [d_head, B * q_heads * S_tkg] @ SBUF
     """
     q_heads_attn = q_heads * KVDP
     nBS = q_heads_attn * B_attn * S_tkg
@@ -624,13 +610,12 @@ def _KVDP_attn_output_all_gather_slice(attn_sb, q_heads, d_head, KVDP, B_attn, S
     )
     ncc.all_gather(dsts=[attn_gathered], srcs=[attn_hbm], replica_group=replica_group, collective_dim=0)
 
-    # Slice heads with rank_id
-    dynamic_rank_id = ncc.rank_id()
-    attn_gathered_head_slice_view = TensorView(attn_gathered.reshape((B, KVDP, q_heads, d_head, S_tkg))).select(
-        dim=1, index=dynamic_rank_id
+    # Slice heads with dynamic_KVDP_rank_sb
+    attn_gathered_head_slice_view = (attn_gathered.reshape((B, KVDP, q_heads, d_head, S_tkg))).select(
+        dim=1, index=dynamic_KVDP_rank_sb
     )
     attn_sliced = nl.ndarray(attn_gathered_head_slice_view.shape, dtype=dtype, buffer=nl.shared_hbm, name="attn_sliced")
-    nisa.dma_copy(dst=attn_sliced, src=attn_gathered_head_slice_view.get_view())
+    nisa.dma_copy(dst=attn_sliced, src=attn_gathered_head_slice_view)
 
     # dma_copy + tiled transpose back to SBUF: (B*q*S, d) -> (d, B*q*S)
     attn_final_sb = sbm.alloc_stack((d_head, nBS), dtype=dtype, buffer=nl.sbuf)
