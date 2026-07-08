@@ -17,10 +17,15 @@
 from dataclasses import dataclass
 
 import nki
+import nki.isa as nisa
 import nki.language as nl
 
-from ...mlp.mlp_parameters import MLPParameters
-from ...mlp.mlp_tkg.projection_mx_constants import (
+from ...utils.allocator import sizeinbytes
+from ...utils.common_types import ActFnType, ExpertAffinityScaleMode, MoEAllToAllVStrategy, MoELNCShardingStrategy
+from ...utils.kernel_assert import kernel_assert
+from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
+from .mlp_parameters import MLPParameters
+from .projection_mx_constants import (
     MAX_MATMULT_MX_UNPACKED_CONTRACT_DIM,
     MIN_MATMULT_MX_P_DIM,
     MX_PACKED_DTYPES,
@@ -29,18 +34,22 @@ from ...mlp.mlp_tkg.projection_mx_constants import (
     SUPPORTED_QMX_INPUT_DTYPES,
     _q_width,
 )
-from ...utils.common_types import ActFnType, ExpertAffinityScaleMode, MoEAllToAllVStrategy, MoELNCShardingStrategy
-from ...utils.kernel_assert import kernel_assert
-from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 
 # Constants
 NUM_H4_FOLDS_PER_COLUMN = 32
 NUM_DYNAMIC_ALGO_STATIC_BLOCKS = 1
 NONZERO_WITH_COUNT_PAD_VAL = -1  # We pad indices with -1s to utilize DMA skipping
+NONZERO_WITH_COUNT_P_STRIDE = (
+    32  # Partition stride for parallel nonzero_with_count (stride 32 for SBUF access compatibility)
+)
+NONZERO_WITH_COUNT_EXPERT_GROUP_SIZE = nl.tile_size.pmax // NONZERO_WITH_COUNT_P_STRIDE  # 4 experts per call
 UINT8_TP_VIEW_DTYPE = nl.float8_e5m2  # Used with bitcast for uint8 transposes, since PE does not support uint8 input
 FP8X4_TP_VIEW_DTYPE = (
     nl.float32
 )  # Used with bitcast for float8_x4 transposes, since PE does not support float8_x4 input
+
+# Dummy MX scale value: uint32 representation of 4 × uint8(127) = 0x7F7F7F7F
+_DUMMY_SCALE_U32 = 2139062143
 
 # Dtype packing conversions
 FP8_PER_BF16 = 2
@@ -62,20 +71,20 @@ SUPPORTED_MOE_SHARDING_STRATEGIES = [
 class AllExpertMXInputTensors(nl.NKIObject):
     """Input tensors for all-expert MX kernel."""
 
-    hidden_input: nl.ndarray
-    gate_up_weights: nl.ndarray
-    down_weights: nl.ndarray
-    output: nl.ndarray
-    expert_affinities_masked: nl.ndarray
-    gate_up_weights_scale: nl.ndarray
-    down_weights_scale: nl.ndarray
-    hidden_input_scale: nl.ndarray
-    gate_up_weights_bias: nl.ndarray
-    down_weights_bias: nl.ndarray
+    hidden_input: nl.NkiTensor
+    gate_up_weights: nl.NkiTensor
+    down_weights: nl.NkiTensor
+    output: nl.NkiTensor
+    expert_affinities_masked: nl.NkiTensor
+    gate_up_weights_scale: nl.NkiTensor
+    down_weights_scale: nl.NkiTensor
+    hidden_input_scale: nl.NkiTensor
+    gate_up_weights_bias: nl.NkiTensor
+    down_weights_bias: nl.NkiTensor
     # STATIC_MX: per-tensor FP8 dequant scales for activations (float32)
-    gate_up_in_scale: nl.ndarray = None  # [E_L, 1] or [1, 1]
-    down_in_scale: nl.ndarray = None  # [E_L, 1] or [1, 1]
-    input_dequant_scale: nl.ndarray = None  # [pmax, 1] in SBUF, broadcast input dequant scale
+    gate_up_in_scale: nl.NkiTensor = None  # [E_L, 1] or [1, 1]
+    down_in_scale: nl.NkiTensor = None  # [E_L, 1] or [1, 1]
+    input_dequant_scale: nl.NkiTensor = None  # [pmax, 1] in SBUF, broadcast input dequant scale
 
 
 @dataclass
@@ -106,6 +115,7 @@ class AllExpertMXDimensions(nl.NKIObject):
     I: int  # Intermediate dimension size
     H: int  # Hidden dimension size
     H_concat: int  # Size of dim1 of input tensor when [input_hidden, input_scale, expert_affinities, token_idx] is concatenated
+    sharding_strategy: MoELNCShardingStrategy = None
 
     def __post_init__(self):
         """Derive tiling strategy from tensor dimensions."""
@@ -114,6 +124,11 @@ class AllExpertMXDimensions(nl.NKIObject):
         _, n_prgs, prg_id = get_verified_program_sharding_info("_all_expert_moe_tkg_mx", (0, 1))
         self.n_prgs = n_prgs
         self.prg_id = prg_id
+
+        # Pad T to the next multiple of 4 to satisfy nc_matmul_mx even free-dim constraint.
+        # T_physical retains the original (unpadded) token count for output writes.
+        self.T_physical = self.T
+        self.T = div_ceil(self.T, _q_width) * _q_width
 
         # Shared tiling strategy
         self.n_tiles_in_T = div_ceil(self.T, self.pmax)
@@ -131,10 +146,14 @@ class AllExpertMXDimensions(nl.NKIObject):
             self.n_prgs > 1
             and self.T % self.n_prgs == 0
             and T_local_candidate >= NUM_H4_FOLDS_PER_COLUMN  # HBM layout adapter requires T_local >= 32
+            and self.T_physical % _q_width == 0  # not allow shard on T for T_physical not divisible by 4
         )
 
         # Determine sharding strategy (I-sharding takes priority over T-sharding)
-        if can_shard_on_I:
+        if self.sharding_strategy != None:
+            # Use user specified sharding strategy is already specified.
+            pass
+        elif can_shard_on_I:
             self.sharding_strategy = MoELNCShardingStrategy.SHARD_I
         elif can_shard_on_T:
             self.sharding_strategy = MoELNCShardingStrategy.SHARD_T
@@ -168,7 +187,7 @@ class AllExpertMXDimensions(nl.NKIObject):
             self.n_tiles_in_T = div_ceil(self.T_local, self.pmax)
             self.n_T32_tiles = div_ceil(self.T_local, NUM_H4_FOLDS_PER_COLUMN)
             self.tile_T = min(self.T_local, self.pmax)
-        else:  # NO_SHARD
+        else:  # NO_SHARD or SHARD_E
             self.n_I512_tiles_local = total_I512_tiles
             self.tile_start = 0
             self.I_offset = 0
@@ -229,32 +248,57 @@ class AllExpertMXDynamismConfig(nl.NKIObject):
 class ExpertWeightsSBUF(nl.NKIObject):
     """Expert weights, scales, and biases loaded in SBUF for one expert."""
 
-    gate_weight_sb: nl.ndarray
-    up_weight_sb: nl.ndarray
-    down_weight_sb: nl.ndarray
-    gate_weight_scale_sb: nl.ndarray
-    up_weight_scale_sb: nl.ndarray
-    down_weight_scale_sb: nl.ndarray
-    gate_bias_sb: nl.ndarray
-    up_bias_sb: nl.ndarray
-    down_bias_sb: nl.ndarray
+    gate_weight_sb: nl.NkiTensor
+    up_weight_sb: nl.NkiTensor
+    down_weight_sb: nl.NkiTensor
+    gate_weight_scale_sb: nl.NkiTensor
+    up_weight_scale_sb: nl.NkiTensor
+    down_weight_scale_sb: nl.NkiTensor
+    gate_bias_sb: nl.NkiTensor
+    up_bias_sb: nl.NkiTensor
+    down_bias_sb: nl.NkiTensor
     # STATIC_MX: per-expert combined dequant scales (input_scale * weight_scale)
-    gate_dequant_scale_sb: nl.ndarray = None
-    up_dequant_scale_sb: nl.ndarray = None
-    down_dequant_scale_sb: nl.ndarray = None
+    gate_dequant_scale_sb: nl.NkiTensor = None
+    up_dequant_scale_sb: nl.NkiTensor = None
+    down_dequant_scale_sb: nl.NkiTensor = None
+    dummy_scale_tile_sb: nl.NkiTensor = None  # SW quant: shared 2D [128, F] dummy scale (all-127)
+
+
+def alloc_dummy_scale_tile(_pmax=128, free_dim=512):
+    """Allocate a 2D dummy MX scale tile [_pmax, free_dim] (all-127, i.e. scale=1.0).
+
+    SW quant path uses this shared 2D tile in place of the normal per-tile 3D scale
+    [P, n_tiles, F]. Matmul callers index it as [:, :slice] instead of [:, tile_idx, slice].
+
+    Internally allocates [_pmax, free_dim // 4] uint32, memsets to 0x7F7F7F7F, and
+    returns a uint8 view of shape [_pmax, free_dim].
+
+    Args:
+        _pmax (int): Partition dimension (default 128).
+        free_dim (int): Free dimension of the returned tile (default 512).
+
+    Returns:
+        nl.NkiTensor: uint8 tensor of shape [_pmax, free_dim].
+    """
+    n_u32 = free_dim // _q_width
+    n_part = _pmax
+    u32_buf = nl.ndarray((n_part, n_u32), dtype=nl.uint32, buffer=nl.sbuf)
+    nisa.memset(dst=u32_buf, value=_DUMMY_SCALE_U32)
+    return u32_buf.view(nl.uint8)
 
 
 def init_all_expert_mx_configs(
     mlp_params: MLPParameters,
-    output: nl.ndarray,
+    output: nl.NkiTensor,
     activation_compute_dtype: nki.dtype = nl.bfloat16,
+    sharding_strategy: MoELNCShardingStrategy = None,
 ) -> tuple[AllExpertMXInputTensors, AllExpertMXKernelConfig, AllExpertMXDimensions, AllExpertMXDynamismConfig]:
     """
     Initialize all sub-configs for the all-expert MX kernel from MLPParameters.
 
     Args:
         mlp_params (MLPParameters): Source parameters.
-        output (nl.ndarray): Output tensor.
+        output (nl.NkiTensor): Output tensor.
         activation_compute_dtype: Compute dtype for activations.
 
     Returns:
@@ -266,11 +310,11 @@ def init_all_expert_mx_configs(
     down_weights = mlp_params.down_proj_weights_tensor
 
     # Extract T based on input location and quantization state
-    if hidden_input.buffer == nl.sbuf:
-        if hidden_input_scale != None:
-            T = hidden_input.shape[-1]
-        else:
-            T = hidden_input.shape[1]
+    if hidden_input_scale != None:
+        # Pre-quantized input (SBUF or HBM): T is the last dimension
+        T = hidden_input.shape[-1]
+    elif hidden_input.buffer == nl.sbuf:
+        T = hidden_input.shape[1]
     else:
         T, _ = hidden_input.shape
 
@@ -307,8 +351,8 @@ def init_all_expert_mx_configs(
         gate_up_weights_scale=mlp_params.quant_params.gate_w_scale,
         down_weights_scale=mlp_params.quant_params.down_w_scale,
         hidden_input_scale=hidden_input_scale,
-        gate_up_weights_bias=(mlp_params.bias_params.gate_proj_bias_tensor if mlp_params.bias_params else None),
-        down_weights_bias=(mlp_params.bias_params.down_proj_bias_tensor if mlp_params.bias_params else None),
+        gate_up_weights_bias=mlp_params.bias_params.gate_proj_bias_tensor if mlp_params.bias_params else None,
+        down_weights_bias=mlp_params.bias_params.down_proj_bias_tensor if mlp_params.bias_params else None,
         gate_up_in_scale=mlp_params.quant_params.gate_up_in_scale if is_static_quant else None,
         down_in_scale=mlp_params.quant_params.down_in_scale if is_static_quant else None,
         input_dequant_scale=mlp_params.input_dequant_scale,
@@ -320,7 +364,9 @@ def init_all_expert_mx_configs(
         gate_clamp_upper_limit=mlp_params.gate_clamp_upper_limit,
         up_clamp_lower_limit=mlp_params.up_clamp_lower_limit,
         up_clamp_upper_limit=mlp_params.up_clamp_upper_limit,
-        input_in_sbuf=mlp_params.input_in_sbuf,
+        # input_in_sbuf=True means "input is already in quantized layout, skip _layout_adapter_qmx_hbm".
+        # Pre-quantized HBM input (hidden_input_scale != None) also skips the adapter.
+        input_in_sbuf=mlp_params.input_in_sbuf or mlp_params.hidden_input_scale is not None,
         output_in_sbuf=output_in_sbuf,
         activation_compute_dtype=activation_compute_dtype,
         expert_affinities_dtype=expert_affinities_dtype,
@@ -333,6 +379,7 @@ def init_all_expert_mx_configs(
         I=I,
         H=H,
         H_concat=H_concat,
+        sharding_strategy=sharding_strategy,
     )
     dynamism_cfg = AllExpertMXDynamismConfig(
         is_all_expert_dynamic=mlp_params.expert_params.is_all_expert_dynamic,
@@ -390,10 +437,21 @@ def validate_all_expert_mx_inputs(
             f"Expected quantized input dtype in {MX_UNPACKED_DTYPES} with all_to_all_v_strategy!=DISABLED, got {input_tensors.hidden_input.dtype=}, {dynamism_cfg.all_to_all_v_strategy=}",
         )
 
-    # Validate T size based on input state
-    if input_tensors.hidden_input_scale == None:
+    # Validate T size based on quantization.
+    # When quantized, T can be divisible by 4; otherwise T must be divisible by 32. When using SHARD_T, these constraints double.
+    is_quantized = sizeinbytes(input_tensors.hidden_input.dtype) < 2 or input_tensors.hidden_input_scale is not None
+    is_static_mx = kernel_cfg.is_static_quant
+    if is_quantized:
+        kernel_assert(dims.T % 4 == 0, f"Expected T divisible by 4 with quantized input, got T={dims.T}")
+        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
+            kernel_assert(
+                dims.T_local % 4 == 0,
+                f"Expected T_local divisible by 4 for SHARD_T with sub-2-byte input, got T_local={dims.T_local}.",
+            )
+    # all-expert STATIC_MX expects non pre-quantized inputs
+    elif not is_static_mx:
         kernel_assert(
-            dims.T % 32 == 0,
+            dims.T_physical % 32 == 0,
             f"Expected T divisible by 32, got T={dims.T}. "
             "To use T divisible by 4, provide prequantized input and hidden_input_scale.",
         )
@@ -401,13 +459,6 @@ def validate_all_expert_mx_inputs(
             kernel_assert(
                 dims.T_local % 32 == 0,
                 f"Expected T_local divisible by 32 for SHARD_T with HBM input, got T_local={dims.T_local}.",
-            )
-    else:
-        kernel_assert(dims.T % 4 == 0, f"Expected T divisible by 4, got T={dims.T}")
-        if dims.sharding_strategy == MoELNCShardingStrategy.SHARD_T:
-            kernel_assert(
-                dims.T_local % 4 == 0,
-                f"Expected T_local divisible by 4 for SHARD_T with pre-quantized input, got T_local={dims.T_local}.",
             )
 
     # Validate expert affinities shape (affinities are packed when using all_to_all_v)
@@ -423,8 +474,8 @@ def validate_all_expert_mx_inputs(
         f"All-expert MX kernel does not yet support SBUF output, got {kernel_cfg.output_in_sbuf=}",
     )
 
-    # Validate input_in_sbuf requires pre-quantized input
-    if kernel_cfg.input_in_sbuf:
+    # Validate input_in_sbuf requires pre-quantized input (except STATIC_MX which receives bf16 for per-expert quantization)
+    if kernel_cfg.input_in_sbuf and not kernel_cfg.is_static_quant:
         kernel_assert(
             input_tensors.hidden_input_scale != None,
             f"Expected pre-quantized input when input is in SBUF, "
@@ -439,15 +490,12 @@ def validate_all_expert_mx_inputs(
                 f"Expected expert_affinities_masked in HBM, got {input_tensors.expert_affinities_masked.buffer=}",
             )
         kernel_assert(
-            dims.E_L == 1,
-            f"All-expert MX kernel does not support E_L>1 with is_all_expert_dynamic=True, but got {dims.E_L=}",
-        )
-        kernel_assert(
             dynamism_cfg.block_size != None and _is_valid_block_size(dims.T, dynamism_cfg.block_size),
             f"Invalid block_size: expected (1) nonzero block_size (2) block_size that evenly divides T, (3) block_size at most T/2, "
-            f"and (4) block_size<32 and divisible by 8, block_size<128 and divisible by 32, or block_size divisible by 128; "
+            f"and (4) block_size≤32 and divisible by 4, block_size≤128 and divisible by 32, or block_size divisible by 128; "
             f"but got {dynamism_cfg.block_size=}, {dims.T=}",
         )
+
     # all_to_all_v requires is_all_expert_dynamic
     else:
         kernel_assert(
@@ -476,7 +524,7 @@ def _is_valid_block_size(T: int, block_size: int) -> bool:
     Validate that block_size is valid for a given T.
 
     Block size must be nonzero, evenly divide T, be at most T/2 (resulting in at least 2 blocks),
-    and satisfy: block_size<32 and divisible by 8, block_size<128 and divisible by 32, or
+    and satisfy: block_size≤32 and divisible by 4, block_size≤128 and divisible by 32, or
     block_size divisible by 128.
 
     Args:
@@ -492,8 +540,8 @@ def _is_valid_block_size(T: int, block_size: int) -> bool:
         return False
     if block_size > T // 2:
         return False
-    if block_size < 32:
-        return block_size % 8 == 0
-    elif block_size < 128:
+    if block_size <= 32:
+        return block_size % 4 == 0
+    elif block_size <= 128:
         return block_size % 32 == 0
     return block_size % 128 == 0

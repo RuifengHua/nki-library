@@ -20,12 +20,14 @@ import pytest
 from nkilib_src.nkilib.experimental.collectives.fg_allgather import (
     fine_grained_allgather,
 )
-from test.integration.nkilib.experimental.collectives.test_collectives import make_golden_torch_ref
+from nkilib_src.nkilib.experimental.collectives.fg_allgather_torch import (
+    fine_grained_allgather_torch_ref,
+)
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import CollectiveUnitTestFramework
+from test.utils.unit_test_collective_framework import CollectiveUnitTestFramework
 
 PARAM_NAMES = "m, K, dtype, tp_degree, lnc, force_hbm_cc"
 TEST_PARAMS = [
@@ -69,7 +71,6 @@ class TestFgAllgather:
         np.random.seed(42)
         num_groups = 1
         M = m * tp_degree
-
         # Global tensor: [M, K] — each rank owns rows [rank*m : (rank+1)*m]
         lhs_global = np.random.randn(M, K).astype(dtype)
 
@@ -81,21 +82,16 @@ class TestFgAllgather:
                 "force_hbm_cc": force_hbm_cc,
             }
 
-        def create_golden(rank_id: int):
-            # All ranks produce the full gathered tensor
-            return {"result": lhs_global.astype(dtype)}
-
-        torch_ref, ref_override = make_golden_torch_ref(fine_grained_allgather, create_golden)
         CollectiveUnitTestFramework(
             test_manager=test_manager,
             kernel_entry=fine_grained_allgather,
-            torch_ref=torch_ref,
+            torch_ref=fine_grained_allgather_torch_ref,
             per_rank_input_generator=create_inputs,
             collective_ranks=tp_degree,
-            per_rank_torch_ref_input_override=ref_override,
         ).run_test(
             test_config=None,
             compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            output_keys=["result"],
             rtol=1e-3,
             atol=1e-3,
         )

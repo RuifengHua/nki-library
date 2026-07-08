@@ -29,6 +29,11 @@ class LncSubscriptable(Generic[TorchRefProtocolT]):
         self._lnc: int = 0
         self._shard_id: int = 0
         _verify_protocol_sync(func, protocol)
+        # Expose the wrapped function so inspect.signature() and inspect.unwrap()
+        # return the underlying signature / file rather than the LncSubscriptable
+        # wrapper. This is required by the dispatch audit's signature parity check.
+        self.__signature__ = inspect.signature(func)
+        self.__wrapped__ = func
 
     def __getitem__(self, lnc: int) -> TorchRefProtocolT:
         def wrapper(*args, **kwargs):

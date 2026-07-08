@@ -18,15 +18,12 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
-from ...subkernels.layernorm_tkg import layernorm_tkg
 from ...subkernels.norm_tkg_utils import _CONTIGUOUS_LOAD_H_THRESHOLD, contiguous_load_transpose
-from ...subkernels.rmsnorm_tkg import rmsnorm_tkg, rmsnorm_tkg_th
 from ...utils.allocator import SbufManager
 from ...utils.common_types import HiddenLayout, NormType
 from ...utils.interleave_copy import interleave_copy
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import div_ceil
-from ...utils.tensor_view import TensorView
 from ..mlp_parameters import (
     _Q_WIDTH,
     MLPParameters,
@@ -34,6 +31,8 @@ from ..mlp_parameters import (
     mlpp_has_rms_normalization,
 )
 from .mlp_tkg_constants import MLPTKGConstantsDimensionSizes
+from .mlp_tkg_layernorm import layernorm_tkg
+from .mlp_tkg_rmsnorm import rmsnorm_tkg
 
 _DGE_MODE_UNKNOWN = 0  # Compiler decides best DMA mode internally
 _DGE_MODE_NONE = 3  # Use STATIC DMA mode
@@ -41,24 +40,11 @@ _DGE_MODE_NONE = 3  # Use STATIC DMA mode
 
 def alloc_tensor_view(
     sbm: SbufManager, shape, dtype, buffer=nl.sbuf, name=None, base_partition=0, align=None, heap=False
-) -> TensorView:
-    """Allocate an SBUF tensor via SbufManager and wrap it in a TensorView."""
+) -> nl.NkiTensor:
+    """Allocate an SBUF tensor via SbufManager and wrap it in a NkiTensor."""
     if heap:
-        return TensorView(sbm.alloc_heap(shape, dtype, buffer, name, base_partition, align))
-    return TensorView(sbm.alloc_stack(shape, dtype, buffer, name, base_partition, align))
-
-
-def convert_params_to_views(params: MLPParameters):
-    """Convert all weight, bias, fused-add, and quantization scale tensors in params to TensorView."""
-    params.hidden_tensor = TensorView(params.hidden_tensor)
-    if params.gate_proj_weights_tensor is not None:
-        params.gate_proj_weights_tensor = TensorView(params.gate_proj_weights_tensor)
-    params.up_proj_weights_tensor = TensorView(params.up_proj_weights_tensor)
-    params.down_proj_weights_tensor = TensorView(params.down_proj_weights_tensor)
-    params.bias_params.convert_to_view()
-    params.fused_add_params.convert_to_view()
-    if params.quant_params.is_quant():
-        params.quant_params.convert_to_view()
+        return sbm.alloc_heap(shape, dtype, buffer, name, base_partition, align)
+    return sbm.alloc_stack(shape, dtype, buffer, name, base_partition, align)
 
 
 def prepare_gate_up_bias_and_scale(
@@ -86,7 +72,7 @@ def prepare_gate_up_bias_and_scale(
         dims (MLPTKGConstantsDimensionSizes): Dimension and sharding metadata.
 
     Returns:
-        tuple: (gate_b, up_b, gate_w_scale, up_w_scale) — pre-shaped TensorViews or None.
+        tuple: (gate_b, up_b, gate_w_scale, up_w_scale) — pre-shaped NkiTensors or None.
     """
     gate_b = params.bias_params.gate_proj_bias_tensor
     up_b = params.bias_params.up_proj_bias_tensor
@@ -95,9 +81,9 @@ def prepare_gate_up_bias_and_scale(
 
     # Pre-squeeze bias for LHS/RHS swap path (needs 1D)
     if not params.use_tkg_gate_up_proj_column_tiling:
-        if gate_b is not None and gate_b.get_dim() > 1:
+        if gate_b is not None and gate_b.ndim > 1:
             gate_b = gate_b.squeeze_dim(dim=0)
-        if up_b is not None and up_b.get_dim() > 1:
+        if up_b is not None and up_b.ndim > 1:
             up_b = up_b.squeeze_dim(dim=0)
 
     return gate_b, up_b, gate_w_scale, up_w_scale
@@ -128,7 +114,7 @@ def prepare_down_bias_and_scale(
         dims (MLPTKGConstantsDimensionSizes): Dimension and sharding metadata.
 
     Returns:
-        tuple: (down_b, down_w_scale) — pre-shaped TensorViews or None.
+        tuple: (down_b, down_w_scale) — pre-shaped NkiTensors or None.
     """
     down_b = params.bias_params.down_proj_bias_tensor
     down_w_scale = params.quant_params.down_w_scale
@@ -142,13 +128,13 @@ def prepare_down_bias_and_scale(
             ).broadcast(dim=0, size=dims.T)
         else:
             # [1, H] or [H] → [H_per_shard] → [H0, H1_shard]
-            bias_dim = 0 if down_b.get_dim() == 1 else 1
+            bias_dim = 0 if down_b.ndim == 1 else 1
             down_b = down_b.slice(
                 dim=bias_dim,
                 start=dims.H1_offset * dims.H0,
                 end=dims.H1_offset * dims.H0 + dims.H_per_shard,
             )
-            if down_b.get_dim() > 1:
+            if down_b.ndim > 1:
                 down_b = down_b.squeeze_dim(dim=0)
             down_b = down_b.reshape_dim(dim=0, shape=(dims.H0, dims.H1_shard))
 
@@ -178,7 +164,7 @@ def prepare_down_bias_and_scale(
     return down_b, down_w_scale
 
 
-def _layout_adapter_hbm(src: nl.ndarray, n_prgs: int, prg_id: int):
+def _layout_adapter_hbm(src: nl.NkiTensor, n_prgs: int, prg_id: int):
     """
     Load and transpose input tensor from HBM to SBUF with swizzled layout.
 
@@ -189,12 +175,12 @@ def _layout_adapter_hbm(src: nl.ndarray, n_prgs: int, prg_id: int):
     4. Obtain swizzle layout: [16_H * 8_H(P), H/512, T/4, 4_T * 4_H]
 
     Args:
-        src (nl.ndarray): [T, H], 5D tensor in HBM with internally shuffled layout [T, 4_H, H/512, 16_H, 8_H].
+        src (nl.NkiTensor): [T, H], 5D tensor in HBM with internally shuffled layout [T, 4_H, H/512, 16_H, 8_H].
         n_prgs (int): Number of programs.
         prg_id (int): Program ID.
 
     Returns:
-        result (nl.ndarray): [16_H * 8_H(P), H/512, ceil(T/4) * 4, 4_H], 4D tensor in SBUF with swizzled layout.
+        result (nl.NkiTensor): [16_H * 8_H(P), H/512, ceil(T/4) * 4, 4_H], 4D tensor in SBUF with swizzled layout.
     """
     _q_width = _Q_WIDTH
     _pmax = nl.tile_size.pmax
@@ -251,17 +237,17 @@ def _layout_adapter_hbm(src: nl.ndarray, n_prgs: int, prg_id: int):
     return result.reshape((_pmax, H_div_512, T_padded, _q_width))
 
 
-def _layout_adapter_sb(src: nl.ndarray, n_prgs: int, prg_id: int):
+def _layout_adapter_sb(src: nl.NkiTensor, n_prgs: int, prg_id: int):
     """
     SBUF version of the layout adapter.
 
     Args:
-        src (nl.ndarray): [_pmax, T, _q_width, n_H512_tiles], Input tensor in SBUF.
+        src (nl.NkiTensor): [_pmax, T, _q_width, n_H512_tiles], Input tensor in SBUF.
         n_prgs (int): Number of programs.
         prg_id (int): Program ID.
 
     Returns:
-        shfl_sb (nl.ndarray): [_pmax, n_H512_tile_sharded, ceil_div(T, 4) * 4, _q_width], Shuffled tensor in SBUF.
+        shfl_sb (nl.NkiTensor): [_pmax, n_H512_tile_sharded, ceil_div(T, 4) * 4, _q_width], Shuffled tensor in SBUF.
     """
     _q_width = _Q_WIDTH
     _pmax = nl.tile_size.pmax
@@ -288,50 +274,48 @@ def _layout_adapter_sb(src: nl.ndarray, n_prgs: int, prg_id: int):
     nisa.memset(dst=shfl_sb, value=0.0)
 
     src_view = (
-        TensorView(src)
-        .slice(dim=3, start=prg_id * n_H512_tile_sharded, end=(prg_id + 1) * n_H512_tile_sharded)
-        .permute(dims=[0, 3, 1, 2])  # [P, n_H512_tiles_sharded, T, _q_width]
+        src.slice(dim=3, start=prg_id * n_H512_tile_sharded, end=(prg_id + 1) * n_H512_tile_sharded).permute(
+            dims=[0, 3, 1, 2]
+        )  # [P, n_H512_tiles_sharded, T, _q_width]
     )
 
-    dst_view = TensorView(shfl_sb).slice(dim=2, start=0, end=T)
+    dst_view = shfl_sb.slice(dim=2, start=0, end=T)
 
     nisa.tensor_copy(
-        dst=dst_view.get_view(),
-        src=src_view.get_view(),
+        dst=dst_view,
+        src=src_view,
     )
 
     return shfl_sb
 
 
 def input_fused_add(
-    input: TensorView,
-    fused_add_tensor: TensorView,
-    fused_output: TensorView,
+    input: nl.NkiTensor,
+    fused_add_tensor: nl.NkiTensor,
+    fused_output: nl.NkiTensor,
     normtype: NormType,
     sbm: SbufManager,
     dims: MLPTKGConstantsDimensionSizes,
-) -> TensorView:
+) -> nl.NkiTensor:
     """
     Add fused_add_tensor to input hidden tensor (fused add).
 
-    Depending on sharding:
-    - Batch sharding (`do_norm_batch_sharding`): shard along T.
-    - Hidden sharding: shard along H.
+    Hidden sharding: shard along H.
         A core barrier is inserted when normalization follows to ensure all shards complete before use.
 
     Flattens 3D inputs to 2D, shards along T (batch) or H (hidden), and performs
     element-wise add on HBM using dma_compute.
 
     Args:
-        input (TensorView): Input hidden state [B, S, H] in HBM.
-        fused_add_tensor (TensorView): Tensor to add [B, S, H] in HBM.
-        fused_output (TensorView): Output buffer, modified in-place.
+        input (NkiTensor): Input hidden state [B, S, H] in HBM.
+        fused_add_tensor (NkiTensor): Tensor to add [B, S, H] in HBM.
+        fused_output (NkiTensor): Output buffer, modified in-place.
         normtype (NormType): Normalization type (controls barrier usage).
         sbm (SbufManager): SBUF allocation manager.
         dims (MLPTKGConstantsDimensionSizes): Dimension and sharding metadata.
 
     Returns:
-        TensorView: fused_output in HBM.
+        NkiTensor: fused_output in HBM.
     """
     shard_id = dims.shard_id
     num_shards = dims.num_shards
@@ -343,58 +327,47 @@ def input_fused_add(
     )
     fused_out_2d = fused_output.flatten_dims(start_dim=0, end_dim=1) if len(fused_output.shape) == 3 else fused_output
 
-    if num_shards > 1 and dims.do_norm_batch_sharding:
-        # Batch-sharded
-        T_shard = dims.T // num_shards
-        input_nd = input_2d.reshape_dim(dim=0, shape=[num_shards, T_shard]).select(dim=0, index=shard_id)
-        fused_add_nd = fused_add_2d.reshape_dim(dim=0, shape=[num_shards, T_shard]).select(dim=0, index=shard_id)
-        fused_out_nd = fused_out_2d.reshape_dim(dim=0, shape=[num_shards, T_shard]).select(dim=0, index=shard_id)
-    else:
-        # Hidden-sharded
-        input_nd = input_2d.reshape_dim(dim=1, shape=[num_shards, H_per_shard]).select(dim=1, index=shard_id)
-        fused_add_nd = fused_add_2d.reshape_dim(dim=1, shape=[num_shards, H_per_shard]).select(dim=1, index=shard_id)
-        fused_out_nd = fused_out_2d.reshape_dim(dim=1, shape=[num_shards, H_per_shard]).select(dim=1, index=shard_id)
+    # Hidden-sharded
+    input_nd = input_2d.reshape_dim(dim=1, shape=[num_shards, H_per_shard]).select(dim=1, index=shard_id)
+    fused_add_nd = fused_add_2d.reshape_dim(dim=1, shape=[num_shards, H_per_shard]).select(dim=1, index=shard_id)
+    fused_out_nd = fused_out_2d.reshape_dim(dim=1, shape=[num_shards, H_per_shard]).select(dim=1, index=shard_id)
 
     nisa.dma_compute(
-        dst=fused_out_nd.get_view(),
-        srcs=[input_nd.get_view(), fused_add_nd.get_view()],
+        dst=fused_out_nd,
+        srcs=[input_nd, fused_add_nd],
         scales=[1.0, 1.0],
         reduce_op=nl.add,
     )
 
     if num_shards > 1 and normtype.value != NormType.NO_NORM.value:
-        nisa.core_barrier(fused_output.get_view(), cores=[0, 1])
+        nisa.core_barrier(fused_output, cores=[0, 1])
 
     return fused_output
 
 
 def input_norm_load(
-    input: TensorView,
-    output: TensorView,
+    input: nl.NkiTensor,
     params: MLPParameters,
     dims: MLPTKGConstantsDimensionSizes,
     sbm: SbufManager,
     T_offset: int = 0,
-) -> TensorView:
+) -> nl.NkiTensor:
     """
     Load input activations and optionally apply normalization.
 
+    Allocates the output SBUF buffer internally and returns it.
+    Output is always [H0, H1_shard, T] layout.
+
     Args:
-        input (TensorView): Input hidden state [B, S, H] in HBM, [H0, T, H1] in SBUF, or [H0, n_prgs, H1_shard, BxS] when transposed_in=True.
-        output (TensorView): SBUF tensor [H0, T, H1_shard] for normalized or loaded output.
+        input (NkiTensor): Input hidden state [B, S, H] in HBM, [H0, T, H1] in SBUF,
+            or [H0, n_prgs, H1_shard, T] when transposed_in=True.
         params (MLPParameters): Normalization parameters and settings.
-        dims (MLPTKGConstantsDimensionSizes): Dimension data.
+        dims (MLPTKGConstantsDimensionSizes): Dimension data. hidden_layout is set by this function.
         sbm (SbufManager): SBUF allocation manager.
         T_offset (int): Offset into the T dimension for T-tiling. Only used in no-norm HBM path.
 
     Returns:
-        TensorView: SBUF [H0, T, H1_shard].
-
-    Notes:
-        - MLP weight tensors are stack-allocated.
-        - Normalization intermediates are heap-allocated to avoid address
-          reuse and thereby prevent anti-dependencies when prefetching MLP weight tensors.
-        - Supports RMSNorm and LayerNorm.
+        NkiTensor: SBUF [H0, H1_shard, T].
     """
     H0 = dims.H0
     T = dims.T
@@ -406,112 +379,17 @@ def input_norm_load(
     norm_bias = params.norm_params.normalization_bias_tensor
     eps = params.eps
 
+    output = alloc_tensor_view(
+        sbm,
+        (H0, H1_shard * T),
+        dtype=params.output_dtype,
+        buffer=nl.sbuf,
+        name="input_sbuf",
+        heap=True,
+    )
+
     # ------------------------- Norm + Input Load -------------------------
     if mlpp_has_normalization(params):
-        if params.transposed_in:
-            # Transposed input: [H0, n_prgs, H1_shard, T] in HBM
-            # Contiguous load per-NC shard, permute in SBUF, run shard_on_h rmsnorm
-            nc_size = H1_shard * T
-            flat_size = num_shards * nc_size
-            nc_offset = shard_id * nc_size
-
-            # Step 1: Contiguous load [H0, H1_shard*T] from HBM
-            input_raw_sb = sbm.alloc_heap(
-                (H0, H1_shard, T), dtype=input.dtype, buffer=nl.sbuf, name="transposed_in_raw"
-            )
-            nisa.dma_copy(
-                dst=input_raw_sb.reshape((H0, nc_size)),
-                src=input.get_view().reshape((H0, flat_size))[:, nc_offset : nc_offset + nc_size],
-            )
-
-            # Step 2: Permute in SBUF: [H0, H1_shard, T] -> [H0, T, H1_shard]
-            input_nc_sb = sbm.alloc_heap(
-                (H0, T, H1_shard), dtype=input.dtype, buffer=nl.sbuf, name="transposed_in_perm"
-            )
-            nisa.tensor_copy(
-                dst=input_nc_sb,
-                src=TensorView(input_raw_sb).permute(dims=[0, 2, 1]).get_view(),
-            )
-
-            # Step 3: Run shard_on_h rmsnorm
-            if mlpp_has_rms_normalization(params):
-                rmsnorm_tkg(
-                    input=TensorView(input_nc_sb),
-                    gamma=norm_weights,
-                    output=output,
-                    eps=eps,
-                    hidden_actual=H0 * H1,
-                    shard_on_h=True,
-                    use_heap_memory=True,
-                    sbm=sbm,
-                )
-            else:
-                layernorm_tkg(
-                    input=TensorView(input_nc_sb),
-                    gamma=norm_weights,
-                    beta=norm_bias,
-                    output=output,
-                    eps=eps,
-                    use_heap_memory=True,
-                    sbm=sbm,
-                )
-            sbm.pop_heap()  # deallocate input_nc_sb
-            sbm.pop_heap()  # deallocate input_raw_sb
-        else:
-            use_th_layout = mlpp_has_rms_normalization(params) and not input.is_sbuf() and T >= H0
-
-            if use_th_layout:
-                # Contiguous load [T, H] + norm in [T, H] layout + transpose to [H0, H1_shard, T]
-                kernel_assert(
-                    dims.hidden_layout == HiddenLayout.H0_H1_T,
-                    "For using (T, H) layout rmsnorm, the hidden layout should be set to (H0, H1, T)",
-                )
-                hidden_flat = input.flatten_dims(start_dim=0, end_dim=1) if len(input.shape) == 3 else input
-                rmsnorm_tkg_th(
-                    input_hbm=hidden_flat,
-                    gamma=norm_weights,
-                    output=output,
-                    num_H_shards=num_shards,
-                    hidden_actual=dims.H,
-                    eps=eps,
-                    sbm=sbm,
-                )
-            else:
-                norm_out = output
-                if num_shards > 1:
-                    norm_out = sbm.alloc_heap((H0, T, H1), dtype=input.dtype, buffer=nl.sbuf, name="norm_out_tensor")
-
-                # Select normalization kernel (RMSNorm or LayerNorm)
-                if mlpp_has_rms_normalization(params):
-                    rmsnorm_tkg(
-                        input=input,
-                        gamma=norm_weights,
-                        output=norm_out,
-                        eps=eps,
-                        use_heap_memory=True,
-                        sbm=sbm,
-                    )
-                else:
-                    layernorm_tkg(
-                        input=input,
-                        gamma=norm_weights,
-                        beta=norm_bias,
-                        output=norm_out,
-                        eps=eps,
-                        use_heap_memory=True,
-                        sbm=sbm,
-                    )
-
-                # Slice normalized output per shard
-                if num_shards > 1:
-                    norm_out = norm_out.reshape(((H0, T, num_shards, H1_shard)))
-                    nisa.tensor_copy(dst=output.get_view(), src=norm_out[:, :, shard_id, :])
-
-                    # deallocate norm_out
-                    sbm.pop_heap()
-
-    # --------------------------- No-Norm Path ----------------------------
-    else:
         if params.transposed_in:
             # Transposed input: [H0, n_prgs, H1_shard, T] in HBM
             # Contiguous load per-NC shard, permute in SBUF
@@ -519,20 +397,78 @@ def input_norm_load(
             flat_size = num_shards * nc_size
             nc_offset = shard_id * nc_size
 
-            raw_sb = sbm.alloc_heap(
-                (H0, H1_shard, T), dtype=input.dtype, buffer=nl.sbuf, name="transposed_in_raw_nonorm"
+            input_nc_sb = sbm.alloc_heap(
+                (H0, T, H1_shard), dtype=input.dtype, buffer=nl.sbuf, name="transposed_in_perm"
             )
+            input_raw_sb = sbm.alloc_heap(
+                (H0, H1_shard, T), dtype=input.dtype, buffer=nl.sbuf, name="transposed_in_raw"
+            )
+            # Step 1: Contiguous load [H0, H1_shard*T] from HBM
             nisa.dma_copy(
-                dst=raw_sb.reshape((H0, nc_size)),
-                src=input.get_view().reshape((H0, flat_size))[:, nc_offset : nc_offset + nc_size],
+                dst=input_raw_sb.reshape((H0, nc_size)),
+                src=input.reshape((H0, flat_size))[:, nc_offset : nc_offset + nc_size],
             )
-            # Permute in SBUF: [H0, H1_shard, T] -> [H0, T, H1_shard]
+            # Step 2: Permute in SBUF: [H0, H1_shard, T] -> [H0, T, H1_shard]
             nisa.tensor_copy(
-                dst=output.get_view(),
-                src=TensorView(raw_sb).permute(dims=[0, 2, 1]).get_view(),
+                dst=input_nc_sb,
+                src=input_raw_sb.permute(dims=[0, 2, 1]),
             )
-            sbm.pop_heap()  # deallocate raw_sb
+            norm_input = input_nc_sb
+            sbm.pop_heap()  # deallocate input_raw_sb
+        elif input.buffer == nl.sbuf:
+            norm_input = input.slice(dim=2, start=shard_id * H1_shard, end=(shard_id + 1) * H1_shard)
         else:
+            norm_input = input
+
+        # Run normalization
+        if mlpp_has_rms_normalization(params):
+            output, out_layout = rmsnorm_tkg(
+                input=norm_input,
+                gamma=norm_weights,
+                output=output,
+                hidden_scale=1.0 / dims.H,
+                eps=eps,
+                hidden_dim_tp=False,
+                sbm=sbm,
+            )
+            dims.hidden_layout = out_layout
+        else:
+            output, out_layout = layernorm_tkg(
+                input=norm_input,
+                gamma=norm_weights,
+                output=output,
+                hidden_scale=1.0 / dims.H,
+                beta=norm_bias,
+                eps=eps,
+                hidden_dim_tp=False,
+                sbm=sbm,
+            )
+            dims.hidden_layout = out_layout
+
+        if params.transposed_in:
+            sbm.pop_heap()  # deallocate input_nc_sb
+
+    # --------------------------- No-Norm Path ----------------------------
+    else:
+        if params.transposed_in:
+            # Transposed input: [H0, n_prgs, H1_shard, T] in HBM
+            # Already in [H0, H1_shard, T] layout per shard
+            dims.hidden_layout = HiddenLayout.H0_H1_T
+
+            nc_size = H1_shard * T
+            flat_size = num_shards * nc_size
+            nc_offset = shard_id * nc_size
+
+            nisa.dma_copy(
+                dst=output.reshape((H0, nc_size)),
+                src=input.reshape((H0, flat_size))[:, nc_offset : nc_offset + nc_size],
+            )
+            output = output.reshape_dim(dim=1, shape=[H1_shard, T])
+        else:
+            # No-norm, non-transposed: load to [H0, T, H1_shard]
+            output = output.reshape_dim(dim=1, shape=[T, H1_shard])
+            dims.hidden_layout = HiddenLayout.H0_T_H1
+
             input_view = input
             if len(input_view.shape) == 3:
                 input_view = input_view.flatten_dims(start_dim=0, end_dim=1)
@@ -560,9 +496,7 @@ def input_norm_load(
             else:
                 input_view = input
                 if len(input_view.shape) == 3:
-                    # (B, S, H)
                     input_view = input_view.flatten_dims(start_dim=0, end_dim=1)
-                # Expecting (T_total, H) otherwise
 
                 # Apply T_offset slicing for T-tiling
                 if T_offset > 0 or T < input_view.shape[0]:
@@ -576,8 +510,8 @@ def input_norm_load(
 
                 # Load input[T, H] to [H0, T, H1_shard]
                 nisa.dma_copy(
-                    src=input_view.get_view(),
-                    dst=output.get_view(),
+                    src=input_view,
+                    dst=output,
                     dge_mode=_DGE_MODE_NONE,
                 )
 
@@ -585,8 +519,8 @@ def input_norm_load(
 
 
 def _load_transposed_tile(
-    src_tensor: TensorView,
-    dst_tile: TensorView,
+    src_tensor: nl.NkiTensor,
+    dst_tile: nl.NkiTensor,
     total_size: int,
     tile_size: int,
     op_name: str,
@@ -599,14 +533,14 @@ def _load_transposed_tile(
     when possible, falls back to dma_copy + nc_transpose for dynamic access patterns.
 
     Args:
-        src_tensor (TensorView): 1D source tensor of size total_size.
-        dst_tile (TensorView): 2D destination tile [tile_size, num_total_tiles] in SBUF.
+        src_tensor (NkiTensor): 1D source tensor of size total_size.
+        dst_tile (NkiTensor): 2D destination tile [tile_size, num_total_tiles] in SBUF.
         total_size (int): Total number of elements in source.
         tile_size (int): Size of each tile (typically I0=128).
         op_name (str): Operation name for buffer naming.
         sbm (SbufManager): SBUF allocation manager.
     """
-    src_dim = 0 if src_tensor.get_dim() == 1 else 1
+    src_dim = 0 if src_tensor.ndim == 1 else 1
     num_full_tiles = total_size // tile_size
     res_elements = total_size % tile_size
 
@@ -614,12 +548,12 @@ def _load_transposed_tile(
         src_view = src_tensor.slice(dim=src_dim, start=0, end=total_size - res_elements).reshape_dim(
             dim=src_dim, shape=(num_full_tiles, tile_size)
         )
-        if not src_view.has_dynamic_access():
-            while src_view.get_dim() < 4:
+        if not src_view.is_indirect():
+            while src_view.ndim < 4:
                 src_view = src_view.expand_dim(1)
             nisa.dma_transpose(
-                src=src_view.get_view(),
-                dst=dst_tile.slice(dim=1, start=0, end=num_full_tiles).expand_dim(1).expand_dim(1).get_view(),
+                src=src_view,
+                dst=dst_tile.slice(dim=1, start=0, end=num_full_tiles).expand_dim(1).expand_dim(1),
                 dge_mode=_DGE_MODE_NONE,
             )
         else:
@@ -632,12 +566,7 @@ def _load_transposed_tile(
             )
             tmp_psum = nl.ndarray((tile_size, num_full_tiles), dtype=src_tensor.dtype, buffer=nl.psum)
             nisa.dma_copy(
-                src=src_view.base_tensor.ap(
-                    pattern=[[tile_size, num_full_tiles], [1, tile_size]],
-                    offset=src_view.offset,
-                    indirect_dim=src_view.indirect_dim,
-                    scalar_offset=src_view.scalar_offset,
-                ),
+                src=src_view,
                 dst=tmp_sbuf.ap(
                     pattern=[[tile_size, num_full_tiles], [1, tile_size]],
                     offset=0,
@@ -645,20 +574,20 @@ def _load_transposed_tile(
                 dge_mode=adaptive_dge_mode(src_view),
             )
             nisa.nc_transpose(dst=tmp_psum, data=tmp_sbuf)
-            nisa.tensor_copy(dst=dst_tile.slice(dim=1, start=0, end=num_full_tiles).get_view(), src=tmp_psum)
+            nisa.tensor_copy(dst=dst_tile.slice(dim=1, start=0, end=num_full_tiles), src=tmp_psum)
 
     if res_elements > 0:
         src_view = src_tensor.slice(dim=src_dim, start=total_size - res_elements, end=total_size).expand_dim(1)
         nisa.dma_copy(
-            src=src_view.get_view(),
-            dst=dst_tile.slice(dim=0, start=0, end=res_elements)
-            .slice(dim=1, start=num_full_tiles, end=num_full_tiles + 1)
-            .get_view(),
+            src=src_view,
+            dst=dst_tile.slice(dim=0, start=0, end=res_elements).slice(
+                dim=1, start=num_full_tiles, end=num_full_tiles + 1
+            ),
             dge_mode=adaptive_dge_mode(src_view),
         )
 
 
-def _clamp_lower_upper_limit(tensor: nl.ndarray, lower_limit, upper_limit) -> None:
+def _clamp_lower_upper_limit(tensor: nl.NkiTensor, lower_limit, upper_limit) -> None:
     """Apply optional lower and upper clamping to a tensor in-place."""
     if upper_limit is not None:
         nisa.tensor_scalar(data=tensor, dst=tensor, op0=nl.minimum, operand0=upper_limit)
@@ -667,8 +596,8 @@ def _clamp_lower_upper_limit(tensor: nl.ndarray, lower_limit, upper_limit) -> No
 
 
 def transpose_store(
-    output_temp: nl.ndarray,
-    output: nl.ndarray,
+    output_temp: nl.NkiTensor,
+    output: nl.NkiTensor,
     dims: MLPTKGConstantsDimensionSizes,
     output_dtype: nki.dtype,
     sbm: SbufManager,
@@ -682,8 +611,8 @@ def transpose_store(
     and data layout.
 
     Args:
-        output_temp (nl.ndarray): Temporary output tensor storage [H0, H1, T] in SBUF.
-        output (nl.ndarray): Final output tensor [T, H] in HBM.
+        output_temp (nl.NkiTensor): Temporary output tensor storage [H0, H1, T] in SBUF.
+        output (nl.NkiTensor): Final output tensor [T, H] in HBM.
         dims (MLPTKGConstantsDimensionSizes): Dimension sizes object.
         output_dtype (nki.dtype): Data type of the output tensor.
         sbm (SbufManager): SbufManager for buffer allocation.
@@ -724,8 +653,8 @@ def transpose_store(
 
 
 def transpose_store_sbuf_copy(
-    output_temp: nl.ndarray,
-    output: nl.ndarray,
+    output_temp: nl.NkiTensor,
+    output: nl.NkiTensor,
     dims: MLPTKGConstantsDimensionSizes,
     output_dtype: nki.dtype,
     sbm: SbufManager,
@@ -740,8 +669,8 @@ def transpose_store_sbuf_copy(
     a single DMA using access patterns.
 
     Args:
-        output_temp (nl.ndarray): Temporary output tensor storage [H0, H1_shard, T] in SBUF.
-        output (nl.ndarray): Final output tensor [T, H] in HBM.
+        output_temp (nl.NkiTensor): Temporary output tensor storage [H0, H1_shard, T] in SBUF.
+        output (nl.NkiTensor): Final output tensor [T, H] in HBM.
         dims (MLPTKGConstantsDimensionSizes): Dimension sizes object.
         output_dtype (nki.dtype): Data type of the output tensor.
         sbm (SbufManager): SbufManager for buffer allocation.
@@ -778,17 +707,17 @@ def transpose_store_sbuf_copy(
     )
 
 
-def adaptive_dge_mode(tensor: TensorView) -> int:
+def adaptive_dge_mode(tensor: nl.NkiTensor) -> int:
     """
     Determine DGE mode based on tensor access pattern.
 
     Args:
-        tensor: TensorView to check for dynamic access.
+        tensor: nl.NkiTensor to check for dynamic access.
 
     Returns:
         int: _DGE_MODE_UNKNOWN if dynamic access (compiler decides), _DGE_MODE_NONE (static) otherwise.
     """
-    if not isinstance(tensor, TensorView) or not tensor.has_dynamic_access():
+    if not tensor.is_indirect():
         return _DGE_MODE_NONE
     else:
         return _DGE_MODE_UNKNOWN

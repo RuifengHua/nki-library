@@ -14,21 +14,15 @@
 
 """PyTorch reference implementation for qkv_tkg kernel."""
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import nki.language as nl
 import numpy as np
 import torch
 
-from test.integration.nkilib.utils.test_kernel_common import norm_name2func_torch
-
-from ..utils.common_types import NormType, QKVOutputLayout, QuantizationType
+from ..subkernels.norm_torch_dispatch import norm_name2func_torch
+from ..utils.common_types import DtypeMode, NormType, QKVOutputLayout, QuantizationType
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
-
-# FP8 clipping constant for STATIC quantization (float8_e4m3 max representable value)
-FP8_E4M3_CLIP_VALUE = get_max_positive_value_for_dtype(nl.float8_e4m3)
-# FP8 clipping constant for STATIC_MX quantization (float8_e4m3fn max representable value)
-FP8_E4M3FN_CLIP_VALUE = get_max_positive_value_for_dtype(nl.float8_e4m3fn)
 
 P_MAX = 128
 _Q_WIDTH = 4
@@ -55,7 +49,9 @@ def qkv_tkg_torch_ref(
     qkv_bias: Optional[torch.Tensor] = None,
     norm_bias: Optional[torch.Tensor] = None,
     hidden_actual: Optional[int] = None,
+    sbm: Any = None,  # noqa: ARG001 — SbufManager is hardware-only; accepted for signature parity with kernel
     transposed_in: bool = False,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> Dict[str, torch.Tensor]:
     """
     PyTorch reference implementation for qkv_tkg kernel.
@@ -159,20 +155,13 @@ def qkv_tkg_torch_ref(
     is_row_mx = quantization_type == QuantizationType.ROW_MX
     is_static = quantization_type == QuantizationType.STATIC
 
-    # STATIC_MX / ROW_MX: unpack fp8_x4 weights to float32 [H, I]
+    # STATIC_MX / ROW_MX: weights are unpacked fp8 [H//4, I, 4] -> float32 [H, I]
     if is_static_mx or is_row_mx:
-        from ..utils.mx_torch_common import unpack_float8_e4m3fn_x4
-
         weights_np = qkv_w if isinstance(qkv_w, np.ndarray) else qkv_w.numpy()
-        w_unpacked_np = unpack_float8_e4m3fn_x4(weights_np).numpy()
+        # weights_np is [H//4, I, 4] unpacked fp8
         H_quarter = weights_np.shape[0]
-        I = w_unpacked_np.shape[1] // _Q_WIDTH
-        qkv_w = torch.from_numpy(
-            w_unpacked_np.reshape(H_quarter, I, _Q_WIDTH)
-            .transpose(0, 2, 1)
-            .reshape(H_quarter * _Q_WIDTH, I)
-            .astype(np.float32)
-        )
+        I = weights_np.shape[1]
+        qkv_w = torch.from_numpy(weights_np.transpose(0, 2, 1).reshape(H_quarter * _Q_WIDTH, I).astype(np.float32))
     else:
         qkv_w = qkv_w.to(torch.float32)
 
@@ -219,12 +208,20 @@ def qkv_tkg_torch_ref(
             raise ValueError("num_q_heads required for STATIC/STATIC_MX quantization")
         if num_kv_heads is None:
             raise ValueError("num_kv_heads required for STATIC/STATIC_MX quantization")
-        clip_value = FP8_E4M3FN_CLIP_VALUE if is_static_mx else FP8_E4M3_CLIP_VALUE
+        # STATIC_MX is always OCP. STATIC follows dtype_mode (caller pre-resolves AUTO).
+        assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
+            "qkv_tkg_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+        )
+        if is_static_mx or dtype_mode == DtypeMode.OCP:
+            _fp8_e4m3_dtype = nl.float8_e4m3fn
+        else:
+            _fp8_e4m3_dtype = nl.float8_e4m3
+        clip_value = get_max_positive_value_for_dtype(_fp8_e4m3_dtype)
         hidden = (hidden / qkv_in_scale).clamp(-clip_value, clip_value)
 
     if is_row_mx:
-        # Per-row dynamic quantization: absmax per token, scale = absmax / fp8_max
-        clip_value = FP8_E4M3FN_CLIP_VALUE
+        # ROW_MX is TRN3-only, always OCP.
+        clip_value = get_max_positive_value_for_dtype(nl.float8_e4m3fn)
         absmax = hidden.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
         row_dequant_scale = absmax / clip_value
         hidden = (hidden / row_dequant_scale).clamp(-clip_value, clip_value)
@@ -277,7 +274,7 @@ def qkv_tkg_torch_ref(
 
 def _qkv_tkg_mx_torch_ref(
     hidden: torch.Tensor,
-    qkv_w,  # numpy fp8_x4
+    qkv_w,  # numpy fp8 [H//4, I, 4]
     norm_w: Optional[torch.Tensor],
     fused_add: bool,
     mlp_prev: Optional[torch.Tensor],
@@ -328,7 +325,8 @@ def _qkv_tkg_mx_torch_ref(
 
     # MX block quantization of input
     weights_np = qkv_w if isinstance(qkv_w, np.ndarray) else qkv_w.numpy()
-    _, I = weights_np.shape
+    # weights_np is [H//4, I, 4] unpacked fp8
+    H_quarter, I, _pack = weights_np.shape
 
     hidden_np = hidden.reshape(B * S, H).T.numpy()  # [H, B*S]
     hidden_np = (
@@ -339,8 +337,8 @@ def _qkv_tkg_mx_torch_ref(
     )
     hidden_mx, hidden_scale = quantize_to_mx(hidden_np, nl.float8_e4m3fn_x4)
 
-    # Unpack weights and hidden from x4 packed format
-    weights_unpacked = unpack_float8_e4m3fn_x4(weights_np)
+    # Unpack hidden from x4 packed format; weights are already unpacked [H//4, I, 4]
+    weights_unpacked = torch.from_numpy(weights_np.reshape(H_quarter, I * _Q_WIDTH).astype(np.float32))
     hidden_mx_torch = unpack_float8_e4m3fn_x4(hidden_mx)
 
     # Prepare scales

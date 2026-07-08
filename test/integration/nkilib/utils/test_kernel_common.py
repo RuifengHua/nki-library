@@ -19,9 +19,29 @@ import numpy as np
 import torch
 from scipy.special import erf, expit
 
-from nkilib_src.nkilib.core.subkernels.layernorm_torch import layer_norm_torch_ref
-from nkilib_src.nkilib.core.subkernels.rmsnorm_torch import rms_norm_torch_ref
-from nkilib_src.nkilib.core.utils.common_types import ActFnType, NormType
+from nkilib_src.nkilib.core.subkernels.norm_torch_dispatch import norm_name2func_torch as _norm_name2func_torch_src
+from nkilib_src.nkilib.core.utils.common_types import ActFnType, DtypeMode, NormType
+from test.utils.common_dataclasses import Platforms
+
+
+def resolve_dtype_mode_for_torch_ref(dtype_mode: DtypeMode, platform_target: Platforms) -> DtypeMode:
+    """Pre-resolve ``DtypeMode.AUTO`` to ``OCP`` / ``NON_OCP`` for torch refs.
+
+    The kernel resolves AUTO at trace time using ``nisa.get_nc_version()``.
+    Torch refs run on CPU and have no equivalent signal, so tests pick based
+    on ``platform_target.is_trn3()`` before handing the mode to the ref.
+
+    Args:
+        dtype_mode: Caller's ``DtypeMode``. ``OCP`` and ``NON_OCP`` pass through.
+        platform_target: Pytest's ``platform_target`` fixture. TRN3 picks ``OCP``;
+            anything else picks ``NON_OCP``, matching the kernel's trace-time choice.
+
+    Returns:
+        ``DtypeMode.OCP`` or ``DtypeMode.NON_OCP``.
+    """
+    if dtype_mode == DtypeMode.AUTO:
+        return DtypeMode.OCP if platform_target.is_trn3() else DtypeMode.NON_OCP
+    return dtype_mode
 
 
 def rms_norm(hidden, gamma, eps=1e-6, hidden_actual=None, **_):
@@ -61,12 +81,7 @@ norm_name2func = {
 }
 
 
-norm_name2func_torch = {
-    NormType.NO_NORM: lambda *x, **_: x[0],
-    NormType.RMS_NORM: rms_norm_torch_ref,
-    NormType.LAYER_NORM: layer_norm_torch_ref,
-    NormType.RMS_NORM_SKIP_GAMMA: rms_norm_torch_ref,
-}
+norm_name2func_torch = _norm_name2func_torch_src
 
 
 def gelu(x: np.ndarray):

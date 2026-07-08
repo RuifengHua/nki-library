@@ -52,7 +52,7 @@ _FP8_DTYPE_MAP = {
 }
 
 
-def quantize_mxfp8_torch_ref(
+def quantize_block_mxfp8_torch_ref(
     src_tensor: np.ndarray,
     return_fp8_dtype: str,
     run_with_lnc2: bool = False,

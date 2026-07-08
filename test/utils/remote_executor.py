@@ -108,6 +108,7 @@ class RemoteExecutor:
         self._connection = connection
         self._next_id = 0
         self._channel = None
+        self._explicitly_closed = False
         self._start()
 
     def _start(self):
@@ -127,6 +128,9 @@ class RemoteExecutor:
         # Verify the server is alive
         resp = self.call("ping")
         if resp != "ok":
+            # Null the channel so the next call self-heals cleanly instead of
+            # reusing this half-started (live socket, bad server) channel.
+            self._channel = None
             raise RemoteExecutorError(f"Remote executor ping failed: {resp}")
 
     def _recv_line(self) -> str:
@@ -153,8 +157,14 @@ class RemoteExecutor:
         Raises:
             RemoteExecutorError: On protocol or server-side errors.
         """
+        # Distinguish an intentional shutdown from a crashed channel. close() sets
+        # _explicitly_closed; a transient I/O failure only nulls _channel. In the
+        # latter case self-heal by rebuilding the channel before serving this request
+        # (we never silently retry the in-flight request that hit the failure).
         if self._channel is None:
-            raise RemoteExecutorError("Executor is closed")
+            if self._explicitly_closed:
+                raise RemoteExecutorError("Executor is closed")
+            self._start()
         req_id = self._next_id
         self._next_id += 1
         request = {"id": req_id, "token": self._token, "method": method, "params": params}
@@ -191,6 +201,10 @@ class RemoteExecutor:
 
     def close(self):
         """Shut down the remote server and close the channel."""
+        # Mark closed first and unconditionally: a crashed executor (channel
+        # already nulled by a prior I/O failure) must still be treated as
+        # explicitly closed so a later call() does not silently resurrect it.
+        self._explicitly_closed = True
         if self._channel is None:
             return
         try:

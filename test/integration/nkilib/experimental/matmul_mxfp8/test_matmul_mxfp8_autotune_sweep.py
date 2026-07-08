@@ -70,12 +70,30 @@ def _parse_shapes():
     model_config = os.environ.get("AUTOTUNE_MODEL_CONFIG", "")
     if model_config.strip():
         from test.integration.nkilib.experimental.matmul_mxfp8.model_config_reader import (
-            generate_transformer_block_shapes,
+            TorchTitanModelConfig,
+            generate_attention_shapes,
+            generate_dense_mlp_shapes,
+            generate_moe_expert_mlp_shapes,
         )
 
         tp = int(os.environ.get("AUTOTUNE_TP", "1"))
         cp = int(os.environ.get("AUTOTUNE_CP", "1"))
-        model_shapes = generate_transformer_block_shapes(model_config, TP=tp, CP=cp)
+        cfg = TorchTitanModelConfig.from_json(model_config)
+        is_moe = (
+            cfg.get("moe_enabled", "False").lower() == "true"
+            if isinstance(cfg.get("moe_enabled"), str)
+            else bool(cfg.get("moe_enabled", False))
+        )
+
+        if is_moe:
+            model_shapes = generate_attention_shapes(model_config, TP=tp, CP=cp) + generate_moe_expert_mlp_shapes(
+                model_config, TP=tp
+            )
+        else:
+            model_shapes = generate_attention_shapes(model_config, TP=tp, CP=cp) + generate_dense_mlp_shapes(
+                model_config, TP=tp, CP=cp
+            )
+
         seen = set()
         for name, M, K, N in model_shapes:
             M, K, N = int(M), int(K), int(N)
@@ -115,7 +133,7 @@ def _make_test_config(kc, dtype_mode, idx, shape_label):
             seed=42,
             lhs_dtype=constants.MatrixPrecision.MXFP8_X4,
             rhs_dtype=constants.MatrixPrecision.MXFP8_X4,
-            output_dtype=constants.MatrixPrecision.FP32,
+            output_dtype=constants.MatrixPrecision.BFLOAT16,
             dists=["uniform", "uniform"],
             params=[{"a": -1.0, "b": 1.0}, {"a": -1.0, "b": 1.0}],
         )
@@ -138,11 +156,11 @@ def _make_test_config(kc, dtype_mode, idx, shape_label):
             seed=42,
             lhs_dtype=constants.MatrixPrecision.BFLOAT16,
             rhs_dtype=constants.MatrixPrecision.BFLOAT16,
-            output_dtype=constants.MatrixPrecision.FP32,
+            output_dtype=constants.MatrixPrecision.BFLOAT16,
             enable_scale_packing=False,
             lhs_is_swizzled=True,
             rhs_is_swizzled=True,
-            spill_reload=True,
+            spill_reload=kc.spill_reload,
             dists=["uniform", "uniform"],
             params=[{"a": -1.0, "b": 1.0}, {"a": -1.0, "b": 1.0}],
         )
@@ -159,6 +177,9 @@ def _generate_all_configs():
         candidates = generate_autotune_candidates(base)
         for mode in modes:
             for idx, kc in enumerate(candidates):
+                # Skip spill_reload=True for prequant (mxfp8 never uses spill)
+                if mode == "prequant" and kc.spill_reload:
+                    continue
                 configs.append(_make_test_config(kc, mode, idx, label))
     return configs
 
@@ -183,6 +204,7 @@ class TestMatmulMxfp8AutotuneSweep:
         if not platform_target.is_trn3():
             pytest.skip("MX is only supported on TRN3.")
 
+        test_manager.collector.set_kernel_params(conf.to_metrics_dict())
         output_dtype = get_output_dtype(conf)
 
         def input_generator(test_config):
@@ -194,7 +216,6 @@ class TestMatmulMxfp8AutotuneSweep:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
 
         framework = UnitTestFramework(

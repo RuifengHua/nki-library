@@ -21,30 +21,28 @@ from typing import Any, Union
 import numpy as np
 import numpy.typing as npt
 
+# Unpack functions for packed x4 MX dtypes → float32 numpy arrays for histogram visualization
+from nkilib_src.nkilib.core.utils.mx_torch_common import (
+    unpack_float4_x4,
+    unpack_float8_e4m3fn_x4,
+    unpack_float8_e5m2_x4,
+)
+
 from .common_dataclasses import (
     CustomValidatorWithOutputTensorData,
     KernelArgs,
     LazyGoldenGenerator,
     PerRankLazyGoldenGenerator,
 )
-from .comparators import get_largest_abs_diff, maxAllClose
+from .comparators import max_all_close_with_accuracy
 from .metrics_collector import IMetricsCollector, MetricName
 from .tensor_histogram import TensorHistogram
 
-
-def _get_x4_unpackers() -> dict:
-    """Lazy import of MX unpack functions to avoid pulling in neuron_dtypes at module load time."""
-    from nkilib_src.nkilib.core.utils.mx_torch_common import (
-        unpack_float4_x4,
-        unpack_float8_e4m3fn_x4,
-        unpack_float8_e5m2_x4,
-    )
-
-    return {
-        "float8_e4m3fn_x4": unpack_float8_e4m3fn_x4,
-        "float8_e5m2_x4": unpack_float8_e5m2_x4,
-        "float4_e2m1fn_x4": unpack_float4_x4,
-    }
+_X4_UNPACKERS = {
+    "float8_e4m3fn_x4": unpack_float8_e4m3fn_x4,
+    "float8_e5m2_x4": unpack_float8_e5m2_x4,
+    "float4_e2m1fn_x4": unpack_float4_x4,
+}
 
 
 def load_output_tensor_as_bytes(filepath: Union[str, pathlib.Path]) -> npt.NDArray[np.uint8]:
@@ -237,7 +235,7 @@ class OutputValidator:
         rank_prefix = f"rank{rank_id}:" if rank_id is not None else ""
         for output_key, expected_value in golden_output.items():
             assert output_key in actual_outputs, (
-                f"{rank_prefix}{output_key} was not emitted by neuron-profile capture. Double check the names of golden outputs and variable names of what {self.kernels_args.kernel_func.__name__} returns "
+                f"{rank_prefix}{output_key} was not emitted by neuron-explorer capture. Double check the names of golden outputs and variable names of what {self.kernels_args.kernel_func.__name__} returns "
             )
 
             if isinstance(expected_value, CustomValidatorWithOutputTensorData):
@@ -258,7 +256,7 @@ class OutputValidator:
                 except TypeError:
                     dtype_name = str(actual_outputs[output_key].dtype)
                     label = f"{rank_prefix}{output_key}"
-                    unpacker = _get_x4_unpackers().get(dtype_name)
+                    unpacker = _X4_UNPACKERS.get(dtype_name)
                     if unpacker is None:
                         if enable_histograms:
                             self.LOGGER.info(
@@ -280,19 +278,14 @@ class OutputValidator:
                     actual_output = unpacker(actual_outputs[output_key]).numpy().astype(np.float32)
                     expected_output = unpacker(expected_value).numpy().astype(np.float32)
 
-                largest_abs_diff = get_largest_abs_diff(actual_output, expected_output, atol=params.absolute_accuracy)
-
-                # Record -1 if accuracy metric is invalid
-                if math.isfinite(largest_abs_diff):
-                    metrics_collector.record_metric(MetricName.ACCURACY_HW, largest_abs_diff, "None")
-                else:
-                    metrics_collector.record_metric(MetricName.ACCURACY_HW, -1.0, "None")
-
-                # Perform comparison
+                # max_all_close_with_accuracy hands back the largest-abs-diff accuracy
+                # metric it already computes internally, so we avoid a second
+                # full-array pass that a separate get_largest_abs_diff call would
+                # cost (significant for large unpacked MX outputs).
                 self.LOGGER.info(f"Results for {rank_prefix}{output_key}:")
                 if logfile:
                     print(f"Results for {rank_prefix}{output_key}:", file=logfile)
-                comparison_passed = maxAllClose(
+                result = max_all_close_with_accuracy(
                     actual_output,
                     expected_output,
                     params.relative_accuracy,
@@ -301,6 +294,14 @@ class OutputValidator:
                     verbose=1,
                     logfile=logfile,
                 )
+                comparison_passed = result.passed
+                largest_abs_diff = result.accuracy
+
+                # Record -1 if accuracy metric is invalid
+                if math.isfinite(largest_abs_diff):
+                    metrics_collector.record_metric(MetricName.ACCURACY_HW, largest_abs_diff, "None")
+                else:
+                    metrics_collector.record_metric(MetricName.ACCURACY_HW, -1.0, "None")
 
                 # Print visualization report (always if enabled, regardless of pass/fail)
                 visualizer.print_full_comparison_report(
@@ -334,7 +335,7 @@ class OutputValidator:
         result: dict[str, npt.NDArray[Any]] = {}
 
         for output_file_path in output_file_list:
-            # neuron-profiler names files the same as output variable name
+            # neuron-explorer names files the same as output variable name
             file_name_without_extension = os.path.splitext(os.path.basename(output_file_path))[0]
 
             if file_name_without_extension not in golden_output:

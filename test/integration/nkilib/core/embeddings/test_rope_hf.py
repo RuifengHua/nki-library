@@ -47,6 +47,18 @@ ROPE_HF_TEST_CASES = [
     (1, 32, 8, 256, 128, nl.float32, True),    # Backward pass, float32
     (1, 32, 8, 64, 128, nl.float32, False),    # NEGATIVE TEST CASE: seq_len < PMAX * lnc_count
 ]
+
+
+# (batch_size, num_q_heads, num_kv_heads, seq_len, head_dim, dtype, backward)
+_ROPE_HF_LNC_FAST_KEYS = frozenset({
+    (4, 1, 1, 512, 128, nl.bfloat16, False),    # No GQA, bfloat16
+    (1, 32, 8, 256, 128, nl.float32, True),     # Backward pass, float32
+    (1, 32, 8, 64, 128, nl.float32, False),     # NEGATIVE TEST CASE: seq_len < PMAX * lnc_count
+})
+ROPE_HF_LNC_TEST_CASES = [
+    pytest.param(*c, marks=pytest.mark.fast) if c in _ROPE_HF_LNC_FAST_KEYS else pytest.param(*c)
+    for c in ROPE_HF_TEST_CASES
+]
 # fmt: on
 
 _ABBREVS = {
@@ -92,9 +104,8 @@ def _generate_inputs(batch_size, num_q_heads, num_kv_heads, seq_len, head_dim, d
 class TestRopeHFKernel:
     """Test class for rope kernel with HuggingFace format."""
 
-    @pytest.mark.fast
     @pytest.mark.parametrize("lnc_count", [1, 2])
-    @pytest_parametrize(ROPE_HF_PARAMS, ROPE_HF_TEST_CASES, abbrevs=_ABBREVS)
+    @pytest_parametrize(ROPE_HF_PARAMS, ROPE_HF_LNC_TEST_CASES, abbrevs=_ABBREVS)
     def test_rope_hf_lnc(
         self,
         test_manager: Orchestrator,

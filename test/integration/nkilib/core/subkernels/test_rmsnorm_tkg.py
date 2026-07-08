@@ -56,7 +56,7 @@ RMSNORM_TKG_TEST_CASES = [
     (2, 1, 1, 8192, None, False, False, np.float16),
     # LNC2 higher batch
     (2, 2, 8, 8192, None, False, False, np.float16),
-    (2, 4, 8, 8192, None, False, False, np.float16),
+    pytest.param(2, 4, 8, 8192, None, False, False, np.float16, marks=pytest.mark.fast),
     (2, 128, 1, 8192, None, False, False, np.float16),
     (2, 4, 1, 5120, None, False, False, np.float16),
     # LNC2 BxS tiling
@@ -70,13 +70,13 @@ RMSNORM_TKG_TEST_CASES = [
     (2, 2, 8, 16384, None, False, False, np.float16),
     (2, 2, 8, 3072, 2880, False, False, np.float16),
     # hidden_dim_tp = True
-    (1, 1, 1, 4096, 3072, True, False, np.float16),
+    pytest.param(1, 1, 1, 4096, 3072, True, False, np.float16, marks=pytest.mark.fast),
     (2, 1, 1, 5120, None, True, False, np.float16),
     (2, 128, 1, 8192, None, True, False, np.float16),
     (2, 2, 8, 3072, 2880, True, False, np.float16),
     # Shard on H
     (2, 1, 1, 8192, None, False, True, np.float16),
-    (2, 2, 8, 8192, None, False, True, np.float16),
+    pytest.param(2, 2, 8, 8192, None, False, True, np.float16, marks=pytest.mark.fast),
     (2, 1, 1, 5120, None, False, True, np.float16),
     (2, 4, 1, 3072, None, False, True, np.float16),
     (2, 1, 1, 16384, None, False, True, np.float16),
@@ -89,7 +89,6 @@ RMSNORM_TKG_TEST_CASES = [
 class TestRmsNormTKGKernel:
     """Test class for RMSNorm TKG kernel using UnitTestFramework."""
 
-    @pytest.mark.fast
     @pytest_parametrize(RMSNORM_TKG_PARAMS, RMSNORM_TKG_TEST_CASES, abbrevs=_ABBREVS)
     def test_rmsnorm_tkg_unit(
         self,

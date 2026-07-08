@@ -20,7 +20,7 @@ import nki.language as nl
 import numpy as np
 import torch
 
-from ..utils.common_types import QuantizationType
+from ..utils.common_types import DtypeMode, QuantizationType
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
 from ..utils.mx_torch_common import mx_matmul, quantize_to_mx, unpack_float8_e4m3fn_x4
 
@@ -40,6 +40,7 @@ def output_projection_tkg_torch_ref(
     TRANSPOSE_OUT: bool = False,
     OUT_IN_SB: bool = False,
     sbm=None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> dict:
     """PyTorch reference implementation of output projection for TKG (token generation).
 
@@ -68,6 +69,11 @@ def output_projection_tkg_torch_ref(
             False: [B*S, H]
             True: [128, lnc, H//(lnc*128), B*S] where lnc is inferred from H.
     """
+    # AUTO must be pre-resolved by the caller (see resolve_dtype_mode_for_torch_ref);
+    # the torch ref runs on CPU and can't query hardware.
+    assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
+        "output_projection_tkg_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+    )
 
     if quantization_type == QuantizationType.MX:
         return output_projection_tkg_mx_torch_ref(
@@ -86,26 +92,19 @@ def output_projection_tkg_torch_ref(
     is_static = quantization_type == QuantizationType.STATIC
 
     D, B, N, S = attention.shape
-    H = weight.shape[1]
 
     attention = attention.float()
     # Reshape from [D, B, N, S] to [B*S, N*D]
     attn = attention.permute(1, 3, 2, 0).reshape(B * S, N * D)
 
-    # STATIC_MX: Undo packing of fp8_x4 weights, to float32 [N*D, H]
-    # In this torch-stub we use the regular numpy matmult (not matmult_mx), so 4x packing has to be undone.
+    # STATIC_MX: weights are unpacked fp8 [N*D//4, H, 4] -> float32 [N*D, H]
     if is_static_mx:
         weights_np = weight if isinstance(weight, np.ndarray) else weight.numpy()
         ND_packed = weights_np.shape[0]
-        w_unpacked_np = unpack_float8_e4m3fn_x4(weights_np).numpy()
-        H = w_unpacked_np.shape[1] // _Q_WIDTH
-        weight = torch.from_numpy(
-            w_unpacked_np.reshape(ND_packed, H, _Q_WIDTH)
-            .transpose(0, 2, 1)
-            .reshape(ND_packed * _Q_WIDTH, H)
-            .astype(np.float32)
-        )
+        H = weights_np.shape[1]
+        weight = torch.from_numpy(weights_np.transpose(0, 2, 1).reshape(ND_packed * _Q_WIDTH, H).astype(np.float32))
     else:
+        H = weight.shape[1]
         weight = weight.float()
 
     if is_static or is_static_mx:
@@ -119,7 +118,13 @@ def output_projection_tkg_torch_ref(
             if isinstance(input_scale, torch.Tensor)
             else float(np.asarray(input_scale).flat[0])
         )
-        clip_value = _FP8_E4M3FN_MAX if is_static_mx else _FP8_E4M3_MAX
+        # STATIC_MX is always OCP; STATIC follows dtype_mode (OCP → 448, NON_OCP → 240).
+        if is_static_mx:
+            clip_value = _FP8_E4M3FN_MAX
+        elif dtype_mode == DtypeMode.OCP:
+            clip_value = _FP8_E4M3FN_MAX
+        else:
+            clip_value = _FP8_E4M3_MAX
         attn = torch.clamp(attn / input_scale_value, -clip_value, clip_value)
     elif quantization_type == QuantizationType.ROW:
         weight_scale_value = weight_scale[0, :].float()
@@ -169,7 +174,7 @@ def output_projection_tkg_mx_torch_ref(
 
     Args:
         attention: [D, B, N, S] input tensor from attention block (BF16, quantized online), dtype=nl.bfloat16
-        weight: [N*D // 4, H] weight tensor (pre-quantized, x4 packed on partition dim), dtype=nl.float8_e4m3fn_x4
+        weight: [N*D // 4, H, 4] weight tensor (pre-quantized, unpacked fp8), dtype=nl.float8_e4m3fn
                 NOTE: weight is np.ndarray dtype because of MX dtype.
         bias: [1, H] optional bias tensor.
         quantization_type: Type of quantization (must be QuantizationType.MX)
@@ -194,6 +199,8 @@ def output_projection_tkg_mx_torch_ref(
     D, B, N, S = attention.shape
     BxS = B * S
     N_D = N * D
+    # weight is [N*D//4, H, 4] unpacked fp8
+    ND_packed = weight.shape[0]
     H = weight.shape[1]
 
     # Goal: We need multiply attn_qtz @ weight_qtz = [N*D//4, BxS] @ [N*D//4, H]
@@ -205,9 +212,9 @@ def output_projection_tkg_mx_torch_ref(
     attn_qtz, attn_scale = quantize_to_mx(attn_for_quant, nl.float8_e4m3fn_x4)
 
     ####################  Convert to torch tensors needed for mx_matmul ############
-    # Unpack quantized tensors to torch float32
+    # Unpack quantized attention from x4; weights are already unpacked fp8
     attn_unpacked = unpack_float8_e4m3fn_x4(attn_qtz)
-    weight_unpacked = unpack_float8_e4m3fn_x4(weight)
+    weight_unpacked = torch.from_numpy(weight.reshape(ND_packed, H * _Q_WIDTH).astype(np.float32))
     # Scales are numpy uint8 tensors, convert them to torch
     attn_scale_torch = torch.from_numpy(attn_scale).float()
     weight_scale_torch = torch.from_numpy(weight_scale).float()

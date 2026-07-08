@@ -15,6 +15,7 @@
 
 import json
 import logging
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import final
 
@@ -23,7 +24,7 @@ from botocore.exceptions import ClientError
 from typing_extensions import override
 
 from .metrics_collector import IMetricsCollector
-from .metrics_emitter import IMetricsEmitter, OutputMode, SessionContext
+from .metrics_emitter import CoverageData, IMetricsEmitter, OutputMode, SessionContext
 
 
 @final
@@ -93,22 +94,27 @@ class SQSEmitter(IMetricsEmitter):
         tests_total: int,
         tests_skipped: int = 0,
         tests_xfailed: int = 0,
+        coverage_data: CoverageData | None = None,
     ) -> None:
         """Send run_complete message at session end."""
         if not self._session.sqs_queue_url:
             return
 
         try:
+            payload = {
+                **self._session.to_dimensions(),
+                "TestsPassed": tests_passed,
+                "TestsTotal": tests_total,
+                "TestsSkipped": tests_skipped,
+                "TestsXfailed": tests_xfailed,
+                "Timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            if coverage_data:
+                payload.update(asdict(coverage_data))
+
             message = {
                 "type": "run_complete",
-                "payload": {
-                    **self._session.to_dimensions(),
-                    "TestsPassed": tests_passed,
-                    "TestsTotal": tests_total,
-                    "TestsSkipped": tests_skipped,
-                    "TestsXfailed": tests_xfailed,
-                    "Timestamp": datetime.now(timezone.utc).isoformat(),
-                },
+                "payload": payload,
             }
 
             # Log the SQS message being sent for debugging

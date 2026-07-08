@@ -18,7 +18,8 @@ and hooks for NKI kernel testing.
 
 Fixtures:
     platform_target, trace_mode, output_directory, metric_output_mode,
-    collector, emitter, host_manager, perf_analysis_enabled, test_manager
+    collector, emitter, host_manager, perf_analysis_enabled, hw_profile_enabled,
+    test_manager
 
 Hooks:
     pytest_addoption, pytest_configure, pytest_generate_tests,
@@ -27,9 +28,13 @@ Hooks:
 
 from __future__ import annotations
 
+import argparse
+import functools
+import getpass
 import logging
 import os
 import random
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -51,7 +56,7 @@ from .feature_flag_helper import derive_pytest_test_id, get_feature_flag, resolv
 from .host_management import HostManager, detect_local_neuron_devices
 from .metrics_collector import IMetricsCollector, MetricsCollector, NoopMetricsCollector
 from .metrics_emitter import IMetricsEmitter, MetricsEmitter, NoopMetricsEmitter, OutputMode
-from .param_extractor import extract_pytest_params, normalize_param_names
+from .param_extractor import compute_params_hash, derive_test_method_id, extract_pytest_params, normalize_param_names
 from .pytest_test_metadata import derive_labeled_kernel_name, discover_pytest_test_metadata_marks
 from .s3_utils import S3ArtifactUploadConfig
 from .simulation_setup import setup_simulation_mode
@@ -113,6 +118,37 @@ def is_debugger_mode(config: Config) -> bool:
     return resolve_session_trace_mode(config) == TraceMode.Debugger
 
 
+@functools.lru_cache(maxsize=None)
+def resolve_current_user(default: str | None = None) -> str | None:
+    """Return the current OS user, falling back to ``default`` if unresolved.
+
+    Result is cached per ``default`` value.
+    """
+    try:
+        return getpass.getuser()
+    except Exception:
+        return default
+
+
+@functools.lru_cache(maxsize=None)
+def resolve_git_short_sha(default: str | None = None) -> str | None:
+    """Return the short SHA of HEAD, falling back to ``default`` if unresolved.
+
+    Result is cached per ``default`` value.
+    """
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout.strip()
+        return sha or default
+    except Exception:
+        return default
+
+
 def make_collector(
     request: pytest.FixtureRequest,
     metric_output_mode: OutputMode | None,
@@ -126,9 +162,16 @@ def make_collector(
     collector.set_namespace(namespace)
 
     if hasattr(request.node, "callspec"):
-        params = extract_pytest_params(request.node.callspec.params)
+        raw_params = request.node.callspec.params
+        params = extract_pytest_params(raw_params)
         params = normalize_param_names(params)
         collector.set_kernel_params(params)
+        collector.add_dimension({"TestParamsHash": compute_params_hash(raw_params)})
+    else:
+        collector.add_dimension({"TestParamsHash": compute_params_hash({})})
+
+    # Emit stable test method identifier: module::class::method
+    collector.add_dimension({"TestMethodId": derive_test_method_id(request.node)})
 
     # Set TestName from nodeid (same derivation as orchestrator)
     collector.set_test_name(derive_pytest_test_id())
@@ -194,8 +237,13 @@ def make_host_manager(
         target_hosts=target_hosts,
         ssh_config_path=ssh_config_path,
         s3_config=s3_config,
+        host_rotation_patience_seconds=get_feature_flag(config, "ssh_host_rotation_patience_seconds"),
     )
-    hm.initialize_host_stats()
+    hm.initialize_host_stats(
+        # Bound concurrent init-time capacity probes by the xdist worker cap so we
+        # never spawn more parallel SSH probes than the configured test parallelism.
+        max_probe_workers=config.getoption("maxprocesses", default=None),
+    )
     return hm
 
 
@@ -205,6 +253,7 @@ def make_test_manager(
     host_manager: HostManager,
     collector: IMetricsCollector,
     perf_analysis_enabled: bool = False,
+    hw_profile_enabled: bool = True,
     kernel_name: str | None = None,
 ) -> Orchestrator:
     """Create a standard Orchestrator from shared config."""
@@ -214,6 +263,7 @@ def make_test_manager(
         host_manager,
         collector,
         perf_analysis_enabled=perf_analysis_enabled,
+        hw_profile_enabled=hw_profile_enabled,
         kernel_name=kernel_name,
         nki_compilation_mode=NKICompilationMode[get_feature_flag(config, "nki_compilation_mode")],
     )
@@ -239,7 +289,7 @@ def pytest_addoption(parser):
     group.addoption(
         "--neuron-tools-bin-path",
         default="/opt/aws/neuron/bin",
-        help="Path to directory containing neuron tools (neuron-profile, neuron-ls, etc.) on remote hosts",
+        help="Path to directory containing neuron tools (neuron-explorer, neuron-ls, etc.) on remote hosts",
     )
     group.addoption(
         "--ssh-config-path",
@@ -317,6 +367,12 @@ def pytest_addoption(parser):
         help="Enable performance analysis with perf sim and detailed profiled JSON",
     )
     group.addoption(
+        "--enable-hw-profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable HW profile capture (NTFF -> MBU/MFU/cycles). Default True. Use --no-enable-hw-profile to disable.",
+    )
+    group.addoption(
         "--force-local-cleanup",
         action="store_true",
         default=False,
@@ -354,6 +410,7 @@ def pytest_addoption(parser):
         help="AWS profile name for S3 authentication",
     )
     group.addoption(
+        "-U",
         "--upload-profile-to-explorer",
         nargs="?",
         const=UploadProfileMode.ALWAYS.value,
@@ -367,6 +424,31 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="Exclude model tests from collection",
+    )
+    group.addoption(
+        "--neuronx-cc-jobs",
+        action="store",
+        default="auto",
+        metavar="N",
+        help="Thread count passed to neuronx-cc via --jobs. "
+        "'auto' (default) divides CPU count by the number of xdist workers so "
+        "concurrent compilations don't thrash. '0' leaves neuronx-cc to choose.",
+    )
+    group.addoption(
+        "--s3-neuronx-cc-cache-path",
+        action="store",
+        default="",
+        help="S3 URI for BIR-to-NEFF compilation cache (e.g. s3://my-bucket/neff-cache). "
+        "When set, reuses cached NEFFs when neuronxcc version and BIR are unchanged.",
+    )
+
+    group.addoption(
+        "--ssh-host-rotation-patience-seconds",
+        default=None,
+        action="store",
+        type=int,
+        help="Seconds threshold controlling acceptable wait inference queue wait time. Negative value disable patience"
+        + " mechanic entirely",
     )
 
     coverage_group = parser.getgroup("coverage-parametrize")
@@ -385,6 +467,20 @@ def pytest_addoption(parser):
 
 
 # ─── Shared fixtures ───
+
+
+@pytest.fixture(autouse=True)
+def _neuron_tag_workflow_item(request: pytest.FixtureRequest):
+    """Set NEURON_TAG_WORKFLOW_ITEM to the pytest nodeid for the test's
+    duration. The remote-host pass-through in host_management.py forwards
+    this to the workload process, where the hardware monitor agent reads
+    it from the env at /dev/neuron0 open time.
+    """
+    os.environ["NEURON_TAG_WORKFLOW_ITEM"] = request.node.nodeid.rsplit("::", 1)[-1]
+    try:
+        yield
+    finally:
+        os.environ.pop("NEURON_TAG_WORKFLOW_ITEM", None)
 
 
 @pytest.fixture(scope="session")
@@ -444,12 +540,19 @@ def perf_analysis_enabled(request: pytest.FixtureRequest) -> bool:
 
 
 @pytest.fixture
+def hw_profile_enabled(request: pytest.FixtureRequest) -> bool:
+    """Whether HW profile capture runs. Gated by --enable-hw-profile."""
+    return get_feature_flag(request.config, "enable_hw_profile", True)
+
+
+@pytest.fixture
 def test_manager(
     request: pytest.FixtureRequest,
     trace_mode: TraceMode,
     host_manager: HostManager,
     collector: IMetricsCollector,
     perf_analysis_enabled: bool,
+    hw_profile_enabled: bool,
 ) -> Orchestrator:
     """Standard kernel test orchestrator."""
     metadata_name = None
@@ -462,6 +565,7 @@ def test_manager(
         host_manager,
         collector,
         perf_analysis_enabled=perf_analysis_enabled,
+        hw_profile_enabled=hw_profile_enabled,
         kernel_name=kernel_name,
     )
 
@@ -475,8 +579,30 @@ def platform_target(request: pytest.FixtureRequest) -> Platforms:
 # ─── Shared hooks ───
 
 
+def _set_neuron_tag_defaults(config: Config) -> None:
+    """Populate known NEURON_TAG_* the orchestrator didn't set.
+
+    Both the pipeline and local --shared-fleet runs go through pytest, so
+    setting defaults here is the only place they're guaranteed to land in
+    both flows. setdefault means orchestrator-provided values always win.
+
+    Runs only on the xdist controller — workers inherit env from the
+    controller via fork, so they don't need to re-resolve the same values.
+    """
+    if hasattr(config, "workerinput"):
+        return  # xdist worker; env was inherited from the controller
+
+    os.environ.setdefault("NEURON_TAG_TEAM", "nkilib")
+    os.environ.setdefault("NEURON_TAG_REQUESTER", "User")
+    os.environ.setdefault("NEURON_TAG_WORKFLOW_NAME", f"local/{resolve_current_user(default='unknown')}")
+    os.environ.setdefault("NEURON_TAG_WORKFLOW_ID", "local")
+    os.environ.setdefault("NEURON_TAG_WORKFLOW_VERSION", f"git/{resolve_git_short_sha(default='unknown')}")
+
+
 def pytest_configure(config: Config):
     """Auto-discover marks, set up simulation mode, register platform markers."""
+    _set_neuron_tag_defaults(config)
+
     # Discover marks from @pytest_test_metadata decorators
     # Use config.rootdir so discovery works whether the plugin is loaded from
     # the source tree or from the installed nkilib_testing wheel.
@@ -553,8 +679,26 @@ def pytest_collection_modifyitems(config: Config, items: list[pytest.Item]):
     if is_simulation_mode(config):
         from .simulation_setup import skip_slow_simulation_tests
 
+        # Skip tests that carry an explicit TraceMode marker override (e.g.
+        # trace_only, compile_only, compile_and_infer).  The trace_mode fixture
+        # would honour these markers and switch away from Simulator mode,
+        # causing the orchestrator to take a non-simulation code-path.
+        non_sim_modes = [m for m in TraceMode if m != TraceMode.Simulator]
+        for item in items:
+            for mode in non_sim_modes:
+                if item.get_closest_marker(mode.value):
+                    item.add_marker(
+                        pytest.mark.skip(reason=f"test requests {mode.value} mode, incompatible with simulation")
+                    )
+                    break
+
         skip_marker = pytest.mark.skip(reason="Skipping slow simulation test (see test/simulation.md)")
         skip_slow_simulation_tests(items, skip_marker)
+
+        skip_incompatible = pytest.mark.skip(reason="Known simulator incompatibility (skip_simulation)")
+        for item in items:
+            if item.get_closest_marker("skip_simulation"):
+                item.add_marker(skip_incompatible)
 
 
 # =========================

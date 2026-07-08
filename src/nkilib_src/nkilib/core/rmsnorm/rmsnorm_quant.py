@@ -23,7 +23,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 
-from ..utils.common_types import NormType, QuantizationType
+from ..utils.common_types import DtypeMode, NormType, QuantizationType
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import (
     get_program_sharding_info,
@@ -88,14 +88,14 @@ class RmsNormQuantKernelArgs(nl.NKIObject):
 
 @nki.jit
 def rmsnorm_quant_kernel(
-    hidden: nl.ndarray,
-    ln_w: nl.ndarray,
+    hidden: nl.NkiTensor,
+    ln_w: nl.NkiTensor,
     kargs: RmsNormQuantKernelArgs,
-    input_dequant_scale: nl.ndarray = None,
-    pre_norm_gamma: nl.ndarray = None,
-    residual: nl.ndarray = None,
-    auto_resolve_fp8_dtype: bool = False,
-) -> nl.ndarray:
+    input_dequant_scale: nl.NkiTensor = None,
+    pre_norm_gamma: nl.NkiTensor = None,
+    residual: nl.NkiTensor = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+) -> nl.NkiTensor:
     """
     Perform optional RMS normalization followed by FP8 quantization along the last dimension.
 
@@ -130,18 +130,23 @@ def rmsnorm_quant_kernel(
         PD: Processing dimension (H)
 
     Args:
-        hidden (nl.ndarray): [B, S, H], Input hidden states tensor on HBM
-        ln_w (nl.ndarray): [H] or [1, H], Gamma multiplicative bias vector for RMS norm
+        hidden (nl.NkiTensor): [B, S, H], Input hidden states tensor on HBM
+        ln_w (nl.NkiTensor): [H] or [1, H], Gamma multiplicative bias vector for RMS norm
         kargs (RmsNormQuantKernelArgs): Kernel configuration arguments
-        input_dequant_scale (nl.ndarray): [128, 1], Input dequantization scale for static quant
-        pre_norm_gamma (nl.ndarray): [H] or [1, H], Optional gamma for a first RMSNorm applied
+        input_dequant_scale (nl.NkiTensor): [128, 1], Input dequantization scale for static quant
+        pre_norm_gamma (nl.NkiTensor): [H] or [1, H], Optional gamma for a first RMSNorm applied
             to ``hidden`` before the residual add.  Can be used with or without ``residual``.
-        residual (nl.ndarray): [B, S, H], Optional residual tensor on HBM.  Can be used
+        residual (nl.NkiTensor): [B, S, H], Optional residual tensor on HBM.  Can be used
             with or without ``pre_norm_gamma``.
+        dtype_mode (DtypeMode): Explicit FP8 E4M3 dtype selection for the quantized output.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3``
+              elsewhere.
 
     Returns:
         When ``residual`` is None (default path):
-            output (nl.ndarray): [B, S, H+4] for row quant or [B, S, H] for static quant,
+            output (nl.NkiTensor): [B, S, H+4] for row quant or [B, S, H] for static quant,
                 Quantized output tensor on HBM. For row quant, last 4 elements per row
                 store the fp32 dequantization scale as 4 fp8 values.
         When ``residual`` is provided (fused path):
@@ -191,9 +196,7 @@ def rmsnorm_quant_kernel(
     tsr_proc_shape = _collapse_shape_major_dimensions(hidden.shape)
     # Build data structures with info that we need throughout the kernel
     tile_info = build_rms_norm_quant_tile_info(tsr_proc_shape)
-    constants = build_rms_norm_quant_constants(
-        tile_info, kargs.eps, tsr_proc_shape, auto_resolve_fp8_dtype=auto_resolve_fp8_dtype
-    )
+    constants = build_rms_norm_quant_constants(tile_info, kargs.eps, tsr_proc_shape, dtype_mode=dtype_mode)
 
     _validate_kernel_input(hidden, ln_w, input_dequant_scale, kargs, constants, pre_norm_gamma)
 
@@ -233,7 +236,7 @@ def rmsnorm_quant_kernel(
             pre_norm_gamma,
             res_tsr_hbm_view,
             res_out_hbm_view,
-            auto_resolve_fp8_dtype=auto_resolve_fp8_dtype,
+            dtype_mode=dtype_mode,
         )
     else:
         _rmsnorm_quant_single_core_kernel(
@@ -255,23 +258,23 @@ def rmsnorm_quant_kernel(
 
 
 def _validate_kernel_input(
-    hidden: nl.ndarray,
-    ln_w: nl.ndarray,
-    input_sc: nl.ndarray,
+    hidden: nl.NkiTensor,
+    ln_w: nl.NkiTensor,
+    input_sc: nl.NkiTensor,
     kargs: RmsNormQuantKernelArgs,
     constants: RMSNormQuantConstants,
-    pre_norm_gamma: nl.ndarray = None,
+    pre_norm_gamma: nl.NkiTensor = None,
 ) -> None:
     """
     Validate all input parameters for the RMS norm quantization kernel.
 
     Args:
-        hidden (nl.ndarray): Input hidden states tensor
-        ln_w (nl.ndarray): Gamma multiplicative bias vector
-        input_sc (nl.ndarray): Input dequantization scale for static quant
+        hidden (nl.NkiTensor): Input hidden states tensor
+        ln_w (nl.NkiTensor): Gamma multiplicative bias vector
+        input_sc (nl.NkiTensor): Input dequantization scale for static quant
         kargs (RmsNormQuantKernelArgs): Kernel configuration arguments
         constants (RMSNormQuantConstants): Kernel constants
-        pre_norm_gamma (nl.ndarray): Optional pre-norm gamma vector
+        pre_norm_gamma (nl.NkiTensor): Optional pre-norm gamma vector
 
     Notes:
         - Input tensor must have at least 2 dimensions
@@ -387,8 +390,8 @@ def _collapse_shape_major_dimensions(shape: tuple[int, ...]) -> tuple[int, int]:
 
 
 def _load_and_invert_static_dequant_scale(
-    in_scale_hbm: nl.ndarray,
-    in_scale_sbuf: nl.ndarray,
+    in_scale_hbm: nl.NkiTensor,
+    in_scale_sbuf: nl.NkiTensor,
 ) -> None:
     """
     Load input dequantization scale from HBM and compute its reciprocal.
@@ -397,8 +400,8 @@ def _load_and_invert_static_dequant_scale(
     Input is a scalar value broadcasted to [128, 1] on HBM.
 
     Args:
-        in_scale_hbm (nl.ndarray): [128, 1], Input dequant scale on HBM
-        in_scale_sbuf (nl.ndarray): [128, 1], Output buffer in SBUF for quant scale
+        in_scale_hbm (nl.NkiTensor): [128, 1], Input dequant scale on HBM
+        in_scale_sbuf (nl.NkiTensor): [128, 1], Output buffer in SBUF for quant scale
     """
     nisa.dma_copy(src=in_scale_hbm[: nl.tile_size.pmax, :1], dst=in_scale_sbuf[: nl.tile_size.pmax, :1])
     nisa.reciprocal(data=in_scale_sbuf[: nl.tile_size.pmax, :1], dst=in_scale_sbuf[: nl.tile_size.pmax, :1])
@@ -407,9 +410,9 @@ def _load_and_invert_static_dequant_scale(
 def _load_input_tensor_tile(
     tile_info: RMSNormQuantTileInfo,
     constants: RMSNormQuantConstants,
-    in_tsr_hbm: nl.ndarray,
+    in_tsr_hbm: nl.NkiTensor,
     outer_dim_tile_num: int,
-    output_tile_sbuf: nl.ndarray,
+    output_tile_sbuf: nl.NkiTensor,
 ) -> None:
     """
     Load a single tile from the input tensor in HBM into SBUF.
@@ -419,9 +422,9 @@ def _load_input_tensor_tile(
     Args:
         tile_info (RMSNormQuantTileInfo): Tile configuration info
         constants (RMSNormQuantConstants): Kernel constants
-        in_tsr_hbm (nl.ndarray): [OD, PD], Input tensor on HBM
+        in_tsr_hbm (nl.NkiTensor): [OD, PD], Input tensor on HBM
         outer_dim_tile_num (int): Current outer dimension tile index
-        output_tile_sbuf (nl.ndarray): [ODT, PD], Output buffer in SBUF
+        output_tile_sbuf (nl.NkiTensor): [ODT, PD], Output buffer in SBUF
 
     Notes:
         - No special handling needed for processing dimension (not tiled when loading)
@@ -440,9 +443,9 @@ def _store_tensor_tile_and_dequant_scales(
     tile_info: RMSNormQuantTileInfo,
     constants: RMSNormQuantConstants,
     outer_dim_tile_num: int,
-    in_tile_sbuf: nl.ndarray,
-    dequant_scales_tile_sbuf: nl.ndarray,
-    out_tsr_hbm: nl.ndarray,
+    in_tile_sbuf: nl.NkiTensor,
+    dequant_scales_tile_sbuf: nl.NkiTensor,
+    out_tsr_hbm: nl.NkiTensor,
 ) -> None:
     """
     Store computed tile and dequantization scales to output tensor in HBM.
@@ -466,9 +469,9 @@ def _store_tensor_tile_and_dequant_scales(
         tile_info (RMSNormQuantTileInfo): Tile configuration info
         constants (RMSNormQuantConstants): Kernel constants
         outer_dim_tile_num (int): Current outer dimension tile index
-        in_tile_sbuf (nl.ndarray): [ODT, PD], Quantized tile in SBUF
-        dequant_scales_tile_sbuf (nl.ndarray): [ODT, 1], Dequant scales in SBUF
-        out_tsr_hbm (nl.ndarray): [OD, PDS], Output tensor on HBM
+        in_tile_sbuf (nl.NkiTensor): [ODT, PD], Quantized tile in SBUF
+        dequant_scales_tile_sbuf (nl.NkiTensor): [ODT, 1], Dequant scales in SBUF
+        out_tsr_hbm (nl.NkiTensor): [OD, PDS], Output tensor on HBM
 
     Notes:
         - No special handling needed for processing dimension (not tiled when storing)
@@ -489,13 +492,9 @@ def _store_tensor_tile_and_dequant_scales(
                 outer_dim_offset : outer_dim_offset + num_p,
                 constants.proc_dim_size : constants.proc_dim_size + constants.dequant_scale_size,
             ],
-            src=dequant_scales_tile_sbuf.ap(
-                pattern=[
-                    [constants.dequant_scale_size, num_p],
-                    [1, constants.dequant_scale_size],
-                ],
-                dtype=constants.quant_data_type,
-            ),
+            # Reinterpret the fp32 dequant scales (num_p, 1) as dequant_scale_size
+            # fp8 values per row (num_p, dequant_scale_size).
+            src=dequant_scales_tile_sbuf.view(constants.quant_data_type)[0:num_p, :],
         )
 
 
@@ -503,10 +502,10 @@ def _rms_normalize_tile(
     tile_info: RMSNormQuantTileInfo,
     constants: RMSNormQuantConstants,
     outer_dim_tile_num: int,
-    in_tile_sbuf: nl.ndarray,
-    gamma_hbm: nl.ndarray,
-    squared_in_tsr_sbuf: nl.ndarray,
-    inverse_rms_scale_sbuf: nl.ndarray,
+    in_tile_sbuf: nl.NkiTensor,
+    gamma_hbm: nl.NkiTensor,
+    squared_in_tsr_sbuf: nl.NkiTensor,
+    inverse_rms_scale_sbuf: nl.NkiTensor,
 ) -> None:
     """
     Compute RMS normalization along the last dimension for a tile.
@@ -515,10 +514,10 @@ def _rms_normalize_tile(
         tile_info (RMSNormQuantTileInfo): Tile configuration info
         constants (RMSNormQuantConstants): Kernel constants
         outer_dim_tile_num (int): Current outer dimension tile index
-        in_tile_sbuf (nl.ndarray): [ODT, PD], Input tile in SBUF (modified in place)
-        gamma_hbm (nl.ndarray): [1, PD], Gamma values on HBM
-        squared_in_tsr_sbuf (nl.ndarray): [ODT, PD], Scratch buffer for squared values
-        inverse_rms_scale_sbuf (nl.ndarray): [ODT, 1], Buffer for inverse RMS scale
+        in_tile_sbuf (nl.NkiTensor): [ODT, PD], Input tile in SBUF (modified in place)
+        gamma_hbm (nl.NkiTensor): [1, PD], Gamma values on HBM
+        squared_in_tsr_sbuf (nl.NkiTensor): [ODT, PD], Scratch buffer for squared values
+        inverse_rms_scale_sbuf (nl.NkiTensor): [ODT, 1], Buffer for inverse RMS scale
 
     Notes:
         - Computation is stored in place in in_tile_sbuf
@@ -625,9 +624,9 @@ def _row_quantize_tile(
     tile_info: RMSNormQuantTileInfo,
     constants: RMSNormQuantConstants,
     outer_dim_tile_num: int,
-    in_tile_sbuf: nl.ndarray,
-    out_tile_sbuf: nl.ndarray,
-    out_dequant_scales_sbuf: nl.ndarray,
+    in_tile_sbuf: nl.NkiTensor,
+    out_tile_sbuf: nl.NkiTensor,
+    out_dequant_scales_sbuf: nl.NkiTensor,
 ) -> None:
     """
     Compute row quantization and dequantization scales along the last dimension.
@@ -637,9 +636,9 @@ def _row_quantize_tile(
         tile_info (RMSNormQuantTileInfo): Tile configuration info
         constants (RMSNormQuantConstants): Kernel constants
         outer_dim_tile_num (int): Current outer dimension tile index
-        in_tile_sbuf (nl.ndarray): [ODT, PD], Input tile in SBUF
-        out_tile_sbuf (nl.ndarray): [ODT, PD], Output quantized tile in SBUF
-        out_dequant_scales_sbuf (nl.ndarray): [ODT, 1], Output dequant scales in SBUF
+        in_tile_sbuf (nl.NkiTensor): [ODT, PD], Input tile in SBUF
+        out_tile_sbuf (nl.NkiTensor): [ODT, PD], Output quantized tile in SBUF
+        out_dequant_scales_sbuf (nl.NkiTensor): [ODT, 1], Output dequant scales in SBUF
     """
     # Alias these to cut down on the verbosity in the code
     outer_dim_tile_size = tile_info.outer_dim_tile.tile_size
@@ -721,9 +720,9 @@ def _static_quantize_tile(
     tile_info: RMSNormQuantTileInfo,
     constants: RMSNormQuantConstants,
     outer_dim_tile_num: int,
-    in_tile_sbuf: nl.ndarray,
-    in_static_quant_scales_sbuf: nl.ndarray,
-    out_tile_sbuf: nl.ndarray,
+    in_tile_sbuf: nl.NkiTensor,
+    in_static_quant_scales_sbuf: nl.NkiTensor,
+    out_tile_sbuf: nl.NkiTensor,
 ) -> None:
     """
     Compute static quantization for a tile using pre-computed scale.
@@ -732,9 +731,9 @@ def _static_quantize_tile(
         tile_info (RMSNormQuantTileInfo): Tile configuration info
         constants (RMSNormQuantConstants): Kernel constants
         outer_dim_tile_num (int): Current outer dimension tile index
-        in_tile_sbuf (nl.ndarray): [ODT, PD], Input tile in SBUF
-        in_static_quant_scales_sbuf (nl.ndarray): [128, 1], Static quant scale in SBUF
-        out_tile_sbuf (nl.ndarray): [ODT, PD], Output quantized tile in SBUF
+        in_tile_sbuf (nl.NkiTensor): [ODT, PD], Input tile in SBUF
+        in_static_quant_scales_sbuf (nl.NkiTensor): [128, 1], Static quant scale in SBUF
+        out_tile_sbuf (nl.NkiTensor): [ODT, PD], Output quantized tile in SBUF
     """
     # Alias these to cut down on the verbosity in the code
     outer_dim_tile_size = tile_info.outer_dim_tile.tile_size
@@ -764,10 +763,10 @@ def _quantize_tile(
     tile_info: RMSNormQuantTileInfo,
     constants: RMSNormQuantConstants,
     outer_dim_tile_num: int,
-    in_tile_sbuf: nl.ndarray,
-    in_static_quant_scales_sbuf: nl.ndarray,
-    out_tile_sbuf: nl.ndarray,
-    out_row_dequant_scales_sbuf: nl.ndarray,
+    in_tile_sbuf: nl.NkiTensor,
+    in_static_quant_scales_sbuf: nl.NkiTensor,
+    out_tile_sbuf: nl.NkiTensor,
+    out_row_dequant_scales_sbuf: nl.NkiTensor,
 ) -> None:
     """
     Dispatch to row or static quantization based on kernel arguments.
@@ -777,10 +776,10 @@ def _quantize_tile(
         tile_info (RMSNormQuantTileInfo): Tile configuration info
         constants (RMSNormQuantConstants): Kernel constants
         outer_dim_tile_num (int): Current outer dimension tile index
-        in_tile_sbuf (nl.ndarray): [ODT, PD], Input tile in SBUF
-        in_static_quant_scales_sbuf (nl.ndarray): [128, 1], Static quant scale (or None)
-        out_tile_sbuf (nl.ndarray): [ODT, PD], Output quantized tile in SBUF
-        out_row_dequant_scales_sbuf (nl.ndarray): [ODT, 1], Row dequant scales (or None)
+        in_tile_sbuf (nl.NkiTensor): [ODT, PD], Input tile in SBUF
+        in_static_quant_scales_sbuf (nl.NkiTensor): [128, 1], Static quant scale (or None)
+        out_tile_sbuf (nl.NkiTensor): [ODT, PD], Output quantized tile in SBUF
+        out_row_dequant_scales_sbuf (nl.NkiTensor): [ODT, 1], Row dequant scales (or None)
     """
     if kargs.is_row_quant():
         _row_quantize_tile(
@@ -801,13 +800,13 @@ def _rmsnorm_quant_single_core_kernel(
     kargs: RmsNormQuantKernelArgs,
     tile_info: RMSNormQuantTileInfo,
     constants: RMSNormQuantConstants,
-    in_tsr_hbm: nl.ndarray,
-    rmsn_gamma_hbm: nl.ndarray,
-    in_sc_hbm: nl.ndarray,
-    out_tsr_hbm: nl.ndarray,
-    pre_norm_gamma_hbm: nl.ndarray = None,
-    res_tsr_hbm: nl.ndarray = None,
-    res_out_hbm: nl.ndarray = None,
+    in_tsr_hbm: nl.NkiTensor,
+    rmsn_gamma_hbm: nl.NkiTensor,
+    in_sc_hbm: nl.NkiTensor,
+    out_tsr_hbm: nl.NkiTensor,
+    pre_norm_gamma_hbm: nl.NkiTensor = None,
+    res_tsr_hbm: nl.NkiTensor = None,
+    res_out_hbm: nl.NkiTensor = None,
 ) -> None:
     """
     Process all tiles along the outer dimension with optional RMS norm and quantization.
@@ -822,13 +821,13 @@ def _rmsnorm_quant_single_core_kernel(
         kargs (RmsNormQuantKernelArgs): Kernel configuration arguments
         tile_info (RMSNormQuantTileInfo): Tile configuration info
         constants (RMSNormQuantConstants): Kernel constants
-        in_tsr_hbm (nl.ndarray): [OD, PD], Input tensor on HBM
-        rmsn_gamma_hbm (nl.ndarray): [1, PD] or [PD], RMS norm gamma on HBM
-        in_sc_hbm (nl.ndarray): [128, 1], Static dequant scale on HBM (or None)
-        out_tsr_hbm (nl.ndarray): [OD, PDS], Output tensor on HBM
-        pre_norm_gamma_hbm (nl.ndarray): [1, PD] or [PD], Optional pre-norm gamma on HBM
-        res_tsr_hbm (nl.ndarray): [OD, PD], Optional residual tensor on HBM
-        res_out_hbm (nl.ndarray): [OD, PD], Optional residual output tensor on HBM
+        in_tsr_hbm (nl.NkiTensor): [OD, PD], Input tensor on HBM
+        rmsn_gamma_hbm (nl.NkiTensor): [1, PD] or [PD], RMS norm gamma on HBM
+        in_sc_hbm (nl.NkiTensor): [128, 1], Static dequant scale on HBM (or None)
+        out_tsr_hbm (nl.NkiTensor): [OD, PDS], Output tensor on HBM
+        pre_norm_gamma_hbm (nl.NkiTensor): [1, PD] or [PD], Optional pre-norm gamma on HBM
+        res_tsr_hbm (nl.NkiTensor): [OD, PD], Optional residual tensor on HBM
+        res_out_hbm (nl.NkiTensor): [OD, PD], Optional residual output tensor on HBM
     """
     has_pre_norm = pre_norm_gamma_hbm != None
     has_residual = res_tsr_hbm != None
@@ -957,14 +956,14 @@ def _rmsnorm_quant_single_core_kernel(
 
 def _rmsnorm_quant_sharded_kernel(
     kargs: RmsNormQuantKernelArgs,
-    in_tsr_hbm: nl.ndarray,
-    rmsn_gamma_hbm: nl.ndarray,
-    in_sc_hbm: nl.ndarray,
-    out_tsr_hbm: nl.ndarray,
-    pre_norm_gamma_hbm: nl.ndarray = None,
-    res_tsr_hbm: nl.ndarray = None,
-    res_out_hbm: nl.ndarray = None,
-    auto_resolve_fp8_dtype: bool = False,
+    in_tsr_hbm: nl.NkiTensor,
+    rmsn_gamma_hbm: nl.NkiTensor,
+    in_sc_hbm: nl.NkiTensor,
+    out_tsr_hbm: nl.NkiTensor,
+    pre_norm_gamma_hbm: nl.NkiTensor = None,
+    res_tsr_hbm: nl.NkiTensor = None,
+    res_out_hbm: nl.NkiTensor = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> None:
     """
     Handle 1D SPMD sharding for the RMS norm quantization kernel.
@@ -975,13 +974,13 @@ def _rmsnorm_quant_sharded_kernel(
 
     Args:
         kargs (RmsNormQuantKernelArgs): Kernel configuration arguments
-        in_tsr_hbm (nl.ndarray): [OD, PD], Input tensor on HBM
-        rmsn_gamma_hbm (nl.ndarray): [1, PD] or [PD], RMS norm gamma on HBM
-        in_sc_hbm (nl.ndarray): [128, 1], Static dequant scale on HBM (or None)
-        out_tsr_hbm (nl.ndarray): [OD, PDS], Output tensor on HBM
-        pre_norm_gamma_hbm (nl.ndarray): [1, PD] or [PD], Optional pre-norm gamma on HBM
-        res_tsr_hbm (nl.ndarray): [OD, PD], Optional residual tensor on HBM
-        res_out_hbm (nl.ndarray): [OD, PD], Optional residual output tensor on HBM
+        in_tsr_hbm (nl.NkiTensor): [OD, PD], Input tensor on HBM
+        rmsn_gamma_hbm (nl.NkiTensor): [1, PD] or [PD], RMS norm gamma on HBM
+        in_sc_hbm (nl.NkiTensor): [128, 1], Static dequant scale on HBM (or None)
+        out_tsr_hbm (nl.NkiTensor): [OD, PDS], Output tensor on HBM
+        pre_norm_gamma_hbm (nl.NkiTensor): [1, PD] or [PD], Optional pre-norm gamma on HBM
+        res_tsr_hbm (nl.NkiTensor): [OD, PD], Optional residual tensor on HBM
+        res_out_hbm (nl.NkiTensor): [OD, PD], Optional residual output tensor on HBM
 
     Notes:
         - Supports 1D launch grid only (or no launch grid)
@@ -1023,9 +1022,7 @@ def _rmsnorm_quant_sharded_kernel(
     tsr_proc_shape = _collapse_shape_major_dimensions(in_tile_shard_hbm.shape)
     # Build data structures with info that we need throughout the kernel
     tile_info = build_rms_norm_quant_tile_info(tsr_proc_shape)
-    constants = build_rms_norm_quant_constants(
-        tile_info, kargs.eps, tsr_proc_shape, auto_resolve_fp8_dtype=auto_resolve_fp8_dtype
-    )
+    constants = build_rms_norm_quant_constants(tile_info, kargs.eps, tsr_proc_shape, dtype_mode=dtype_mode)
 
     return _rmsnorm_quant_single_core_kernel(
         kargs,

@@ -48,7 +48,7 @@ def _output_tensor_descriptor(kernel_input):
 FAST_PARAM_NAMES = \
     "T, E, f_len"
 FAST_TEST_PARAMS = [
-    (4096,  1,   128),
+    pytest.param(4096,  1,   128, marks=pytest.mark.fast),
     (4096,  2,   128),
     (4096,  2,   256),
     (4096,  3,   128),
@@ -73,7 +73,7 @@ SPARSE_ROUTING_PARAM_NAMES = \
     "T, E, f_len, row_offsets_start, tokens_per_expert"
 SPARSE_ROUTING_TEST_PARAMS = [
     # Empty expert: cross-NC race (expert 1 on NC0, expert 2 on NC1 share offset).
-    (256,  4, 16, 0,  [16, 0, 16, 16]),
+    pytest.param(256,  4, 16, 0,  [16, 0, 16, 16], marks=pytest.mark.fast),
     # Empty expert: with row_offsets_start.
     (256,  4, 16, 8,  [16, 0, 16, 16]),
     # Multiple empty experts: cross-NC overlap.
@@ -86,6 +86,19 @@ SPARSE_ROUTING_TEST_PARAMS = [
     (4096, 4, 128, 0,  [1, 1, 1, 1]),
     # Mixed: empty expert + padding spill.
     (4096, 4, 128, 0,  [128, 0, 200, 500]),
+]
+
+BOUNDARY_STRADDLE_PARAM_NAMES = \
+    "T, E, f_len, tokens_per_expert"
+BOUNDARY_STRADDLE_TEST_PARAMS = [
+    # TIGHT output_len (no padding past the last owned block) so the last populated
+    # expert's fused partitions_per_row-block write straddles the buffer end. Pre-fix the
+    # LNC2 oob_mode.skip dropped the ENTIRE straddling tile, losing that expert's in-bounds
+    # blocks; the kernel now over-allocates internally so the in-bounds blocks survive.
+    # partitions_per_row = T//f_len = 16 here; earlier experts fit, only the last straddles.
+    (2048, 3, 128, [2048, 2048, 200]),
+    (2048, 4, 128, [2048, 2048, 2048, 128]),
+    (4096, 2, 128, [4096, 256]),
 ]
 # fmt: on
 
@@ -111,7 +124,6 @@ class TestIndexedFlattenKernel:
             rtol=0,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(FAST_PARAM_NAMES, FAST_TEST_PARAMS)
     def test_indexed_flatten_fast(
         self,
@@ -139,7 +151,6 @@ class TestIndexedFlattenKernel:
 
         self._run_test(test_manager, platform_target, input_generator)
 
-    @pytest.mark.fast
     @pytest_parametrize(ROW_OFFSET_PARAM_NAMES, ROW_OFFSET_TEST_PARAMS)
     def test_indexed_flatten_row_offsets_start(
         self,
@@ -169,7 +180,6 @@ class TestIndexedFlattenKernel:
 
         self._run_test(test_manager, platform_target, input_generator)
 
-    @pytest.mark.fast
     @pytest_parametrize(SPARSE_ROUTING_PARAM_NAMES, SPARSE_ROUTING_TEST_PARAMS)
     def test_indexed_flatten_sparse_token_routing(
         self,
@@ -224,6 +234,60 @@ class TestIndexedFlattenKernel:
                 "output_len": output_len,
                 "row_offsets": np.array(row_offsets_list, dtype=np.int32),
                 "row_offsets_start": np.array([row_offsets_start], dtype=np.int32),
+                "padding_val": -1,
+            }
+
+        self._run_test(test_manager, platform_target, input_generator)
+
+    @pytest.mark.fast
+    @pytest_parametrize(BOUNDARY_STRADDLE_PARAM_NAMES, BOUNDARY_STRADDLE_TEST_PARAMS)
+    def test_indexed_flatten_boundary_straddle(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        T: int,
+        E: int,
+        f_len: int,
+        tokens_per_expert: list,
+    ):
+        """Last populated expert's fused write straddles a TIGHT output_len boundary.
+
+        Each expert writes partitions_per_row = T//f_len blocks at its row_offset, but the
+        last expert only owns ceil(tokens/f_len) < partitions_per_row blocks, so its fused
+        write spans past num_output_blocks. With output_len set tight (no trailing padding),
+        the LNC2 oob_mode.skip previously dropped the ENTIRE straddling tile, losing that
+        expert's in-bounds blocks (left as padding_val) and mismatching the torch reference
+        (which writes each in-bounds block independently). The kernel now over-allocates its
+        private buffer by partitions_per_row blocks so the in-bounds blocks survive. The
+        atol=rtol=0 exact comparison catches any dropped block.
+        """
+        np.random.seed(42)
+
+        def input_generator(test_config):
+            blocks_per_expert = [(t + f_len - 1) // f_len for t in tokens_per_expert]
+            row_offsets_list = []
+            block_pos = 0
+            for i in range(E):
+                row_offsets_list.append(block_pos)
+                block_pos += blocks_per_expert[i]
+
+            # Real token IDs packed at the front of each row, padding (-1) at the tail.
+            input_tensor = np.full((E, T), -1, dtype=np.int32)
+            for e in range(E):
+                n_tokens = tokens_per_expert[e]
+                if n_tokens > 0:
+                    input_tensor[e, :n_tokens] = np.random.permutation(T)[:n_tokens]
+
+            # TIGHT output_len: no trailing partitions_per_row padding, so the last expert's
+            # fused write straddles the buffer end (this is what triggers the boundary bug).
+            output_len = block_pos * f_len
+            output_len = ((output_len + 127) // 128) * 128
+            return {
+                "input_tensor": input_tensor,
+                "f_len": f_len,
+                "output_len": output_len,
+                "row_offsets": np.array(row_offsets_list, dtype=np.int32),
+                "row_offsets_start": None,
                 "padding_val": -1,
             }
 

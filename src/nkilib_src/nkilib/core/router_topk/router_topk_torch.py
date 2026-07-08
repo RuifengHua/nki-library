@@ -40,7 +40,6 @@ def router_topk_torch_ref(
     shard_on_tokens: bool = False,
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
-    x_input_in_sbuf: bool = False,
 ):
     """
     PyTorch reference implementation for router top-K kernel.
@@ -58,13 +57,12 @@ def router_topk_torch_ref(
         x_sb_layout: Layout of x in SBUF (unused in reference)
         router_pre_norm: If True, apply activation before top-K
         norm_topk_prob: If True, normalize top-K probabilities with L1 norm
-        x_input_in_sbuf: If True, x is in SBUF (affects layout interpretation)
 
     Returns:
         dict: Dictionary containing 'router_logits', 'expert_index', and 'expert_affinities' as torch tensors
     """
     # Determine x layout: True if x is [T, H], False if [H, T]
-    x_th_layout = x_input_in_sbuf or x_hbm_layout == 1
+    x_th_layout = x_hbm_layout == 1
 
     # Transpose x if needed to get [H, T]
     x_work = x.T if x_th_layout else x

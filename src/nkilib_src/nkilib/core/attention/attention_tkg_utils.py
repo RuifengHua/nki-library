@@ -93,6 +93,13 @@ class AttnTKGConfig(nl.NKIObject):
     """Whether to enable Flash Attention (FA) with s_prior tiling.
     When enabled, tiles the attention computation across s_prior to reduce peak memory usage."""
 
+    fp8_packed: bool = False
+    """Enable packed FP8 k_prior cache layout for block KV with FP8.
+    When True, k_prior has shape [num_blocks, block_len // 2, d_head, 2] with fp8 dtype,
+    where the last dimension holds two consecutive sequence positions. This enables DMA transpose
+    (which requires 2-byte elements) for FP8 block KV, avoiding the slower PE transpose fallback.
+    Requires: block_len > 0, FP8 KV cache, block_len % 2 == 0."""
+
 
 ### Constants
 @dataclass
@@ -139,7 +146,9 @@ def uses_flash_attention(cfg_flag: bool, s_prior: int) -> Tuple[bool, int]:
     return (should_enable, _FA_TILE_SIZE)
 
 
-def uses_batch_tiling(bs_per_nc: int, q_head: int, s_active: int, fa_tile_s_prior: int) -> Tuple[bool, int]:
+def uses_batch_tiling(
+    bs_per_nc: int, q_head: int, s_active: int, fa_tile_s_prior: int, is_auto_alloc: bool, dtype_size: int
+) -> Tuple[bool, int]:
     """
     Determine if batch tiling is needed and compute the batch tile size.
 
@@ -147,10 +156,18 @@ def uses_batch_tiling(bs_per_nc: int, q_head: int, s_active: int, fa_tile_s_prio
 
     Returns (use_batch_tiling, batch_tile_size) where batch_tile_size <= bs_per_nc.
     """
-    per_batch_cost = 8 * q_head * s_active * fa_tile_s_prior
+    # QK buffers per batch: qk (float32=4) + qk_io_type (dtype_size) + mask (1 byte)
+    # Use 8 for bf16/fp8 (power-of-2 tile friendly), 10 for float32
+    bytes_per_element = 10 if dtype_size == 4 else 8
+    per_batch_cost = bytes_per_element * q_head * s_active * fa_tile_s_prior
     if per_batch_cost == 0:
         return (False, bs_per_nc)
     max_tile_bs = _BATCH_TILE_SBUF_BUDGET // per_batch_cost
+
+    # If auto-alloc is enabled, allow at least 1 batch tile even if it exceeds budget.
+    if is_auto_alloc:
+        max_tile_bs = max(max_tile_bs, 1)
+
     kernel_assert(
         max_tile_bs >= 1,
         f"Cannot fit even a single batch in SBUF. "
@@ -171,7 +188,7 @@ def is_fp8_e5m2(dtype) -> bool:
     return dtype == nl.float8_e5m2 or str(dtype) == "float8e5"
 
 
-def is_batch_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_max: int):
+def is_batch_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_max: int, fuse_rope: bool = False):
     """
     Returns true if for lnc=2, batch should be sharded given the configuration.
 
@@ -181,18 +198,25 @@ def is_batch_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_ma
       s_active: Active sequence length.
       curr_sprior: Current prior sequence length.
       p_max: Number of partitions in the SBUF.
+      fuse_rope: Whether RoPE is fused (incompatible with batch sharding).
 
     NOTE: this function is used both at trace time and also for testing infrastructure.
           Thus, it needs to take p_max as an argument.
     """
+    if fuse_rope:
+        return False
     LNC = 2
     # Batch sharding is needed if:
-    # - BQS is large, to reduce the number of BQS tiles, or
+    # - BQS fills (or overflows) the partition dim, so batch-sharding keeps each core's BQS within
+    #   one p_max tile AND keeps the two cores symmetric (both run the same per-batch code instead
+    #   of the s_prior-sharded path where only the last core loads k_active/v_active), or
     # - s_prior is too small to shard
-    return (bs % LNC == 0) and (bs * q_head * s_active > p_max or curr_sprior < 256)
+    #   (at curr_sprior=256 we can shard on sprior but use batch sharding so we
+    #    can support packed fp8 layout which requires block size >= 2 after resize)
+    return (bs % LNC == 0) and (bs * q_head * s_active >= p_max or curr_sprior <= 2 * p_max)
 
 
-def is_s_prior_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_max: int):
+def is_s_prior_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_max: int, fuse_rope: bool = False):
     """
     Returns true if for lnc=2, s_prior should be sharded given the configuration.
 
@@ -206,6 +230,7 @@ def is_s_prior_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_
       s_active: Active sequence length.
       curr_sprior: Current prior sequence length.
       p_max: Number of partitions in the SBUF.
+      fuse_rope: Whether RoPE is fused (passed through to is_batch_sharded).
 
     NOTE: this function is used both at trace time and also for testing infrastructure.
           Thus, it needs to take p_max as an argument.
@@ -213,10 +238,12 @@ def is_s_prior_sharded(bs: int, q_head: int, s_active: int, curr_sprior: int, p_
     # s_prior sharding requires:
     # 1. Batch is not sharded (batch sharding takes priority)
     # 2. s_prior is large enough to shard across 2 cores
-    return not is_batch_sharded(bs, q_head, s_active, curr_sprior, p_max) and curr_sprior >= 2 * p_max
+    return not is_batch_sharded(bs, q_head, s_active, curr_sprior, p_max, fuse_rope) and curr_sprior >= 2 * p_max
 
 
-def get_total_n_prgs(bs: int, q_head: int, s_active: int, curr_sprior: int, lnc: int, p_max: int) -> int:
+def get_total_n_prgs(
+    bs: int, q_head: int, s_active: int, curr_sprior: int, lnc: int, p_max: int, fuse_rope: bool = False
+) -> int:
     """Compute the total number of programs (NCs) used, matching the kernel's sharding logic.
 
     Returns lnc if either batch or s_prior sharding is active, otherwise 1.
@@ -228,10 +255,11 @@ def get_total_n_prgs(bs: int, q_head: int, s_active: int, curr_sprior: int, lnc:
         curr_sprior: Current prior sequence length.
         lnc: Number of logical neuron cores (1 or 2).
         p_max: Number of partitions in the SBUF.
+        fuse_rope: Whether RoPE is fused (incompatible with batch sharding).
     """
     if lnc <= 1:
         return 1
-    _args = (bs, q_head, s_active, curr_sprior, p_max)
+    _args = (bs, q_head, s_active, curr_sprior, p_max, fuse_rope)
     if is_batch_sharded(*_args) or is_s_prior_sharded(*_args):
         return lnc
     return 1
@@ -248,6 +276,7 @@ def resize_cache_block_len_for_attention_tkg_kernel(
     s_active: int,
     full_sprior: int = 0,
     enable_fa_s_prior_tiling: bool = True,
+    fuse_rope: bool = False,
 ):
     """
     Block KV in token gen attention loads p_max blocks per fold onto SBUF partitions in parallel.
@@ -275,7 +304,7 @@ def resize_cache_block_len_for_attention_tkg_kernel(
     NOTE: This function is used both at trace time and by testing infrastructure. Thus, it needs to take p_max as an argument.
     """
     bucket_len = num_blocks_per_batch * block_len
-    sprior_n_prgs = lnc if lnc > 1 and is_s_prior_sharded(bs, q_head, s_active, bucket_len, p_max) else 1
+    sprior_n_prgs = lnc if lnc > 1 and is_s_prior_sharded(bs, q_head, s_active, bucket_len, p_max, fuse_rope) else 1
     min_multiple = sprior_n_prgs * p_max
     kernel_assert(
         bucket_len % min_multiple == 0,

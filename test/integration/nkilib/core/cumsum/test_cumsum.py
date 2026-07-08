@@ -53,7 +53,7 @@ def _output_tensors(kernel_input):
 FAST_PARAM_NAMES = \
     "batch, hidden, ndim, seq_len, dtype"
 FAST_TEST_PARAMS = [
-    pytest.param(1,   256,  2, 1, np.float32,         id="1_256_2_1_float32"),
+    pytest.param(1,   256,  2, 1, np.float32,         id="1_256_2_1_float32",         marks=pytest.mark.fast),
     pytest.param(64,  1024, 3, 4, ml_dtypes.bfloat16, id="64_1024_3_4_bfloat16"),
     pytest.param(128, 2048, 2, 1, np.float32,         id="128_2048_2_1_float32"),
 ]
@@ -65,7 +65,6 @@ FAST_TEST_PARAMS = [
 class TestCumsumKernel:
     """Test class for cumsum kernel."""
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(FAST_PARAM_NAMES, FAST_TEST_PARAMS)
     def test_cumsum_fast(
         self, test_manager: Orchestrator, platform_target: Platforms, batch, hidden, ndim, seq_len, dtype

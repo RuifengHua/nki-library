@@ -31,14 +31,12 @@ from typing import Optional
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nki.isa import dge_mode
 
 from ..utils.allocator import SbufManager
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ..utils.logging import get_logger
 from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ..utils.tensor_view import TensorView
 from .attention_tkg_utils import (
     AttnTKGConfig,
     resize_cache_block_len_for_attention_tkg_kernel,
@@ -52,23 +50,24 @@ from .attention_tkg_utils import (
 
 
 def gen_mask_tkg(
-    pos_ids: nl.ndarray,
-    mask_out: nl.ndarray,
+    pos_ids: nl.NkiTensor,
+    mask_out: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
     is_s_prior_sharded: bool,
     s_prior_per_shard: int,
-    start_pos: Optional[nl.ndarray] = None,
+    start_pos: Optional[nl.NkiTensor] = None,
     s_prior_offset: int = 0,
     block_len: int = 0,
     strided_mm1: bool = True,
-    active_mask: Optional[nl.ndarray] = None,
+    active_mask: Optional[nl.NkiTensor] = None,
     sbm: Optional[SbufManager] = None,
     is_batch_sharded: bool = False,
     batch_offset: int = 0,
     n_sprior_tile_total: int = 0,
-) -> nl.ndarray:
+    dynamic_s_prior_offset: Optional[nl.NkiTensor] = None,
+) -> nl.NkiTensor:
     """
     Generate attention mask for TKG kernel.
 
@@ -93,20 +92,20 @@ def gen_mask_tkg(
             token_idx = fold_idx * block_len * P_MAX + partition * block_len + blk_offset
 
     Args:
-        pos_ids (nl.ndarray): [P_MAX, bs * s_active], Position IDs tensor in SBUF. P_MAX is broadcasted.
-        mask_out (nl.ndarray): [P_MAX, n_sprior_tile, bs, q_head, s_active], Output mask buffer in SBUF.
+        pos_ids (nl.NkiTensor): [P_MAX, bs * s_active], Position IDs tensor in SBUF. P_MAX is broadcasted.
+        mask_out (nl.NkiTensor): [P_MAX, n_sprior_tile, bs, q_head, s_active], Output mask buffer in SBUF.
         bs (int): Batch size.
         q_head (int): Number of query heads.
         s_active (int): Active sequence length.
         is_s_prior_sharded (bool): Whether s_prior dimension is sharded across LNCs.
         s_prior_per_shard (int): Total s_prior per shard (NC's full s_prior, used for NC offset calculation).
-        start_pos (Optional[nl.ndarray]): [P_MAX, bs * s_active], Per-query SWA window start (inclusive).
+        start_pos (Optional[nl.NkiTensor]): [P_MAX, bs * s_active], Per-query SWA window start (inclusive).
             When None, standard attention mask is generated (iota < pos_ids).
             When provided, per-query banded SWA mask is generated.
         s_prior_offset (int): Offset within current shard (for flash attention tiling). Default: 0.
         block_len (int): Block length for block KV cache (0 = flat cache). Default: 0.
         strided_mm1 (bool): Whether to use strided MM1 layout. Default: True.
-        active_mask (Optional[nl.ndarray]): [s_active, bs_full, q_head, s_active], Optional active mask
+        active_mask (Optional[nl.NkiTensor]): [s_active, bs_full, q_head, s_active], Optional active mask
             tensor in HBM. If provided, loaded onto the last section of the mask.
             The batch slice starts at the NC's shard offset plus batch_offset.
         sbm (Optional[SbufManager]): SBUF memory manager. If None, creates a new one.
@@ -121,7 +120,7 @@ def gen_mask_tkg(
             iota channel_multiplier). 0 = use n_sprior_tile (no FA tiling). Default: 0.
 
     Returns:
-        mask_out (nl.ndarray): [P_MAX, n_sprior_tile, bs, q_head, s_active], Generated mask tensor.
+        mask_out (nl.NkiTensor): [P_MAX, n_sprior_tile, bs, q_head, s_active], Generated mask tensor.
 
     Notes:
         - For block KV cache, indices are shuffled to match K cache block layout
@@ -209,11 +208,16 @@ def gen_mask_tkg(
         n_sprior_tile=n_sprior_tile,
         s_prior_per_shard=s_prior_per_shard,
         sprior_prg_id=sprior_prg_id,
-        s_prior_offset=s_prior_offset,
+        s_prior_offset=0 if dynamic_s_prior_offset is not None else s_prior_offset,
         block_len=block_len,
         strided_mm1=strided_mm1,
         n_sprior_tile_total=n_sprior_tile_total,
     )
+
+    # For dynamic FA tiling, add the runtime s_prior_offset to the iota.
+    # dynamic_s_prior_offset is (P_MAX, 1) float32 SBUF tensor, pre-broadcast on partition dim.
+    if dynamic_s_prior_offset is not None:
+        nisa.activation(dst=tmp_iota, op=nl.copy, data=tmp_iota, bias=dynamic_s_prior_offset, scale=1.0)
 
     # Step 2: Create prior masks by per-batch comparison
     # Trace-time routing: SWA path when start_pos is provided, standard path otherwise
@@ -240,9 +244,9 @@ def gen_mask_tkg(
             name=f"mask_iota_{s_prior_offset}_{batch_offset}",
         )
         # dst: reshape flat free dim into [n_sprior_tile, s_active_qh]
-        dst_view = TensorView(mask_iota).reshape_dim(1, (n_sprior_tile, s_active_qh)).get_view()
+        dst_view = mask_iota.reshape_dim(1, (n_sprior_tile, s_active_qh))
         # src: expand + broadcast n_sprior_tile across s_active_qh copies
-        src_view = TensorView(tmp_iota).expand_dim(2).broadcast(2, s_active_qh).get_view()
+        src_view = tmp_iota.expand_dim(2).broadcast(2, s_active_qh)
         nisa.tensor_copy(
             dst=dst_view,
             src=src_view,
@@ -293,7 +297,7 @@ def gen_mask_tkg(
 
 
 def _generate_iota_tensor(
-    tmp_iota: nl.ndarray,
+    tmp_iota: nl.NkiTensor,
     n_sprior_tile: int,
     s_prior_per_shard: int,
     sprior_prg_id: int,
@@ -367,9 +371,9 @@ def _generate_iota_tensor(
 
 
 def _create_batch_masks(
-    mask_iota: nl.ndarray,
-    mask_out: nl.ndarray,
-    pos_ids: nl.ndarray,
+    mask_iota: nl.NkiTensor,
+    mask_out: nl.NkiTensor,
+    pos_ids: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
@@ -415,7 +419,7 @@ def _create_batch_masks(
 
         # Copy mask for this batch to mask_out with batch interleaving on fdim
         cur_mask = cur_mask.reshape((P_MAX, n_sprior_tile, q_head, s_active))
-        mask_out_pat = TensorView(mask_out).select(2, batch_idx).get_view()
+        mask_out_pat = mask_out.select(2, batch_idx)
 
         # Alternate between scalar and vector engines for better performance
         if batch_idx % 2 == 0:
@@ -425,10 +429,10 @@ def _create_batch_masks(
 
 
 def _create_batch_masks_swa(
-    iota: nl.ndarray,
-    mask_out: nl.ndarray,
-    pos_ids: nl.ndarray,
-    start_pos: nl.ndarray,
+    iota: nl.NkiTensor,
+    mask_out: nl.NkiTensor,
+    pos_ids: nl.NkiTensor,
+    start_pos: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
@@ -550,11 +554,9 @@ def _create_batch_masks_swa(
             # Step 9: Copy result to mask_out for each q_head
             for qh_idx in range(q_head):
                 out_view = (
-                    TensorView(mask_out)
-                    .select(2, batch_idx)  # [P_MAX, n_sprior_tile, q_head, s_active]
+                    mask_out.select(2, batch_idx)  # [P_MAX, n_sprior_tile, q_head, s_active]
                     .select(2, qh_idx)  # [P_MAX, n_sprior_tile, s_active]
                     .select(2, sa_idx)  # [P_MAX, n_sprior_tile]
-                    .get_view()
                 )
                 if (batch_idx + qh_idx + sa_idx) % 2 == 0:
                     nisa.tensor_copy(out_view, buf_ge[...], engine=nisa.scalar_engine)
@@ -563,8 +565,8 @@ def _create_batch_masks_swa(
 
 
 def _load_active_mask(
-    mask_out: nl.ndarray,
-    active_mask: nl.ndarray,
+    mask_out: nl.NkiTensor,
+    active_mask: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
@@ -665,38 +667,33 @@ def _load_active_mask(
             f_local = f_global - s_prior_offset // P_MAX if n_sprior_tile_total > 0 else f_global
 
             active_mask_view = (
-                TensorView(active_mask)
-                .select(0, k_idx)  # [bs_full, q_head, s_active]
+                active_mask.select(0, k_idx)  # [bs_full, q_head, s_active]
                 .slice(0, batch_start, batch_start + bs)  # [bs, q_head, s_active]
                 .expand_dim(0)  # [1, bs, q_head, s_active]
                 .expand_dim(0)  # [1, 1, bs, q_head, s_active]
-                .get_view()
             )
             nisa.dma_copy(
                 mask_out[p : p + 1, f_local : f_local + 1, :, :, :],
                 active_mask_view,
-                dge_mode=dge_mode.none,
                 name=f"active_mask_strided_{k_idx}_bo{batch_offset}_sp{s_prior_offset}",
             )
     else:
         # Non-strided: load to bottom-right chunk of size [s_active, 1, bs, q_head, s_active]
         active_mask_view = (
-            TensorView(active_mask)
-            .slice(1, batch_start, batch_start + bs)  # [s_active, bs, q_head, s_active]
-            .expand_dim(1)  # [s_active, 1, bs, q_head, s_active]
-            .get_view()
+            active_mask.slice(1, batch_start, batch_start + bs).expand_dim(  # [s_active, bs, q_head, s_active]
+                1
+            )  # [s_active, 1, bs, q_head, s_active]
         )
         nisa.dma_copy(
             mask_out[P_MAX - s_active :, n_sprior_tile - 1 : n_sprior_tile, :, :, :],
             active_mask_view,
-            dge_mode=dge_mode.none,
             name=f"active_mask_sequential_bo{batch_offset}_sp{s_prior_offset}",
         )
 
 
 def _load_active_mask_block_kv(
-    mask_out: nl.ndarray,
-    active_mask: nl.ndarray,
+    mask_out: nl.NkiTensor,
+    active_mask: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
@@ -755,17 +752,14 @@ def _load_active_mask_block_kv(
 
         # Copy active_mask[k_idx, batch_start:batch_start+bs] → mask_out[p, f]
         active_mask_view = (
-            TensorView(active_mask)  # [s_active, bs_full, q_head, s_active]
-            .select(0, k_idx)  # [bs_full, q_head, s_active]
+            active_mask.select(0, k_idx)  # [s_active, bs_full, q_head, s_active]  # [bs_full, q_head, s_active]
             .slice(0, batch_start, batch_start + bs)  # [bs, q_head, s_active]
             .expand_dim(0)  # [1, bs, q_head, s_active]
             .expand_dim(0)  # [1, 1, bs, q_head, s_active]
-            .get_view()
         )
         nisa.dma_copy(
             mask_out[p : p + 1, f : f + 1, :, :, :],
             active_mask_view,
-            dge_mode=dge_mode.none,
             name=f"active_mask_block_kv_{k_idx}_bo{batch_start}_sp{s_prior_offset}",
         )
 
@@ -776,8 +770,8 @@ def _load_active_mask_block_kv(
 
 
 def _load_active_mask_hbm(
-    mask_out: nl.ndarray,
-    active_mask: nl.ndarray,
+    mask_out: nl.NkiTensor,
+    active_mask: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
@@ -828,17 +822,11 @@ def _load_active_mask_hbm(
             f_local = f_global - fa_tile_base
 
             active_mask_view = (
-                TensorView(active_mask)
-                .select(0, k_idx)
-                .slice(0, batch_start, batch_start + bs)
-                .expand_dim(0)
-                .expand_dim(0)
-                .get_view()
+                active_mask.select(0, k_idx).slice(0, batch_start, batch_start + bs).expand_dim(0).expand_dim(0)
             )
             nisa.dma_copy(
                 mask_out[p : p + 1, f_local : f_local + 1, :, :, :],
                 active_mask_view,
-                dge_mode=dge_mode.none,
                 name=f"active_mask_hbm_strided_{k_idx}_sp{s_prior_offset}_b{batch_start}",
             )
     else:
@@ -872,16 +860,17 @@ def _load_active_mask_hbm(
 
 @nki.jit
 def gen_mask_tkg_hbm(
-    pos_ids_hbm: nl.ndarray,
+    pos_ids_hbm: nl.NkiTensor,
     bs: int,
     q_head: int,
     s_active: int,
     s_prior: int,
-    start_pos_hbm: Optional[nl.ndarray] = None,
+    start_pos_hbm: Optional[nl.NkiTensor] = None,
     block_len: int = 0,
-    active_mask: Optional[nl.ndarray] = None,
+    active_mask: Optional[nl.NkiTensor] = None,
     enable_fa_s_prior_tiling: bool = True,
-) -> nl.ndarray:
+    fuse_rope: bool = False,
+) -> nl.NkiTensor:
     """HBM wrapper for gen_mask_tkg.
 
     Accepts HBM-resident tensors, manages SBUF allocation, DMA transfers,
@@ -902,6 +891,7 @@ def gen_mask_tkg_hbm(
         active_mask: Optional [s_active, bs, q_head, s_active] active mask in HBM.
         enable_fa_s_prior_tiling: Whether flash attention tiling is enabled. Must match
             the value passed to attention_tkg / attention_block_tkg. Default: True.
+        fuse_rope: Whether RoPE is fused (impacts LNC sharding decision).
 
     Returns:
         mask_out_hbm: [s_prior, bs, q_head, s_active] generated mask in HBM.
@@ -913,13 +903,13 @@ def gen_mask_tkg_hbm(
     # LNC sharding
     _, lnc, nc_id = get_verified_program_sharding_info("gen_mask_tkg_hbm", (0, 1))
 
-    cfg = AttnTKGConfig(bs=bs, q_head=q_head, s_active=s_active, curr_sprior=s_prior)
+    cfg = AttnTKGConfig(bs=bs, q_head=q_head, s_active=s_active, curr_sprior=s_prior, fuse_rope=fuse_rope)
 
-    if lnc == 2 and is_s_prior_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+    if lnc == 2 and is_s_prior_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope):
         sprior_sharded = True
         batch_sharded = False
         s_prior_per_shard = s_prior // lnc
-    elif lnc == 2 and is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX):
+    elif lnc == 2 and is_batch_sharded_fn(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, P_MAX, cfg.fuse_rope):
         sprior_sharded = False
         batch_sharded = True
         s_prior_per_shard = s_prior
@@ -941,6 +931,7 @@ def gen_mask_tkg_hbm(
             q_head,
             s_active,
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+            fuse_rope=fuse_rope,
         )
 
     n_sprior_tile_total = s_prior // P_MAX
@@ -1111,16 +1102,15 @@ def gen_mask_tkg_hbm(
             # DMA store to HBM (n_sprior_tile-major layout)
             # SBUF: [P_MAX, cur_sprior_tiles, bs_tile, q_head, s_active]
             # HBM:  [n_sprior_tile_total, P_MAX, bs, q_head, s_active]
-            # Use TensorView to permute then slice for the DMA store.
+            # Use NkiTensor to permute then slice for the DMA store.
             if has_overlap:
                 dst_view = (
-                    TensorView(mask_out_result)
-                    .permute([1, 0, 2, 3, 4])
+                    mask_out_result.permute([1, 0, 2, 3, 4])
                     .slice(dim=1, start=hbm_sp_offset, end=hbm_sp_offset + cur_sprior_tiles)
                     .slice(dim=2, start=overlap_start, end=overlap_start + overlap_bs)
                 )
                 nisa.dma_copy(
-                    dst=dst_view.get_view(),
+                    dst=dst_view,
                     src=mask_out_sbuf[:, :, overlap_local : overlap_local + overlap_bs, :, :],
                 )
 

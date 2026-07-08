@@ -18,6 +18,14 @@ import nki.language as nl
 import numpy as np
 from neuron_dtypes import static_cast
 
+# Re-export of utilities that have been moved to src/.
+from nkilib_src.nkilib.core.utils.mx_torch_common import (
+    get_p_contiguous_scale as get_p_contiguous_scale,
+)
+from nkilib_src.nkilib.core.utils.mx_torch_common import (
+    nc_matmul_mx_golden as nc_matmul_mx_golden,
+)
+
 # Mapping from nki dtype strings to neuron_dtypes dtype objects
 NL_TO_DT_DTYPE = {
     nl.float8_e4m3fn_x4: dt.float8_e4m3fn_x4,
@@ -93,79 +101,6 @@ def quantize_mx_golden(in_tensor, out_x4_dtype, ocp_saturation=True, reverse_dst
     mx_data_golden = static_cast(mx_data_golden.astype(np.float32), NL_TO_DT_DTYPE.get(out_x4_dtype, out_x4_dtype))
 
     return mx_data_golden, mx_scale_golden
-
-
-def get_p_contiguous_scale(hw_scale, data_p_size, p_offset=0):
-    if data_p_size <= 32:
-        return hw_scale[p_offset : p_offset + data_p_size]
-
-    scale = np.zeros((data_p_size // 8,) + tuple(hw_scale.shape[1:]), hw_scale.dtype)
-    for i in range(data_p_size // 8):
-        scale[i] = hw_scale[i // 4 * 32 + i % 4 + p_offset]
-
-    return scale
-
-
-def nc_matmul_mx_golden(
-    stationary_x4,
-    moving_x4,
-    stationary_scale,
-    moving_scale,
-    use_contiguous_scale=True,
-    stationary_scale_p_offset=0,
-    moving_scale_p_offset=0,
-):
-    # Process moving tensor
-    moving = static_cast(moving_x4, np.float32)
-    new_shape = moving.shape[:-1] + (moving.shape[-1] // 4, 4)
-    moving = moving.reshape(new_shape)
-    MP, MF0, MF1 = moving.shape
-    assert MF1 == 4
-    moving_scale = moving_scale.astype(np.float32)
-    if not use_contiguous_scale:
-        # if scale follows hw layout, make it contiguous at partition dimension
-        moving_scale = get_p_contiguous_scale(moving_scale, MP, moving_scale_p_offset)
-
-    MSP, MSF0 = moving_scale.shape
-
-    # The scale tensor may have more columns than needed (e.g., when stationary and moving scales are packed together).
-    moving_scale_relevant = moving_scale[:, :MF0]
-
-    # Convert scale exponents to scale factors and apply via broadcasting
-    # Each scale factor applies to an 8x1x4 block: [MSP, 1, MF0, 1] broadcasts to [MSP, 8, MF0, 4]
-    moving_scale_factors = 2.0 ** (moving_scale_relevant - 127)  # Shape: [MSP, MF0]
-    moving = moving.reshape(MSP, 8, MF0, 4)
-    moving *= moving_scale_factors[:, np.newaxis, :, np.newaxis]
-    moving = moving.reshape(MP, MF0, 4)
-
-    # Process stationary tensor
-    stationary = static_cast(stationary_x4, np.float32)
-    new_shape = stationary.shape[:-1] + (stationary.shape[-1] // 4, 4)
-    stationary = stationary.reshape(new_shape)
-    SP, SF0, SF1 = stationary.shape
-    assert SF1 == 4
-    stationary = stationary.astype(np.float32)
-    stationary_scale = stationary_scale.astype(np.float32)
-    if not use_contiguous_scale:
-        # if scale follows hw layout, make it contiguous at partition dimension
-        stationary_scale = get_p_contiguous_scale(stationary_scale, SP, stationary_scale_p_offset)
-
-    SSP, SSF0 = stationary_scale.shape
-
-    # The scale tensor may have more columns than needed (e.g., when stationary and moving scales are packed together).
-    stationary_scale_relevant = stationary_scale[:, :SF0]
-
-    # Convert scale exponents to scale factors and apply via broadcasting
-    # Each scale factor applies to an 8x1x4 block: [SSP, 1, SF0, 1] broadcasts to [SSP, 8, SF0, 4]
-    stationary_scale_factors = 2.0 ** (stationary_scale_relevant - 127)  # Shape: [SSP, SF0]
-    stationary = stationary.reshape(SSP, 8, SF0, 4)
-    stationary *= stationary_scale_factors[:, np.newaxis, :, np.newaxis]
-    stationary = stationary.reshape(SP, SF0, 4)
-
-    # Contract over k (partition) and q (4-wide): einsum("kiq,kjq->ij") = [SF0, MF0]
-    # Reshape to [SF0, SP*4] and [MF0, MP*4], then matmul
-    golden = stationary.transpose(1, 0, 2).reshape(SF0, -1) @ moving.transpose(1, 0, 2).reshape(MF0, -1).T
-    return golden
 
 
 def dequantize_mx_golden(mx_data_x4, mx_scale):

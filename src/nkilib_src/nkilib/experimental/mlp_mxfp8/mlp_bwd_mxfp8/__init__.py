@@ -15,36 +15,25 @@
 """MLP Backward MXFP8 kernel implementations."""
 
 from .config import (
-    DEFAULT_MATMUL_CONFIG,
-    L_TILE_K,
-    TILE_K,
-    TILE_M,
-    TILE_N,
-    BlockConfig,
-    MatmulConfig,
-    get_autotuned_config,
-    get_config_for_shape,
+    ClampLimits,
+    MlpBwdMatmulConfig,
 )
-from .mlp_bwd_mxfp8_kernel import mlp_backward_mxfp8_base_nki, mlp_backward_mxfp8_nki
+from .mlp_bwd_mxfp8_kernel import (
+    mlp_backward_mxfp8_base_nki,
+    mlp_backward_mxfp8_nki,
+)
 from .recompute import (
     recompute_gate_act,
     recompute_gate_up_projection,
-    recompute_hidden,
+    recompute_intermediate,
 )
 
 __all__ = [
     'mlp_backward_mxfp8_nki',
     'mlp_backward_mxfp8_base_nki',
-    'TILE_M',
-    'TILE_K',
-    'TILE_N',
-    'L_TILE_K',
-    'BlockConfig',
-    'MatmulConfig',
-    'DEFAULT_MATMUL_CONFIG',
-    'get_config_for_shape',
-    'get_autotuned_config',
+    'ClampLimits',
+    'MlpBwdMatmulConfig',
     'recompute_gate_up_projection',
     'recompute_gate_act',
-    'recompute_hidden',
+    'recompute_intermediate',
 ]

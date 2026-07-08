@@ -17,37 +17,35 @@
 import nki.isa as nisa
 import nki.language as nl
 
-from ...mlp.mlp_parameters import (
-    MLPBiasParameters,
-    MLPParameters,
-    MLPQuantizationParameters,
-)
-
-# MLP utils
-from ...mlp.mlp_tkg.mlp_tkg_constants import MLPTKGConstants
-from ...mlp.mlp_tkg.mlp_tkg_down_projection import process_down_projection
-from ...mlp.mlp_tkg.mlp_tkg_gate_up_projection import process_gate_up_projection
-from ...mlp.mlp_tkg.mlp_tkg_utils import input_norm_load, transpose_store
-
 # common utils
 from ...utils.allocator import SbufManager
 from ...utils.common_types import ExpertAffinityScaleMode, GateUpDim, QuantizationType
 from ...utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from ...utils.logging import get_logger
 from ...utils.stream_shuffle_broadcast import stream_shuffle_broadcast
-from ...utils.tensor_view import TensorView
+from .mlp_parameters import (
+    MLPBiasParameters,
+    MLPParameters,
+    MLPQuantizationParameters,
+)
+
+# MLP utils
+from .mlp_tkg_constants import MLPTKGConstants
+from .mlp_tkg_down_projection import process_down_projection
+from .mlp_tkg_gate_up_projection import process_gate_up_projection
 from .moe_tkg_utils import (
     broadcast_token_affinity,
     gather_expert_affinities,
     reshape_scale_for_mlp,
     safe_tensor_view,
 )
+from .projection_utils import input_norm_load, transpose_store
 
 
 def _selective_expert_moe_tkg(
     params: MLPParameters,
-    output: nl.ndarray,
-) -> nl.ndarray:
+    output: nl.NkiTensor,
+) -> nl.NkiTensor:
     """
     Selective-expert Mixture of Experts (MoE) kernel for token generation (TKG).
 
@@ -56,10 +54,10 @@ def _selective_expert_moe_tkg(
 
     Args:
         params (MLPParameters): MLPParameters containing model configuration, weights, and input tensors.
-        output (nl.ndarray): Output tensor to store the final result.
+        output (nl.NkiTensor): Output tensor to store the final result.
 
     Returns:
-        output (nl.ndarray): Output tensor with accumulated expert results.
+        output (nl.NkiTensor): Output tensor with accumulated expert results.
 
     Notes:
         - Processes tokens sequentially, experts selectively based on top-K indices
@@ -176,9 +174,7 @@ def _selective_expert_moe_tkg(
     # Allocate SBUF locations for down result
     down_output_list = []
     for expert_k_idx in range(dims.K):
-        down_sb = sbm.alloc_stack(
-            (dims.H0, dims.H1_shard), dtype=io_dtype, name=f"down_sbuf_{expert_k_idx}", buffer=nl.sbuf
-        )
+        down_sb = sbm.alloc_stack((dims.H0, dims.H1_shard), dtype=io_dtype, buffer=nl.sbuf)
         down_output_list.append(down_sb)
 
     # Reshape gate_up weights from [E, H, 2, I] to [E, H, 2 * I]
@@ -209,6 +205,7 @@ def _selective_expert_moe_tkg(
         nisa.tensor_copy(dst=expert_affinities_sb[0 : dims.T, 0 : dims.E], src=expert_affinities)
     else:
         # Prefetch expertIndices (Up to 128 tokens input)
+        nisa.memset(expert_affinities_sb, value=0.0)
         nisa.dma_copy(
             dst=expert_affinities_sb[0 : dims.T, 0 : dims.E],
             src=expert_affinities[0 : dims.T, 0 : dims.E],
@@ -301,7 +298,7 @@ def _selective_expert_moe_tkg(
             if initial_mlp_quant_params.quantization_type == QuantizationType.STATIC:
                 """
                 The MLP projection expects (128, 1) scales, but MOE per-expert
-                selection produces a broadcast TensorView over a scalar that DMA
+                selection produces a broadcast NkiTensor over a scalar that DMA
                 can't handle. Load to partition 0 and broadcast on-chip instead.
                 """
                 gate_w_dequant_sb = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -309,24 +306,24 @@ def _selective_expert_moe_tkg(
                 down_w_dequant_sb = nl.ndarray((dims._pmax, 1), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(
                     dst=gate_w_dequant_sb[0:1, 0:1],
-                    src=params.quant_params.gate_w_scale.slice(dim=0, start=0, end=1).get_view(),
+                    src=params.quant_params.gate_w_scale.slice(dim=0, start=0, end=1),
                 )
                 stream_shuffle_broadcast(gate_w_dequant_sb, gate_w_dequant_sb)
                 nisa.dma_copy(
                     dst=up_w_dequant_sb[0:1, 0:1],
-                    src=params.quant_params.up_w_scale.slice(dim=0, start=0, end=1).get_view(),
+                    src=params.quant_params.up_w_scale.slice(dim=0, start=0, end=1),
                 )
                 stream_shuffle_broadcast(up_w_dequant_sb, up_w_dequant_sb)
                 nisa.dma_copy(
                     dst=down_w_dequant_sb[0:1, 0:1],
-                    src=params.quant_params.down_w_scale.slice(dim=0, start=0, end=1).get_view(),
+                    src=params.quant_params.down_w_scale.slice(dim=0, start=0, end=1),
                 )
                 stream_shuffle_broadcast(down_w_dequant_sb, down_w_dequant_sb)
                 params.quant_params = MLPQuantizationParameters(
                     quantization_type=QuantizationType.STATIC,
-                    gate_w_scale=TensorView(gate_w_dequant_sb),
-                    up_w_scale=TensorView(up_w_dequant_sb),
-                    down_w_scale=TensorView(down_w_dequant_sb),
+                    gate_w_scale=gate_w_dequant_sb,
+                    up_w_scale=up_w_dequant_sb,
+                    down_w_scale=down_w_dequant_sb,
                     gate_up_in_scale=None,
                     down_in_scale=None,
                     clipping_bound=params.quant_params.clipping_bound,
@@ -380,7 +377,8 @@ def _selective_expert_moe_tkg(
     dims.T = T_per_shard
 
     # Store output
-    if output.buffer == nl.sbuf:
+    output_is_sbuf = output.buffer == nl.sbuf
+    if output_is_sbuf:
         # Transpose output_temp [H0, H1_shard, T_per_shard] -> [H0, T, H1_shard] for SBUF output
         for h1_idx in range(dims.H1_shard):
             nisa.tensor_copy(dst=output[:, T_offset : T_offset + T_per_shard, h1_idx], src=output_temp[:, h1_idx, :])
@@ -409,13 +407,13 @@ def _selective_expert_moe_tkg(
     return output
 
 
-def _select_quant_scales(quant_params: MLPQuantizationParameters, expert_id_offset: nl.ndarray):
+def _select_quant_scales(quant_params: MLPQuantizationParameters, expert_id_offset: nl.NkiTensor):
     """
     Select and reshape quantization scales for a specific expert.
 
     Args:
         quant_params (MLPQuantizationParameters): Quantization parameters.
-        expert_id_offset (nl.ndarray): Expert ID offset for selecting scales.
+        expert_id_offset (nl.NkiTensor): Expert ID offset for selecting scales.
 
     Returns:
         MLPQuantizationParameters: Quantization parameters with scales for the specified expert.

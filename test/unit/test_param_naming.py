@@ -45,6 +45,7 @@ _GRANDFATHERED_FILES = {
     "core/output_projection/test_output_proj_tkg.py",
     "core/qkv/test_qkv_cte.py",
     "core/qkv/test_qkv_tkg.py",
+    "experimental/primitives/output_projection/test_output_proj_tkg.py",
     "core/router_topk/test_router_topk.py",
     "core/subkernels/test_find_nonzero_indices.py",
     "core/subkernels/test_indexed_flatten.py",

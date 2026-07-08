@@ -13,18 +13,41 @@
 # limitations under the License.
 import logging
 import os
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional, Protocol, TextIO, runtime_checkable
 
+from typing_extensions import override
+
+# NOTE: use a sys.version_info guard rather than try/except ImportError. mypy
+# (run with --python-version 3.10) cannot resolve a try/except import of
+# enum.StrEnum and falls back to typeshed, making members resolve to plain str.
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    # Python 3.10 fallback: create a StrEnum-like base that uses value-based
+    # equality and hashing, making members safe for cross-module dict lookups.
+    class StrEnum(str, Enum):  # type: ignore[no-redef]
+        def __str__(self) -> str:
+            return self.value
+
+        def __eq__(self, other) -> bool:
+            if isinstance(other, str):
+                return str.__eq__(self.value, other)
+            return NotImplemented
+
+        def __hash__(self) -> int:
+            return hash(self.value)
+
+
 try:
     import nki.isa as nisa
 except ModuleNotFoundError:
     nisa = None  # nki not available; get_nc_gen() will raise if called
 import numpy.typing as npt
-from typing_extensions import override
 
 from .metrics_collector import IMetricsCollector
 
@@ -183,6 +206,7 @@ class SeparationPassMode(Enum):
     NONE = "none"
     DIRECT = "direct"
     INDIRECT = "indirect"
+    INDIRECT_SERIALIZE = "indirect-serialize"  # Indirect separation with ordered edges between all moved loads
 
 
 class UploadProfileMode(Enum):
@@ -294,15 +318,23 @@ class PerRankLazyInputGenerator(PerRankLazyGenerator):
     """
 
 
+@dataclass
 class PerRankLazyGoldenGenerator(PerRankLazyGenerator):
-    """Generates golden values per rank for collectives tests.
+    """Lazy golden generator for multi-rank collective tests.
 
-    Example:
-        def create_golden(rank_id):
-            return {"out": expected[rank_id]}
+    Wraps a callable that runs torch refs across all ranks via SimDistRunner.
+    Only created in hardware (compile-and-infer) mode. In compile-only mode,
+    the framework passes validation_args=None instead, skipping golden gen.
 
-        golden_output=PerRankLazyGoldenGenerator(create_golden)
+    output_keys: List of output tensor names returned by the torch ref.
+    Required so the framework knows output names without calling the generator,
+    enabling compile-only mode to build output descriptors for the NEFF.
     """
+
+    output_keys: list = field(default_factory=list)
+
+    def for_rank(self, rank_id: int) -> dict:
+        return super().for_rank(rank_id)
 
 
 # Type aliases for golden output handling:
@@ -344,31 +376,43 @@ class ValidationArgs:
     equal_nan_inf: bool = False
 
     def __post_init__(self):
+        error_message: str = f"ValidationArgs only supports LazyGoldenGenerator, PerRankLazyGoldenGenerator, or dict[str, CustomValidatorWithOutputTensorData], but got {type(self.golden_output)}"
         if isinstance(self.golden_output, (LazyGoldenGenerator, PerRankLazyGoldenGenerator)):
             pass
         elif isinstance(self.golden_output, dict):
             for key, value in self.golden_output.items():
                 assert isinstance(key, str) and isinstance(value, CustomValidatorWithOutputTensorData), error_message
         else:
-            error_message: str = f"ValidationArgs only supports LazyGoldenGenerator, PerRankLazyGoldenGenerator, or dict[str, CustomValidatorWithOutputTensorData], but got {type(self.golden_output)}"
             assert False, error_message
 
 
-class Platforms(Enum):
+class Platforms(StrEnum):
+    """Target hardware platforms for NKI kernel compilation and execution.
+
+    Uses StrEnum so that members use string-based equality and hashing. This is
+    critical because the same module can be loaded under two paths (test.utils.*
+    and nkilib_testing.*) when the pytest11 entry point is active — StrEnum
+    ensures cross-module dict lookups and set operations work correctly.
+    """
+
     TRN1 = "trn1"
     TRN2 = "trn2"
     TRN3 = "trn3"
     TRN3_A0 = "trn3_a0"
+    TRN3_PDS = "trn3_pds"
+    TRN3_PDS_A0 = "trn3_pds_a0"
 
     @override
     def __str__(self) -> str:
         return self.value
 
     def is_trn3(self) -> bool:
-        return self in (Platforms.TRN3, Platforms.TRN3_A0)
+        return self in (Platforms.TRN3, Platforms.TRN3_A0, Platforms.TRN3_PDS, Platforms.TRN3_PDS_A0)
 
     def get_compile_target(self) -> str:
-        if self == Platforms.TRN3_A0:
+        if self in (Platforms.TRN3_A0, Platforms.TRN3_PDS_A0):
+            return "trn3pre"
+        elif self == Platforms.TRN3_PDS:
             return Platforms.TRN3.value
         else:
             return self.value
@@ -381,6 +425,8 @@ class Platforms(Enum):
             Platforms.TRN2: nisa.nc_version.gen3,
             Platforms.TRN3: nisa.nc_version.gen4,
             Platforms.TRN3_A0: nisa.nc_version.gen4,
+            Platforms.TRN3_PDS: nisa.nc_version.gen4,
+            Platforms.TRN3_PDS_A0: nisa.nc_version.gen4,
         }
 
         return gen_map[self].name
@@ -423,7 +469,7 @@ class CompilerArgs:
         self,
         platform_target: Platforms,
         logical_nc_config: int | None = None,
-        additional_cmd_args: list[str] = [],
+        additional_cmd_args: list[str] | None = None,
         enable_debugging: bool = False,
         enable_birsim: bool = False,
         dump_after_lowering: bool = False,
@@ -431,14 +477,18 @@ class CompilerArgs:
         enable_device_dump: bool = False,
     ):
         self.platform_target = platform_target
-        self.additional_cmd_args = additional_cmd_args
+        self.additional_cmd_args = additional_cmd_args if additional_cmd_args is not None else []
         self.enable_debugging = enable_debugging
         self.enable_birsim = enable_birsim
         self.dump_after_lowering = dump_after_lowering
         self.separation_pass_mode = separation_pass_mode
         self.enable_device_dump = enable_device_dump
         if os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS"):
-            self.separation_pass_mode = SeparationPassMode.INDIRECT
+            sep_mode = os.environ.get("NKILIB_ENABLE_SEPARATION_ANALYSIS")
+            if sep_mode == "serialize":
+                self.separation_pass_mode = SeparationPassMode.INDIRECT_SERIALIZE
+            else:
+                self.separation_pass_mode = SeparationPassMode.INDIRECT
         if logical_nc_config is None:
             self.logical_nc_config = self.__get_logical_nc_config_for_platform__()
         else:
@@ -450,6 +500,8 @@ class CompilerArgs:
             Platforms.TRN2: 2,
             Platforms.TRN3: 2,
             Platforms.TRN3_A0: 2,
+            Platforms.TRN3_PDS: 2,
+            Platforms.TRN3_PDS_A0: 2,
         }
 
         return platform_to_logical_nc_config[self.platform_target]
@@ -509,6 +561,7 @@ class NeuronDeviceInfo:
     memory_size: int
     neuroncore_ids: list[int]
     neuron_processes: list[dict[str, Any]]
+    instance_type: str
     logical_neuroncore_config: int = (
         2  # future version of compiler and runtime simply default to lnc 2 without explicitly specifying it
     )
@@ -527,6 +580,7 @@ class NeuronDeviceInfo:
             memory_size=data["memory_size"],
             neuroncore_ids=data["neuroncore_ids"],
             neuron_processes=data.get("neuron_processes", []),
+            instance_type=data["instance_type"],
         )
 
     def get_memory_size_gb(self) -> float:

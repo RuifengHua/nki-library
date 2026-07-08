@@ -23,11 +23,11 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from nkilib_src.nkilib.experimental.mxfp_subkernels.mxfp_load_torch import (
-    mxfp_load_torch_ref,
-)
 from nkilib_src.nkilib.experimental.mxfp_subkernels.mxfp_load_utils import (
     mxfp_load_performance_wrapper,
+)
+from nkilib_src.nkilib.experimental.mxfp_subkernels.mxfp_load_utils_torch import (
+    mxfp_load_performance_wrapper_torch_ref,
 )
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -63,7 +63,7 @@ class TestMxfpLoadPerformance:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=mxfp_load_performance_wrapper,
-            torch_ref=mxfp_load_torch_ref,
+            torch_ref=mxfp_load_performance_wrapper_torch_ref,
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
         )

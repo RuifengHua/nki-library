@@ -9,10 +9,10 @@ wheel:
 	pip --require-virtualenv --isolated wheel . --wheel-dir dist --no-deps
 
 test:
-	pytest test $(ARGS)
+	PYTHONPATH=$(CURDIR):$$PYTHONPATH pytest -p test.utils.pytest_plugin $(ARGS)
 
 unit_test:
-	pytest test/unit
+	PYTHONPATH=$(CURDIR):$$PYTHONPATH pytest -p test.utils.pytest_plugin $(ARGS) test/unit
 
 lint:
 	ruff check .
@@ -38,5 +38,5 @@ install:
 install_wheelhouse:
 	pip install --require-virtualenv wheelhouse/*.whl
 
-# Include internal targets if available 
+# Include internal targets if available
 -include Makefile.internal.mk
