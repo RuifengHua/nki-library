@@ -19,7 +19,8 @@ from typing import Any, Optional
 import nki.language as nl
 import torch
 
-from ...utils.common_types import ActFnType, ExpertAffinityScaleMode
+from ...mlp.mlp_parameters import MLPQuantizationParameters
+from ...utils.common_types import ActFnType, ExpertAffinityScaleMode, QuantizationType
 from .bwmm_mx_torch_common import bwmm_mx_blockwise_loop
 from .moe_cte_utils import SkipMode
 
@@ -39,6 +40,8 @@ def bwmm_shard_on_block_mx_torch_ref(
     block_size: Optional[int] = None,
     n_static_blocks: int = -1,
     n_dynamic_blocks: int = 55,
+    top_k: int = 1,
+    ep_degree: int = 1,
     gate_up_activations_T: Optional[torch.Tensor] = None,
     down_activations: Optional[torch.Tensor] = None,
     activation_function: ActFnType = ActFnType.SiLU,
@@ -51,8 +54,26 @@ def bwmm_shard_on_block_mx_torch_ref(
     gate_clamp_lower_limit: Optional[float] = None,
     up_clamp_lower_limit: Optional[float] = None,
     up_clamp_upper_limit: Optional[float] = None,
+    use_packed_scales: bool = False,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+    gate_up_in_scale: Optional[torch.Tensor] = None,
+    down_in_scale: Optional[torch.Tensor] = None,
 ) -> dict:
     """PyTorch reference for bwmm_shard_on_block_mx. Signature matches kernel exactly."""
+    quant_params = None
+    if quantization_type == QuantizationType.STATIC_MX:
+        # STATIC_MX reuses gate_up_proj_scale / down_proj_scale to carry the per-expert
+        # weight scales (gate/up packed [E, 2, 1], down [E, 1]). Split the packed gate/up
+        # tensor into separate [E, 1] gate and up views (idx 0 = gate, idx 1 = up).
+        quant_params = MLPQuantizationParameters(
+            quantization_type=quantization_type,
+            gate_w_scale=gate_up_proj_scale[:, 0],
+            up_w_scale=gate_up_proj_scale[:, 1],
+            down_w_scale=down_proj_scale,
+            gate_up_in_scale=gate_up_in_scale,
+            down_in_scale=down_in_scale,
+            clipping_bound=0.0,
+        )
     return bwmm_mx_blockwise_loop(
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,
@@ -76,4 +97,5 @@ def bwmm_shard_on_block_mx_torch_ref(
         up_clamp_lower_limit=up_clamp_lower_limit,
         up_clamp_upper_limit=up_clamp_upper_limit,
         separate_outputs=is_tensor_update_accumulating,
+        quant_params=quant_params,
     )

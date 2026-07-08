@@ -227,15 +227,16 @@ The attention_block_tkg kernel with KV data parallelism wraps the standard atten
 | `KVDP`                 | int                 | KV data parallelism degree (1 = disabled)                         |
 | `KVDP_replica_group`   | ReplicaGroup        | Rank group for collectives                                        |
 | `KVDP_collective_mode` | KVDPCollectiveMode  | Collective mode: `ALL_TO_ALL` (default) or `ALL_GATHER_SLICE`     |
+| `KVDP_rank`            | nl.ndarray          | Shape (1,), uint32 @ HBM. This rank's position in its KVDP group  |
 
 ### Collective Modes
 
 The `KVDP_collective_mode` parameter selects the collective operation strategy for Q input and attention output redistribution:
 
 - **ALL_TO_ALL (default):** Single `all_to_all` collective that combines gather and slice in one step. Requires Mesh algorithm (≥4 ranks lnc2 or ≥8 ranks lnc1).
-- **ALL_GATHER_SLICE:** `all_gather` on heads/batch followed by a `rank_id`-based slice. Works with any rank count (≥2).
+- **ALL_GATHER_SLICE:** `all_gather` on heads/batch followed by a `KVDP_rank`-based slice. Works with any rank count (≥2).
 
-Note: K/V batch slicing still uses `rank_id` in both modes (local slice, not a collective).
+Note: K/V batch slicing still uses `KVDP_rank` in both modes (local slice, not a collective).
 
 ### Collective Operations: ALL_TO_ALL
 
@@ -341,7 +342,7 @@ When q_heads==1, the Q transpose can be skipped: all_gather directly on d_head d
         Rearrange: (64, 16)          - rearrange SBUF (d, B, q, S)=(64,8,2,1) → (d, q, B, S)=(64,2,8,1)
         Q @ HBM:   (2, 8, 1, 64)     - tiled transpose: (q=2, B=8, S=1, d=64)
         Gathered:  (8, 8, 1, 64)     - all_gather dim=0: (KVDP*q=8, B=8, S=1, d=64)
-        Sliced:    (8, 2, 1, 64)     - rank_id slice on batch: (KVDP*q=8, B_attn=2, S=1, d=64)
+        Sliced:    (8, 2, 1, 64)     - KVDP_rank slice on batch: (KVDP*q=8, B_attn=2, S=1, d=64)
         Transpose: (64, 16)          - tiled transpose back: (d=64, q_attn*B_attn*S=8*2*1=16)
         Rearrange: (64, 16)          - rearrange SBUF (d, q_attn, B_attn, S)=(64,8,2,1) → (d, B_attn, q_attn, S)=(64,2,8,1)
         Q @ SBUF:  (64, 16)          - (d=64, B_attn*q_attn*S=16)
@@ -350,7 +351,7 @@ When q_heads==1, the Q transpose can be skipped: all_gather directly on d_head d
         attn @ SBUF: (64, 16)        - (d=64, B_attn*q_attn*S=2*8*1=16)
         attn @ HBM:  (2, 8, 64, 1)   - tiled transpose: (B_attn=2, q_attn=8, d=64, S=1)
         Gathered:    (8, 8, 64, 1)   - all_gather dim=0: (B=8, q_attn=8, d=64, S=1)
-        Sliced:      (8, 2, 64, 1)   - rank_id slice on heads: (B=8, q=2, d=64, S=1)
+        Sliced:      (8, 2, 64, 1)   - KVDP_rank slice on heads: (B=8, q=2, d=64, S=1)
         attn @ SBUF: (64, 16)        - tiled transpose back: (d=64, B*q*S=8*2*1=16)
 
 See `_KVDP_attention_input_collectives` and `_KVDP_attention_output_collectives` docstrings for pseudocode.

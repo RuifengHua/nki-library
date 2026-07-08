@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import json
 import typing
 from enum import Enum
@@ -103,111 +104,6 @@ def normalize_param_value(value):
     return value
 
 
-def normalize_params_with_type_hints(params: dict, kernel_func: typing.Callable | None) -> dict:
-    """Normalize param values using kernel function's type hints.
-
-    Converts integer values to enum names when the corresponding kernel arg
-    has an Enum type hint. This ensures consistent string representation
-    regardless of whether params came from sweep tests (integers) or unit tests (enums).
-
-    Uses suffix matching to handle cases where param name (e.g., "norm_type")
-    doesn't exactly match kernel arg name (e.g., "fused_norm_type").
-
-    If kernel_func is None, falls back to basic normalization via normalize_param_value.
-    """
-    if not params:
-        return params
-
-    # If no kernel func provided, just do basic normalization
-    if not kernel_func:
-        return {k: normalize_param_value(v) for k, v in params.items() if normalize_param_value(v) is not None}
-
-    # Unwrap NKI kernel objects to get the original function
-    unwrapped_func = _unwrap_kernel_func(kernel_func)
-
-    try:
-        hints = typing.get_type_hints(unwrapped_func)
-    except Exception:
-        # If we can't get type hints, fall back to basic normalization
-        return {k: normalize_param_value(v) for k, v in params.items() if normalize_param_value(v) is not None}
-
-    # Collect all enum and bool type hints from kernel function
-    # Handle both direct types (bool) and Optional types (Optional[bool])
-    enum_hints: dict[str, type] = {}
-    bool_hints: set[str] = set()
-    for arg_name, hint in hints.items():
-        if isinstance(hint, type) and issubclass(hint, Enum):
-            enum_hints[arg_name] = hint
-        elif hint is bool:
-            bool_hints.add(arg_name)
-        # Handle Optional[bool] - check if it's typing.Optional[bool] or typing.Union[bool, None]
-        elif hasattr(hint, "__origin__") and hint.__origin__ is typing.Union:
-            args = getattr(hint, "__args__", ())
-            if bool in args:
-                bool_hints.add(arg_name)
-
-    normalized = {}
-    for key, value in params.items():
-        # First apply basic normalization
-        basic_normalized = normalize_param_value(value)
-        if basic_normalized is None:
-            continue
-
-        # If basic normalization already converted enum to string, use it
-        if isinstance(value, Enum):
-            normalized[key] = basic_normalized
-            continue
-
-        # Handle non-integer values (strings, floats, lists, etc.) - pass through
-        if not isinstance(value, int):
-            normalized[key] = basic_normalized
-            continue
-
-        # Check for boolean type hint match (exact or suffix)
-        is_bool_param = False
-        # Get the ending part after first underscore for partial matching
-        # e.g., 'fused_add' -> '_add' to match 'fused_residual_add'
-        key_suffix = "_" + key.split("_")[-1] if "_" in key else None
-        key_lower = key.lower()
-        for arg_name in bool_hints:
-            arg_lower = arg_name.lower()
-            # Case-insensitive matching: exact match, suffix match, or ending suffix match
-            if (
-                arg_lower == key_lower
-                or arg_lower.endswith("_" + key_lower)
-                or key_lower.endswith("_" + arg_lower)
-                or (
-                    key_suffix
-                    and arg_lower.endswith(key_suffix.lower())
-                    and arg_lower.startswith(key.split("_")[0].lower())
-                )
-            ):
-                is_bool_param = True
-                break
-        if is_bool_param:
-            normalized[key] = bool(value)
-            continue
-
-        # Find matching enum hint by exact match or suffix match
-        matched_hint = None
-        for arg_name, hint in enum_hints.items():
-            arg_lower = arg_name.lower()
-            # Case-insensitive matching for enums too
-            if arg_lower == key_lower or arg_lower.endswith("_" + key_lower) or key_lower.endswith("_" + arg_lower):
-                matched_hint = hint
-                break
-
-        if matched_hint:
-            try:
-                normalized[key] = matched_hint(value).name
-            except ValueError:
-                normalized[key] = basic_normalized  # Keep original if conversion fails
-        else:
-            normalized[key] = basic_normalized
-
-    return normalized
-
-
 def extract_pytest_params(params: dict) -> dict:
     """Extract and serialize pytest parametrized values for metrics."""
     result = {}
@@ -231,3 +127,74 @@ def normalize_param_names(params: dict) -> dict:
     If two source keys map to the same canonical name, the last one wins.
     """
     return {CANONICAL_PARAM_NAMES.get(k, k): v for k, v in params.items()}
+
+
+def _stable_param_value(value):
+    """Serialize a parameter value for stable hashing.
+
+    Prioritizes stability over readability:
+    - Enums use .value (integer) rather than .name (string) since values are
+      part of the API contract and won't change if a member is renamed.
+    - Numpy scalars are converted to Python native types.
+    - Lists/tuples/dicts are recursively normalized.
+    - Objects with __dict__ are decomposed into sorted attribute dicts.
+    - Raises TypeError for unsupported types to force explicit handling.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, type):
+        return value.__name__
+    if isinstance(value, (list, tuple)):
+        return [_stable_param_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _stable_param_value(v) for k, v in sorted(value.items())}
+    # Handle sets by sorting for deterministic ordering
+    if isinstance(value, (set, frozenset)):
+        return sorted((_stable_param_value(v) for v in value), key=repr)
+    # Handle numpy scalars (int64, float32, etc.)
+    if hasattr(value, "item"):
+        return value.item()
+    # Decompose dataclasses and other objects into their attributes
+    if hasattr(value, "__dict__"):
+        return {k: _stable_param_value(v) for k, v in sorted(vars(value).items())}
+    raise TypeError(
+        f"Unsupported parameter type for hashing: {type(value).__name__}. Add explicit handling in _stable_param_value."
+    )
+
+
+def compute_params_hash(params: dict) -> str:
+    """Compute a stable hash from raw pytest callspec params.
+
+    Serializes all values (including None) in sorted key order to produce
+    a deterministic fingerprint. This is used as part of the permutation
+    identity key for regression tracking.
+
+    Unlike extract_pytest_params, this preserves None values to avoid
+    collisions between parametrizations that differ only by a None value.
+    Uses _stable_param_value which prefers enum .value over .name for
+    stability against member renames.
+    """
+    serialized = {}
+    for key in sorted(params.keys()):
+        serialized[key] = _stable_param_value(params[key])
+    canonical = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def derive_test_method_id(node) -> str:
+    """Derive a stable test method identifier from a pytest node.
+
+    Returns a string in the format module::class::method (or module::method
+    if the test is not inside a class). This identifies the test code being
+    executed, independent of parametrize values or pytest ID formatting.
+    """
+    module_name = node.module.__name__ if node.module else ""
+    class_name = node.cls.__name__ if node.cls else ""
+    method_name = node.originalname
+    if class_name:
+        return f"{module_name}::{class_name}::{method_name}"
+    return f"{module_name}::{method_name}"

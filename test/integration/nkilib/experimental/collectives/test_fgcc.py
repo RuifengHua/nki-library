@@ -20,12 +20,14 @@ import pytest
 from nkilib_src.nkilib.experimental.collectives.fgcc import (
     allgather_compute_matmul,
 )
-from test.integration.nkilib.experimental.collectives.test_collectives import make_golden_torch_ref
+from nkilib_src.nkilib.experimental.collectives.fgcc_torch import (
+    allgather_compute_matmul_torch_ref,
+)
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import CollectiveUnitTestFramework
+from test.utils.unit_test_collective_framework import CollectiveUnitTestFramework
 
 PARAM_NAMES = "m, K, N, dtype, tp_degree, lnc, force_hbm_cc"
 TEST_PARAMS = [
@@ -78,14 +80,8 @@ class TestFgcc:
         """Test fused all-gather + compute matmul (FGCC) kernel."""
         np.random.seed(42)
         num_groups = 1
-
-        # lhs: (m * tp_degree, K) row-sharded -> each rank gets (m, K)
-        # rhs: (K, N) column-sharded -> each rank gets (K, N // tp_degree)
         lhs_global = np.random.randn(m * tp_degree, K).astype(dtype)
         rhs_global = np.random.randn(K, N).astype(dtype)
-
-        # Golden: full matmul
-        result_global = (lhs_global.astype(np.float32) @ rhs_global.astype(np.float32)).astype(dtype)
 
         def create_inputs(rank_id: int):
             return {
@@ -96,21 +92,16 @@ class TestFgcc:
                 "force_hbm_cc": force_hbm_cc,
             }
 
-        def create_golden(rank_id: int):
-            # Each rank gets column-sharded result
-            return {"result": result_global[:, rank_id * (N // tp_degree) : (rank_id + 1) * (N // tp_degree)]}
-
-        torch_ref, ref_override = make_golden_torch_ref(allgather_compute_matmul, create_golden)
         CollectiveUnitTestFramework(
             test_manager=test_manager,
             kernel_entry=allgather_compute_matmul,
-            torch_ref=torch_ref,
+            torch_ref=allgather_compute_matmul_torch_ref,
             per_rank_input_generator=create_inputs,
             collective_ranks=tp_degree,
-            per_rank_torch_ref_input_override=ref_override,
         ).run_test(
             test_config=None,
             compiler_args=CompilerArgs(logical_nc_config=lnc, platform_target=platform_target),
+            output_keys=["result"],
             rtol=1e-2,
             atol=1e-2,
         )

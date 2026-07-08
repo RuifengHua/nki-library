@@ -21,28 +21,34 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Generator, final
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any, Callable, Generator, NoReturn, final
 
 import fabric2
-from attr import dataclass
 from filelock import FileLock
+from invoke.exceptions import CommandTimedOut
 from paramiko import SSHException
 from typing_extensions import override
 
 from . import core_lock_client as lock_client
 from .common_dataclasses import INF_ARTIFACT_DIR_NAME, NeuronDeviceInfo, Platforms, TargetHost
-from .core_lock_client import REMOTE_LOCKS_JSON
+from .core_lock_client import POLL_JITTER_MAX, POLL_PERIOD, REMOTE_LOCKS_JSON, STALE_THRESHOLD
 from .core_lock_manager import (
+    AllocationStatus,
     CoreAllocation,
     CoreLockManager,
     LockAcquisitionError,
     LockVersionError,
+    calculate_total_needed_physical_cores,
 )
 from .exceptions import (
     InferenceException,
     LocalExecutionException,
     NoNeuronDevicesException,
+    QueuePatienceRotation,
     RemoteExecutionException,
     TimeoutException,
     UnimplementedException,
@@ -52,6 +58,58 @@ from .remote_executor import RemoteExecutor
 from .resources import RemoteDirectory
 from .s3_utils import S3ArtifactUploadConfig
 from .scripts.remote_lock_scripts import LockState, find_contiguous_cores
+
+# Caller-side patience for FIFO core allocation.
+# If a host's worst-case ETA exceeds this, the caller dequeues and rotates to
+# another host rather than camping. Capped well under the per-test pytest
+# timeout so the caller can cycle through a few hosts before the test is killed.
+DEFAULT_PATIENCE_SECONDS = 3 * lock_client.DEFAULT_LOCK_TIMEOUT_SECONDS  # = 180
+
+# Wall-clock deadline for acquiring a host + core allocation. A busy FIFO queue
+# is transient (not a host failure), so the caller keeps rotating across hosts
+# until this deadline elapses rather than giving up after a fixed attempt count.
+# ~2.5h, capped under the overall suite budget.
+DEFAULT_ACQUISITION_DEADLINE_SECONDS = 9000
+# Backoff between host rotations when the whole fleet is momentarily busy, so a
+# fully-busy fleet re-cycles at a bounded rate instead of hot-spinning.
+HOST_ROTATION_BACKOFF_SECONDS = 1
+
+# Short poll cadence for a near-front waiter. 1 s is the empirical FCFS hand-off
+# floor (bounded by the SSH round-trip), so polling this fast near the front
+# closes the per-hand-off idle gap without spending extra load for no gain.
+# Must stay below POLL_PERIOD (FAST_POLL_PERIOD < POLL_PERIOD).
+FAST_POLL_PERIOD = 1
+
+# Hard timeout for the inference/test command itself. A single remote command
+# must not outlive its core-lock lease, so reuse the lock-timeout constant.
+SSH_INFERENCE_TIMEOUT_SECONDS = lock_client.DEFAULT_LOCK_TIMEOUT_SECONDS  # = 60
+POST_LOCK_TIMEOUT_SECONDS = 900
+
+
+def select_poll_base(position: int | None, *, fast: int = FAST_POLL_PERIOD, slow: int = POLL_PERIOD) -> int:
+    """Return the poll-loop sleep base for a queued caller.
+
+    A caller at or one slot from the front of the queue (``position <= 1``)
+    polls at the short ``fast`` cadence so it commits its reserved block
+    within ~1 s of a hand-off instead of waiting a full slow poll cycle; any
+    deeper position (or an unknown position) uses the normal ``slow`` cadence.
+    The ``fast``/``slow`` arguments are injectable so callers can pass a
+    customized slow period.
+    """
+    if position is not None and position <= 1:
+        return fast
+    return slow
+
+
+def should_rotate(worst_case_eta: int | None, draining: bool, patience_seconds: int) -> bool:
+    """Pure predicate: should a queued caller abandon this host and rotate away?
+
+    Returns True only for a non-draining caller whose worst-case ETA exceeds
+    ``patience_seconds``. Negative patience disables rotation i.e. would always return negative guaidance.
+    A draining host never triggers rotation (ETA is meaningless mid-drain, so the caller stays and keeps probing),
+    and a missing ETA is treated as "stay". Kept pure/host-free for unit testing.
+    """
+    return (not draining) and worst_case_eta is not None and worst_case_eta > patience_seconds and patience_seconds > 0
 
 
 @contextlib.contextmanager
@@ -66,10 +124,14 @@ def temporary_random_seed(seed: int) -> Generator[None, None, None]:
 
 
 @functools.lru_cache(maxsize=1)
-def _run_neuron_ls(neuron_installation_path: str) -> list[dict] | None:
+def _run_neuron_ls(neuron_installation_path: str) -> list[NeuronDeviceInfo] | None:
     """Run neuron-ls --json-output and return parsed JSON, or None on failure."""
     try:
-        neuron_ls_path = os.path.join(neuron_installation_path, "neuron-ls")
+        neuron_ls_path = (
+            os.path.join(neuron_installation_path, "neuron-ls")
+            if not neuron_installation_path.endswith("neuron-ls")
+            else neuron_installation_path
+        )
         if not os.path.isfile(neuron_ls_path):
             return None
         result = subprocess.run(
@@ -81,7 +143,7 @@ def _run_neuron_ls(neuron_installation_path: str) -> list[dict] | None:
         if result.returncode == 0:
             data = json.loads(result.stdout)
             if data:
-                return data
+                return [NeuronDeviceInfo.from_dict(device) for device in data]
         return None
     except Exception:
         return None
@@ -104,7 +166,7 @@ def detect_local_platform(neuron_installation_path: str) -> Platforms | None:
     if not data:
         return None
 
-    instance_type = data[0].get("instance_type", "")
+    instance_type = data[0].instance_type
     # instance_type is e.g. "trn2.48xlarge" or "trn3pds.48xlarge" — extract "trn" + digits
     match = re.match(r"(trn\d+)", instance_type)
     if not match:
@@ -129,6 +191,9 @@ class Host(ABC):
         get_list_of_files_to_copy: Callable[[str], list[str]] | None = None,
         post_lock_command: str | None = None,
     ) -> str | None:
+        run_exception = None
+        stdout = ""
+
         with self.get_core_allocation(
             collective_ranks=collective_ranks, lnc_config=lnc_config, collector=collector
         ) as core_allocation:
@@ -141,18 +206,37 @@ class Host(ABC):
                     self._get_debug_output_dir(target_directory),
                 )
 
-                stdout = self._run_command(command, target_directory, neuron_env, collector)
+                neuron_env.update(self._setup_neuron_tags())
+                try:
+                    stdout = self._run_command(command, target_directory, neuron_env, collector)
+                except Exception as e:
+                    run_exception = e
 
-        if post_lock_command:
+        if not run_exception and post_lock_command:
             if self._should_run_post_lock():
                 post_lock_stdout = self._run_post_lock_command(post_lock_command, target_directory, collector)
                 stdout = stdout + "\n" + post_lock_stdout
             else:
                 logging.error("Skipping post-lock commands: host is draining")
 
+        artifact_path = None
         if do_copy_artifacts:
-            return self._collect_artifacts(target_directory, stdout, get_list_of_files_to_copy, collector)
-        return None
+            try:
+                artifact_path = self._collect_artifacts(target_directory, stdout, get_list_of_files_to_copy, collector)
+            except Exception:
+                if run_exception:
+                    logging.warning("Failed to collect artifacts after command failure", exc_info=True)
+                else:
+                    raise
+
+        if run_exception:
+            raise run_exception
+
+        return artifact_path
+
+    @abstractmethod
+    def get_total_physical_cores(self) -> int:
+        raise UnimplementedException()
 
     @abstractmethod
     def _get_debug_output_dir(self, target_directory: str) -> str:
@@ -197,7 +281,7 @@ class Host(ABC):
         collective_ranks: int = 1,
         lnc_config: int = 2,
         timeout_seconds: int = 9000,
-        poll_period_seconds: int = 5,
+        poll_period_seconds: int = POLL_PERIOD,
     ) -> contextlib.AbstractContextManager[CoreAllocation, Any]:
         """
         Allocate logical cores for execution by locking physical cores.
@@ -229,6 +313,19 @@ class Host(ABC):
     def _should_run_post_lock(self) -> bool:
         """Check if post-lock commands should run. Override to check drain state."""
         return True
+
+    def soft_join_queue(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int = 1,
+        lnc_config: int = 2,
+    ) -> None:
+        """Reserve a FIFO core-queue slot before/while artifacts upload.
+
+        Default no-op. Only SshHost participates in the remote FIFO queue;
+        LocalHost uses the file-lock path and must NOT enqueue.
+        """
+        return None
 
     @abstractmethod
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
@@ -264,6 +361,16 @@ class Host(ABC):
             "NEURON_RT_DEBUG_OUTPUT_DIR": debug_output_dir,
         }
 
+    @staticmethod
+    def _setup_neuron_tags() -> dict[str, str]:
+        """Build the NEURON_TAG_* dict that ships to the remote workload:
+        every NEURON_TAG_* in the local env, plus a fresh per-invocation
+        REQUEST_ID. Future tags are picked up automatically.
+        """
+        tags = {k: v for k, v in os.environ.items() if k.startswith("NEURON_TAG_")}
+        tags["NEURON_TAG_REQUEST_ID"] = str(uuid.uuid4())
+        return tags
+
     def __lock__(self, lock_file_path: str, timeout_seconds: int):
         return FileLock(f"{lock_file_path}.lock", timeout=timeout_seconds * 1000)
 
@@ -294,11 +401,20 @@ class LocalHost(Host):
             if active:
                 raise RuntimeError(
                     f"Active remote core locks found in {REMOTE_LOCKS_JSON} (cores: {active}). "
-                    "This machine appears to be in use as a shared fleet host via SSH. "
-                    "Local testing is not supported on shared fleet instances to avoid core allocation conflicts."
+                    + "This machine appears to be in use as a shared fleet host via SSH. "
+                    + "Local testing is not supported on shared fleet instances to avoid core allocation conflicts."
                 )
         except (json.JSONDecodeError, OSError):
             pass
+
+    @override
+    def get_total_physical_cores(self) -> int:
+        devices = _run_neuron_ls(self.neuron_ls_path)
+        if devices is None:
+            raise RuntimeError(f"Unable to detect local number of physical cores!")
+
+        device_lnc_count: int = sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in devices)
+        return device_lnc_count
 
     @override
     def _get_debug_output_dir(self, target_directory: str) -> str:
@@ -402,7 +518,7 @@ class LocalHost(Host):
         collective_ranks: int = 1,
         lnc_config: int = 2,
         timeout_seconds: int = 9000,
-        poll_period_seconds: int = 5,
+        poll_period_seconds: int = POLL_PERIOD,
     ) -> Generator[CoreAllocation, None, None]:
         # Guard against running LocalHost on a machine also used as a remote SshHost target.
         # SshHost uses locks.json for core locking — if it has active (non-expired) locks,
@@ -411,9 +527,8 @@ class LocalHost(Host):
 
         with collector.timer(MetricName.CORE_ALLOCATION_TIME):
             devices = self.get_neuron_device_info()
-            # neuron-ls returns logical core IDs; multiply by lnc_config to get physical count
-            device_lnc = devices[0].logical_neuroncore_config if devices else lnc_config
-            total_physical_cores = sum(len(d.neuroncore_ids) * device_lnc for d in devices)
+            collector.add_dimension({MetricName.INSTANCE_TYPE: devices[0].instance_type})
+            total_physical_cores = self.get_total_physical_cores()
 
             # We lock at the physical core level to prevent conflicts between
             # LNC1 and LNC2 tests (same approach as SshHost/CoreLockManager).
@@ -503,7 +618,12 @@ class LocalHost(Host):
 
     @override
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
-        result = subprocess.run([self.neuron_ls_path, "--json-output"], capture_output=True, text=True)
+        result = subprocess.run(
+            [self.neuron_ls_path, "--json-output"],
+            capture_output=True,
+            text=True,
+            timeout=SSH_INFERENCE_TIMEOUT_SECONDS,
+        )
         data = json.loads(result.stdout)
         if not data:
             raise NoNeuronDevicesException("localhost")
@@ -513,6 +633,14 @@ class LocalHost(Host):
 @final
 class SshHost(Host):
     SSH_CONNECT_TIMEOUT_SECONDS = 10
+    # SSH keepalive interval. paramiko probes the peer every N seconds so a host
+    # that wedges or is silently recycled mid-operation is detected (within ~2
+    # intervals) and surfaces as an SSHException inside a blocked run(), instead
+    # of hanging the caller indefinitely.
+    SSH_KEEPALIVE_SECONDS = 15
+    # Control/setup commands (mkdir, rm, neuron-ls, venv, version probe) are fast;
+    # bound them at half the inference budget.
+    SSH_COMMAND_TIMEOUT_SECONDS = SSH_INFERENCE_TIMEOUT_SECONDS // 2  # = 30
 
     def __init__(
         self,
@@ -522,12 +650,14 @@ class SshHost(Host):
         run_id: str,
         ssh_config_path: str,
         s3_config: S3ArtifactUploadConfig,
+        patience_seconds: int,
         remote_base_path: str = "/tmp/neuronx-cc/tests",
     ):
         super().__init__()
         self.ssh_alias: str = ssh_alias
         self.run_id: str = run_id
         self.s3_config = s3_config
+        self.patience_seconds = patience_seconds
 
         config_overrides = {"run": {"in_stream": False, "warn": True, "pty": True}}
 
@@ -546,6 +676,11 @@ class SshHost(Host):
         self._total_physical_cores: int | None = None
         self._remote_executor = None
         self._host_locking_version: int | None = None
+        # Cached during one allocation attempt so a manager created by
+        # soft_join_queue during artifact upload is reused (same entry_id) at
+        # commit time. Bound to the owning collector and cleared on teardown so
+        # it never bleeds across tests/attempts (see _ensure_core_lock_manager).
+        self._core_lock_manager: CoreLockManager | None = None
         self.neuron_ls_path: str = os.path.join(remote_neuron_install_dir, "neuron-ls")
         # Cached for the lifetime of this SshHost — device topology is assumed stable during a test run.
         self._cached_device_info: list[NeuronDeviceInfo] | None = None
@@ -553,6 +688,13 @@ class SshHost(Host):
     @override
     def get_host_id(self) -> str:
         return self.ssh_alias
+
+    @override
+    def get_total_physical_cores(self) -> int:
+        if self._total_physical_cores is None:
+            devices = self.get_neuron_device_info()
+            self._total_physical_cores = sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in devices)
+        return self._total_physical_cores
 
     @override
     def _get_debug_output_dir(self, target_directory: str) -> str:
@@ -568,7 +710,38 @@ class SshHost(Host):
         """Reconnect SSH and rebuild the remote executor."""
         self.connection.close()
         self.connection.open()
+        self._apply_keepalive()
         self._remote_executor = RemoteExecutor(self.connection)
+
+    def _apply_keepalive(self) -> None:
+        """Open the connection if needed and enable SSH keepalive.
+
+        Keepalive makes paramiko probe the peer every ``SSH_KEEPALIVE_SECONDS``,
+        so a host that wedges or is silently recycled mid-operation surfaces as
+        an SSHException inside a blocked ``run()`` (within ~2 intervals) instead
+        of hanging the caller indefinitely.
+        """
+        if not self.connection.is_connected:
+            self.connection.open()
+        client = getattr(self.connection, "client", None)
+        transport = client.get_transport() if client is not None else None
+        if transport is not None:
+            transport.set_keepalive(SshHost.SSH_KEEPALIVE_SECONDS)
+
+    def _conn_run(self, command: str, *, timeout: float, **kwargs) -> fabric2.Result:
+        """Run a remote command with keepalive enabled and a hard command timeout.
+
+        A ``CommandTimedOut`` is translated to ``TimeoutException`` so the
+        host-rotation loop in ``HostManager`` treats it as a connection failure
+        and rotates away rather than letting the test hang.
+        """
+        self._apply_keepalive()
+        try:
+            return self.connection.run(command, timeout=timeout, **kwargs)
+        except CommandTimedOut as e:
+            raise TimeoutException(
+                f"[{self.ssh_alias}] remote command exceeded {timeout}s and was aborted: {command[:120]}"
+            ) from e
 
     @override
     def _run_command(
@@ -584,11 +757,13 @@ class SshHost(Host):
         full_command = self.inside_venv(f"set -o pipefail; cd {self.remote_full_path} && {env_var} && {command}")
         logging.info(f"Executing remote command: {full_command}")
 
-        result: fabric2.Result = self.connection.run(full_command)
+        result: fabric2.Result = self._conn_run(full_command, timeout=SSH_INFERENCE_TIMEOUT_SECONDS)
 
         if result.failed:
             # Log PATH on remote host to help debug missing tools issues
-            path_result = self.connection.run("echo DIAGNOSTIC: PATH=$PATH", warn=True)
+            path_result = self._conn_run(
+                "echo DIAGNOSTIC: PATH=$PATH", timeout=SshHost.SSH_COMMAND_TIMEOUT_SECONDS, warn=True
+            )
             logging.warning(
                 f"Remote PATH on {self.ssh_alias}: {path_result.stdout.strip() if path_result.ok else 'FAILED TO GET PATH'}"
             )
@@ -608,7 +783,7 @@ class SshHost(Host):
         full_command = self.inside_venv(f"set -o pipefail; cd {self.remote_full_path} && {command}")
         logging.info(f"Executing remote post-lock command: {full_command}")
 
-        result: fabric2.Result = self.connection.run(full_command)
+        result: fabric2.Result = self._conn_run(full_command, timeout=POST_LOCK_TIMEOUT_SECONDS)
 
         if result.failed:
             raise RemoteExecutionException(f"Post-lock command failed in {self.remote_full_path}", result)
@@ -665,7 +840,7 @@ class SshHost(Host):
         exceptions: list[Exception] = [base_exception] if base_exception else []
         for remote_path in remote_path_list:
             try:
-                self.connection.run(f"rm -rf {remote_path}")
+                self._conn_run(f"rm -rf {remote_path}", timeout=SshHost.SSH_COMMAND_TIMEOUT_SECONDS)
             except Exception as e:
                 exceptions.append(e)
 
@@ -713,7 +888,9 @@ class SshHost(Host):
                 remote_dir.cleanup()
 
     def __install_prerequisites__(self, remote_path: str):
-        result: fabric2.Result = self.connection.run(f"python3 -m venv {remote_path}/.venv")
+        result: fabric2.Result = self._conn_run(
+            f"python3 -m venv {remote_path}/.venv", timeout=SshHost.SSH_COMMAND_TIMEOUT_SECONDS
+        )
         if result.failed:
             raise RemoteExecutionException(
                 f"Unable to initialize python virtual env at {remote_path}/.venv",
@@ -735,7 +912,7 @@ class SshHost(Host):
         for attempt in range(max_retries):
             try:
                 logging.info(f"Executing remote command (attempt {attempt + 1}): {command}")
-                result = self.connection.run(command, hide=hide)
+                result = self._conn_run(command, timeout=SshHost.SSH_COMMAND_TIMEOUT_SECONDS, hide=hide)
                 return result
             except Exception as e:
                 if attempt == max_retries - 1:
@@ -754,29 +931,25 @@ class SshHost(Host):
 
         raise Exception("Retry logic failed unexpectedly")
 
-    @override
-    @contextlib.contextmanager
-    def get_core_allocation(
-        self,
-        collector: IMetricsCollector,
-        collective_ranks: int = 1,
-        lnc_config: int = 2,
-        timeout_seconds: int = 9000,
-        poll_period_seconds: int = 5,
-    ) -> Generator[CoreAllocation, None, None]:
-        """
-        Allocate logical cores for execution by locking physical cores.
+    def _ensure_core_lock_manager(self, collector: IMetricsCollector) -> CoreLockManager:
+        """Create or return a CoreLockManager bound to the given collector.
 
-        Physical cores are locked to prevent conflicts between LNC1 and LNC2 tests.
-        Logical core IDs are returned for use with NEURON_RT_VISIBLE_CORES.
+        Resolves the host's physical-core count and locking version (creating
+        infra_version.json with the default if missing), then returns a manager.
+        The cached manager is reused ONLY while it belongs to the same
+        ``collector`` (the per-test/per-attempt owner): a manager created by
+        ``soft_join_queue`` during artifact upload is the SAME instance
+        ``get_core_allocation`` later commits with, so the FIFO slot anchored at
+        soft-join time is reused (same ``entry_id``). When the collector differs
+        (a new test/attempt) the cache is rebuilt, which re-mints ``entry_id``,
+        rebinds the collector, and resets all fairness counters — making
+        cross-test metric bleed impossible.
         """
-        # Get locking version from host (creates infra_version.json with default if missing)
-        if self._total_physical_cores is None:
-            devices = self.get_neuron_device_info()
-            self._total_physical_cores = sum(len(d.neuroncore_ids) * d.logical_neuroncore_config for d in devices)
-        if self._host_locking_version is not None:
-            locking_version = self._host_locking_version
-        else:
+        if self._core_lock_manager is not None and self._core_lock_manager.collector is collector:
+            return self._core_lock_manager
+
+        self._total_physical_cores = self.get_total_physical_cores()
+        if self._host_locking_version is None:
             executor = self._get_remote_executor()
             with collector.timer(MetricName.CORE_LOCK_INIT_TIME):
                 self._host_locking_version = lock_client.initialize_and_deploy(executor)
@@ -785,16 +958,92 @@ class SshHost(Host):
                     required_version=self._host_locking_version,
                     current_version=lock_client.DEFAULT_LOCKING_PROTOCOL_VERSION,
                 )
-            locking_version = self._host_locking_version
-        logging.info(f"[{self.ssh_alias}] Using locking protocol v{locking_version}")
+        logging.info(f"[{self.ssh_alias}] Using locking protocol v{self._host_locking_version}")
 
-        core_lock_manager = CoreLockManager(
+        self._core_lock_manager = CoreLockManager(
             self.ssh_alias,
             self._total_physical_cores,
             collector,
             executor=self._get_remote_executor(),
             host_locking_version=self._host_locking_version,
         )
+        return self._core_lock_manager
+
+    @override
+    def soft_join_queue(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int = 1,
+        lnc_config: int = 2,
+    ) -> None:
+        """Reserve a FIFO core-queue slot before/while artifacts upload.
+
+        Synchronous (no background threads). First issue a read-only ``probe``
+        that peeks the worst-case ETA for a not-yet-queued caller WITHOUT
+        joining the queue. If that ETA exceeds patience (and the host is not
+        draining) the host is rotated BEFORE any enqueue or upload by raising
+        ``QueuePatienceRotation`` — no enqueue, no dequeue, no churn. Otherwise a
+        single ``ready=False`` poll anchors this attempt's FIFO position so it
+        does not pay the upload latency with its queue slot; the real commit
+        happens later in ``get_core_allocation``, which reuses the SAME cached
+        manager/``entry_id``.
+
+        ``probe`` is the single ETA gate. ``should_rotate`` returns ``False``
+        while draining (ETA is meaningless mid-drain), so a ``DRAINING`` probe
+        does not short-circuit — it falls through to ``acquire(ready=False)`` and
+        the normal stay-and-poll behavior.
+
+        Best-effort: every ``probe``/``acquire`` RPC error is logged at warning
+        and swallowed; ``get_core_allocation`` (the hard acquire) owns host
+        lifetime — soft-join adds none. Only ``QueuePatienceRotation`` propagates
+        so the surrounding host-assignment retry rotates. The cached manager is
+        intentionally NOT dropped: a patience rotation does not mark the host
+        failed, so the unused/enqueued entry is reused or transparently
+        re-enqueued (by the ``poll`` verb) on the next attempt.
+        """
+        try:
+            manager = self._ensure_core_lock_manager(collector)
+            probe_outcome = manager.probe(collective_ranks, lnc_config)
+            if probe_outcome.status in (AllocationStatus.QUEUED, AllocationStatus.DRAINING) and should_rotate(
+                probe_outcome.worst_case_eta,
+                draining=(probe_outcome.status == AllocationStatus.DRAINING),
+                patience_seconds=self.patience_seconds,
+            ):
+                raise QueuePatienceRotation(
+                    f"[{self.ssh_alias}] Queue ETA {probe_outcome.worst_case_eta}s exceeds "
+                    f"patience {self.patience_seconds}s, rotating host"
+                )
+            outcome = manager.acquire(collective_ranks, lnc_config, ready=False)
+            logging.info(
+                f"[{self.ssh_alias}] Soft-joined core queue (ready=False): "
+                f"status={outcome.status} position={outcome.position}"
+            )
+        except QueuePatienceRotation:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"[{self.ssh_alias}] Best-effort soft-join failed: {e}")
+
+    @override
+    @contextlib.contextmanager
+    def get_core_allocation(
+        self,
+        collector: IMetricsCollector,
+        collective_ranks: int = 1,
+        lnc_config: int = 2,
+        timeout_seconds: int = 9000,
+        poll_period_seconds: int = POLL_PERIOD,
+    ) -> Generator[CoreAllocation, None, None]:
+        """
+        Allocate logical cores for execution by locking physical cores.
+
+        Physical cores are locked to prevent conflicts between LNC1 and LNC2 tests.
+        Logical core IDs are returned for use with NEURON_RT_VISIBLE_CORES.
+        """
+        collector.add_dimension({MetricName.INSTANCE_TYPE: self.get_instance_type()})
+
+        # Reuse the cached manager (and its entry_id) if soft_join_queue already
+        # created one during artifact upload; otherwise build it now.
+        core_lock_manager = self._ensure_core_lock_manager(collector)
 
         with collector.timer(MetricName.CORE_ALLOCATION_TIME):
             logging.info(
@@ -803,34 +1052,85 @@ class SshHost(Host):
 
             # Poll until we get cores or timeout
             max_retryable_errors = 10
+            # Liveness invariant: STALE_THRESHOLD must cover the poll loop's full
+            # retry budget *including jitter* so a caller actively retrying
+            # through transient SSH disruption is never pruned out from under
+            # itself mid-budget. The real inter-refresh gap is POLL_PERIOD +
+            # up to POLL_JITTER_MAX, so the budget is max_retryable_errors
+            # refreshes at that spacing.
+            assert STALE_THRESHOLD >= max_retryable_errors * (POLL_PERIOD + POLL_JITTER_MAX)
             consecutive_retryable_errors = 0
             start_time = time.time()
-            result = None
+            outcome = None
+
+            def _dequeue_best_effort() -> None:
+                # Free the abandoned host's FIFO slot. Best-effort: a failed
+                # dequeue is non-fatal (TTL prune is the crash safety net).
+                try:
+                    core_lock_manager.dequeue()
+                except Exception as dq_err:  # noqa: BLE001
+                    logging.warning(f"[{self.ssh_alias}] Best-effort dequeue failed: {dq_err}")
+
+            def _abandon_attempt() -> None:
+                # Terminal abandon teardown. Flush this attempt's queue-wait /
+                # contention / drain-wait metrics BEFORE freeing the slot so the
+                # starved attempts the observability was built to measure are not
+                # invisible (success and abandon are mutually exclusive within an
+                # attempt, so this never double-counts the success path's flush).
+                core_lock_manager.record_contention_metrics()
+                _dequeue_best_effort()
+
             while time.time() - start_time < timeout_seconds:
                 try:
-                    result = core_lock_manager.acquire(collective_ranks, lnc_config)
-                    if result:
-                        break
+                    # Artifacts are uploaded before acquisition in the current
+                    # ordering, so the caller is always ready to commit.
+                    outcome = core_lock_manager.acquire(collective_ranks, lnc_config, ready=True)
                     consecutive_retryable_errors = 0
+                    if outcome.status == AllocationStatus.ALLOCATED:
+                        break
+                    if outcome.status == AllocationStatus.DRAINING:
+                        # Host draining: stay-and-probe. Keep polling
+                        # the same host without counting this as a retryable error
+                        # and without aborting. Drains are typically fleet-wide, so
+                        # rotating off would just land on another draining host, so
+                        # position is preserved organically as last_seen_ts keeps
+                        # refreshing.
+                        logging.info(
+                            f"[{self.ssh_alias}] Host draining; continuing to poll (position={outcome.position})"
+                        )
+                    # QUEUED / DRAINING: no cores yet, keep polling.
                 except (LockAcquisitionError, LockVersionError) as e:
                     logging.warning(f"[{self.ssh_alias}] Lock error (retryable={e.retryable}): {e}")
                     if not e.retryable:
                         raise
                     consecutive_retryable_errors += 1
+                    # An error is not evidence the caller is near the front, so
+                    # discard any stale near-front position from a prior
+                    # successful poll; the cadence below must fall back to the
+                    # SLOW base (select_poll_base(None) -> slow) instead of
+                    # fast-spinning and burning the retry budget early.
+                    outcome = None
                     if consecutive_retryable_errors >= max_retryable_errors:
+                        _abandon_attempt()
                         raise OSError(
                             f"[{self.ssh_alias}] Lock acquisition failed after {max_retryable_errors} "
                             f"consecutive retryable errors. Last error: {e}"
                         ) from e
-                jitter = random.uniform(0, 0.5)
-                time.sleep(poll_period_seconds + jitter)
+                base = select_poll_base(
+                    outcome.position if outcome is not None else None,
+                    slow=poll_period_seconds,
+                )
+                jitter = random.uniform(0, POLL_JITTER_MAX)
+                time.sleep(base + jitter)
 
-            if not result:
+            if outcome is None or outcome.status != AllocationStatus.ALLOCATED:
+                _abandon_attempt()
                 raise TimeoutException(
                     f"[{self.ssh_alias}] Unable to allocate {collective_ranks} logical cores within {timeout_seconds}s"
                 )
 
-            logical_cores, physical_cores = result
+            logical_cores = outcome.logical_cores
+            physical_cores = outcome.physical_cores
             core_lock_manager.record_contention_metrics()
             logging.info(f"[{self.ssh_alias}] Allocated logical cores {logical_cores} (physical: {physical_cores})")
 
@@ -838,6 +1138,12 @@ class SshHost(Host):
             yield CoreAllocation(host_id=self.ssh_alias, logical_core_ids=logical_cores, lnc_config=lnc_config)
         finally:
             core_lock_manager.release(physical_cores)
+            # Drop the cached manager so the next attempt always starts fresh
+            # (re-minted entry_id, rebound collector, reset counters) even if it
+            # skips soft-join. The collector-identity guard in
+            # _ensure_core_lock_manager already prevents cross-test reuse; this
+            # is defense in depth and a clean per-attempt teardown hook.
+            self._core_lock_manager = None
 
     @override
     def get_neuron_device_info(self) -> list[NeuronDeviceInfo]:
@@ -857,6 +1163,19 @@ class SshHost(Host):
         self._cached_device_info = [NeuronDeviceInfo.from_dict(device) for device in data]
         return self._cached_device_info
 
+    def get_instance_type(self) -> str:
+        return self.get_neuron_device_info()[0].instance_type
+
+
+def _safe_probe_cores(host) -> int:
+    """Probe a host's physical-core count, returning 0 (ineligible) on any
+    failure so a single unreachable host cannot abort fleet initialization."""
+    try:
+        return host.get_total_physical_cores()
+    except Exception as e:
+        logging.warning(f"Could not determine physical cores for a host; marking 0 (ineligible): {e}")
+        return 0
+
 
 @dataclass
 class HostInfo:
@@ -864,6 +1183,7 @@ class HostInfo:
     work_queue_depth: int
     run_id: str
     host_type: str | None
+    num_physical_cores: int
 
     def to_json(self):
         return {
@@ -871,15 +1191,17 @@ class HostInfo:
             "work_queue_depth": self.work_queue_depth,
             "run_id": self.run_id,
             "host_type": self.host_type,
+            "num_physical_cores": self.num_physical_cores,
         }
 
     @classmethod
     def from_json(cls, input: Any):
         return HostInfo(
-            input["host_alias"],
-            input["work_queue_depth"],
-            input.get("run_id", ""),
-            input.get("host_type", ""),
+            host_alias=input["host_alias"],
+            work_queue_depth=input["work_queue_depth"],
+            num_physical_cores=input.get("num_physical_cores", 0),
+            run_id=input.get("run_id", ""),
+            host_type=input.get("host_type", ""),
         )
 
 
@@ -892,14 +1214,20 @@ class HostManager:
         neuron_installation_path: str,
         ssh_config_path: str,
         s3_config: S3ArtifactUploadConfig | None = None,
+        host_rotation_patience_seconds: int | None = DEFAULT_PATIENCE_SECONDS,
     ) -> None:
         self.run_id = str(os.getppid())
         self.ssh_config_path = ssh_config_path
         self.s3_config = s3_config or S3ArtifactUploadConfig()
+        # A missing/None value (e.g. the unset CLI flag resolving to None) falls
+        # back to the default rather than propagating None into should_rotate.
+        if host_rotation_patience_seconds is None:
+            host_rotation_patience_seconds = DEFAULT_PATIENCE_SECONDS
         self.target_hosts, self.host_types = self.__derive_hosts__(
             target_hosts,
             neuron_installation_path=neuron_installation_path,
             base_host_info_path=base_host_info_path,
+            patience_seconds=host_rotation_patience_seconds,
         )
         self.is_local: bool = len(target_hosts) < 1
         self.host_info_path: str = os.path.join(base_host_info_path, "host_stats.json")
@@ -910,6 +1238,7 @@ class HostManager:
         target_hosts: list[TargetHost],
         neuron_installation_path: str,
         base_host_info_path: str,
+        patience_seconds: int,
     ) -> tuple[dict[str, Host], dict[str, Platforms | None]]:
         if len(target_hosts) == 0:
             local_host_id = "localhost"
@@ -922,7 +1251,7 @@ class HostManager:
             )
         else:
             hosts: dict[str, Host] = dict()
-            host_types: dict[str, Platforms] = dict()
+            host_types: dict[str, Platforms | None] = dict()
 
             for target_host in target_hosts:
                 # Note: ssh_alias format must match fetch_shared_fleet_metadata.sh which has to derive the same alias from the JSON
@@ -934,6 +1263,7 @@ class HostManager:
                     run_id=self.run_id,
                     ssh_config_path=self.ssh_config_path,
                     s3_config=self.s3_config,
+                    patience_seconds=patience_seconds,
                 )
                 host_types[ssh_alias] = target_host.host_type
 
@@ -966,25 +1296,52 @@ class HostManager:
                     fp,
                 )
 
-    def initialize_host_stats(self):
+    def _probe_cores_for_aliases(self, aliases: list[str], max_probe_workers: int) -> dict[str, int]:
+        """Probe each host's physical-core count concurrently and return
+        {alias: cores}. I/O-bound SSH probes run in a thread pool bounded by
+        ``max_probe_workers`` (the xdist parallelism cap, or CPU count) so a
+        large fleet is initialized in ~one probe's wall-clock instead of N.
+        Per-host failures are isolated by ``_safe_probe_cores`` (recorded as 0).
+        """
+        if not aliases:
+            return {}
+        workers = max(1, min(len(aliases), max_probe_workers))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {alias: executor.submit(_safe_probe_cores, self.target_hosts[alias]) for alias in aliases}
+            return {alias: future.result() for alias, future in futures.items()}
+
+    def initialize_host_stats(self, max_probe_workers: int | None = None):
+        # Upper bound on the concurrent host-capacity probes at initialization.
+        # A missing/None value (e.g. the unset --maxprocesses CLI flag) falls back
+        # to the CPU count so a large fleet is probed in parallel; a caller-provided
+        # value (the xdist worker cap) prevents spawning more parallel SSH probes
+        # than the configured test parallelism.
+        max_probe_workers = (
+            max_probe_workers if (max_probe_workers and max_probe_workers > 0) else (os.cpu_count() or 1)
+        )
+
         # Each pytest worker tries to create this file, but only one needs to.
         # All others use the file created by the first to reach this point.
         # If file exists from a previous run (different run_id), reset all work_queue_depth to 0.
         with self.__create_lockfile__(10).acquire():
             if not os.path.isfile(self.host_info_path):
                 with open(self.host_info_path, "w+") as fp:
+                    aliases = list(self.target_hosts.keys())
+                    probed_cores = self._probe_cores_for_aliases(aliases, max_probe_workers)
                     hosts_info = [
                         HostInfo(
                             host_alias,
                             work_queue_depth=0,
                             run_id=self.run_id,
                             host_type=pt.value if (pt := self.host_types.get(host_alias)) else None,
+                            num_physical_cores=probed_cores[host_alias],
                         )
-                        for host_alias in self.target_hosts.keys()
+                        for host_alias in aliases
                     ]
                     # randomly shuffle hosts, so that different test suites don't always hammer the
                     # same hosts first
-                    random.shuffle(hosts_info)
+                    with temporary_random_seed(time.time_ns()):
+                        random.shuffle(hosts_info)
                     json.dump([h.to_json() for h in hosts_info], fp)
             else:
                 # File exists - validate hosts and check run_id
@@ -1002,14 +1359,17 @@ class HostManager:
                     if existing_hosts != current_hosts or needs_reset:
                         _ = fp.seek(0)
                         _ = fp.truncate()
+                        aliases = list(current_hosts)
+                        probed_cores = self._probe_cores_for_aliases(aliases, max_probe_workers)
                         hosts_info = [
                             HostInfo(
                                 host_alias,
                                 work_queue_depth=0,
                                 run_id=self.run_id,
                                 host_type=pt.value if (pt := self.host_types.get(host_alias)) else None,
+                                num_physical_cores=probed_cores[host_alias],
                             )
-                            for host_alias in current_hosts
+                            for host_alias in aliases
                         ]
                         json.dump([h.to_json() for h in hosts_info], fp)
 
@@ -1024,54 +1384,143 @@ class HostManager:
         """Get the number of hosts that have failed during this run."""
         return len(self.failed_hosts)
 
-    def __get_host_assignment__(self, platform_target: Platforms, timeout_seconds: int = 10) -> Host:
-        generator = self.__read_host_file__()
-        with generator as hosts:
-            # Filter out failed hosts and hosts that don't match the platform target
-            available_hosts = [
-                h for h in hosts if h.host_alias not in self.failed_hosts and h.host_type == platform_target.value
-            ]
+    def _eligible_host_aliases(self, platform_target: Platforms, num_of_physical_cores_needed: int) -> set[str]:
+        """Return the set of currently-eligible host aliases using the SAME
+        predicate as ``__get_host_assignment__``'s ``__is_elligible_host__``:
+        not failed, matching platform, known target, and enough persisted cores."""
+        with self.__read_host_file__() as hosts:
+            return {
+                h.host_alias
+                for h in hosts
+                if h.host_alias not in self.failed_hosts
+                and h.host_type == platform_target.value
+                and h.host_alias in self.target_hosts
+                and h.num_physical_cores >= num_of_physical_cores_needed
+            }
 
-            if not available_hosts:
-                matching_hosts = [h for h in hosts if h.host_type == platform_target.value]
-                if not matching_hosts:
-                    raise Exception(f"No hosts available for platform {platform_target.value}")
-                raise Exception(
-                    f"No available hosts for platform {platform_target.value} - "
-                    f"all {len(matching_hosts)} matching hosts have failed"
-                )
+    def _raise_no_available_hosts(
+        self, hosts: list[HostInfo], platform_target: Platforms, num_of_physical_cores_needed: int
+    ) -> NoReturn:
+        """Raise a diagnostic explaining why no host could be assigned. Distinguishes
+        three mutually-exclusive causes so callers can tell a genuine fleet-wide
+        failure apart from a request that is simply too large for any host:
+          * no host of the requested platform exists in the pool at all;
+          * matching hosts exist but each is failed / too small / not a target.
+        For the second case it reports the per-reason breakdown (with the largest
+        available core count) and the requested core count.
+        """
+        matching_hosts = [h for h in hosts if h.host_type == platform_target.value]
+        if not matching_hosts:
+            raise Exception(
+                f"No hosts available for platform {platform_target.value} - "
+                + f"no host of this type exists in the pool"
+            )
+        failed = [h for h in matching_hosts if h.host_alias in self.failed_hosts]
+        not_target = [
+            h for h in matching_hosts if h.host_alias not in self.failed_hosts and h.host_alias not in self.target_hosts
+        ]
+        too_small = [
+            h
+            for h in matching_hosts
+            if h.host_alias not in self.failed_hosts
+            and h.host_alias in self.target_hosts
+            and h.num_physical_cores < num_of_physical_cores_needed
+        ]
+        reasons: list[str] = []
+        if failed:
+            reasons.append(f"{len(failed)} failed")
+        if too_small:
+            largest = max(h.num_physical_cores for h in too_small)
+            reasons.append(f"{len(too_small)} too small (largest available {largest} cores)")
+        if not_target:
+            reasons.append(f"{len(not_target)} not in the target host set")
+        breakdown = ", ".join(reasons) if reasons else "reason unknown"
+        raise Exception(
+            f"No available hosts for platform {platform_target.value} "
+            + f"needing {num_of_physical_cores_needed} physical cores - "
+            + f"of {len(matching_hosts)} matching hosts: {breakdown}"
+        )
 
-            asc_host_infos = sorted(
-                available_hosts,
-                key=lambda host: host.work_queue_depth,
+    def __get_host_assignment__(
+        self,
+        platform_target: Platforms,
+        num_of_physical_cores_needed: int,
+        timeout_seconds: int = 10,
+        exclude: set[str] | None = None,
+    ) -> Host:
+        exclude = exclude or set()
+
+        def __is_elligible_host__(h: HostInfo) -> bool:
+            # Filter out failed hosts, hosts that don't match the platform target and insufficiently large hosts (core
+            # count). The core-count check reads the PERSISTED HostInfo.num_physical_cores (single source of truth)
+            # rather than a live probe: this keeps eligibility and the ranking key coherent, and because
+            # num_of_physical_cores_needed is always >= 1 a host with num_physical_cores == 0 (or missing -> 0) is
+            # automatically ineligible and can never reach the ranking division.
+            return (
+                h.host_alias not in self.failed_hosts
+                and h.host_type == platform_target.value
+                and h.host_alias in self.target_hosts
+                and h.num_physical_cores >= num_of_physical_cores_needed
             )
 
-            # Pick randomly from top 3 hosts with lowest queue depth
-            top_n = min(3, len(asc_host_infos))
-            with temporary_random_seed(time.time_ns()):
-                selected_host_info = random.choice(asc_host_infos[:top_n])
+        generator = self.__read_host_file__()
+        with generator as hosts:
+            available_hosts = [h for h in hosts if __is_elligible_host__(h)]
 
-            selected_host_info.work_queue_depth += 1
+            if not available_hosts:
+                self._raise_no_available_hosts(hosts, platform_target, num_of_physical_cores_needed)
+
+            # Prefer hosts not in the transient exclude set (busy this allocation); if
+            # every eligible host is excluded, fall back to the full set so a host is
+            # still returned.
+            selectable = [h for h in available_hosts if h.host_alias not in exclude] or available_hosts
+
+            # Pick the least-loaded host by POST-placement load ratio: score the ratio each
+            # host WOULD HAVE after taking this request, so an idle small host (0 cores used)
+            # no longer automatically outranks a larger host that still has proportionally more
+            # spare capacity. Routes work toward the host with the most headroom while smalls
+            # still win once the large host's resulting ratio climbs past theirs. Float division
+            # preserves capacity resolution, so a 48xl with far more cores absorbs
+            # proportionally more work than a 3xl instead of an equal per-host share.
+            selected_host_info = min(
+                selectable,
+                key=lambda host: (host.work_queue_depth + num_of_physical_cores_needed) / host.num_physical_cores,
+            )
+
+            selected_host_info.work_queue_depth += num_of_physical_cores_needed
             host = self.target_hosts[selected_host_info.host_alias]
 
             return host
 
-    def release_host(self, host: Host):
+    def release_host(self, host: Host, num_of_physical_cores_to_release: int):
         host_id = host.get_host_id()
 
         with self.__read_host_file__() as hosts:
             for h in hosts:
                 if h.host_alias == host_id:
-                    h.work_queue_depth -= 1
+                    h.work_queue_depth -= num_of_physical_cores_to_release
                     break
 
     def get_host_assignment_with_retry(
         self,
         platform_target: Platforms,
         collector: IMetricsCollector,
-        max_retries: int = 3,
+        collective_ranks: int,
+        lnc_config: int,
+        *,
+        deadline_seconds: float = DEFAULT_ACQUISITION_DEADLINE_SECONDS,
+        connection_failure_cap: int = 3,
+        backoff_seconds: float = HOST_ROTATION_BACKOFF_SECONDS,
     ):
-        """Execute a function with automatic retry on different hosts if connection times out."""
+        """Execute a function with automatic retry on different hosts.
+
+        A busy FIFO queue (``QueuePatienceRotation``) is transient: the host is NOT
+        marked failed and stays eligible, the caller backs off briefly and keeps
+        rotating across hosts until ``deadline_seconds`` elapses -- it never
+        self-terminates merely because all matching hosts are currently busy.
+        Genuine connection failures keep the prior behavior: mark the host failed,
+        exclude it, and stop after ``connection_failure_cap`` of them.
+        """
         # Track errors from each host attempt for better debugging
         host_errors: dict[str, str] = {}
 
@@ -1082,61 +1531,119 @@ class HostManager:
         # in case code block that's yielded to by context_manager_wrapper does not directly return
         # make sure that we record successes and terminate retries
         success = False
+        # Genuine connection failures for THIS allocation; bounded by connection_failure_cap.
+        connection_failures = 0
+        # Transient busy-queue rotations across hosts for THIS allocation (no failure).
+        rotation_count = 0
+        # Hosts whose FIFO queue was busy during THIS allocation. Excluded from the next
+        # deterministic pick so selection rotates instead of re-picking the same host;
+        # cleared once the whole eligible fleet has been tried so a sustained-busy fleet
+        # keeps cycling until the deadline.
+        busy_hosts: set[str] = set()
 
         def succeeded():
             nonlocal success
             success = True
 
         @contextlib.contextmanager
-        def context_manager_wrapper(notify_success: Callable[[], None], execution_host: Host, attempt: int):
+        def context_manager_wrapper(notify_success: Callable[[], None], execution_host: Host):
+            nonlocal connection_failures, rotation_count
             try:
                 yield execution_host
-            except (OSError, TimeoutError, SSHException) as e:
+            except QueuePatienceRotation as e:
+                # A busy FIFO queue is transient, NOT a host failure: do not mark the
+                # host failed, do not count it toward the connection-failure cap, and
+                # leave it eligible for re-selection. Record the rotation metric and
+                # back off so a fully-busy fleet re-cycles at a bounded rate.
+                host_id = execution_host.get_host_id() if execution_host else "unknown"
+                rotation_count += 1
+                busy_hosts.add(host_id)
+                # Reset against the currently-ELIGIBLE hosts, not all target hosts:
+                # ineligible hosts (wrong platform / too small) never enter busy_hosts,
+                # so comparing against the full target set would keep this reset from
+                # ever firing in a heterogeneous pool.
+                eligible = self._eligible_host_aliases(platform_target, num_of_physical_cores_needed)
+                busy_hosts.intersection_update(eligible)  # drop entries no longer eligible (e.g. later failed)
+                if eligible and busy_hosts >= eligible:
+                    # Every eligible host has been tried-and-busy; clear so deterministic
+                    # selection re-rotates the fleet rather than sticking on one host.
+                    busy_hosts.clear()
+                logging.info(f"Host {host_id} queue busy (patience rotation #{rotation_count}); rotating: {e}")
+                if collector:
+                    collector.record_metric(
+                        MetricName.CORE_LOCK_HOST_ROTATION_COUNT,
+                        1.0,
+                        "Count",
+                    )
+                time.sleep(backoff_seconds)
+            except (OSError, TimeoutError, SSHException, TimeoutException, CommandTimedOut) as e:
                 host_id = execution_host.get_host_id() if execution_host else "unknown"
                 error_msg = f"{type(e).__name__}: {e}"
                 host_errors[host_id] = error_msg
 
-                logging.error(f"Connection error on host {host_id}, attempt {attempt + 1}/{max_retries}: {e}")
+                connection_failures += 1
+                logging.error(
+                    f"Connection error on host {host_id}, failure {connection_failures}/{connection_failure_cap}: {e}"
+                )
                 self.mark_host_as_failed(host_id)
+                busy_hosts.discard(host_id)
 
                 if collector:
+                    # Emit one datapoint of 1.0 per rotation (a delta) so that
+                    # sum/avg aggregations over EMF datapoints reflect the true
+                    # rotation count instead of over-counting the cumulative value.
+                    collector.record_metric(
+                        MetricName.CORE_LOCK_HOST_ROTATION_COUNT,
+                        1.0,
+                        "Count",
+                    )
                     collector.record_metric(
                         MetricName.FAILED_HOSTS_COUNT,
                         float(self.get_failed_host_count()),
                         "Count",
                     )
 
-                if attempt == max_retries - 1:
+                if connection_failures >= connection_failure_cap:
                     error_details = format_host_errors()
                     raise InferenceException(
-                        f"Connection error after {attempt + 1} attempts. "
-                        f"Hosts attempted: {', '.join(attempted_hosts)}\n"
-                        f"Errors from each host:\n{error_details}"
+                        f"Connection error after {connection_failures} attempts. "
+                        + f"Hosts attempted: {', '.join(attempted_hosts)}\n"
+                        + f"Errors from each host:\n{error_details}"
                     ) from e
 
-                logging.warning(f"Retrying on different host (attempt {attempt + 2}/{max_retries})")
+                logging.warning("Retrying on a different host")
             else:
                 notify_success()
 
         attempted_hosts = []
 
-        for attempt in range(max_retries):
-            if success:
-                break
+        num_of_physical_cores_needed: int = calculate_total_needed_physical_cores(
+            collectives_ranks=collective_ranks, lnc_config=lnc_config
+        )
 
+        deadline = time.time() + deadline_seconds
+        while not success and time.time() < deadline:
             execution_host = None
 
             try:
                 if collector:
                     with collector.timer(MetricName.HOST_LOCK_TIME):
-                        execution_host = self.__get_host_assignment__(platform_target)
+                        execution_host = self.__get_host_assignment__(
+                            platform_target,
+                            num_of_physical_cores_needed=num_of_physical_cores_needed,
+                            exclude=busy_hosts,
+                        )
                 else:
-                    execution_host = self.__get_host_assignment__(platform_target)
+                    execution_host = self.__get_host_assignment__(
+                        platform_target,
+                        num_of_physical_cores_needed,
+                        exclude=busy_hosts,
+                    )
 
                 host_id = execution_host.get_host_id()
                 attempted_hosts.append(host_id)
 
-                yield context_manager_wrapper(succeeded, execution_host, attempt)
+                yield context_manager_wrapper(succeeded, execution_host)
 
             except Exception as e:
                 # Report error with details from previous failures
@@ -1146,4 +1653,13 @@ class HostManager:
                 raise
             finally:
                 if execution_host:
-                    self.release_host(execution_host)
+                    self.release_host(execution_host, num_of_physical_cores_needed)
+
+        if not success:
+            # Distinct from "No available hosts" and "Connection error after N attempts":
+            # the fleet was reachable but every matching host stayed busy past the deadline.
+            raise InferenceException(
+                f"Core allocation deadline ({deadline_seconds}s) exceeded after rotating across hosts; "
+                f"all matching hosts remained busy. "
+                f"Patience rotations: {rotation_count}. Hosts attempted: {', '.join(attempted_hosts)}"
+            )

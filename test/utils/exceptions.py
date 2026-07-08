@@ -56,6 +56,14 @@ class TimeoutException(Exception):
         super().__init__(*args)
 
 
+class QueuePatienceRotation(TimeoutException):
+    """Transient signal that this host's core-allocation queue ETA exceeds the
+    caller's patience right now, so the caller should release its slot and try a
+    different host. This is not a host failure; the host stays eligible for
+    re-selection. Subclasses the timeout error so existing catch sites that expect
+    a timeout continue to work until a caller branches on this type explicitly."""
+
+
 class NoNeuronDevicesException(Exception):
     def __init__(self, host_alias: str):
         super().__init__(f"No Neuron devices found on {host_alias}")

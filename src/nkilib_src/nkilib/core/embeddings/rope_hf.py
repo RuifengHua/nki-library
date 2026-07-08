@@ -28,15 +28,15 @@ NUM_COALESCE_TILES = 8
 
 @nki.jit
 def rope_hf(
-    q: nl.ndarray,
-    k: nl.ndarray,
-    q_out: nl.ndarray,
-    k_out: nl.ndarray,
-    cos: Optional[nl.ndarray] = None,
-    sin: Optional[nl.ndarray] = None,
-    rope_cache: Optional[nl.ndarray] = None,
+    q: nl.NkiTensor,
+    k: nl.NkiTensor,
+    q_out: nl.NkiTensor,
+    k_out: nl.NkiTensor,
+    cos: Optional[nl.NkiTensor] = None,
+    sin: Optional[nl.NkiTensor] = None,
+    rope_cache: Optional[nl.NkiTensor] = None,
     backward: bool = False,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Apply Rotary Position Embedding (RoPE) to query and key tensors using HuggingFace layout.
 
@@ -51,15 +51,15 @@ def rope_hf(
         head_dim: Head dimension size
 
     Args:
-        q (nl.ndarray): [batch_size, q_heads, seq_len, head_dim] @ HBM, Query tensor
-        k (nl.ndarray): [batch_size, k_heads, seq_len, head_dim] @ HBM, Key tensor
-        q_out (nl.ndarray): [batch_size, q_heads, seq_len, head_dim] @ HBM, Output query tensor
-        k_out (nl.ndarray): [batch_size, k_heads, seq_len, head_dim] @ HBM, Output key tensor
-        cos (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim] @ HBM, Cosine embeddings.
+        q (nl.NkiTensor): [batch_size, q_heads, seq_len, head_dim] @ HBM, Query tensor
+        k (nl.NkiTensor): [batch_size, k_heads, seq_len, head_dim] @ HBM, Key tensor
+        q_out (nl.NkiTensor): [batch_size, q_heads, seq_len, head_dim] @ HBM, Output query tensor
+        k_out (nl.NkiTensor): [batch_size, k_heads, seq_len, head_dim] @ HBM, Output key tensor
+        cos (Optional[nl.NkiTensor]): [optional(batch_size), seq_len, head_dim] @ HBM, Cosine embeddings.
             Required if rope_cache is None.
-        sin (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim] @ HBM, Sine embeddings.
+        sin (Optional[nl.NkiTensor]): [optional(batch_size), seq_len, head_dim] @ HBM, Sine embeddings.
             Required if rope_cache is None.
-        rope_cache (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim*2] @ HBM,
+        rope_cache (Optional[nl.NkiTensor]): [optional(batch_size), seq_len, head_dim*2] @ HBM,
             Packed cos/sin tensor. First half contains cos, second half contains sin.
         backward (bool): If True, compute backward pass (gradient w.r.t. inputs). Default False.
 
@@ -109,38 +109,19 @@ def rope_hf(
             cos_tile = nl.ndarray((seq_tile_size, num_tiles, head_dim), dtype=q.dtype, buffer=nl.sbuf)
             sin_tile = nl.ndarray((seq_tile_size, num_tiles, head_dim), dtype=q.dtype, buffer=nl.sbuf)
 
-            # Slice cos, sin tiles using access pattern depending on input shapes
-            rope_shape = (rope_cache if rope_cache != None else cos).shape
-            rope_seq_len, rope_dim = rope_shape[-2:]
-            if len(rope_shape) == 3:
-                rope_batch_offset = batch_id
-            else:
-                rope_batch_offset = 0
+            seq_end = seq_start + num_tiles * seq_tile_size
 
             if rope_cache != None:
-                # Packed rope_cache format
-                # rope_cache: [..., head_dim*2]
-                # Access cos portion (first half of last dimension)
-                cos_ap_src = rope_cache.ap(
-                    pattern=[[rope_dim, seq_tile_size], [seq_tile_size * rope_dim, num_tiles], [1, head_dim]],
-                    offset=rope_batch_offset * rope_seq_len * rope_dim + seq_start * rope_dim,
-                )
-                # Access sin portion (second half of last dimension)
-                sin_ap_src = rope_cache.ap(
-                    pattern=[[rope_dim, seq_tile_size], [seq_tile_size * rope_dim, num_tiles], [1, head_dim]],
-                    offset=rope_batch_offset * rope_seq_len * rope_dim + seq_start * rope_dim + head_dim,
-                )
+                rope_tensor = rope_cache[batch_id, :, :] if rope_cache.ndim == 3 else rope_cache
+                rope_tensor = rope_tensor[seq_start:seq_end, :]
+                rope_tensor = rope_tensor.reshape_dim(0, (num_tiles, seq_tile_size)).permute((1, 0, 2))
+                cos_ap_src = rope_tensor[:, :, :head_dim]
+                sin_ap_src = rope_tensor[:, :, head_dim:]
             else:
-                # cos, sin format
-                # cos: [..., head_dim]
-                cos_ap_src = cos.ap(
-                    pattern=[[head_dim, seq_tile_size], [seq_tile_size * head_dim, num_tiles], [1, head_dim]],
-                    offset=rope_batch_offset * rope_seq_len * rope_dim + seq_start * head_dim,
-                )
-                sin_ap_src = sin.ap(
-                    pattern=[[head_dim, seq_tile_size], [seq_tile_size * head_dim, num_tiles], [1, head_dim]],
-                    offset=rope_batch_offset * rope_seq_len * rope_dim + seq_start * head_dim,
-                )
+                cos_tensor = cos[batch_id, seq_start:seq_end, :] if len(cos.shape) == 3 else cos[seq_start:seq_end, :]
+                sin_tensor = sin[batch_id, seq_start:seq_end, :] if len(sin.shape) == 3 else sin[seq_start:seq_end, :]
+                cos_ap_src = cos_tensor.reshape_dim(0, (num_tiles, seq_tile_size)).permute((1, 0, 2))
+                sin_ap_src = sin_tensor.reshape_dim(0, (num_tiles, seq_tile_size)).permute((1, 0, 2))
 
             nisa.dma_copy(cos_tile, cos_ap_src)
             nisa.dma_copy(sin_tile, sin_ap_src)
@@ -152,22 +133,22 @@ def rope_hf(
 
 
 def _validate_apply_rope_inputs(
-    q: nl.ndarray,
-    k: nl.ndarray,
-    cos: Optional[nl.ndarray],
-    sin: Optional[nl.ndarray],
-    rope_cache: Optional[nl.ndarray],
+    q: nl.NkiTensor,
+    k: nl.NkiTensor,
+    cos: Optional[nl.NkiTensor],
+    sin: Optional[nl.NkiTensor],
+    rope_cache: Optional[nl.NkiTensor],
     num_shards: int,
 ) -> None:
     """
     Validate inputs for apply_rope operation.
 
     Args:
-        q (nl.ndarray): [batch_size, q_heads, seq_len, head_dim], Query tensor
-        k (nl.ndarray): [batch_size, k_heads, seq_len, head_dim], Key tensor
-        cos (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim], Cosine embeddings
-        sin (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim], Sine embeddings
-        rope_cache (Optional[nl.ndarray]): [optional(batch_size), seq_len, head_dim*2], Packed cos/sin
+        q (nl.NkiTensor): [batch_size, q_heads, seq_len, head_dim], Query tensor
+        k (nl.NkiTensor): [batch_size, k_heads, seq_len, head_dim], Key tensor
+        cos (Optional[nl.NkiTensor]): [optional(batch_size), seq_len, head_dim], Cosine embeddings
+        sin (Optional[nl.NkiTensor]): [optional(batch_size), seq_len, head_dim], Sine embeddings
+        rope_cache (Optional[nl.NkiTensor]): [optional(batch_size), seq_len, head_dim*2], Packed cos/sin
         num_shards (int): Number of LNC shards
 
     Returns:
@@ -215,10 +196,10 @@ def _validate_apply_rope_inputs(
 
 
 def _apply_rope_all_heads(
-    x: nl.ndarray,
-    x_out: nl.ndarray,
-    cos_tile: nl.ndarray,
-    sin_tile: nl.ndarray,
+    x: nl.NkiTensor,
+    x_out: nl.NkiTensor,
+    cos_tile: nl.NkiTensor,
+    sin_tile: nl.NkiTensor,
     batch_id: int,
     seq_start: int,
     backward: bool = False,
@@ -227,10 +208,10 @@ def _apply_rope_all_heads(
     Apply rotary embedding to a tensor for all attention heads using preloaded cos/sin tiles.
 
     Args:
-        x (nl.ndarray): [batch_size, num_heads, seq_len, head_dim] @ HBM, Input tensor
-        x_out (nl.ndarray): [batch_size, num_heads, seq_len, head_dim] @ HBM, Output tensor
-        cos_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Cosine embedding tile
-        sin_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Sine embedding tile
+        x (nl.NkiTensor): [batch_size, num_heads, seq_len, head_dim] @ HBM, Input tensor
+        x_out (nl.NkiTensor): [batch_size, num_heads, seq_len, head_dim] @ HBM, Output tensor
+        cos_tile (nl.NkiTensor): [seq_tile_size, num_tiles, head_dim] @ SBUF, Cosine embedding tile
+        sin_tile (nl.NkiTensor): [seq_tile_size, num_tiles, head_dim] @ SBUF, Sine embedding tile
         batch_id (int): Current batch index
         seq_start (int): Starting sequence position
         backward (bool): If True, compute backward pass rotation. Default False.
@@ -248,41 +229,40 @@ def _apply_rope_all_heads(
     # Process all heads sequentially
     for head_id in range(num_heads):
         x_tile = nl.ndarray((seq_tile_size, num_tiles, head_dim), dtype=x.dtype, buffer=nl.sbuf)
-        x_ap_src = x.ap(
-            pattern=[[head_dim, seq_tile_size], [seq_tile_size * head_dim, num_tiles], [1, head_dim]],
-            offset=batch_id * x.shape[1] * x.shape[2] * x.shape[3]
-            + head_id * x.shape[2] * x.shape[3]
-            + seq_start * head_dim,
+        # Select batch+head, slice seq range, reshape into tiles, permute to (seq_tile, num_tiles, head_dim)
+        x_ap_src = (
+            x[batch_id, head_id, seq_start : seq_start + num_tiles * seq_tile_size, :]
+            .reshape_dim(0, (num_tiles, seq_tile_size))
+            .permute((1, 0, 2))
         )
         nisa.dma_copy(x_tile, x_ap_src)
 
         x_rotated = _apply_rope_single(x_tile, cos_tile, sin_tile, backward)
-        x_out_ap = x_out.ap(
-            pattern=[[head_dim, seq_tile_size], [seq_tile_size * head_dim, num_tiles], [1, head_dim]],
-            offset=batch_id * x_out.shape[1] * x_out.shape[2] * x_out.shape[3]
-            + head_id * x_out.shape[2] * x_out.shape[3]
-            + seq_start * head_dim,
+        x_out_view = (
+            x_out[batch_id, head_id, seq_start : seq_start + num_tiles * seq_tile_size, :]
+            .reshape_dim(0, (num_tiles, seq_tile_size))
+            .permute((1, 0, 2))
         )
-        nisa.dma_copy(x_out_ap, x_rotated)
+        nisa.dma_copy(x_out_view, x_rotated)
 
 
 def _apply_rope_single(
-    x_tile: nl.ndarray,
-    cos_tile: nl.ndarray,
-    sin_tile: nl.ndarray,
+    x_tile: nl.NkiTensor,
+    cos_tile: nl.NkiTensor,
+    sin_tile: nl.NkiTensor,
     backward: bool = False,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Apply rotary embedding to a single tensor tile in SBUF.
 
     Args:
-        x_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Input tensor tile
-        cos_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Cosine embedding tile
-        sin_tile (nl.ndarray): [seq_tile_size, num_tiles, head_dim] @ SBUF, Sine embedding tile
+        x_tile (nl.NkiTensor): [seq_tile_size, num_tiles, head_dim] @ SBUF, Input tensor tile
+        cos_tile (nl.NkiTensor): [seq_tile_size, num_tiles, head_dim] @ SBUF, Cosine embedding tile
+        sin_tile (nl.NkiTensor): [seq_tile_size, num_tiles, head_dim] @ SBUF, Sine embedding tile
         backward (bool): If True, compute backward pass rotation. Default False.
 
     Returns:
-        nl.ndarray: [seq_tile_size, num_tiles, head_dim] @ SBUF, Rotated tensor tile
+        nl.NkiTensor: [seq_tile_size, num_tiles, head_dim] @ SBUF, Rotated tensor tile
 
     Notes:
         - Forward: y = [x1, x2] * [cos1, cos2] + [-x2, x1] * [sin1, sin2]

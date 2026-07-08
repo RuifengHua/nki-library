@@ -44,6 +44,7 @@ from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import (
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
+    with_active_sbm,
 )
 from nkilib_src.nkilib.experimental.quantize_mxfp8.quantize_mxfp8 import (
     quantize_block_mxfp8_kernel,
@@ -56,6 +57,7 @@ from test.utils.unit_test_framework import UnitTestFramework
 
 
 @nki.jit
+@with_active_sbm
 def quantize_lhs_matmul_pipeline_kernel(
     lhs_bf16,
     rhs_sw,
@@ -111,6 +113,7 @@ def quantize_lhs_matmul_pipeline_kernel(
 
 
 @nki.jit
+@with_active_sbm
 def quantize_rhs_matmul_pipeline_kernel(
     lhs_sw,
     rhs_bf16,
@@ -311,7 +314,6 @@ class TestQuantizeMatmulPipeline:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=lnc_degree,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
 
         (
@@ -401,7 +403,6 @@ class TestQuantizeMatmulPipeline:
     # Case 2: RHS pre-quantized, LHS BF16 → quantize LHS → matmul
     #         (with and without scale packing)
     # ------------------------------------------------------------------
-    @pytest.mark.fast
     @pytest.mark.parametrize("M,K,N", _SMALL_SHAPES + _MEDIUM_SHAPES + _LARGE_SHAPES)
     @pytest.mark.parametrize("enable_scale_packing", [True, False], ids=["packed", "unpacked"])
     @pytest.mark.parametrize("spill_reload", [True, False])

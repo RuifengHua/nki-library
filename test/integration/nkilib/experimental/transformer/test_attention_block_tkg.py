@@ -27,9 +27,9 @@ import pytest
 from nki.collectives import ReplicaGroup
 from typing_extensions import override
 
-from nkilib_src.nkilib.core.attention.attention_tkg import INACTIVE_BLOCK_IDX
+from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
 from nkilib_src.nkilib.core.utils.allocator import SbufManager
-from nkilib_src.nkilib.core.utils.common_types import QuantizationType
+from nkilib_src.nkilib.core.utils.common_types import DtypeMode, QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_helpers import (
     get_max_positive_value_for_dtype,
     get_program_sharding_info,
@@ -65,7 +65,6 @@ from test.utils.common_dataclasses import (
     CustomValidator,
     CustomValidatorWithOutputTensorData,
     ModelTestType,
-    PerRankLazyInputGenerator,
     Platforms,
     ValidationArgs,
 )
@@ -74,7 +73,8 @@ from test.utils.metadata_loader import load_model_configs
 from test.utils.metrics_collector import IMetricsCollector
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
 from test.utils.test_orchestrator import Orchestrator
-from test.utils.unit_test_framework import CollectiveUnitTestFramework, UnitTestFramework, torch_ref_wrapper
+from test.utils.unit_test_collective_framework import CollectiveUnitTestFramework
+from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
 # Maximum memory (GB) for test tensor allocation. Tests exceeding this are skipped.
 # Override via environment variable TEST_ATTN_BLK_TKG_MAX_MEMORY_GB.
@@ -118,308 +118,6 @@ def _generate_mx_weights_and_scales(
         base_scale = 1.0 / _FP8_FN_MAX
         weight_scale = (base_scale * rng.uniform(0.995, 1.005, w_scale_shape)).astype(np.float32)
     return weights, weight_scale, input_scale
-
-
-def _slice_block_kv_for_all_ranks(
-    full_K_cache: np.ndarray,
-    full_V_cache: np.ndarray,
-    full_active_blocks_table: np.ndarray,
-    full_kv_cache_update_idx: np.ndarray,
-    KVDP: int,
-    B_attn: int,
-    S_ctx: int,
-    block_len: int,
-    d_head: int,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
-    """Slice block KV cache for all ranks in KV data parallelism.
-
-    vLLM treats each DP rank as an independent inference endpoint with its own KV cache.
-    Each rank has a local block pool with indices local to that rank's cache, not global indices.
-
-    The test generates golden outputs using a single global KV cache (no KV data parallelism),
-    but the kernel under test runs per-rank with local caches. This function converts the global
-    KV cache into the per-rank KV cache that vLLM provides.
-
-    For each rank, this function:
-    1. Slices active_blocks_table[B, num_active_blocks] on B to get this rank's batches
-    2. Finds which global block indices this rank uses
-    3. Creates a compact local cache with only this rank's blocks
-    4. Remaps active_blocks_table from global to local indices
-
-    Example with B=8, KVDP=4, B_attn=B/KVDP=2, S_ctx=1024, block_len=32:
-        Global cache: K_cache[256, 32, d_head]  (256 = B * S_ctx // block_len = 8 * 1024 // 32)
-        Rank 0 uses batches [0:2], references global blocks [100, 147, 212, 199, ...]
-        After slicing: K_cache_0[64, 32, d_head] with local indices [0, 1, 2, 3, ..., 62, 63]
-            (64 = B_attn * S_ctx // block_len = 2 * 1024 // 32)
-        active_blocks_table remapped: [100, 147, 212, 199, ...] -> [0, 1, 2, 3, ...]
-
-    Args:
-        full_K_cache (np.ndarray): Global K cache [num_blocks, block_len, d_head]
-        full_V_cache (np.ndarray): Global V cache [num_blocks, block_len, d_head]
-        full_active_blocks_table (np.ndarray): Global block table [B, num_active_blocks]
-        full_kv_cache_update_idx (np.ndarray): Global KV update indices [B, S_tkg]
-        KVDP (int): KV data parallelism (number of ranks)
-        B_attn (int): Batch size of KV cache per rank
-        S_ctx (int): Context sequence length
-        block_len (int): Block length
-        d_head (int): Head dimension
-
-    Returns:
-        K_cache (list[np.ndarray]): Per-rank K caches, each [num_blocks/KVDP, block_len, d_head]
-        V_cache (list[np.ndarray]): Per-rank V caches, each [num_blocks/KVDP, block_len, d_head]
-        active_blocks_table (list[np.ndarray]): Remapped active_blocks_tables, each [B_attn, num_active_blocks]
-        kv_cache_update_idx (list[np.ndarray]): Remapped KV update indices, each [B_attn, S_tkg]
-    """
-    # Validate input shapes
-    assert full_K_cache.ndim == 3 and full_K_cache.shape[1:] == (block_len, d_head)
-    assert full_V_cache.shape == full_K_cache.shape
-    assert full_active_blocks_table.ndim == 2 and full_active_blocks_table.shape[0] == KVDP * B_attn
-    assert full_kv_cache_update_idx.ndim == 2 and full_kv_cache_update_idx.shape[0] == KVDP * B_attn
-
-    blocks_per_rank = B_attn * S_ctx // block_len
-    K_cache, V_cache, active_blocks_table, kv_cache_update_idx = [], [], [], []
-
-    for rank_idx in range(KVDP):
-        # Slice active_blocks_table for this rank's batches
-        rank_active_blocks_table = full_active_blocks_table[rank_idx * B_attn : (rank_idx + 1) * B_attn]
-
-        # Find which global block indices this rank uses (excluding inactive sentinel)
-        used_blocks = np.unique(rank_active_blocks_table[rank_active_blocks_table != INACTIVE_BLOCK_IDX])
-
-        # Create compact local cache with only this rank's blocks
-        new_k = np.zeros((blocks_per_rank, block_len, d_head), dtype=full_K_cache.dtype)
-        new_v = np.zeros((blocks_per_rank, block_len, d_head), dtype=full_V_cache.dtype)
-
-        # Copy block data and build global->local index mapping
-        block_map = {}
-        for new_idx, old_idx in enumerate(used_blocks):
-            new_k[new_idx], new_v[new_idx] = full_K_cache[old_idx], full_V_cache[old_idx]
-            block_map[old_idx] = new_idx
-
-        # Remap active_blocks_table from global to local indices
-        new_abt = rank_active_blocks_table.copy()
-        for batch_idx in range(B_attn):
-            for col_idx in range(rank_active_blocks_table.shape[1]):
-                if rank_active_blocks_table[batch_idx, col_idx] != INACTIVE_BLOCK_IDX:
-                    new_abt[batch_idx, col_idx] = block_map[rank_active_blocks_table[batch_idx, col_idx]]
-
-        # Remap kv_cache_update_idx (block_idx * block_len + offset) for all S_tkg columns
-        rank_kv_idx = full_kv_cache_update_idx[rank_idx * B_attn : (rank_idx + 1) * B_attn].copy()
-        S_tkg = rank_kv_idx.shape[1]
-        for batch_idx in range(B_attn):
-            for token_idx in range(S_tkg):
-                if rank_kv_idx[batch_idx, token_idx] != np.iinfo(np.uint32).max:
-                    old_block, offset = divmod(int(rank_kv_idx[batch_idx, token_idx]), block_len)
-                    rank_kv_idx[batch_idx, token_idx] = block_map.get(old_block, old_block) * block_len + offset
-
-        K_cache.append(new_k)
-        V_cache.append(new_v)
-        active_blocks_table.append(new_abt)
-        kv_cache_update_idx.append(rank_kv_idx)
-
-    return K_cache, V_cache, active_blocks_table, kv_cache_update_idx
-
-
-def _create_per_rank_inputs(
-    base_input: dict, KVDP: int, q_heads: int, d_head: int, B_attn: int, S_tkg: int, S_ctx: int, block_len: int
-) -> tuple:
-    """Create per-rank kernel inputs for KV data parallelism tests.
-
-    Slices kernel inputs per rank for multi-rank execution.
-    Each rank gets a slice of the batch dimension for K/V cache and mask,
-    while Q heads are distributed across ranks.
-
-    Args:
-        base_input (dict): Full kernel input dictionary with all tensors
-        KVDP (int): KV data parallelism (number of ranks)
-        q_heads (int): Number of query heads per rank
-        d_head (int): Head dimension
-        B_attn (int): Batch size of KV cache per rank (total_batch / KVDP)
-        S_tkg (int): Token generation sequence length
-        S_ctx (int): Context sequence length
-        block_len (int): Block length for block KV cache (0 for flat cache)
-
-    Returns:
-        per_rank_input (PerRankLazyInputGenerator): Generator that creates inputs for each rank
-        per_rank_cache (dict): Pre-sliced tensors for golden reference computation
-    """
-    total_q_heads = KVDP * q_heads
-
-    replica_group = ReplicaGroup([list(range(KVDP))])
-
-    # Slice W_qkv per rank: Q portion sliced (each rank gets q_heads), K/V replicated (GQA shares 1 KV head)
-    full_W_qkv = base_input['W_qkv']
-    q_end = total_q_heads * d_head
-    k_end = q_end + d_head
-    v_end = k_end + d_head
-    W_q_full, W_k, W_v = full_W_qkv[:, :q_end], full_W_qkv[:, q_end:k_end], full_W_qkv[:, k_end:v_end]
-    w_qkV_cache = [
-        np.concatenate([W_q_full[:, rank_idx * q_heads * d_head : (rank_idx + 1) * q_heads * d_head], W_k, W_v], axis=1)
-        for rank_idx in range(KVDP)
-    ]
-
-    # Slice bias_qkv if present
-    full_bias_qkv = base_input.get('bias_qkv')
-    if full_bias_qkv is not None:
-        bias_q_full, bias_k, bias_v = (
-            full_bias_qkv[:, :q_end],
-            full_bias_qkv[:, q_end:k_end],
-            full_bias_qkv[:, k_end:v_end],
-        )
-        bias_qkV_cache = [
-            np.concatenate(
-                [bias_q_full[:, rank_idx * q_heads * d_head : (rank_idx + 1) * q_heads * d_head], bias_k, bias_v],
-                axis=1,
-            )
-            for rank_idx in range(KVDP)
-        ]
-    else:
-        bias_qkV_cache = [None] * KVDP
-
-    # Slice W_out per rank
-    full_W_out = base_input.get('W_out')
-    w_out_slices = (
-        [
-            full_W_out[rank_idx * q_heads * d_head : (rank_idx + 1) * q_heads * d_head, :].copy()
-            for rank_idx in range(KVDP)
-        ]
-        if full_W_out is not None
-        else [None] * KVDP
-    )
-
-    # Slice mask per rank
-    # full_mask shape: (S_ctx, B, total_q_heads, S_tkg)
-    # Kernel needs: (S_ctx, B_attn, total_q_heads, S_tkg) - sliced batch, all heads (after gather)
-    # Golden needs: (S_ctx, B, q_heads, S_tkg) - full batch, 1 Q head
-    full_mask = base_input['attention_mask']
-    mask_slices = [full_mask[:, rank_idx * B_attn : (rank_idx + 1) * B_attn, :, :] for rank_idx in range(KVDP)]
-    golden_mask = full_mask[:, :, :q_heads, :]
-
-    # Slice pos_ids and swa_start_pos_ids per rank (batch dimension)
-    # full shape: (B, S_tkg) -> per-rank: (B_attn, S_tkg)
-    full_pos_ids = base_input.get('pos_ids')
-    if full_pos_ids is not None:
-        pos_ids_slices = [full_pos_ids[rank_idx * B_attn : (rank_idx + 1) * B_attn] for rank_idx in range(KVDP)]
-    else:
-        pos_ids_slices = [None] * KVDP
-    full_swa_start_pos_ids = base_input.get('swa_start_pos_ids')
-    if full_swa_start_pos_ids is not None:
-        swa_start_pos_ids_slices = [
-            full_swa_start_pos_ids[rank_idx * B_attn : (rank_idx + 1) * B_attn] for rank_idx in range(KVDP)
-        ]
-    else:
-        swa_start_pos_ids_slices = [None] * KVDP
-
-    # Slice K/V cache per rank
-    full_K_cache, full_V_cache = base_input['K_cache'], base_input['V_cache']
-    full_active_blocks_table = base_input.get('active_blocks_table')
-    full_kv_cache_update_idx = base_input.get('kv_cache_update_idx')
-
-    if block_len > 0:
-        K_cache, V_cache, active_blocks_table, kv_cache_update_idx = _slice_block_kv_for_all_ranks(
-            full_K_cache,
-            full_V_cache,
-            full_active_blocks_table,
-            full_kv_cache_update_idx,
-            KVDP,
-            B_attn,
-            S_ctx,
-            block_len,
-            d_head,
-        )
-    else:
-        K_cache = [full_K_cache[rank_idx * B_attn : (rank_idx + 1) * B_attn] for rank_idx in range(KVDP)]
-        V_cache = [full_V_cache[rank_idx * B_attn : (rank_idx + 1) * B_attn] for rank_idx in range(KVDP)]
-        active_blocks_table = [None] * KVDP
-        kv_cache_update_idx = [
-            full_kv_cache_update_idx[rank_idx * B_attn : (rank_idx + 1) * B_attn] for rank_idx in range(KVDP)
-        ]
-
-    def create_per_rank_input(rank_id: int) -> dict:
-        result = base_input.copy()
-        result['W_qkv'] = w_qkV_cache[rank_id]
-        result['bias_qkv'] = bias_qkV_cache[rank_id]
-        result['W_out'] = w_out_slices[rank_id]
-        result['K_cache'] = K_cache[rank_id]
-        result['V_cache'] = V_cache[rank_id]
-        result['attention_mask'] = mask_slices[rank_id]
-        result['pos_ids'] = pos_ids_slices[rank_id]
-        result['swa_start_pos_ids'] = swa_start_pos_ids_slices[rank_id]
-        result['active_blocks_table'] = active_blocks_table[rank_id]
-        result['kv_cache_update_idx'] = kv_cache_update_idx[rank_id]
-        result['KVDP'] = KVDP
-        result['KVDP_replica_group'] = replica_group
-        return result
-
-    per_rank_input = PerRankLazyInputGenerator(generator=create_per_rank_input)
-    per_rank_input.base_input = base_input  # Store for golden reference
-
-    per_rank_cache = {
-        'w_qkv': w_qkV_cache,
-        'bias_qkv': bias_qkV_cache,
-        'w_out': w_out_slices,
-        'golden_mask': golden_mask,
-        'full_active_blocks_table': full_active_blocks_table,
-    }
-    return per_rank_input, per_rank_cache
-
-
-def _slice_golden_KV_cache_for_rank(
-    rank_golden: dict,
-    rank_id: int,
-    B_attn: int,
-    block_len: int,
-    d_head: int,
-    S_ctx: int,
-    per_rank_cache: dict,
-    update_cache: bool,
-) -> dict:
-    """Slice golden K/V cache output for a specific rank.
-
-    Golden computes with full batch B, so K/V outputs have shape [B, ...].
-    This function slices to [B/KVDP, ...] to match the kernel's per-rank output.
-    X_out is returned unchanged (already has correct shape from golden).
-
-    When update_cache is False, the torch ref returns K_tkg/V_tkg (raw projected
-    K/V) instead of K_cache_updated/V_cache_updated
-
-    Args:
-        rank_golden (dict): Full golden output with 'X_out' and either
-            'K_cache_updated'/'V_cache_updated' (update_cache=True) or
-            'K_tkg'/'V_tkg' (update_cache=False)
-        rank_id (int): Rank index to slice for
-        B_attn (int): Batch size of KV cache per rank (B/KVDP)
-        block_len (int): Block length for block KV cache (0 for flat cache)
-        d_head (int): Head dimension
-        S_ctx (int): Context sequence length
-        per_rank_cache (dict): Pre-computed slicing info including 'full_active_blocks_table'
-        update_cache (bool): Whether cache update is enabled
-
-    Returns:
-        dict: Golden output with X_out unchanged, K/V sliced to per-rank batch size
-    """
-    if not update_cache:
-        # K_tkg shape: [D, B, S_tkg], V_tkg shape: [B, S_tkg, D]
-        golden_k = rank_golden['K_tkg'][:, rank_id * B_attn : (rank_id + 1) * B_attn, :]
-        golden_v = rank_golden['V_tkg'][rank_id * B_attn : (rank_id + 1) * B_attn, :, :]
-        return {'X_out': rank_golden['X_out'], 'K_tkg': golden_k, 'V_tkg': golden_v}
-
-    if block_len > 0:
-        blocks_per_rank = B_attn * S_ctx // block_len
-        full_active_blocks_table = per_rank_cache['full_active_blocks_table']
-        rank_active_blocks_table = full_active_blocks_table[rank_id * B_attn : (rank_id + 1) * B_attn]
-        used_blocks = np.unique(rank_active_blocks_table[rank_active_blocks_table != INACTIVE_BLOCK_IDX])
-
-        golden_k = np.zeros((blocks_per_rank, block_len, d_head), dtype=rank_golden['K_cache_updated'].dtype)
-        golden_v = np.zeros((blocks_per_rank, block_len, d_head), dtype=rank_golden['V_cache_updated'].dtype)
-        for new_idx, old_idx in enumerate(used_blocks):
-            golden_k[new_idx] = rank_golden['K_cache_updated'][old_idx]
-            golden_v[new_idx] = rank_golden['V_cache_updated'][old_idx]
-    else:
-        golden_k = rank_golden['K_cache_updated'][rank_id * B_attn : (rank_id + 1) * B_attn]
-        golden_v = rank_golden['V_cache_updated'][rank_id * B_attn : (rank_id + 1) * B_attn]
-
-    return {'X_out': rank_golden['X_out'], 'K_cache_updated': golden_k, 'V_cache_updated': golden_v}
 
 
 def estimate_test_memory_bytes(cfg: AttnBlkTestConfig) -> int:
@@ -487,7 +185,7 @@ def estimate_test_memory_bytes(cfg: AttnBlkTestConfig) -> int:
         if not skip_output_projection:
             total += 2 * 128 * 4  # weight/input dequant scales out
 
-    # --- KVDP per-rank copies (_create_per_rank_inputs) ---
+    # --- KVDP per-rank inputs ---
     if KVDP > 1:
         B_attn = batch // KVDP
         if is_block_kv:
@@ -530,8 +228,12 @@ def _generate_kv_quant_inputs(
     K_cache_shape,
     V_cache_shape,
     kv_quant_dtype,
+    seed: int = 42,
 ):
     """Derive kv_scale from std(K_active) and generate quantized KV cache.
+
+    Args:
+        seed: RNG seed for KV cache generation. Different per rank in KVDP tests.
 
     See attention_block_tkg_input_distributions_design_spec.md for full analysis.
     """
@@ -594,7 +296,7 @@ def _generate_kv_quant_inputs(
 
     # Generate KV cache matching the distribution of scaled K/V:
     # Cache stores K*scale, so std in cache = std(K) × scale = dtype_max/coverage
-    np.random.seed(42)
+    np.random.seed(seed)
     k_cache_std = k_active_std * k_scale_scalar
     v_cache_std = v_active_std * v_scale_scalar
     K_cache_f32 = np.random.normal(0, k_cache_std, K_cache_shape).astype(np.float32)
@@ -605,8 +307,13 @@ def _generate_kv_quant_inputs(
     return k_scale, v_scale, K_cache, V_cache
 
 
-def generate_kernel_inputs(cfg: AttnBlkTestConfig):
-    from nkilib_src.nkilib.core.attention.gen_mask_tkg_torch import build_full_attention_mask
+def generate_kernel_inputs(cfg: AttnBlkTestConfig, seed: int = 0):
+    """Generate kernel inputs for a single rank.
+
+    Args:
+        seed: RNG seed. Use different values per rank in KVDP tests to produce
+            independent K/V cache, weights, and mask data for each rank.
+    """
     from test.integration.nkilib.core.attention.test_attention_tkg_utils import (
         build_active_attention_mask,
         build_swa_positions,
@@ -620,7 +327,13 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
     S_ctx, S_max_ctx, S_tkg = cfg.S_ctx, cfg.S_max_ctx, cfg.S_tkg
     H_actual = cfg.H_actual if cfg.H_actual is not None else H
     num_q_heads = cfg.q_heads
-    num_kv_heads = 1
+    num_kv_heads = cfg.kv_heads
+    # KVDP: X uses full batch, K/V cache and mask use local batch
+    B_attn = batch // cfg.KVDP if cfg.KVDP > 1 else batch
+    num_mask_heads = cfg.KVDP * num_q_heads if cfg.KVDP > 1 else num_q_heads
+
+    # Seed global RNG for generate_cache_lens / gen_deterministic_active_block_table
+    np.random.seed(seed)
 
     eps = 1e-5 if dtype == np.float32 else 1e-3
 
@@ -670,7 +383,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
     # - After softmax, larger weights are fine — the peaky regime is past.
     #
     # See attention_block_tkg_input_distributions_design_spec.md for full analysis.
-    _rng = np.random.default_rng(0)
+    _rng = np.random.default_rng(seed)
 
     def uniform_activation(shape, dtype):
         """Uniform[-1, 1]"""
@@ -754,6 +467,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
             static_mx_in_shape=(1, 1),
             rng=_rng,
         )
+        W_qkv = W_qkv.view(nl.float8_e4m3fn).reshape(H // _q_width, dim_I_qkv, _q_width)
         # Pre-shuffle X along H for MXFP hardware layout: [B,S,H//512,128,4] → [B,S,4,H//512,128]
         X = np.ascontiguousarray(
             X.reshape(batch, S_tkg, H // (_P_MAX * _q_width), _P_MAX, _q_width)
@@ -785,21 +499,37 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
     # -- Attention (and KV cache)
     is_block_kv = cfg.block_len > 0
 
+    # The explicit kv-head axis is required when kv_heads > 1;
+    # cache_has_kv_head_dim only toggles the optional size-1 axis for kv_heads == 1.
+    use_explicit_kv_head_dim = cfg.cache_has_kv_head_dim or num_kv_heads > 1
+
     # Determine cache shapes
     if is_block_kv:
         assert not cfg.K_cache_transposed
         assert S_ctx % cfg.block_len == 0
-        assumed_num_cache_blocks = batch * S_ctx // cfg.block_len
-        K_cache_shape = V_cache_shape = (assumed_num_cache_blocks, cfg.block_len, d_head)
+        assumed_num_cache_blocks = B_attn * num_kv_heads * S_ctx // cfg.block_len
+        if cfg.fp8_packed:
+            K_cache_shape = (assumed_num_cache_blocks, cfg.block_len // 2, d_head, 2)
+        else:
+            K_cache_shape = (assumed_num_cache_blocks, cfg.block_len, d_head)
+        V_cache_shape = (assumed_num_cache_blocks, cfg.block_len, d_head)
+        if use_explicit_kv_head_dim:
+            K_cache_shape = (K_cache_shape[0] // num_kv_heads, num_kv_heads) + K_cache_shape[1:]
+            V_cache_shape = (V_cache_shape[0] // num_kv_heads, num_kv_heads) + V_cache_shape[1:]
     else:
         assumed_num_cache_blocks = 0
-        K_cache_shape = (batch, 1, d_head, S_max_ctx) if cfg.K_cache_transposed else (batch, 1, S_max_ctx, d_head)
-        V_cache_shape = (batch, 1, S_max_ctx, d_head)
+        K_cache_shape = (
+            (B_attn, num_kv_heads, d_head, S_max_ctx)
+            if cfg.K_cache_transposed
+            else (B_attn, num_kv_heads, S_max_ctx, d_head)
+        )
+        V_cache_shape = (B_attn, num_kv_heads, S_max_ctx, d_head)
 
     # Generate KV cache in FP8 when kv_quant=True
     kv_cache_dtype = cfg.kv_quant_dtype if cfg.kv_quant else dtype
     _CACHE_DTYPE_MAX = get_max_positive_value_for_dtype(kv_cache_dtype)
     if cfg.kv_quant:
+        K_cache_gen_shape = (assumed_num_cache_blocks, cfg.block_len, d_head) if cfg.fp8_packed else K_cache_shape
         # Determine KV scale and generate FP8 cache
         k_scale, v_scale, K_cache, V_cache = _generate_kv_quant_inputs(
             cfg,
@@ -810,10 +540,17 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
             d_head,
             weight_dequant_scale_qkv,
             input_dequant_scale_qkv,
-            K_cache_shape,
+            K_cache_gen_shape,
             V_cache_shape,
             kv_cache_dtype,
+            seed=seed,
         )
+        if cfg.fp8_packed:
+            # Transpose/Reshape fp8 [num_blocks, block_len, d_head] -> [num_blocks, block_len//2, d_head, 2]
+            num_blocks, block_len_full, d_head_k = K_cache.shape
+            K_cache = K_cache.reshape(num_blocks, block_len_full // 2, 2, d_head_k).transpose(0, 1, 3, 2)
+            if use_explicit_kv_head_dim:
+                K_cache = K_cache.reshape((K_cache.shape[0] // num_kv_heads, num_kv_heads) + K_cache.shape[1:])
     else:
         # KV cache stores projected K/V values which are O(1) after fan-in-scaled projection
         K_cache = uniform_activation(K_cache_shape, kv_cache_dtype)
@@ -825,10 +562,16 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
     cache_len_kwargs = {}
     if cfg.cache_lens_mean is not None:
         cache_len_kwargs["mean_frac"] = cfg.cache_lens_mean
+    elif cfg.max_context_len is not None:
+        cache_len_kwargs["mean_frac"] = cfg.max_context_len / (2 * (S_ctx - S_tkg))
     if cfg.cache_lens_stddev is not None:
         cache_len_kwargs["stddev_frac"] = cfg.cache_lens_stddev
-    cache_len = generate_cache_lens(batch, S_ctx, S_tkg, **cache_len_kwargs)
+    cache_len = generate_cache_lens(B_attn, S_ctx, S_tkg, **cache_len_kwargs)
     assert cache_len.max() <= (S_ctx - S_tkg)
+    if cfg.max_context_len is not None:
+        max_cache = cfg.max_context_len - S_tkg
+        cache_len = np.clip(cache_len, 0, max_cache)
+        cache_len[0] = max_cache
     import torch
 
     cache_lens_torch = torch.from_numpy(cache_len.flatten()).to(torch.float32)
@@ -838,22 +581,22 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
         if cfg.sliding_window > 0:
             swa_start_pos_ids, pos_ids = build_swa_positions(
                 pos_id=cache_len,
-                bs=batch,
+                bs=B_attn,
                 s_active=S_tkg,
                 sliding_window=cfg.sliding_window,
                 cache_len=S_ctx,
                 block_len=cfg.block_len,
             )
         else:
-            pos_ids = np.broadcast_to(cache_len, (batch, S_tkg)).astype(np.float32)
+            pos_ids = np.broadcast_to(cache_len, (B_attn, S_tkg)).astype(np.float32)
             if S_tkg > 1:
                 pos_ids = pos_ids + np.arange(S_tkg, dtype=np.float32)[np.newaxis, :]
             swa_start_pos_ids = None
 
         attention_mask = (
             build_active_attention_mask(
-                batch=batch,
-                num_heads=cfg.q_heads,
+                batch=B_attn,
+                num_heads=num_mask_heads,
                 s_active=S_tkg,
                 transposed=True,
             )
@@ -865,8 +608,8 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
         swa_start_pos_ids = None
         attention_mask = build_full_attention_mask(
             cache_lens=cache_lens_torch,
-            batch=batch,
-            num_heads=cfg.q_heads,
+            batch=B_attn,
+            num_heads=num_mask_heads,
             s_active=S_tkg,
             s_ctx=S_ctx,
             lnc=cfg.lnc,
@@ -874,35 +617,57 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
             include_active_mask=True,
             transposed=True,
             enable_fa_s_prior_tiling=cfg.enable_fa_s_prior_tiling,
-            KVDP=cfg.KVDP,
         ).numpy()  # mask: (S_ctx, batch, num_heads, S_tkg)
         attention_mask = dt.static_cast(np.ascontiguousarray(attention_mask), dtype=np.uint8)
 
-    active_blocks_table = (
-        gen_deterministic_active_block_table(
-            batch, S_ctx, S_tkg, cache_len, cfg.block_len, batch * S_ctx // cfg.block_len
-        ).astype(np.int32)
-        if is_block_kv
-        else None
-    )  # (B, S_ctx // block_len)
+    # Attention sink: one scalar per (KVDP-expanded) query head, [q_heads_attn, 1] @ HBM.
+    sink = _rng.uniform(0.0, 1.0, (num_mask_heads, 1)).astype(np.float32) if cfg.test_sink else None
 
-    # kv_cache_update_idx: (B, S_tkg) for block KV with per-token physical positions,
-    #                      (B, 1) for flat KV with start position (consecutive tokens assumed)
+    # active_blocks_table holds GLOBAL block indices into the flattened ``num_blocks * kv_heads`` dimension.
+    # Reuse the same indices between heads shifted to their global indices.
+    if is_block_kv:
+        blocks_per_head_pool = B_attn * S_ctx // cfg.block_len
+        base = gen_deterministic_active_block_table(
+            B_attn, S_ctx, S_tkg, cache_len, cfg.block_len, blocks_per_head_pool
+        ).astype(np.int32)  # [B, num_blocks]; INACTIVE padding = -1
+        if num_kv_heads == 1:
+            active_blocks_table = base
+        else:
+            base = base[:, np.newaxis, :]  # [B, 1, num_blocks]
+            kv_h = np.arange(num_kv_heads, dtype=np.int32).reshape(1, num_kv_heads, 1)
+            shifted = base * num_kv_heads + kv_h  # head-inner flattened addressing
+            active_blocks_table = np.where(base == -1, -1, shifted).astype(np.int32)  # [B, kv_heads, num_blocks]
+    else:
+        active_blocks_table = None
+
+    # kv_cache_update_idx: (B, S_tkg) for block KV (kv_heads==1) with per-token physical positions,
+    #                      (B, kv_heads, S_tkg) for block KV with kv_heads>1 (per-head physical positions),
+    #                      (B, 1) for flat KV with start position (consecutive tokens assumed).
     def generate_kv_cache_update_idx():
         if cfg.block_len == 0:
             # Flat KV: only start position needed, consecutive tokens assumed
             return cache_len.astype(np.uint32)
 
-        # Block KV: translate each token's logical position to physical slot_mapping
-        # Expand cache_len (B, 1) to per-token logical positions (B, S_tkg)
+        # Block KV: translate each token's logical position to physical slot_mapping.
+        # Generated per-(batch, kv_head, token); squeeze kv axis at end to match kernel contract:
+        # (B, S_tkg) for kv_heads==1, (B, kv_heads, S_tkg) otherwise.
         logical_positions = cache_len + np.arange(S_tkg)  # (B, S_tkg)
         logical_blks = logical_positions // cfg.block_len
         offset_in_blk = logical_positions % cfg.block_len
-        physical_blks = active_blocks_table[np.arange(batch)[:, None], logical_blks]
-        physical_kv_cache_update_idx = physical_blks * cfg.block_len + offset_in_blk
-        # Mask update for last batch element to test scenario when it is just padding
-        if batch > 1:
-            physical_kv_cache_update_idx[-1, :] = -1
+        # Wrap a 2D active_blocks_table to 3D for a uniform per-head gather.
+        abt_3d = active_blocks_table if num_kv_heads > 1 else active_blocks_table[:, np.newaxis, :]
+        # physical_blks[b, h, t] = abt_3d[b, h, logical_blks[b, t]]
+        physical_blks = abt_3d[
+            np.arange(B_attn)[:, None, None],
+            np.arange(num_kv_heads)[None, :, None],
+            logical_blks[:, None, :],
+        ]  # (B, kv_heads, S_tkg)
+        physical_kv_cache_update_idx = physical_blks * cfg.block_len + offset_in_blk[:, np.newaxis, :]
+        # Mark last batch element as padding to test that scenario.
+        if B_attn > 1:
+            physical_kv_cache_update_idx[-1, ...] = -1
+        if num_kv_heads == 1:
+            physical_kv_cache_update_idx = physical_kv_cache_update_idx.squeeze(1)  # (B, S_tkg)
         return physical_kv_cache_update_idx.astype(np.uint32)
 
     kv_cache_update_idx = generate_kv_cache_update_idx()
@@ -950,6 +715,7 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
             static_mx_in_shape=(1, 1),
             rng=_rng,
         )
+        W_out = W_out.view(nl.float8_e4m3fn).reshape(N_D // _q_width, H, _q_width)
         # Output projection STATIC_MX scales need broadcast to (128, 1) for kernel interface
         if cfg.quantization_type == QuantizationType.STATIC_MX:
             weight_dequant_scale_out = np.broadcast_to(weight_dequant_scale_out, (128, 1)).copy()
@@ -1000,20 +766,20 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
         "quantization_type_qkv": cfg.quantization_type,
         "weight_dequant_scale_qkv": weight_dequant_scale_qkv,
         "input_dequant_scale_qkv": input_dequant_scale_qkv,
-        # -- QK rmsnorm pre RoPE
-        "rmsnorm_QK_enabled": cfg.qk_norm_pre_rope,
-        "rmsnorm_QK_eps": eps,
-        "W_rmsnorm_Q_pre_rope": W_rmsnorm_Q_pre_rope,
-        "W_rmsnorm_K_pre_rope": W_rmsnorm_K_pre_rope,
+        # -- Q/K processing: pre-RoPE RMSNorm
+        "rmsnorm_QK_pre_rope_enabled": cfg.qk_norm_pre_rope,
+        "rmsnorm_QK_pre_rope_eps": eps,
+        "rmsnorm_QK_pre_rope_W_Q": W_rmsnorm_Q_pre_rope,
+        "rmsnorm_QK_pre_rope_W_K": W_rmsnorm_K_pre_rope,
         # -- RoPE
         "cos": cos,
         "sin": sin,
         "rope_contiguous_layout": cfg.rope_contiguous_layout,
-        # -- QK rmsnorm post RoPE
+        # -- Q/K processing: post-RoPE RMSNorm
         "rmsnorm_QK_post_rope_enabled": cfg.qk_norm_post_rope,
         "rmsnorm_QK_post_rope_eps": eps,
-        "W_rmsnorm_Q_post_rope": W_rmsnorm_Q_post_rope,
-        "W_rmsnorm_K_post_rope": W_rmsnorm_K_post_rope,
+        "rmsnorm_QK_post_rope_W_Q": W_rmsnorm_Q_post_rope,
+        "rmsnorm_QK_post_rope_W_K": W_rmsnorm_K_post_rope,
         # -- attention
         "skip_attention": cfg.skip_attention,
         "K_cache_transposed": cfg.K_cache_transposed,
@@ -1021,9 +787,10 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
         "K_cache": K_cache,
         "V_cache": V_cache,
         "attention_mask": attention_mask,
-        "sink": None,
+        "sink": sink,
         "softmax_scale": softmax_scale_adjusted,
         "enable_fa_s_prior_tiling": cfg.enable_fa_s_prior_tiling,
+        "fp8_packed": cfg.fp8_packed,
         # -- FP8 KV cache quantization
         "k_scale": k_scale,
         "v_scale": v_scale,
@@ -1050,6 +817,8 @@ def generate_kernel_inputs(cfg: AttnBlkTestConfig):
         "S_ctx": S_ctx if (cfg.use_pos_id and cfg.block_len == 0) else None,
         # -- MXFP quantization
         "is_h_transposed_by_4": cfg.quantization_type.is_mx(),
+        # -- dynamic FA
+        "max_context_len": np.array([cfg.max_context_len], dtype=np.int32) if cfg.max_context_len is not None else None,
     }
 
 
@@ -1069,20 +838,20 @@ def attention_block_tkg_kernel_test_wrapper(
     quantization_type_qkv: QuantizationType,
     weight_dequant_scale_qkv: Optional[nl.ndarray],
     input_dequant_scale_qkv: Optional[nl.ndarray],
-    # -- QK rmsnorm pre RoPE
-    rmsnorm_QK_enabled: bool,
-    rmsnorm_QK_eps: Optional[float],
-    W_rmsnorm_Q_pre_rope: Optional[nl.ndarray],
-    W_rmsnorm_K_pre_rope: Optional[nl.ndarray],
+    # -- Q/K processing: pre-RoPE RMSNorm
+    rmsnorm_QK_pre_rope_enabled: bool,
+    rmsnorm_QK_pre_rope_eps: float,
+    rmsnorm_QK_pre_rope_W_Q: Optional[nl.ndarray],
+    rmsnorm_QK_pre_rope_W_K: Optional[nl.ndarray],
     # -- RoPE embeddings
     cos: Optional[nl.ndarray],
     sin: Optional[nl.ndarray],
     rope_contiguous_layout: bool,
-    # -- QK rmsnorm post RoPE
+    # -- Q/K processing: post-RoPE RMSNorm
     rmsnorm_QK_post_rope_enabled: bool,
     rmsnorm_QK_post_rope_eps: float,
-    W_rmsnorm_Q_post_rope: Optional[nl.ndarray],
-    W_rmsnorm_K_post_rope: Optional[nl.ndarray],
+    rmsnorm_QK_post_rope_W_Q: Optional[nl.ndarray],
+    rmsnorm_QK_post_rope_W_K: Optional[nl.ndarray],
     # -- attention
     skip_attention: bool,
     K_cache_transposed: bool,
@@ -1093,6 +862,7 @@ def attention_block_tkg_kernel_test_wrapper(
     sink: Optional[nl.ndarray],
     softmax_scale: Optional[float],
     enable_fa_s_prior_tiling: bool,
+    fp8_packed: bool,
     # -- FP8 KV cache quantization
     k_scale: Optional[nl.ndarray],
     v_scale: Optional[nl.ndarray],
@@ -1114,11 +884,14 @@ def attention_block_tkg_kernel_test_wrapper(
     KVDP: int = 1,
     KVDP_replica_group=None,
     KVDP_collective_mode=None,
+    KVDP_rank: Optional[nl.ndarray] = None,
     # -- in-kernel mask generation
     pos_ids: Optional[nl.ndarray] = None,
     swa_start_pos_ids: Optional[nl.ndarray] = None,
     S_ctx: Optional[int] = None,
     is_h_transposed_by_4: bool = False,
+    max_context_len=None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ):
     if transposed_in:
         # X is already in transposed layout [H0, n_prgs, H1_shard, BxS] from generate_kernel_inputs
@@ -1168,17 +941,17 @@ def attention_block_tkg_kernel_test_wrapper(
         quantization_type_qkv=quantization_type_qkv,
         weight_dequant_scale_qkv=weight_dequant_scale_qkv,
         input_dequant_scale_qkv=input_dequant_scale_qkv,
-        rmsnorm_QK_pre_rope_enabled=rmsnorm_QK_enabled,
-        rmsnorm_QK_pre_rope_eps=rmsnorm_QK_eps if rmsnorm_QK_eps else 1e-5,
-        rmsnorm_QK_pre_rope_W_Q=W_rmsnorm_Q_pre_rope,
-        rmsnorm_QK_pre_rope_W_K=W_rmsnorm_K_pre_rope,
+        rmsnorm_QK_pre_rope_enabled=rmsnorm_QK_pre_rope_enabled,
+        rmsnorm_QK_pre_rope_eps=rmsnorm_QK_pre_rope_eps,
+        rmsnorm_QK_pre_rope_W_Q=rmsnorm_QK_pre_rope_W_Q,
+        rmsnorm_QK_pre_rope_W_K=rmsnorm_QK_pre_rope_W_K,
         cos=cos,
         sin=sin,
         rope_contiguous_layout=rope_contiguous_layout,
         rmsnorm_QK_post_rope_enabled=rmsnorm_QK_post_rope_enabled,
         rmsnorm_QK_post_rope_eps=rmsnorm_QK_post_rope_eps,
-        rmsnorm_QK_post_rope_W_Q=W_rmsnorm_Q_post_rope,
-        rmsnorm_QK_post_rope_W_K=W_rmsnorm_K_post_rope,
+        rmsnorm_QK_post_rope_W_Q=rmsnorm_QK_post_rope_W_Q,
+        rmsnorm_QK_post_rope_W_K=rmsnorm_QK_post_rope_W_K,
         skip_attention=skip_attention,
         K_cache_transposed=K_cache_transposed,
         active_blocks_table=active_blocks_table,
@@ -1188,6 +961,7 @@ def attention_block_tkg_kernel_test_wrapper(
         sink=sink,
         softmax_scale=softmax_scale,
         enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
+        fp8_packed=fp8_packed,
         update_cache=update_cache,
         kv_cache_update_idx=kv_cache_update_idx,
         k_scale=k_scale,
@@ -1204,10 +978,13 @@ def attention_block_tkg_kernel_test_wrapper(
         KVDP=KVDP,
         KVDP_replica_group=KVDP_replica_group,
         KVDP_collective_mode=KVDP_collective_mode,
+        KVDP_rank=KVDP_rank,
         pos_ids=pos_ids,
         swa_start_pos_ids=swa_start_pos_ids,
         S_ctx=S_ctx,
         is_h_transposed_by_4=is_h_transposed_by_4,
+        max_context_len=max_context_len,
+        dtype_mode=dtype_mode,
     )
 
     assert is_hbm_buffer(K_hbm_out)
@@ -1309,9 +1086,13 @@ def _golden_ref_via_torch(kernel_input: dict, lnc: int) -> dict:
     """
     kv_dtype = kernel_input['K_cache'].dtype
     torch_ref = AttentionBlockTkgTorchRef(lnc, kv_quant_dtype=str(kv_dtype))
-    ignored = set(kernel_input) - set(signature(torch_ref).parameters)
+    ref_params = set(signature(torch_ref).parameters)
+    ignored = set(kernel_input) - ref_params
+    # X_in_sb is a test-wrapper param for SBUF pre-loading, not part of the torch_ref
+    ignored.discard("X_in_sb")
     assert not ignored, f"kernel_input keys not consumed by torch ref: {ignored}"
-    ref_output = torch_ref_wrapper(torch_ref)(**kernel_input)
+    ref_input = {k: v for k, v in kernel_input.items() if k in ref_params}
+    ref_output = torch_ref_wrapper(torch_ref)(**ref_input)
     x_dtype = kernel_input['X'].dtype
     output_dtypes = {
         "X_out": x_dtype,
@@ -1418,32 +1199,10 @@ def _run_attention_block_test(
                  └──> GOLDEN ──> X_out, K/V_out ──┘
 
     Multi-rank case (KVDP>1):
-        Uses manual orchestration (UnitTestFramework doesn't support PerRankLazy*).
-        Generate inputs once with total_q_heads = KVDP * q_heads, then slice per-rank.
-        This ensures:
-          - Shared data is identical across ranks: X, W_k, W_v (GQA has 1 KV head shared by all Q heads)
-          - Per-rank data is different: W_q, W_out (by head), K/V cache, mask (by batch)
-
-        For each rank:
-                                          ┌─slice K/V[B/KVDP]──> KERNEL ──> X_out, K/V[B/KVDP] ──────┐
-                                          │                                    │                     │
-        INPUTS ──slice W_q/W_out[q_heads]─┤                                    ├─> compare X_out     ├─> compare K/V
-        K/V[B],                           │                                    │                     │
-        W_q/W_out[q_heads*KVDP]           └────────────────────> GOLDEN ──> X_out, K/V[B] ──slice──> K/V[B/KVDP]
-
-    Shape changes with KVDP>1 (per rank_id):
-
-        Tensor                  Kernel                              Golden                       Description
-        ──────                  ──────                              ──────                       ───────────
-        X                       [B, S_tkg, H]                       [B, S_tkg, H]                same, shared across ranks
-        W_qkv                   [H, d*(q_heads+2)]                  [H, d*(q_heads+2)]           same, sliced Q per rank, W_k/W_v replicated (GQA)
-        W_out                   [q_heads*d, H]                      [q_heads*d, H]               same, sliced Q per rank
-        K_cache (flat)          [B/KVDP, 1, S_ctx, d_head]          [B, 1, S_ctx, d_head]        kernel sliced B, golden full
-        K_cache (block)         [num_blocks/KVDP, block_len, d]     [num_blocks, block_len, d]   kernel sliced B, golden full
-        attention_mask          [S_ctx, B/KVDP, q_heads*KVDP, S]    [S_ctx, B, q_heads, S]       kernel: sliced B, gathered heads
-
-        Note: For block KV indices (active_blocks_table and kv_cache_update_idx)
-        we remap global block indices to per-rank local indices in _slice_block_kv_for_all_ranks()
+        Each rank generates its own inputs via generate_kernel_inputs (KVDP-aware:
+        X at full batch B, K/V cache and mask at B_attn = B/KVDP).
+        X and cos/sin are shared across ranks; everything else is independent.
+        The distributed torch ref handles collectives internally.
     """
     estimated_bytes = estimate_test_memory_bytes(cfg)
     if estimated_bytes > _MAX_MEMORY_BYTES:
@@ -1476,7 +1235,7 @@ def _run_single_rank_test(
 
     # When update_cache=True, the kernel returns K_cache/V_cache in-place, causing:
     # 1. The NKI compiler renames these inputs to K_cache.must_alias_input / V_cache.must_alias_input
-    #    in the NEFF. Rename input keys so the neuron-profile command uses the NEFF names.
+    #    in the NEFF. Rename input keys so the neuron-explorer command uses the NEFF names.
     # 2. The NEFF output files are named K_cache/V_cache (matching the aliased inputs), not
     #    K_cache_updated/V_cache_updated (the torch ref names). Rename golden keys to match.
     # The test framework handles the .must_alias_input suffix throughout
@@ -1505,7 +1264,12 @@ def _run_single_rank_test(
     )
     framework.run_test(
         test_config=None,
-        compiler_args=CompilerArgs(logical_nc_config=cfg.lnc, enable_birsim=False, platform_target=platform_target),
+        compiler_args=CompilerArgs(
+            logical_nc_config=cfg.lnc,
+            enable_birsim=False,
+            platform_target=platform_target,
+            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+        ),
         inference_args=replace(
             TKG_INFERENCE_ARGS,
             collective_ranks=1,
@@ -1523,55 +1287,57 @@ def _run_kvdp_test(
 ):
     """Run multi-rank KVDP test using CollectiveUnitTestFramework.
 
-    Uses per_rank_torch_ref_input_override to transform kernel inputs for golden
-    computation (slice W_qkv/W_out per rank, set KVDP=1 for torch ref), and
-    custom_comparator to post-process the torch_ref golden (slice K/V cache,
-    rename keys, wrap in cosine similarity validators).
+    The torch reference receives the same per-rank input as the kernel,
+    runs collectives internally, and generates golden data for each rank.
     """
 
-    # Block KV with S_tkg > 1 and KVDP: _slice_block_kv_for_all_ranks remaps kv_cache_update_idx
-    # per starting block only. When S_tkg > 1 crosses a block boundary, the kernel writes to
-    # consecutive local blocks, but the remapping doesn't guarantee global block N and N+1 map
-    # to adjacent local blocks. This is an issue with the kernel interface but KVDP exposes
-    # the issue (in other cases golden and kernel behave in the same way).
-    kvdp_cfg = replace(cfg, q_heads=cfg.KVDP * cfg.q_heads)
-    base_input = generate_kernel_inputs(kvdp_cfg)
+    # Replica group and rank mapping
+    replica_group_list = cfg.kvdp_replica_group if cfg.kvdp_replica_group is not None else [list(range(cfg.KVDP))]
+    replica_group = ReplicaGroup(replica_group_list)
+    collective_ranks = sum(len(g) for g in replica_group_list)
+    # Map each global rank to its group-local index (KVDP_rank).
+    # Example: ReplicaGroup([[0,8,16,24], [1,9,17,25], ...])
+    #          kvdp_rank:     0,1, 2, 3    0,1, 2, 3   ...
+    rank_to_kvdp_rank = {}
+    for group in replica_group_list:
+        for kvdp_rank, global_rank in enumerate(group):
+            rank_to_kvdp_rank[global_rank] = kvdp_rank
 
-    # For KV data parallelism with KVDP ranks, each rank has q_heads, so total = KVDP * q_heads.
-    # Generate inputs once with total heads, then slice per-rank.
-    B_attn = cfg.batch // cfg.KVDP
-    per_rank_input_gen, per_rank_cache = _create_per_rank_inputs(
-        base_input, cfg.KVDP, cfg.q_heads, cfg.d_head, B_attn, cfg.S_tkg, cfg.S_ctx, cfg.block_len
-    )
+    # Generate one shared input set — X, cos/sin, norms, scales are identical across ranks.
+    shared_input = generate_kernel_inputs(cfg)
 
-    # Build per-rank input generator with .must_alias_input renaming
+    # Per-rank: weights (sharded Q heads), cache/mask/positions (at B_attn).
     def create_per_rank_input(rank_id):
-        result = per_rank_input_gen.for_rank(rank_id).copy()
+        per_rank = generate_kernel_inputs(cfg, seed=rank_id)
+        result = shared_input.copy()
+        # Per-rank: sharded weights and batch-sliced tensors
+        for key in (
+            'W_qkv',
+            'bias_qkv',
+            'W_out',
+            'weight_dequant_scale_qkv',
+            'weight_dequant_scale_out',
+            'K_cache',
+            'V_cache',
+            'attention_mask',
+            'active_blocks_table',
+            'kv_cache_update_idx',
+            'pos_ids',
+            'swa_start_pos_ids',
+        ):
+            result[key] = per_rank[key]
+        # KVDP params
+        result['KVDP'] = cfg.KVDP
+        result['KVDP_replica_group'] = replica_group
+        result['KVDP_rank'] = np.array([rank_to_kvdp_rank[rank_id]], dtype=np.uint32)
         if cfg.update_cache:
             result['K_cache.must_alias_input'] = result.pop('K_cache')
             result['V_cache.must_alias_input'] = result.pop('V_cache')
         return result
 
-    # Override torch_ref inputs per rank: slice W_qkv/W_out to this rank's q_heads,
-    # use full-batch mask, set KVDP=1, and mask kv_cache_update_idx for block KV.
-    def ref_input_override(rank_id, kernel_input_for_rank):
-        golden_input_copy = per_rank_input_gen.base_input.copy()
-        golden_input_copy['W_qkv'] = per_rank_cache['w_qkv'][rank_id]
-        golden_input_copy['bias_qkv'] = per_rank_cache['bias_qkv'][rank_id]
-        golden_input_copy['W_out'] = per_rank_cache['w_out'][rank_id]
-        golden_input_copy['attention_mask'] = per_rank_cache['golden_mask']
-        golden_input_copy['KVDP'] = 1
-        if cfg.block_len > 0:
-            masked_idx = golden_input_copy['kv_cache_update_idx'].copy()
-            masked_idx[: rank_id * B_attn] = np.iinfo(np.uint32).max
-            masked_idx[(rank_id + 1) * B_attn :] = np.iinfo(np.uint32).max
-            golden_input_copy['kv_cache_update_idx'] = masked_idx
-        return golden_input_copy
-
-    # Post-process torch_ref golden: cast dtypes, slice K/V per rank, rename keys,
-    # wrap in cosine similarity validators.
-    x_dtype = base_input['X'].dtype
-    kv_dtype = base_input['K_cache'].dtype
+    # Dtypes for golden comparison
+    x_dtype = shared_input['X'].dtype
+    kv_dtype = shared_input['K_cache'].dtype
     output_dtypes = {
         "X_out": x_dtype,
         "K_tkg": kv_dtype,
@@ -1583,16 +1349,7 @@ def _run_kvdp_test(
     def comparator(rank_id, golden_dict):
         # Cast from float32 back to kernel IO dtypes (same as _golden_ref_via_torch)
         rank_golden = {k: v.astype(output_dtypes[k]) for k, v in golden_dict.items()}
-        rank_golden = _slice_golden_KV_cache_for_rank(
-            rank_golden,
-            rank_id,
-            B_attn,
-            cfg.block_len,
-            cfg.d_head,
-            cfg.S_ctx,
-            per_rank_cache,
-            cfg.update_cache,
-        )
+        # Torch ref handles KVDP collectives internally — golden is already per-rank.
         if cfg.update_cache:
             rank_golden['K_cache'] = rank_golden.pop('K_cache_updated')
             rank_golden['V_cache'] = rank_golden.pop('V_cache_updated')
@@ -1605,14 +1362,24 @@ def _run_kvdp_test(
         kernel_entry=nki.jit(attention_block_tkg_kernel_test_wrapper),
         torch_ref=torch_ref_wrapper(AttentionBlockTkgTorchRef(cfg.lnc, kv_quant_dtype=cfg.kv_quant_dtype)),
         per_rank_input_generator=create_per_rank_input,
-        collective_ranks=cfg.KVDP,
-        per_rank_torch_ref_input_override=ref_input_override,
+        collective_ranks=collective_ranks,
+    )
+    golden_only = os.environ.get("GOLDEN_ONLY", "0") == "1"
+    kvdp_output_keys = (
+        ["X_out", "K_cache_updated", "V_cache_updated"] if cfg.update_cache else ["X_out", "K_tkg", "V_tkg"]
     )
     framework.run_test(
         test_config=None,
-        compiler_args=CompilerArgs(logical_nc_config=cfg.lnc, enable_birsim=False, platform_target=platform_target),
-        inference_args=replace(TKG_INFERENCE_ARGS, collective_ranks=cfg.KVDP, enable_determinism_check=False),
+        compiler_args=CompilerArgs(
+            logical_nc_config=cfg.lnc,
+            enable_birsim=False,
+            platform_target=platform_target,
+            additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+        ),
+        inference_args=replace(TKG_INFERENCE_ARGS, collective_ranks=collective_ranks, enable_determinism_check=False),
         custom_comparator=comparator,
+        golden_only=golden_only,
+        output_keys=kvdp_output_keys,
     )
 
 
@@ -1647,6 +1414,15 @@ RANGE_ATTN_BLK_CFGS = [
                         K_cache_transposed=True, test_bias=True),
     AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
                         K_cache_transposed=True, test_bias=True),
+    # MXFP case (QKV and Ouput_Projection are in MXFP)
+    # MXFP, KVDP=1
+    AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=6144, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                      block_len=64, test_bias=True, cache_lens_mean=0.2, cache_lens_stddev=0.01, kv_quant=False,
+                      quantization_type=QuantizationType.MX, supported_platforms={Platforms.TRN3, Platforms.TRN3_A0}),
+    # MXPF, KVDP>1
+    AttnBlkTestConfig(batch=8, q_heads=2, d_head=64, H=6144, H_actual=2880, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                      block_len=64, test_bias=True, cache_lens_mean=0.2, cache_lens_stddev=0.01, KVDP=4, kv_quant=False,
+                      quantization_type=QuantizationType.MX, supported_platforms={Platforms.TRN3, Platforms.TRN3_A0}),                
     # Qwen3
     AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=4096, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
                         qk_norm_pre_rope=True),
@@ -1722,6 +1498,12 @@ RANGE_ATTN_BLK_CFGS = [
                         block_len=16),
     AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=5,
                         block_len=16),
+    # 4D block-KV cache layout [blocks, 1, block_len, d_head] (single head at axis 1).
+    # Exercises __internal_squeeze_head_dim/unsqueeze in attention_block_tkg.
+    AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=5,
+                        block_len=16, cache_has_kv_head_dim=True),
+    AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=5,
+                        block_len=16, cache_has_kv_head_dim=True),
     # Block boundary crossing: S_tkg=17 > block_len=16 guarantees tokens span
     # at least two blocks regardless of starting position within a block.
     AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=17,
@@ -1907,6 +1689,9 @@ RANGE_ATTN_BLK_CFGS = [
     AttnBlkTestConfig(batch=129, q_heads=9, d_head=128, H=5120, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                         block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, qk_norm_post_rope=True,
                         qk_norm_post_rope_gamma=True),
+    # Large B*S_tkg triggering multi-tile path (B*S_tkg > pmax)
+    AttnBlkTestConfig(batch=64, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=16384, S_max_ctx=16384, S_tkg=3,
+                        block_len=64, transposed_out=True, use_pos_id=True),
     # rope_contiguous_layout=False with large tile_B * q_heads (exercises gemm_moving_fmax in RoPE)
     AttnBlkTestConfig(batch=255, q_heads=8, d_head=64, H=8192, H_actual=None, S_ctx=32768, S_max_ctx=32768, S_tkg=5,
                         block_len=128, rope_contiguous_layout=False),
@@ -1925,6 +1710,12 @@ RANGE_ATTN_BLK_CFGS = [
                         block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, KVDP=4),
     AttnBlkTestConfig(batch=2048, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
                         block_len=128, KVDP=8, kv_quant=True),
+    # Strided KVDP replica group: TP=8, KVDP=4, collective_ranks=32
+    # kvdp_replica_group=[[0,8,16,24], [1,9,17,25], ..., [7,15,23,31]]
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=4096, S_max_ctx=4096, S_tkg=1,
+                        rmsnorm_X=False, test_bias=True,
+                        KVDP=4,
+                        kvdp_replica_group=[[tp + d * 8 for d in range(4)] for tp in range(8)]),
     # KV-DP ALL_GATHER_SLICE regression tests (KVDP=4, S_ctx=1k)
     # flat KV q_heads=1
     AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
@@ -1999,6 +1790,107 @@ RANGE_ATTN_BLK_CFGS = [
                         block_len=32, KVDP=4, use_pos_id=True),
     AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=5376, H_actual=None, S_ctx=16384, S_max_ctx=16384, S_tkg=3,
                         block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, KVDP=4, use_pos_id=True, sliding_window=256),
+
+    # ===== Large q_head, S_tkg to test functionality when single batch exceeds batch sharding budget =====
+    AttnBlkTestConfig(batch=1, q_heads=64, d_head=128, H=5376, H_actual=None, S_ctx=16384, S_max_ctx=16384, S_tkg=8,
+                     block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, use_pos_id=True),
+
+    # ===== fp8_packed block KV =====
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                        block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, fp8_packed=True),
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=5,
+                        block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, fp8_packed=True, KVDP=8),
+    AttnBlkTestConfig(batch=2, q_heads=8, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=2,
+                        block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, fp8_packed=True, update_cache=False),
+    AttnBlkTestConfig(batch=2, q_heads=8, d_head=128, H=8192, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=3,
+                        block_len=32, quantization_type=QuantizationType.STATIC, transposed_out=True, kv_quant=True, fp8_packed=True, sliding_window=128,
+                        cache_has_kv_head_dim=True),
+
+    # ===== Attention sink (streaming attention sink tokens) =====
+    # Flat KV, q_heads=1
+    AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=1,
+                        K_cache_transposed=True, rmsnorm_X=False, test_sink=True),
+    # Flat KV, multi q_heads + S_tkg > 1 + bias
+    AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                        K_cache_transposed=True, test_bias=True, test_sink=True),
+    # Block KV
+    AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=8192, S_max_ctx=8192, S_tkg=5,
+                        block_len=16, test_sink=True),
+    # Block KV + FP8 KV quant
+    AttnBlkTestConfig(batch=16, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=2048, S_max_ctx=2048, S_tkg=1,
+                        block_len=16, rmsnorm_X=False, kv_quant=True, test_sink=True),
+    # In-kernel mask generation + SWA + sink
+    AttnBlkTestConfig(batch=4, q_heads=1, d_head=128, H=5376, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, use_pos_id=True,
+                        sliding_window=256, test_sink=True),
+    # KVDP + sink (sink is per q_heads_attn = KVDP * q_heads head)
+    AttnBlkTestConfig(batch=8, q_heads=1, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        test_bias=True, KVDP=4, kv_quant=True, test_sink=True),
+
+    # Multi-KV-head (kv_heads=2), flat KV, with sink + in-kernel mask
+    AttnBlkTestConfig(batch=2, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                        kv_heads=2, test_sink=True, use_pos_id=True),
+    # Multi-KV-head + odd batch (sink-phase coverage), flat KV
+    AttnBlkTestConfig(batch=1, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                        kv_heads=2, test_sink=True, use_pos_id=True),
+    AttnBlkTestConfig(batch=3, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                        kv_heads=2, test_sink=True, use_pos_id=True),
+    AttnBlkTestConfig(batch=1, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                        kv_heads=4, test_sink=True, use_pos_id=True),
+    # Multi-KV-head + odd batch, block KV
+    AttnBlkTestConfig(batch=3, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        kv_heads=2, block_len=32, test_sink=True, use_pos_id=True),
+    # Multi-KV-head with q_per_group=2 (q_heads=8, kv_heads=4), block KV
+    AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        kv_heads=4, block_len=32, test_sink=True, use_pos_id=True),
+    # Multi-KV-head + FP8 KV cache quantization, flat KV
+    AttnBlkTestConfig(batch=2, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                        kv_heads=2, kv_quant=True, test_sink=True, use_pos_id=True),
+    # Multi-KV-head + FP8 packed block KV cache
+    AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                        kv_heads=2, block_len=32, kv_quant=True, fp8_packed=True, test_sink=True, use_pos_id=True),
+    AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                        kv_heads=4, block_len=32, kv_quant=True, fp8_packed=True, test_sink=True, use_pos_id=True),
+    # Multi-KV-head + KVDP=4, block KV
+    AttnBlkTestConfig(batch=8, q_heads=4, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        kv_heads=2, block_len=32, KVDP=4,
+                        KVDP_collective_mode=KVDPCollectiveMode.ALL_GATHER_SLICE,
+                        test_sink=True, use_pos_id=True),
+    # 4D block KV cache [num_blocks, kv_heads, block_len, d_head].
+    AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                        kv_heads=4, block_len=32, cache_has_kv_head_dim=True),
+    # kv_heads=2, bf16, update_cache=False (returns new K/V tokens; no cache split).
+    AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                        kv_heads=2, block_len=32, cache_has_kv_head_dim=True, update_cache=False),
+    # kv_heads=4, fp8_packed (5D input [num_blocks, kv_heads, block_len//2, d, 2]) + sink + in-kernel mask.
+    AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                        kv_heads=4, block_len=32, kv_quant=True, fp8_packed=True,
+                        cache_has_kv_head_dim=True, test_sink=True, use_pos_id=True),
+    # ===== DMA batching coverage =====
+    # fp8_packed d_head=64 fold-batching
+    AttnBlkTestConfig(batch=16, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True),
+    # fp8_packed d_head=64 SWA batch-batching
+    AttnBlkTestConfig(batch=16, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, sliding_window=128),
+    # fp8_packed d_head=64 with k_active stitching
+    AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                        block_len=64, kv_quant=True, fp8_packed=True, cache_lens_mean=0.01, cache_lens_stddev=0.0),
+    # non-packed fp8 kv bulk-copy stitching with fold-batching
+    AttnBlkTestConfig(batch=16, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                        block_len=32, kv_quant=True, cache_lens_mean=0.01, cache_lens_stddev=0.0),
+    # bf16 d_head=64 ppf=2 per-token stitching with fold-batching
+    AttnBlkTestConfig(batch=16, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=1,
+                        block_len=64, cache_lens_mean=0.01, cache_lens_stddev=0.0),
+    # combined fold+batch batching (k_dma_batch_n_folds=2, k_dma_batch_n_batches=4)
+    AttnBlkTestConfig(batch=32, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=2048, S_max_ctx=2048, S_tkg=4,
+                        block_len=8, kv_quant=True, fp8_packed=True, cache_lens_mean=0.01, cache_lens_stddev=0.0),
+    # bf16 d_head=64 batch-batching with stitching (last tile batch-batches)
+    AttnBlkTestConfig(batch=8, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                        block_len=32, cache_lens_mean=0.01, cache_lens_stddev=0.0),
+    # d_head=128 (k_row_tile_factor=1) with fold-batching + stitching
+    AttnBlkTestConfig(batch=16, q_heads=8, d_head=128, H=3072, H_actual=2880, S_ctx=10240, S_max_ctx=10240, S_tkg=4,
+                        block_len=32, cache_lens_mean=0.01, cache_lens_stddev=0.0),
 ]
 # fmt: on
 
@@ -2041,13 +1933,104 @@ class TestRangeAttnBlk:
         # H_actual padding (GPT-OSS style)
         AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                             test_bias=True),
+        # Dynamic FA early exit (LNC2, validated via attention_tkg + attention_block_tkg)
+        AttnBlkTestConfig(batch=1, q_heads=8, d_head=128, H=5376, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                            block_len=32, use_pos_id=True, max_context_len=16385),
+        AttnBlkTestConfig(batch=1, q_heads=8, d_head=128, H=5376, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                            block_len=32, use_pos_id=True, max_context_len=24576),
+        AttnBlkTestConfig(batch=1, q_heads=8, d_head=128, H=5376, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                            block_len=32, use_pos_id=True, max_context_len=30000),
+        AttnBlkTestConfig(batch=1, q_heads=8, d_head=128, H=5376, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                            block_len=32, use_pos_id=True, max_context_len=65536),
+        AttnBlkTestConfig(batch=1, q_heads=8, d_head=128, H=5376, H_actual=None, S_ctx=131072, S_max_ctx=131072, S_tkg=1,
+                            block_len=32, use_pos_id=True, max_context_len=131072),
+        # FP8 packed KV cache
+        AttnBlkTestConfig(batch=4, q_heads=4, d_head=64, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                            block_len=32, kv_quant=True, fp8_packed=True),
+        # Attention sink (streaming attention sink tokens)
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=2880, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            block_len=32, test_bias=True, test_sink=True),
+        # Multi-KV-head (kv_heads > 1), flat KV, S_tkg=1
+        AttnBlkTestConfig(batch=2, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                            kv_heads=2),
+        # Multi-KV-head with q_per_group=2 (q_heads=8, kv_heads=4), block KV
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=4, block_len=32),
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=4, block_len=32, kv_quant=True),
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                            kv_heads=4, block_len=32, kv_quant=True, fp8_packed=True),
+        # Multi-KV-head + per-Q-head attention sink (compact [q_heads_attn,1] sink, broadcast in _prep_sink)
+        AttnBlkTestConfig(batch=2, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                            kv_heads=2, test_sink=True),
+        # Sink + odd real batch -> batch-sharded folded batch cuts mid kv-group (kv-head phase != 0 on NC1).
+        # batch=1,kv=2: B_folded=2, phase=1 on NC1. batch=3,kv=2: B_folded=6, phase + partial tail. batch=1,kv=4: phase=2.
+        AttnBlkTestConfig(batch=1, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                            kv_heads=2, test_sink=True),
+        AttnBlkTestConfig(batch=3, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                            kv_heads=2, test_sink=True),
+        AttnBlkTestConfig(batch=1, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                            kv_heads=4, test_sink=True),
+        # Multi-KV-head + multi-token generation (S_tkg > 1)
+        AttnBlkTestConfig(batch=2, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=4,
+                            kv_heads=2),
+        # Multi-KV-head + block KV cache
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=2, block_len=32),
+        # Multi-KV-head + FP8 KV cache quantization, flat KV
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=2, kv_quant=True, test_bias=True),
+        # Multi-KV-head + FP8 KV cache quantization, block KV
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=2, block_len=32, kv_quant=True),
+        # Multi-KV-head + FP8 packed block KV cache
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                            kv_heads=2, block_len=32, kv_quant=True, fp8_packed=True),
+        # Multi-KV-head + 4D block KV cache [num_blocks, kv_heads, ...], fp8_packed (5D), in-kernel mask.
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                            kv_heads=2, block_len=32, kv_quant=True, fp8_packed=True,
+                            cache_has_kv_head_dim=True, use_pos_id=True),
+        # Multi-KV-head + in-kernel mask generation (pos_ids), block KV
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=2, block_len=32, use_pos_id=True),
+        # Multi-KV-head + sliding-window attention (SWA via pos_ids), block KV
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=2, block_len=32, use_pos_id=True, sliding_window=256),
+        # Multi-KV-head + block KV cache + replicated KVDP
+        AttnBlkTestConfig(batch=8, q_heads=4, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=2, block_len=32, KVDP=4, KVDP_collective_mode=KVDPCollectiveMode.ALL_GATHER_SLICE),
+        # Multi-KV-head + replicated KVDP (KV heads replicated across ranks, batch sliced)
+        AttnBlkTestConfig(batch=8, q_heads=4, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=2, KVDP=4, KVDP_collective_mode=KVDPCollectiveMode.ALL_GATHER_SLICE),
+        AttnBlkTestConfig(batch=8, q_heads=4, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=2, KVDP=4, KVDP_collective_mode=KVDPCollectiveMode.ALL_TO_ALL),
+        # Multi-KV-head + FP8 KV cache quantization (kv_heads=4), block KV, with sink + in-kernel mask
+        AttnBlkTestConfig(batch=4, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
+                            kv_heads=4, block_len=32, kv_quant=True, test_sink=True, use_pos_id=True),
+        # Multi-KV-head + KVDP=4 + FP8 packed block KV cache, with sink + in-kernel mask
+        AttnBlkTestConfig(batch=8, q_heads=4, d_head=64, H=3072, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=3,
+                            kv_heads=2, block_len=32, kv_quant=True, fp8_packed=True, KVDP=4,
+                            KVDP_collective_mode=KVDPCollectiveMode.ALL_GATHER_SLICE,
+                            test_sink=True, use_pos_id=True),
+        # Multi-KV-head + sliding-window attention, flat KV (sink-stress: short context)
+        AttnBlkTestConfig(batch=3, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=128, S_max_ctx=128, S_tkg=1,
+                            kv_heads=2, test_sink=True, use_pos_id=True, sliding_window=16),
+        # Multi-KV-head + sliding-window attention, block KV (sink-stress: kv_heads=4)
+        AttnBlkTestConfig(batch=3, q_heads=8, d_head=64, H=3072, H_actual=None, S_ctx=256, S_max_ctx=256, S_tkg=1,
+                            kv_heads=4, block_len=32, test_sink=True, use_pos_id=True, sliding_window=16),
     ]
     # fmt: on
 
     @pytest.mark.fast
     @pytest.mark.parametrize(
         "attn_blk_cfg",
-        FAST_ATTN_BLK_CFGS,
+        [
+            # Collective (KVDP>1 / DCP>1) configs use multi-rank inputs and collective
+            # ops that the simulator backend does not support, so skip them in the
+            # simulation lane while keeping them in the fast hardware lane.
+            pytest.param(cfg, marks=pytest.mark.skip_simulation) if cfg.KVDP > 1 or cfg.DCP > 1 else cfg
+            for cfg in FAST_ATTN_BLK_CFGS
+        ],
         ids=lambda p: p.test_id(),
     )
     def test_attn_blk_fast(

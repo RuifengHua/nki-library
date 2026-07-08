@@ -130,22 +130,24 @@ CONV3D_BASIC_PARAMS = [
     # Medium
     (1, 48, 96, 4, 16, 16, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16),
     (1, 64, 128, 4, 16, 16, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16),
-    (2, 96, 192, 4, 12, 12, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, ActFnType.SiLU, False, nl.bfloat16),
+    pytest.param(2, 96, 192, 4, 12, 12, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, ActFnType.SiLU, False, nl.bfloat16, marks=pytest.mark.fast),
 
     # Large
     (1, 128, 256, 4, 16, 32, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16),
     (1, 128, 256, 4, 16, 64, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, ActFnType.SiLU, False, nl.bfloat16),
     (1, 128, 512, 4, 16, 128, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16),
+    (1, 32, 1024, 21, 7, 3, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, False, nl.bfloat16),
+    (1, 32, 1024, 21, 7, 3, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, True, nl.bfloat16),
 
     # Kernel size
-    (1, 32, 64, 4, 8, 8, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, False, nl.bfloat16),
+    pytest.param(1, 32, 64, 4, 8, 8, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, False, nl.bfloat16, marks=pytest.mark.fast),
     (1, 32, 64, 4, 8, 16, 3, 2, 5, 1, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16),
     (1, 32, 64, 8, 8, 16, 5, 3, 3, 1, 1, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, True, None, False, nl.bfloat16),
 
     # Stride
     (1, 64, 128, 4, 16, 16, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16),
     (1, 64, 128, 4, 16, 16, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16),
-    (1, 64, 128, 8, 16, 16, 3, 3, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16),
+    pytest.param(1, 64, 128, 8, 16, 16, 3, 3, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16, marks=pytest.mark.fast),
 
     # Dilation
     (1, 32, 64, 8, 16, 16, 3, 3, 3, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, False, None, False, nl.bfloat16),
@@ -170,55 +172,89 @@ CONV3D_BASIC_PARAMS = [
     # float32
     (1, 16, 32, 4, 8, 8, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, False, nl.float32),
     (1, 16, 32, 4, 8, 8, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, ActFnType.SiLU, False, nl.float32),
-    (1, 128, 512, 4, 16, 128, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.float32),
+    pytest.param(1, 128, 512, 4, 16, 128, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.float32, marks=pytest.mark.fast),
 
     # Activations
-    (1, 16, 32, 4, 8, 8, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, ActFnType.ReLU, False, nl.bfloat16),
+    pytest.param(1, 16, 32, 4, 8, 8, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, ActFnType.ReLU, False, nl.bfloat16, marks=pytest.mark.fast),
     (1, 16, 32, 4, 8, 8, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16),
     (1, 64, 128, 4, 16, 16, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.SiLU, False, nl.bfloat16),
 
     # Stride and dilation on all 3 dimensions
     (1, 128, 128, 16, 32, 64, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, False, None, False, nl.bfloat16),
 
+    # Large spatial with DH group crossing depth boundary (regression test for NKILIB-1424).
+    (1, 128, 128, 8, 42, 10, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, False, None, False, nl.bfloat16),
+    (1, 256, 256, 8, 80, 10, 3, 3, 3, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, None, False, nl.bfloat16),
+
 ]
 CONV3D_BASIC_SLOW_PARAMS = [
     (1, 128, 128, 64, 128, 256, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, True, ActFnType.GELU, False, nl.bfloat16),
 ]
-CONV3D_BASIC_ALL_PARAMS = [
-    pytest.param(*c, marks=pytest.mark.fast) for c in CONV3D_BASIC_PARAMS
-] + CONV3D_BASIC_SLOW_PARAMS
+
+CONV3D_BASIC_ALL_PARAMS = CONV3D_BASIC_PARAMS + CONV3D_BASIC_SLOW_PARAMS
 
 # Wan2.2 test parameters
 CONV3D_WAN2_2_VAE_ENCODER_PARAMS = [
-    # Input conv: Conv3d(3, 160, 3, padding=1)
-    (1, 3, 160, 4, 240, 416, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, False, None, True, nl.bfloat16),
-    # Downsample[0] ResBlock: CausalConv3d(160, 160, 3, padding=1), T=4, H=240, W=416
     # Downsample[1] ResBlock first: CausalConv3d(160, 320, 3, padding=1), T=4, H=120, W=208
-    (1, 160, 320, 4, 120, 208, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
-    # Downsample[1] ResBlock: CausalConv3d(320, 320, 3, padding=1), T=4, H=120, W=208
-    (1, 320, 320, 4, 120, 208, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
-    # Downsample[2] ResBlock first: CausalConv3d(320, 640, 3, padding=1), T=2, H=60, W=104
-    (2, 320, 640, 2, 60, 104, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
-    # Downsample[2] ResBlock: CausalConv3d(640, 640, 3, padding=1), T=2, H=60, W=104
-    (2, 640, 640, 2, 60, 104, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
     # Downsample[2] time_conv: CausalConv3d(640, 640, (3,1,1), stride=(2,1,1)), T=3, H=30, W=52
     (2, 640, 640, 3, 30, 52, 3, 1, 1, 2, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, True, None, True, nl.bfloat16),
     # Downsample[3]/Middle ResBlock: CausalConv3d(640, 640, 3, padding=1), T=1, H=30, W=52
-    (2, 640, 640, 1, 30, 52, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
+    pytest.param(2, 640, 640, 1, 30, 52, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16, marks=pytest.mark.fast),
 ]
 
 CONV3D_WAN2_2_VAE_DECODER_PARAMS = [
     # Middle ResBlock: CausalConv3d(1024, 1024, 3, padding=1), T=1, H=30, W=52
     (2, 1024, 1024, 1, 30, 52, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
-    # Upsample[0] ResBlock: CausalConv3d(1024, 1024, 3, padding=1), T=1, H=30, W=104
-    (2, 1024, 1024, 1, 30, 104, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
     # Upsample[1] ResBlock: CausalConv3d(1024, 1024, 3, padding=1), T=2, H=60, W=104
-    # Upsample[1] time_conv: CausalConv3d(1024, 2048, (3,1,1), padding=(1,0,0)), T=2, H=60, W=104
-    (2, 1024, 2048, 2, 60, 104, 3, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 1, 1, 1, True, None, True, nl.bfloat16),
+]
+
+CONV3D_WAN2_2_VAE_DECODER_PARAMS2 = [
+    #B, Ci, Co,  D, H, W,  Kd,Kh,Kw,  Sd,Sh,Sw, PadDL/R,HT/B,WL/R, DilD,H,W, bias, act, lnc_shard,
+    # 720p
+    (1, 16, 16, 3, 90, 160, 1, 1, 1,  1, 1, 1,  0, 0, 0, 0, 0, 0,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 16, 384, 3, 90, 160, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    #(1, 96, 96, 3, 720, 1280, 1, 3, 3,  1, 1, 1,  0, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    #(1, 96, 96, 3, 720, 1280, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    #(1, 96, 3, 3, 720, 1280, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    # 480p
+    pytest.param(1, 16, 16, 3, 60, 104, 1, 1, 1,   1, 1, 1,  0, 0, 0, 0, 0, 0,  1, 1, 1, True, None, True, nl.bfloat16, marks=pytest.mark.fast),
+    pytest.param(1, 16, 384, 3, 60, 104, 3, 3, 3,   1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16, marks=pytest.mark.fast),
+    (1, 384, 384, 3, 60, 104, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 384, 768, 3, 120, 208, 3, 1, 1,  1, 1, 1,  2, 0, 0, 0, 0, 0,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 192, 384, 3, 120, 208, 3, 1, 1,  1, 1, 1,  2, 0, 0, 0, 0, 0,  1, 1, 1, True, None, True, nl.bfloat16),
+    pytest.param(1, 192, 96, 3, 240, 416, 1, 3, 3,  1, 1, 1,  0, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16, marks=pytest.mark.fast),
 ]
 
 # Slow-to-compile Wan2.2 VAE decoder cases (>5min compile), excluded from fast suite
 CONV3D_WAN2_2_SLOW_PARAMS = [
+    # 480p decoder (>2min compile time)
+    (1, 96, 96, 3, 480, 832, 1, 3, 3,  1, 1, 1,  0, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 96, 96, 3, 480, 832, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 96, 3, 3, 480, 832, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    # Encoder/decoder large channel configs (>40s compile)
+    (2, 320, 640, 2, 60, 104, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
+    (2, 1024, 2048, 2, 60, 104, 3, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 1, 1, 1, True, None, True, nl.bfloat16),
+    (2, 1024, 1024, 1, 30, 104, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
+    # 720p decoder large spatial dims (>2min compile time)
+    (1, 384, 384, 3, 180, 320, 1, 3, 3,  1, 1, 1,  0, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 384, 192, 3, 180, 320, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 192, 384, 3, 180, 320, 3, 1, 1,  1, 1, 1,  2, 0, 0, 0, 0, 0,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 192, 96, 3, 360, 640, 1, 3, 3,  1, 1, 1,  0, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    # Downsample[1] ResBlock: CausalConv3d(320, 320, 3, padding=1), T=4, H=120, W=208
+    (1, 320, 320, 4, 120, 208, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
+    # Downsample[1] ResBlock first: CausalConv3d(160, 320, 3, padding=1), T=4, H=120, W=208
+    (1, 160, 320, 4, 120, 208, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
+    # Downsample[2] ResBlock: CausalConv3d(640, 640, 3, padding=1), T=2, H=60, W=104
+    (2, 640, 640, 2, 60, 104, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
+    # 720p decoder
+    (1, 384, 768, 3, 180, 320, 3, 1, 1,  1, 1, 1,  2, 0, 0, 0, 0, 0,  1, 1, 1, True, None, True, nl.bfloat16),
+    # 480p decoder
+    (1, 384, 192, 3, 120, 208, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    # Input conv: Conv3d(3, 160, 3, padding=1), T=4, H=240, W=416
+    (1, 3, 160, 4, 240, 416, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, False, None, True, nl.bfloat16),
+    # 720p/480p large channel configs
+    (1, 384, 384, 3, 90, 160, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 384, 384, 3, 120, 208, 1, 3, 3,  1, 1, 1,  0, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
     # Upsample[3] ResBlock first: CausalConv3d(512, 256, 3, padding=1), T=4, H=240, W=416
     (1, 512, 256, 4, 240, 416, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
     # Upsample[2] ResBlock: CausalConv3d(512, 512, 3, padding=1), T=4, H=120, W=208
@@ -231,15 +267,24 @@ CONV3D_WAN2_2_SLOW_PARAMS = [
     (1, 256, 256, 4, 240, 416, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, True, None, True, nl.bfloat16),
     # Output conv: Conv3d(256, 3, 3, padding=1)
     (1, 256, 3, 4, 240, 416, 3, 3, 3, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 1, False, None, True, nl.bfloat16),
+    # Moved here the slow ones from CONV3D_WAN2_2_VAE_DECODER_PARAMS2
+    (1, 96, 96, 3, 720, 1280, 1, 3, 3,  1, 1, 1,  0, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 96, 96, 3, 720, 1280, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
+    (1, 96, 3, 3, 720, 1280, 3, 3, 3,  1, 1, 1,  2, 0, 1, 1, 1, 1,  1, 1, 1, True, None, True, nl.bfloat16),
 ]
 
-CONV3D_WAN2_2_FAST_PARAMS = CONV3D_WAN2_2_VAE_ENCODER_PARAMS + CONV3D_WAN2_2_VAE_DECODER_PARAMS
+
+CONV3D_WAN2_2_FAST_PARAMS = (
+    CONV3D_WAN2_2_VAE_ENCODER_PARAMS
+    + CONV3D_WAN2_2_VAE_DECODER_PARAMS
+    + CONV3D_WAN2_2_VAE_DECODER_PARAMS2
+)
 
 # Whisper model test parameters
 CONV3D_WHISPER_PARAMS = [
     # Conv1
     (2, 80, 384, 1, 1, 1500, 1, 1, 3, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.float32),
-    (1, 128, 1280, 1, 1, 1500, 1, 1, 3, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, True, ActFnType.GELU, True, nl.bfloat16),
+    pytest.param(1, 128, 1280, 1, 1, 1500, 1, 1, 3, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, True, ActFnType.GELU, True, nl.bfloat16, marks=pytest.mark.fast),
 
     # Conv2
     (2, 384, 384, 1, 1, 1500, 1, 1, 3, 1, 1, 2, 0, 0, 0, 0, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.float32),
@@ -257,16 +302,13 @@ CONV3D_CONV2D_STYLE_PARAMS = [
     (1, 128, 256, 1, 32, 32, 1, 3, 3, 1, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.SiLU, False, nl.bfloat16),
 
     # Conv2D with stride and dilation on H and W
-    (1, 32, 64, 1, 32, 32, 1, 3, 3, 1, 2, 2, 0, 0, 2, 2, 2, 2, 1, 2, 2, False, None, False, nl.bfloat16),
+    pytest.param(1, 32, 64, 1, 32, 32, 1, 3, 3, 1, 2, 2, 0, 0, 2, 2, 2, 2, 1, 2, 2, False, None, False, nl.bfloat16, marks=pytest.mark.fast),
     (1, 64, 128, 1, 32, 32, 1, 3, 3, 1, 2, 2, 0, 0, 2, 2, 2, 2, 1, 2, 2, True, ActFnType.GELU, False, nl.bfloat16),
 
     # Conv2D large
     (1, 128, 256, 1, 56, 56, 1, 3, 3, 1, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, False, None, False, nl.bfloat16),
     (1, 256, 512, 1, 28, 28, 1, 3, 3, 1, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, True, ActFnType.GELU, False, nl.bfloat16),
 ]
-
-# All test parameters combined
-CONV3D_ALL_PARAMS = CONV3D_BASIC_PARAMS + CONV3D_WAN2_2_FAST_PARAMS + CONV3D_WAN2_2_SLOW_PARAMS + CONV3D_WHISPER_PARAMS + CONV3D_CONV2D_STYLE_PARAMS
 # fmt: on
 
 
@@ -338,7 +380,6 @@ class TestConv3DKernel:
             dtype=dtype,
         )
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_WAN2_2_FAST_PARAMS)
     def test_conv3d_wan2_2(
         self,
@@ -401,7 +442,6 @@ class TestConv3DKernel:
             dtype=dtype,
         )
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_WHISPER_PARAMS)
     def test_conv3d_whisper(
         self,
@@ -464,7 +504,6 @@ class TestConv3DKernel:
             dtype=dtype,
         )
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_CONV2D_STYLE_PARAMS)
     def test_conv3d_conv2d_style(
         self,
@@ -497,68 +536,6 @@ class TestConv3DKernel:
         dtype,
     ) -> None:
         """Run Conv2D tests using Conv3D with D=1, K_d=1."""
-        self._run_conv3d_test(
-            test_manager=test_manager,
-            platform_target=platform_target,
-            batch=batch,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            depth=depth,
-            height=height,
-            width=width,
-            filter_d=filter_d,
-            filter_h=filter_h,
-            filter_w=filter_w,
-            stride_d=stride_d,
-            stride_h=stride_h,
-            stride_w=stride_w,
-            pad_d_left=pad_d_left,
-            pad_d_right=pad_d_right,
-            pad_h_top=pad_h_top,
-            pad_h_bottom=pad_h_bottom,
-            pad_w_left=pad_w_left,
-            pad_w_right=pad_w_right,
-            dilation_d=dilation_d,
-            dilation_h=dilation_h,
-            dilation_w=dilation_w,
-            use_bias=use_bias,
-            activation_fn=activation_fn,
-            lnc_shard=lnc_shard,
-            dtype=dtype,
-        )
-
-    @pytest.mark.parametrize(CONV3D_PARAM_NAMES, CONV3D_ALL_PARAMS)
-    def test_conv3d_all(
-        self,
-        test_manager: Orchestrator,
-        platform_target: Platforms,
-        batch: int,
-        in_channels: int,
-        out_channels: int,
-        depth: int,
-        height: int,
-        width: int,
-        filter_d: int,
-        filter_h: int,
-        filter_w: int,
-        stride_d: int,
-        stride_h: int,
-        stride_w: int,
-        pad_d_left: int,
-        pad_d_right: int,
-        pad_h_top: int,
-        pad_h_bottom: int,
-        pad_w_left: int,
-        pad_w_right: int,
-        dilation_d: int,
-        dilation_h: int,
-        dilation_w: int,
-        use_bias: bool,
-        activation_fn: Optional[ActFnType],
-        lnc_shard: bool,
-        dtype,
-    ) -> None:
-        """Run all Conv3D tests."""
         self._run_conv3d_test(
             test_manager=test_manager,
             platform_target=platform_target,

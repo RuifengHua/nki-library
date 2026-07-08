@@ -13,9 +13,9 @@
 # limitations under the License.
 
 import enum
+import functools
 from typing import Optional
 
-import neuron_dtypes as dt
 import nki
 import nki.language as nl
 import numpy as np
@@ -28,7 +28,7 @@ from nkilib_src.nkilib.core.output_projection.output_projection_tkg_torch import
     output_projection_tkg_torch_ref,
 )
 from nkilib_src.nkilib.core.utils.allocator import BufferManager, Logger
-from nkilib_src.nkilib.core.utils.common_types import QuantizationType
+from nkilib_src.nkilib.core.utils.common_types import DtypeMode, QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 from test.integration.nkilib.utils.tensor_generators import (
     FP8_E4M3_MAX,
@@ -37,6 +37,7 @@ from test.integration.nkilib.utils.tensor_generators import (
     np_random_sample,
     static_cast,
 )
+from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
 from test.utils.common_dataclasses import (
     TKG_INFERENCE_ARGS,
     CompilerArgs,
@@ -86,6 +87,7 @@ def output_proj_tkg_wrapper(
     OUT_IN_SB: bool = False,
     # Placeholder param to match torch-ref/kernel signature
     sbm: Optional[BufferManager] = None,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> nl.ndarray:
     sbm = BufferManager(
         0,
@@ -95,13 +97,37 @@ def output_proj_tkg_wrapper(
     )
 
     return output_projection_tkg(
-        attention, weight, bias, quantization_type, weight_scale, input_scale, TRANSPOSE_OUT, OUT_IN_SB, sbm
+        attention,
+        weight,
+        bias,
+        quantization_type,
+        weight_scale,
+        input_scale,
+        TRANSPOSE_OUT,
+        OUT_IN_SB,
+        sbm,
+        dtype_mode=dtype_mode,
     )
 
 
-def build_output_proj_tkg_input(lnc_degree, d_head, B, n_heads, S_tkg, quantization_type, H, test_bias, transpose_out):
+def build_output_proj_tkg_input(
+    lnc_degree,
+    d_head,
+    B,
+    n_heads,
+    S_tkg,
+    quantization_type,
+    H,
+    test_bias,
+    transpose_out,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+):
     dtype = nl.bfloat16
     _q_width = 4
+
+    # Pick E4M3 dtype + clip according to the declared dtype_mode. STATIC_MX is always OCP.
+    _fp8_e4m3_dtype = nl.float8_e4m3fn if dtype_mode == DtypeMode.OCP else nl.float8_e4m3
+    _fp8_e4m3_max = 448.0 if dtype_mode == DtypeMode.OCP else FP8_E4M3_MAX
 
     if quantization_type == QuantizationType.STATIC_MX:
         FP8_E4M3FN_MAX = 448.0
@@ -114,30 +140,12 @@ def build_output_proj_tkg_input(lnc_degree, d_head, B, n_heads, S_tkg, quantizat
         attention = convert_to_range(1, random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention"))
         in_scale = (np.abs(attention).max() / FP8_E4M3FN_MAX) * np.random.uniform(0.995, 1.005)
 
-        # Generate scalar fp8 weights, then repack to x4 matching generate_stabilized_mx_data convention.
+        # Generate scalar fp8 weights in unpacked [N_D//4, H, 4] format.
         weight_bf16 = convert_to_range(1, random_gen(shape=(N_D, H), dtype=dtype, name="weight"))
         w_scale = np.abs(weight_bf16).max() / FP8_E4M3FN_MAX
         weight_scalar_fp8 = static_cast(weight_bf16 / w_scale, nl.float8_e4m3fn)
-        # Pack: [N_D, H] → [N_D//4, 4, H] → transpose → [N_D//4, H, 4] → flatten → [N_D//4, H*4] → x4 → [N_D//4, H]
-        flat = (
-            weight_scalar_fp8.reshape(N_D // _q_width, _q_width, H)
-            .transpose(0, 2, 1)
-            .reshape(N_D // _q_width, H * _q_width)
-        )
-        weight = dt.static_cast(flat.astype(np.float32), nl.float8_e4m3fn_x4)
-
-        '''
-        # Alternative: Using generate_stabilized_mx_data directly (commented out) ---
-        # Chose to generate BF16 tensor and pack it manually to compare golden accuracy to the regualar STATIC golden.
-
-         _, weights_qtz, _ = generate_stabilized_mx_data(
-             mx_dtype=nl.float8_e4m3fn_x4,
-             shape=(N_D // _q_width, H * _q_width),
-        )
-        base_scale = 1.0 / FP8_E4M3FN_MAX
-        w_scale = base_scale * np.random.uniform(0.995, 1.005).astype(np.float32)
-        weight = weights_qtz
-        '''
+        # Reshape: [N_D, H] → [N_D//4, 4, H] → transpose → [N_D//4, H, 4]
+        weight = weight_scalar_fp8.reshape(N_D // _q_width, _q_width, H).transpose(0, 2, 1)
 
         weight_scale = np.broadcast_to(np.array([[w_scale]], dtype=np.float32), (128, 1))
         input_scale = np.broadcast_to(np.array([[in_scale]], dtype=np.float32), (128, 1))
@@ -149,11 +157,11 @@ def build_output_proj_tkg_input(lnc_degree, d_head, B, n_heads, S_tkg, quantizat
 
         attention = convert_to_range(1, random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention"))
         # Compute input_scale from actual max with small perturbation (simulates calibration)
-        in_scale = (np.abs(attention).max() / FP8_E4M3_MAX) * np.random.uniform(0.995, 1.005)
+        in_scale = (np.abs(attention).max() / _fp8_e4m3_max) * np.random.uniform(0.995, 1.005)
 
         weight_bf16 = convert_to_range(1, random_gen(shape=(d_head * n_heads, H), dtype=dtype, name="weight"))
-        w_scale = np.abs(weight_bf16).max() / FP8_E4M3_MAX
-        weight = static_cast(weight_bf16 / w_scale, nl.float8_e4m3)
+        w_scale = np.abs(weight_bf16).max() / _fp8_e4m3_max
+        weight = static_cast(weight_bf16 / w_scale, _fp8_e4m3_dtype)
 
         weight_scale = np.broadcast_to(np.array([[w_scale]], dtype=np.float32), (128, 1))
         input_scale = np.broadcast_to(np.array([[in_scale]], dtype=np.float32), (128, 1))
@@ -166,8 +174,8 @@ def build_output_proj_tkg_input(lnc_degree, d_head, B, n_heads, S_tkg, quantizat
         attention = convert_to_range(1, random_gen(shape=(d_head, B, n_heads, S_tkg), dtype=dtype, name="attention"))
 
         weight_bf16 = convert_to_range(1, random_gen(shape=(d_head * n_heads, H), dtype=dtype, name="weight"))
-        w_scale = np.abs(weight_bf16).max(axis=0, keepdims=True) / FP8_E4M3_MAX
-        weight = static_cast(weight_bf16 / w_scale, nl.float8_e4m3)
+        w_scale = np.abs(weight_bf16).max(axis=0, keepdims=True) / _fp8_e4m3_max
+        weight = static_cast(weight_bf16 / w_scale, _fp8_e4m3_dtype)
 
         weight_scale = np.broadcast_to(w_scale.astype(np.float32), (128, H))
         input_scale = None
@@ -196,13 +204,14 @@ def build_output_proj_tkg_input(lnc_degree, d_head, B, n_heads, S_tkg, quantizat
         "input_scale": input_scale,
         "TRANSPOSE_OUT": transpose_out,
         "OUT_IN_SB": False,
+        "dtype_mode": dtype_mode,
     }
 
 
 # Params in order:
 #    B, n_heads, S_tkg, d_head, H, quantization_type, test_bias, transpose_out
 OUTPUT_PROJ_TKG_TEST_CASES = (
-    [512, 8, 4, 32, 3072, QuantizationType.NONE, True, True],
+    pytest.param(512, 8, 4, 32, 3072, QuantizationType.NONE, True, True, marks=pytest.mark.fast),
     [4, 8, 4, 32, 3072, QuantizationType.NONE, True, True],
     [4, 8, 4, 64, 3072, QuantizationType.NONE, False, False],
     [4, 8, 4, 64, 5376, QuantizationType.NONE, False, False],
@@ -218,7 +227,7 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [4, 8, 8, 128, 8192, QuantizationType.NONE, True, False],
     [4, 8, 8, 128, 16384, QuantizationType.NONE, True, False],
     [4, 10, 8, 128, 8192, QuantizationType.NONE, True, False],
-    [4, 16, 8, 128, 16384, QuantizationType.NONE, True, False],
+    pytest.param(4, 16, 8, 128, 16384, QuantizationType.NONE, True, False, marks=pytest.mark.fast),
     [4, 8, 4, 64, 3072, QuantizationType.NONE, True, True],
     [4, 8, 4, 64, 8192, QuantizationType.NONE, True, True],
     [4, 8, 4, 64, 16384, QuantizationType.NONE, True, True],
@@ -231,7 +240,7 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [16, 8, 1, 128, 8192, QuantizationType.STATIC, True, False],
     [8, 8, 1, 128, 8192, QuantizationType.STATIC, False, False],
     [64, 8, 5, 128, 8192, QuantizationType.STATIC, True, True],
-    [32, 8, 3, 128, 3072, QuantizationType.STATIC, False, False],
+    pytest.param(32, 8, 3, 128, 3072, QuantizationType.STATIC, False, False, marks=pytest.mark.fast),
     [128, 8, 3, 128, 3072, QuantizationType.STATIC, True, False],
     [192, 8, 3, 128, 3072, QuantizationType.NONE, True, False],
     [512, 8, 7, 128, 3072, QuantizationType.STATIC, True, False],
@@ -240,12 +249,14 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [32, 6, 3, 128, 3072, QuantizationType.STATIC, False, False],
     # double_row + transpose_out=True coverage
     [64, 8, 5, 128, 8192, QuantizationType.STATIC, False, True],  # no bias
-    [32, 6, 3, 128, 3072, QuantizationType.STATIC, False, True],  # n_heads=6
-    [128, 6, 1, 128, 3072, QuantizationType.STATIC, True, True],  # larger B, n_heads=6
+    pytest.param(32, 6, 3, 128, 3072, QuantizationType.STATIC, False, True, marks=pytest.mark.fast),  # n_heads=6
+    pytest.param(
+        128, 6, 1, 128, 3072, QuantizationType.STATIC, True, True, marks=pytest.mark.fast
+    ),  # larger B, n_heads=6
     [16, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
     [16, 8, 1, 128, 3072, QuantizationType.ROW, False, False],
     [16, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
-    [16, 8, 1, 128, 3072, QuantizationType.ROW, False, True],
+    pytest.param(16, 8, 1, 128, 3072, QuantizationType.ROW, False, True, marks=pytest.mark.fast),
     [128, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
     [128, 8, 1, 128, 3072, QuantizationType.ROW, True, True],
     [256, 8, 1, 128, 3072, QuantizationType.ROW, True, False],
@@ -256,13 +267,19 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
     [64, 8, 1, 128, 8192, QuantizationType.ROW, True, False],
     [64, 8, 1, 128, 8192, QuantizationType.ROW, True, True],
     # STATIC_MX quantization tests (requires H % 512 == 0, N*D % 4 == 0, TRN3 only)
-    [32, 3, 4, 128, 4096, QuantizationType.STATIC_MX, True, False],
+    pytest.param(32, 3, 4, 128, 4096, QuantizationType.STATIC_MX, True, False, marks=pytest.mark.fast),
     [32, 1, 2, 128, 2048, QuantizationType.STATIC_MX, True, False],
     [64, 4, 2, 128, 3072, QuantizationType.STATIC_MX, True, False],
     [64, 4, 2, 128, 8192, QuantizationType.STATIC_MX, True, False],
     [64, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
     [128, 8, 1, 128, 8192, QuantizationType.STATIC_MX, False, False],
-    [128, 2, 1, 128, 8192, QuantizationType.STATIC_MX, False, False],
+    pytest.param(128, 2, 1, 128, 8192, QuantizationType.STATIC_MX, False, False, marks=pytest.mark.fast),
+    # BxS not divisible by 4
+    [1, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
+    [2, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
+    [3, 2, 1, 128, 4096, QuantizationType.STATIC_MX, False, False],
+    [1, 2, 5, 128, 4096, QuantizationType.STATIC_MX, False, False],
+    [3, 2, 6, 128, 4096, QuantizationType.STATIC_MX, False, False],
 )
 
 # Manual sweep cases: H=602 (not divisible by 128) for negative test coverage
@@ -270,7 +287,7 @@ OUTPUT_PROJ_TKG_TEST_CASES = (
 # with test_bias=True (default) and quantization_type=NONE (default)
 MANUAL_PARAM_NAMES = "B, n_heads, S_tkg, d_head, H, quantization_type, test_bias, transpose_out"
 MANUAL_TEST_CASES = [
-    (4, 10, 8, 128, 602, QuantizationType.NONE, True, False),
+    pytest.param(4, 10, 8, 128, 602, QuantizationType.NONE, True, False, marks=pytest.mark.fast),
     (4, 10, 8, 128, 602, QuantizationType.NONE, True, True),
 ]
 
@@ -342,7 +359,13 @@ class TestOutputProjTkgKernel:
         test_bias: int | bool,
         transpose_out: bool,
         is_negative_test: bool = False,
+        dtype_mode: DtypeMode = DtypeMode.NON_OCP,
     ):
+        # Pre-resolve DtypeMode.AUTO to the concrete OCP/NON_OCP variant so the
+        # weight allocated by build_output_proj_tkg_input matches the platform.
+        # The kernel's internal FP8 allocations follow weight.dtype.
+        resolved_dtype_mode = resolve_dtype_mode_for_torch_ref(dtype_mode, compiler_args.platform_target)
+
         def input_generator(test_config):
             return build_output_proj_tkg_input(
                 lnc_degree=lnc_degree,
@@ -354,6 +377,7 @@ class TestOutputProjTkgKernel:
                 H=H,
                 test_bias=test_bias,
                 transpose_out=transpose_out,
+                dtype_mode=resolved_dtype_mode,
             )
 
         def output_tensors(kernel_input):
@@ -365,10 +389,20 @@ class TestOutputProjTkgKernel:
                 output_shape = (B * S_tkg, H)
             return {"out": np.zeros(output_shape, dtype=dtype)}
 
+        # Pre-resolve DtypeMode.AUTO for the torch ref; the kernel receives the
+        # original dtype_mode (via build_output_proj_tkg_input) and resolves at
+        # trace time. The torch ref runs on CPU and can't query hardware.
+        torch_ref_dtype_mode = resolved_dtype_mode
+
+        @functools.wraps(output_projection_tkg_torch_ref)
+        def _torch_ref_with_resolved_dtype_mode(**kwargs):
+            kwargs["dtype_mode"] = torch_ref_dtype_mode
+            return output_projection_tkg_torch_ref(**kwargs)
+
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=output_proj_tkg_wrapper,
-            torch_ref=torch_ref_wrapper(output_projection_tkg_torch_ref),
+            torch_ref=torch_ref_wrapper(_torch_ref_with_resolved_dtype_mode),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=output_tensors,
         )
@@ -381,7 +415,6 @@ class TestOutputProjTkgKernel:
             is_negative_test=is_negative_test,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(PARAM_NAMES, OUTPUT_PROJ_TKG_TEST_CASES, abbrevs=_ABBREVS)
     def test_output_proj_tkg_unit(
         self,
@@ -415,7 +448,6 @@ class TestOutputProjTkgKernel:
             transpose_out=transpose_out,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(MANUAL_PARAM_NAMES, MANUAL_TEST_CASES, abbrevs=_ABBREVS, prefix="manual")
     def test_output_proj_tkg_sweep_manual(
         self,
@@ -564,7 +596,6 @@ class TestOutputProjTkgKernel:
         )
 
     # MX quantization test cases
-    @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     @pytest.mark.parametrize(
         "batch, n_heads, seqlen, d_head, hidden, add_bias, transpose_out, quantization_type",
@@ -573,9 +604,16 @@ class TestOutputProjTkgKernel:
             [32, 1, 2, 128, 2048, True, False, QuantizationType.MX],
             [64, 4, 2, 128, 3072, True, False, QuantizationType.MX],
             [64, 4, 2, 128, 8192, True, False, QuantizationType.MX],
-            [64, 2, 1, 128, 4096, False, False, QuantizationType.MX],
+            pytest.param(64, 2, 1, 128, 4096, False, False, QuantizationType.MX, marks=pytest.mark.fast),
             [128, 8, 1, 128, 8192, False, False, QuantizationType.MX],
             [128, 2, 1, 128, 8192, False, False, QuantizationType.MX],
+            pytest.param(128, 32, 1, 64, 6144, True, False, QuantizationType.MX, marks=pytest.mark.fast),
+            # BxS not divisible by 4
+            [1, 2, 1, 128, 4096, False, False, QuantizationType.MX],
+            [2, 2, 1, 128, 4096, False, False, QuantizationType.MX],
+            [3, 2, 1, 128, 4096, False, False, QuantizationType.MX],
+            [1, 2, 5, 128, 4096, False, False, QuantizationType.MX],
+            [3, 2, 6, 128, 4096, False, False, QuantizationType.MX],
         ],
     )
     def test_output_proj_tkg_mxfp(
@@ -594,7 +632,6 @@ class TestOutputProjTkgKernel:
         ################## Build kernel input tensors ####################
 
         kernel_assert(quantization_type == QuantizationType.MX, "This input test generator assumes MX dtype.")
-        kernel_assert((batch * seqlen % 4) == 0, "[test_output_proj_tkg_mxfp] requires BxS to be divisible by 4.")
         kernel_assert((hidden % 512) == 0, "")
         dtype = nl.bfloat16
         np.random.seed(42)
@@ -604,11 +641,13 @@ class TestOutputProjTkgKernel:
         attention = gaussian_tensor_generator()(shape=(d_head, batch, n_heads, seqlen), dtype=dtype, name="attention")
 
         # Generate pre-quantized weights using stabilized MX data
-        # weights_qtz has [n_heads * d_head // 4, hidden] shape.
-        _, weights_qtz, weight_scales = generate_stabilized_mx_data(
+        # weights_qtz_x4 has [n_heads * d_head // 4, hidden] x4 shape; convert to unpacked [N*D//4, H, 4] fp8.
+        q_width = 4
+        _, weights_qtz_x4, weight_scales = generate_stabilized_mx_data(
             mx_dtype=nl.float8_e4m3fn_x4,
-            shape=((n_heads * d_head) // 4, hidden * 4),
+            shape=((n_heads * d_head) // q_width, hidden * q_width),
         )
+        weights_qtz = weights_qtz_x4.view(nl.float8_e4m3fn).reshape((n_heads * d_head) // q_width, hidden, q_width)
         weight_scales = weight_scales.reshape((n_heads * d_head) // 32, hidden)
 
         bias = gaussian_tensor_generator(std=100)(shape=(1, hidden), dtype=dtype, name="bias") if add_bias else None
@@ -648,4 +687,50 @@ class TestOutputProjTkgKernel:
             rtol=5e-2,
             atol=1e-3,
             inference_args=TKG_INFERENCE_ARGS,
+        )
+
+    # ------------------------------------------------------------------
+    # Opt-in FP8 E4M3 canary (dtype_mode).
+    #
+    # Kernel: STATIC attention-quant SBUF dtype follows ``weight.dtype``.
+    # Torch ref: STATIC input clip is derived from dtype_mode (OCP → 448,
+    # NON_OCP → 240) so goldens match.
+    # ------------------------------------------------------------------
+    _OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG = dict(
+        B=4,
+        H=3072,
+        S_tkg=4,
+        d_head=128,
+        dtype=nl.bfloat16,
+        n_heads=8,
+        test_bias=True,
+        transpose_out=False,
+    )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
+    @pytest.mark.parametrize("quantization_type", [QuantizationType.STATIC, QuantizationType.ROW])
+    def test_output_proj_tkg_by_dtype_mode(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        quantization_type: QuantizationType,
+        dtype_mode: DtypeMode,
+    ):
+        """Smoke-test each DtypeMode through output_projection_tkg STATIC/ROW.
+
+        NON_OCP → ``nl.float8_e4m3`` (240), any platform.
+        OCP     → ``nl.float8_e4m3fn`` (448), TRN3 only.
+        AUTO    → ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3`` elsewhere.
+        """
+        if dtype_mode == DtypeMode.OCP and not platform_target.is_trn3():
+            pytest.skip("dtype_mode=DtypeMode.OCP only exercises the OCP path on TRN3")
+        compiler_args = CompilerArgs(platform_target=platform_target)
+        self.run_output_proj_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            quantization_type=quantization_type,
+            lnc_degree=compiler_args.logical_nc_config,
+            dtype_mode=dtype_mode,
+            **self._OUTPUT_PROJ_TKG_BY_DTYPE_MODE_CONFIG,
         )

@@ -28,9 +28,9 @@ from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
     ExpertAffinityScaleMode,
     MoEBlockIOLayout,
+    QuantizationType,
     RouterActFnType,
 )
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from test.integration.nkilib.core.mlp.test_mlp_common import gen_moe_mx_weights
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_utils import (
     _get_clamp_limits,
@@ -161,8 +161,8 @@ def mx_moe_block_tkg_wrapper(
     reinterpreted as float4_e2m1fn_x4 or float8_e4m3fn_x4 dtype.
     """
     mx_dtype = _UINT_TO_MX_DTYPE[expert_gate_up_weights.dtype]
-    gate_up_view = TensorView(expert_gate_up_weights).reinterpret_cast(mx_dtype)
-    down_view = TensorView(expert_down_weights).reinterpret_cast(mx_dtype)
+    gate_up_view = expert_gate_up_weights.view(mx_dtype)
+    down_view = expert_down_weights.view(mx_dtype)
 
     return moe_block_tkg_kernel(
         inp=inp,
@@ -249,13 +249,20 @@ def generate_inputs(
     inputs = {}
     inputs["inp"] = dt.static_cast(rng.uniform(low=-0.1, high=0.1, size=(batch, seqlen, hidden)), hidden_dtype)
     inputs["gamma"] = dt.static_cast(rng.uniform(low=-0.1, high=0.1, size=(1, hidden)), hidden_dtype)
-    # Broader weight range for no-bias fp16 configs to reduce ties (NKILIB-1178).
-    # Has-bias configs keep original range so the linspace tie-breaking bias remains effective.
-    # bf16 configs keep original range to preserve numerical accuracy characteristics.
-    w_range = 1.0 if (not has_bias and router_mm_dtype == nl.float16) else 0.1
-    inputs["router_weights"] = dt.static_cast(
-        rng.uniform(low=-w_range, high=w_range, size=(hidden, num_global_experts)), router_mm_dtype
-    )
+    # Router weights: for large-H float16 configs, use separate RNG with small w_range
+    # to avoid sigmoid saturation / near-ties that cause router_topk fp16 matmul precision
+    # to flip top-K selection (NKILIB-729). Other configs keep original behavior.
+    if not has_bias and router_mm_dtype == nl.float16 and hidden >= 7168:  # sigmoid saturates at this H scale
+        router_rng = np.random.default_rng(180)  # seed maximizes min-gap (45e-6) across E_L=8/16/32
+        w_range = 0.1  # keeps logits ~1.3, sigmoid in linear range
+        inputs["router_weights"] = dt.static_cast(
+            router_rng.uniform(low=-w_range, high=w_range, size=(hidden, num_global_experts)), router_mm_dtype
+        )
+    else:
+        w_range = 1.0 if (not has_bias and router_mm_dtype == nl.float16) else 0.1
+        inputs["router_weights"] = dt.static_cast(
+            rng.uniform(low=-w_range, high=w_range, size=(hidden, num_global_experts)), router_mm_dtype
+        )
 
     # Expert weights
     if is_mx_weight:
@@ -283,10 +290,8 @@ def generate_inputs(
             np.float32
         )
         inputs["expert_down_weights_scale"] = rng.uniform(0.001, 0.01, size=(num_local_experts, 1)).astype(np.float32)
-        inputs["expert_gate_up_input_scale"] = np.full(
-            (num_local_experts, 1), rng.uniform(0.001, 0.01), dtype=np.float32
-        )
-        inputs["expert_down_input_scale"] = np.full((num_local_experts, 1), rng.uniform(0.001, 0.01), dtype=np.float32)
+        inputs["expert_gate_up_input_scale"] = rng.uniform(0.001, 0.01, size=(num_local_experts, 1)).astype(np.float32)
+        inputs["expert_down_input_scale"] = rng.uniform(0.01, 0.1, size=(num_local_experts, 1)).astype(np.float32)
     elif is_row_quant:
         # Per-row weight dequant scales (pre-shuffled to match MX output layout)
         # gate/up: [E_L, 2, n_I512*4], down: [E_L, H//128]
@@ -349,7 +354,12 @@ def generate_inputs(
     # rank_id for all-expert mode
     if is_all_expert:
         num_ranks = num_global_experts // num_local_experts
-        rank_id_val = np.random.RandomState(42).randint(0, num_ranks)
+        # Use rank_id=0 for large-H float16 configs to avoid router top-k tie-breaking (NKILIB-729).
+        # Other configs keep random rank_id for broader coverage.
+        if not has_bias and router_mm_dtype == nl.float16 and hidden >= 7168:
+            rank_id_val = 0
+        else:
+            rank_id_val = np.random.RandomState(42).randint(0, num_ranks)
         inputs["rank_id"] = np.array([[rank_id_val]], dtype=np.uint32)
     else:
         inputs["rank_id"] = None
@@ -374,70 +384,79 @@ def generate_inputs(
 # fmt: off
 # Abbreviation mapping for keyword-prefixed test IDs (must match PARAM_NAMES order)
 _PARAM_ABBREVS = \
-    "ln,  ae,              ba,     sq,         hi,         ha,             im,             ge,                 le,                tk,          rf,                         af,                 sm,                                     wd,                     id,             se,                 bi,         cl,         ra,                 np,                 sr,                     rd"
+    "ln,  ae,              ba,     sq,         hi,         ha,             im,             ge,                 le,                tk,          rf,                         af,                 sm,                                     wd,                     id,             se,                 bi,         cl,         ra,                 np,                 sr,                     rd,             qt"
 PARAM_NAMES = \
-    "lnc, is_all_expert,   batch,  seqlen,     hidden,     hidden_actual,  intermediate,   num_global_experts, num_local_experts, top_k,       router_fn,                  hidden_act_fn,      expert_affinities_scaling_mode,         moe_weight_dtype,       input_dtype,    has_shared_expert,  has_bias,   has_clamp,  router_act_first,   norm_topk_prob,     skip_router_logits,     router_mm_dtype"
+    "lnc, is_all_expert,   batch,  seqlen,     hidden,     hidden_actual,  intermediate,   num_global_experts, num_local_experts, top_k,       router_fn,                  hidden_act_fn,      expert_affinities_scaling_mode,         moe_weight_dtype,       input_dtype,    has_shared_expert,  has_bias,   has_clamp,  router_act_first,   norm_topk_prob,     skip_router_logits,     router_mm_dtype,    quant_type"
 
 MANUAL_PARAMS = [
     # Selective-load tests (num_global_experts == num_local_experts)
     # GPT-OSS 120B
-    [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      5,          3072,       2880,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      1,          3072,       None,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      4,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      4,          3072,       2880,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      1,          3072,       None,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      1,          3072,       None,           576,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      4,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          1,      5,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          4,      1,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          8,      1,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          16,     1,          3072,       2880,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          19,     1,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          32,     1,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          38,     1,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     False,          120,     1,         3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
+    [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    pytest.param(2,     False,          1,      5,          3072,       2880,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX, marks=pytest.mark.fast),
+    [2,     False,          1,      1,          3072,       None,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     False,          1,      4,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     False,          1,      1,          3072,       None,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     False,          1,      4,          3072,       2880,           384,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     False,          1,      1,          3072,       None,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     False,          1,      1,          3072,       None,           576,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     False,          1,      4,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    pytest.param(2,     False,          1,      5,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE, marks=pytest.mark.fast),
+    [2,     False,          4,      1,          3072,       2880,           192,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     False,          8,      1,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     False,          16,     1,          3072,       2880,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     False,          19,     1,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    pytest.param(2,     False,          32,     1,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE, marks=pytest.mark.fast),
+    [2,     False,          38,     1,          3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     False,          120,     1,         3072,       None,           128,            128,                128,                4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
     # Qwen3 235B
-    [2,     False,          1,      1,          4096,       None,           384,            128,                128,                8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,            nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16],
-    [2,     False,          1,      1,          4096,       None,           384,            128,                128,                8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3,         nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16],
+    [2,     False,          1,      1,          4096,       None,           384,            128,                128,                8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,            nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16, QuantizationType.NONE],
+    [2,     False,          1,      1,          4096,       None,           384,            128,                128,                8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3,         nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16, QuantizationType.NONE],
     # All-expert BF16 tests (num_local_experts can be smaller than num_global_experts)
     # Minimal test for BF16 with H=640 (odd multiple of 128, unbalanced H-sharding across LNC-2)
-    [2,     True,           16,     1,           640,       None,           640,            8,                  1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
+    [2,     True,           16,     1,           640,       None,           640,            8,                  1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
     # GPT OSS 120B
-    [2,     True,           19,     1,          3072,       None,           128,            128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     1,          3072,       None,           128,            128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     1,          3072,       None,           384,            128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     1,          3072,       None,           768,            128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     1,          3072,       None,           768,            128,                4,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     1,          3072,       None,           1536,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     1,          3072,       None,           1536,           128,                2,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     1,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
+    [2,     True,           19,     1,          3072,       None,           128,            128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     True,           32,     1,          3072,       None,           128,            128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     True,           32,     1,          3072,       None,           384,            128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     True,           32,     1,          3072,       None,           768,            128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     True,           32,     1,          3072,       None,           768,            128,                4,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     True,           32,     1,          3072,       None,           1536,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    [2,     True,           32,     1,          3072,       None,           1536,           128,                2,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE],
+    pytest.param(2,     True,           32,     1,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float16,             nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.NONE, marks=pytest.mark.fast),
     # Qwen3 235B
-    [2,     True,           16,     1,          4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,            nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16],
-    [2,     True,           16,     1,          4096,       None,           384,            128,                128,                8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,            nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16],
-    [2,     True,           16,     1,          4096,       None,           384,            128,                8,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3,         nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16],
-    # All-expert MXFP4 tests (T must be divisible by 4)
+    [2,     True,           16,     1,          4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,            nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16, QuantizationType.NONE],
+    [2,     True,           16,     1,          4096,       None,           384,            128,                128,                8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,            nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16, QuantizationType.NONE],
+    [2,     True,           16,     1,          4096,       None,           384,            128,                8,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3,         nl.bfloat16,    False,              False,      False,      True,               True,               True,                   nl.bfloat16, QuantizationType.NONE],
+    # All-expert MXFP4 tests 
     # GPT-OSS 120B
-    [2,     True,           32,     4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           64,     4,          3072,       None,           3072,           128,                2,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           64,     5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           128,    4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                  nl.float16],
-    [2,     True,           128,    5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           256,    3,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           512,    2,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
+    [2,     True,           32,     4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    pytest.param(2,     True,           32,     4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX, marks=pytest.mark.fast),
+    pytest.param(2,     True,           32,     5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX, marks=pytest.mark.fast),
+    [2,     True,           64,     4,          3072,       None,           3072,           128,                2,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           64,     5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           128,    4,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                  nl.float16, QuantizationType.MX],
+    [2,     True,           128,    5,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           256,    3,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    pytest.param(2,     True,           512,    2,          3072,       None,           3072,           128,                1,                  4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX, marks=pytest.mark.fast),
     # E/EP>1, T<128 tests
-    [2,     True,           4,      1,          3072,       2880,           3072,           128,                16,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           8,      1,          3072,       2880,           3072,           128,                8,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           16,     1,          3072,       2880,           3072,           128,                4,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           32,     1,          3072,       2880,           3072,           128,                2,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
+    [2,     True,           4,      1,          3072,       2880,           3072,           128,                16,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           8,      1,          3072,       2880,           3072,           128,                8,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           16,     1,          3072,       2880,           3072,           128,                4,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           32,     1,          3072,       2880,           3072,           128,                2,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
     # small I
-    [2,     True,           32,      1,          3072,       2880,           384,           128,                128,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           64,      1,          3072,       2880,           192,           128,                128,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
-    [2,     True,           128,      1,          3072,       2880,           96,           128,                128,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16],
+    [2,     True,           32,      1,          3072,       2880,           384,           128,                128,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           64,      1,          3072,       2880,           192,           128,                128,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           128,      1,          3072,       2880,           96,           128,                128,                 4,          RouterActFnType.SOFTMAX,    ActFnType.Swish,    ExpertAffinityScaleMode.POST_SCALE,     nl.float4_e2m1fn_x4,    nl.float16,     False,              True,       True,       False,              False,              True,                   nl.float16, QuantizationType.MX],
+    # DeepSeek-equivalent large-T configs (H=7168) — triggers T-dimension tiling (NKILIB-729)
+    # Uses float16 (not bfloat16) for input/router to reduce router top-k tie-breaking mismatches
+    [2,     True,           4,       1,          7168,       None,           2048,           256,                2,                  8,          RouterActFnType.SIGMOID,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              False,      False,      True,               True,               True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           4,       1,          7168,       None,           2048,           256,                4,                  8,          RouterActFnType.SIGMOID,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              False,      False,      True,               True,               True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           2048,    1,          7168,       None,           2048,           256,                2,                  8,          RouterActFnType.SIGMOID,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              False,      False,      True,               True,               True,                   nl.float16, QuantizationType.MX],
+    [2,     True,           2048,    1,          7168,       None,           2048,           256,                4,                  8,          RouterActFnType.SIGMOID,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              False,      False,      True,               True,               True,                   nl.float16, QuantizationType.MX],
+    pytest.param(2,     True,           512,     4,          7168,       None,           2048,           256,                2,                  8,          RouterActFnType.SIGMOID,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              False,      False,      True,               True,               True,                   nl.float16, QuantizationType.MX, marks=pytest.mark.fast),
+    # NKILIB-729: E_L=8 ticket config (E_L=16/32 blocked on router_topk fp16 precision)
+    [2,     True,           2048,    1,          7168,       None,           1024,           256,                8,                  8,          RouterActFnType.SIGMOID,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.float8_e4m3fn_x4,    nl.float16,     False,              False,      False,      True,               True,               True,                   nl.float16, QuantizationType.MX],
 ]
 
 # STATIC_MX test configs: selective-load and all-expert combined
@@ -456,7 +475,18 @@ STATIC_MX_PARAMS = [
     [2,     True,           4,      1,          4096,       None,           1536,           128,                1,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
     [2,     True,           256,    1,          4096,       None,           1536,           128,                1,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
     [2,     True,           4,      4,          4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
-    [2,     True,           4,      4,          4096,       None,           1536,           128,                1,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
+    pytest.param(2,     True,           4,      4,          4096,       None,           1536,           128,                1,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32, marks=pytest.mark.fast),
+    # Qwen3 235B all-expert (T not divisible by 4)
+    [2,     True,           1,      1,          4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
+    [2,     True,           2,      1,          4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
+    [2,     True,           3,      1,          4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
+    # other all-expert, T not divisible by 4 cases 
+    [2,     True,           63,      1,         4096,       None,           384,            128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
+    # Large T all-expert: T=2048 triggers moe_block T-tiling (HBM [T,H] fed into kernel) and kernel SHARD_T.
+    # skip_router_logits=True because the tiled path does not return router logits.
+    [2,     True,           2048,    1,         4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               True,                   nl.float32],
+    # Large T all-expert with E_L=8 (has_bias=True needed as router tie-breaker)
+    [2,     True,           2048,    1,         4096,       None,           1536,           128,                8,                  8,          RouterActFnType.SOFTMAX,     ActFnType.SiLU,    ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    True,       False,      True,               True,               True,                   nl.float32],
 ]
 # fmt: on
 STATIC_MX_PARAM_IDS = [f"static_mx_{i}" for i in range(len(STATIC_MX_PARAMS))]
@@ -489,11 +519,6 @@ _FULL_ONLY_STATIC_KEYS = frozenset(
     }
 )
 
-STATIC_PARAMS_WITH_MARKS = [
-    pytest.param(*c, marks=pytest.mark.fast) if _exclusion_key(c) not in _FULL_ONLY_STATIC_KEYS else c
-    for c in STATIC_PARAMS
-]
-
 # ROW_MX test configs: all-expert and selective-load (per-token dynamic FP8 quantization)
 # Uses MX-packed weights with per-row float32 dequant scales + per-token dynamic FP8 quantization
 # fmt: off
@@ -506,7 +531,7 @@ ROW_MX_PARAMS = [
     # Qwen3 235B all-expert (is_all_expert=True)
     [2,     True,           1,      32,         4096,       None,           192,            128,                128,                8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
     [2,     True,           4,      1,          4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
-    [2,     True,           4,      1,          4096,       None,           1536,           128,                1,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32],
+    pytest.param(2,     True,           4,      1,          4096,       None,           1536,           128,                1,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    False,      False,      True,               True,               False,                  nl.float32, marks=pytest.mark.fast),
     # Bias + clamp coverage
     [2,     True,           4,      1,          4096,       None,           1536,           128,                2,                  8,          RouterActFnType.SOFTMAX,    ActFnType.SiLU,     ExpertAffinityScaleMode.POST_SCALE,     nl.bfloat16,    True,       True,       True,               True,               False,                  nl.float32],
     # Disabled: router topk tie-breaking on degenerate test inputs leads to numerical mismatch
@@ -530,6 +555,8 @@ def _format_val(v):
 
 def _make_id(params):
     """Generate a keyword-prefixed test ID string from a parameter list."""
+    if hasattr(params, "values") and hasattr(params, "marks"):
+        params = params.values
     return "_".join(f"{k.strip()}-{_format_val(v)}" for k, v in zip(_PARAM_ABBREVS.split(","), params))
 
 
@@ -545,13 +572,19 @@ _FULL_ONLY_MANUAL_KEYS = frozenset(
         (False, 1, 1, 4096, 384, nl.bfloat16),
         (False, 1, 1, 4096, 384, nl.float8_e4m3),
         (True, 16, 1, 4096, 384, nl.bfloat16),
+        # Moved out of fast: high memory (1.4 GB+) with 128 experts, covered by other fast configs
+        (False, 4, 1, 3072, 192, nl.float16),
+        (False, 1, 4, 3072, 192, nl.float16),
+        (False, 1, 1, 3072, 192, nl.float16),
+        # Moved out of fast: high duration (>2min)
+        (True, 2048, 1, 7168, 1024, nl.float8_e4m3fn_x4),
+        (True, 2048, 1, 7168, 2048, nl.float8_e4m3fn_x4),
+        (True, 32, 1, 3072, 384, nl.float4_e2m1fn_x4),
+        (True, 64, 1, 3072, 192, nl.float4_e2m1fn_x4),
+        (True, 128, 1, 3072, 96, nl.float4_e2m1fn_x4),
+        (False, 38, 1, 3072, 128, nl.float16),
     }
 )
-
-MANUAL_PARAMS_WITH_MARKS = [
-    pytest.param(*c, marks=pytest.mark.fast) if _exclusion_key(c) not in _FULL_ONLY_MANUAL_KEYS else c
-    for c in MANUAL_PARAMS
-]
 
 
 @pytest_test_metadata(name="MoE Block TKG Model", tags=["model"])
@@ -695,8 +728,7 @@ class TestMoEBlockTkgKernel:
             compiler_args=CompilerArgs(
                 logical_nc_config=lnc,
                 platform_target=platform_target,
-                # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
-                additional_cmd_args=["--internal-backend-options=--skip-pass=address_rotation_sb"],
+                additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
             ),
             rtol=7e-2
             if (is_static_mx or is_row_quant)
@@ -705,7 +737,7 @@ class TestMoEBlockTkgKernel:
             metadata=metadata,
         )
 
-    @pytest.mark.parametrize(PARAM_NAMES, MANUAL_PARAMS_WITH_MARKS, ids=MANUAL_PARAM_IDS)
+    @pytest.mark.parametrize(PARAM_NAMES, MANUAL_PARAMS, ids=MANUAL_PARAM_IDS)
     def test_moe_block_kernel_unit(
         self,
         test_manager: Orchestrator,
@@ -732,12 +764,13 @@ class TestMoEBlockTkgKernel:
         norm_topk_prob,
         skip_router_logits,
         router_mm_dtype,
+        quant_type,
         platform_target: Platforms,
     ):
         kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs.pop("quant_type", None)
         self._run_moe_block_test(**kwargs)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(STATIC_MX_PARAM_NAMES, STATIC_MX_PARAMS, ids=STATIC_MX_PARAM_IDS)
     def test_moe_block_static_mx(
         self,
@@ -797,7 +830,7 @@ class TestMoEBlockTkgKernel:
             is_static_mx=True,
         )
 
-    @pytest.mark.parametrize(STATIC_PARAM_NAMES, STATIC_PARAMS_WITH_MARKS, ids=STATIC_PARAM_IDS)
+    @pytest.mark.parametrize(STATIC_PARAM_NAMES, STATIC_PARAMS, ids=STATIC_PARAM_IDS)
     @pytest.mark.platforms(exclude=[Platforms.TRN1])
     def test_moe_block_static(
         self,
@@ -832,7 +865,6 @@ class TestMoEBlockTkgKernel:
         kwargs = {k: v for k, v in locals().items() if k != "self"}
         self._run_moe_block_test(**kwargs, is_static=True)
 
-    @pytest.mark.fast
     @pytest.mark.parametrize(ROW_MX_PARAM_NAMES, ROW_MX_PARAMS, ids=ROW_MX_PARAM_IDS)
     def test_moe_block_row_mx(
         self,
@@ -902,8 +934,8 @@ class TestMoEBlockTkgKernel:
             (True, 2, 4096, 384, 128, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False),
             (True, 4, 4096, 384, 128, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False),
             (True, 16, 4096, 384, 128, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False),
-            pytest.param(True, 64, 4096, 1536, 2, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False, marks=pytest.mark.fast),
-            pytest.param(True, 128, 4096, 1536, 2, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False, marks=pytest.mark.fast),
+            (True, 64, 4096, 1536, 2, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False),
+            (True, 128, 4096, 1536, 2, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False),
             # Directional tests
             (True, 16, 4096, 384, 128, 8, MoEBlockIOLayout.B_S_H, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False),
             (False, 1, 4096, 384, 128, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout.B_S_H, nl.bfloat16, False),
@@ -911,8 +943,10 @@ class TestMoEBlockTkgKernel:
             (True, 16, 4096, 384, 128, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.float8_e4m3, False),
             (False, 1, 4096, 384, 128, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.float8_e4m3, False),
             (True, 16, 4096, 384, 128, 8, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.float8_e4m3, True),
-            # Selective transposed with shard_on_h_disabled
-            pytest.param(False, 1, 3072, 384, 128, 4, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False, marks=pytest.mark.fast),
+            # Selective transposed with shard_on_h_disabled — cheap config (8 experts) for fast suite
+            pytest.param(False, 1, 3072, 384, 8, 4, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False, marks=pytest.mark.fast),
+            # Selective transposed with 128 experts — full suite only (high memory: 2.3 GB)
+            (False, 1, 3072, 384, 128, 4, MoEBlockIOLayout._128_Nprgs_Hfree_T, MoEBlockIOLayout._128_Nprgs_Hfree_T, nl.bfloat16, False),
         ],
     )
     # fmt: on
@@ -942,7 +976,10 @@ class TestMoEBlockTkgKernel:
             hidden=hidden,
             hidden_actual=None,
             intermediate=intermediate,
-            num_global_experts=128,
+            # Selective mode: num_global_experts must equal num_local_experts because topK
+            # indices index directly into the weight tensor [num_local_experts, ...].
+            # All-expert mode: num_local_experts < num_global_experts is valid (EP sharding).
+            num_global_experts=num_local_experts if not is_all_expert else 128,
             num_local_experts=num_local_experts,
             top_k=top_k,
             router_fn=RouterActFnType.SOFTMAX,
@@ -1014,6 +1051,10 @@ class TestMoEBlockTkgModel:
             "wd": str(kwargs.get("moe_weight_dtype")),
         }
         metadata = {"config_name": "test_moe_block_tkg", "key": metadata_key}
+        qt = kwargs.pop("quant_type", QuantizationType.NONE)
+        kwargs["is_static"] = qt == QuantizationType.STATIC
+        kwargs["is_static_mx"] = qt == QuantizationType.STATIC_MX
+        kwargs["is_row_quant"] = qt == QuantizationType.ROW_MX
         TestMoEBlockTkgKernel()._run_moe_block_test(**kwargs, metadata=metadata)
 
     @pytest.mark.tier0
@@ -1044,6 +1085,7 @@ class TestMoEBlockTkgModel:
         norm_topk_prob,
         skip_router_logits,
         router_mm_dtype,
+        quant_type,
         platform_target: Platforms,
     ):
         """TIER0: Critical model configs - highest priority for model validation."""
@@ -1079,6 +1121,7 @@ class TestMoEBlockTkgModel:
         norm_topk_prob,
         skip_router_logits,
         router_mm_dtype,
+        quant_type,
         platform_target: Platforms,
     ):
         """OPTIMAL: Performance-optimized model configs."""
@@ -1113,6 +1156,7 @@ class TestMoEBlockTkgModel:
         norm_topk_prob,
         skip_router_logits,
         router_mm_dtype,
+        quant_type,
         platform_target: Platforms,
     ):
         """GENERALITY: Broad coverage model configs."""

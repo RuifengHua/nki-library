@@ -35,22 +35,17 @@ Usage:
     - Automatic parameter filtering
 """
 
-import functools
 import inspect
 from inspect import signature
 from typing import Callable, Optional
 
-import neuron_dtypes as ndt
-import numpy as np
-import torch
+from nkilib_src.nkilib.core.utils.torch_ref_wrapper import torch_ref_wrapper  # noqa: F401
 
 from .common_dataclasses import (
     CompilerArgs,
     InferenceArgs,
     KernelArgs,
     LazyGoldenGenerator,
-    PerRankLazyGoldenGenerator,
-    PerRankLazyInputGenerator,
     ValidationArgs,
 )
 from .coverage_parametrized_tests import assert_negative_test_case
@@ -232,133 +227,6 @@ class UnitTestFramework:
             self.test_manager.execute(kernel_args)
 
 
-class CollectiveUnitTestFramework:
-    """Framework for executing multi-rank collective NKI kernel tests.
-
-    Extends the validation features of UnitTestFramework to collective (multi-rank) tests:
-    - Signature validation (kernel_entry ↔ torch_ref)
-    - .must_alias_input handling
-    - Lazy per-rank golden generation (skipped in compile-only mode)
-    - Cross-rank shape/dtype consistency check
-    - Per-rank torch_ref input override (for KVDP-style tests)
-    - Per-rank custom validation via callable custom_comparator
-    """
-
-    def __init__(
-        self,
-        test_manager: Orchestrator,
-        kernel_entry: Callable,
-        torch_ref: Callable,
-        per_rank_input_generator: Callable[[int], dict],
-        collective_ranks: int,
-        per_rank_torch_ref_input_override: Optional[Callable[[int, dict], dict]] = None,
-        check_unused_params: bool = False,
-        collector: Optional[IMetricsCollector] = None,
-    ):
-        """Initialize the collective test framework.
-
-        Args:
-            test_manager: Test orchestrator for execution
-            kernel_entry: Kernel function under test
-            torch_ref: Torch reference function (signature must match kernel_entry)
-            per_rank_input_generator: Function(rank_id: int) -> dict of inputs per rank
-            collective_ranks: Number of ranks
-            per_rank_torch_ref_input_override: Optional function(rank_id, kernel_input) -> dict
-                that transforms kernel inputs before passing to torch_ref. Use for cases
-                where golden needs different inputs than kernel (e.g., KVDP=1 for golden).
-            check_unused_params: Check for unused parameters in kernel_entry
-            collector: Optional metrics collector
-        """
-        validate_torch_ref_signature(kernel_entry, torch_ref)
-        if check_unused_params:
-            check_unused_parameters(kernel_entry)
-
-        self.test_manager = test_manager
-        self.kernel_entry = kernel_entry
-        self.torch_ref = torch_ref
-        self.per_rank_input_generator = per_rank_input_generator
-        self.collective_ranks = collective_ranks
-        self.per_rank_torch_ref_input_override = per_rank_torch_ref_input_override
-        self.collector = collector
-
-    def run_test(
-        self,
-        test_config,
-        compiler_args: CompilerArgs,
-        rtol: float = 1e-2,
-        atol: float = 1e-2,
-        inference_args: Optional[InferenceArgs] = None,
-        custom_comparator: Optional[Callable] = None,
-        metadata: Optional[dict] = None,
-    ):
-        """Execute a collective test case.
-
-        Args:
-            test_config: Test configuration (unused, for API consistency)
-            compiler_args: Compiler arguments
-            rtol: Relative tolerance
-            atol: Absolute tolerance
-            inference_args: Optional inference arguments (overrides collective_ranks)
-            custom_comparator: Optional callable(rank_id, golden_dict) -> dict mapping
-                output names to CustomValidatorWithOutputTensorData. The framework runs
-                torch_ref per rank to produce golden_dict, then passes it to this function
-                to build custom validators. This keeps golden generation in the framework
-                while allowing custom comparison logic (e.g., cosine similarity).
-            metadata: Optional dict with 'config_name' and 'key' for metrics
-        """
-
-        if self.collector is not None and metadata is not None:
-            metadata_list = load_model_configs(metadata["config_name"])
-            self.collector.match_and_add_metadata_dimensions(metadata["key"], metadata_list)
-
-        # Validate rank-0 inputs
-        rank0_input = self.per_rank_input_generator(rank_id=0)
-        validate_input_keys(rank0_input, self.kernel_entry)
-
-        # Cross-rank shape/dtype consistency check
-        if self.collective_ranks >= 2:
-            validate_cross_rank_consistency(self.per_rank_input_generator, rank0_input, self.collective_ranks)
-
-        # Build per-rank input generator with .must_alias_input filtering
-        def _filtered_input_generator(rank_id: int) -> dict:
-            raw = self.per_rank_input_generator(rank_id=rank_id)
-            return filter_kernel_input(raw, self.kernel_entry)
-
-        # Build per-rank golden generator via torch_ref
-        torch_ref = self.torch_ref
-
-        def _golden_generator(rank_id: int) -> dict:
-            raw_input = self.per_rank_input_generator(rank_id=rank_id)
-            if self.per_rank_torch_ref_input_override is not None:
-                ref_input_raw = self.per_rank_torch_ref_input_override(rank_id, raw_input)
-            else:
-                ref_input_raw = raw_input
-            ref_input = filter_ref_input(ref_input_raw, torch_ref)
-            golden = torch_ref(**ref_input)
-            if custom_comparator is not None:
-                return custom_comparator(rank_id, golden)
-            return golden
-
-        # Resolve validation args
-        validation_args = ValidationArgs(
-            golden_output=PerRankLazyGoldenGenerator(_golden_generator),
-            relative_accuracy=rtol,
-            absolute_accuracy=atol,
-        )
-
-        per_rank_input = PerRankLazyInputGenerator(_filtered_input_generator)
-        per_rank_input.base_input = rank0_input
-
-        kernel_args = KernelArgs(
-            kernel_func=self.kernel_entry,
-            compiler_input=compiler_args,
-            kernel_input=per_rank_input,
-            inference_args=inference_args or InferenceArgs(collective_ranks=self.collective_ranks),
-            validation_args=validation_args,
-        )
-        self.test_manager.execute(kernel_args)
-
-
 # --- Shared Validation Helpers ---
 
 
@@ -425,25 +293,6 @@ def filter_ref_input(kernel_input: dict, torch_ref: Callable) -> dict:
     return ref_input
 
 
-def validate_cross_rank_consistency(
-    per_rank_input_generator: Callable[[int], dict], rank0_input: dict, num_ranks: int
-) -> None:
-    """Validate input tensor shapes/dtypes are consistent across all ranks."""
-    for rank_id in range(1, num_ranks):
-        rank_input = per_rank_input_generator(rank_id=rank_id)
-        for key in rank0_input:
-            v0, vr = rank0_input[key], rank_input.get(key)
-            if isinstance(v0, np.ndarray) and isinstance(vr, np.ndarray):
-                if v0.shape != vr.shape:
-                    raise ValueError(
-                        f"Input tensor '{key}' shape mismatch across ranks: rank 0 {v0.shape} vs rank {rank_id} {vr.shape}"
-                    )
-                if v0.dtype != vr.dtype:
-                    raise ValueError(
-                        f"Input tensor '{key}' dtype mismatch across ranks: rank 0 {v0.dtype} vs rank {rank_id} {vr.dtype}"
-                    )
-
-
 # --- Helper Functions ---
 
 
@@ -498,126 +347,3 @@ def check_unused_parameters(func: Callable) -> None:
             f"Parameters {unused} may be unused in {func.__name__}. "
             "Ensure all parameters are forwarded to the underlying function."
         )
-
-
-def torch_ref_wrapper(
-    torch_ref_func: Callable,
-    preserve_lower_precision: bool = False,
-    input_dtype_converter: Optional[Callable[[np.ndarray], torch.Tensor]] = None,
-    output_dtype_converter: Optional[Callable[[torch.Tensor], np.ndarray]] = None,
-) -> Callable:
-    """Wrap a torch reference function to handle numpy<->torch conversion.
-
-    Converts numpy arrays to torch tensors (float16->float32 for CPU compatibility),
-    calls the torch reference, and converts results back to numpy.
-
-    Args:
-        torch_ref_func: Torch reference function that takes torch tensors as kwargs
-        preserve_lower_precision: If True, cast output tensors back to the original
-            input dtype (e.g., bfloat16) using neuron_dtypes.static_cast. This matches
-            the kernel's output precision, enabling tighter validation tolerances.
-            Computation still happens in float32 for numerical stability.
-        input_dtype_converter: Optional callback to customize numpy->torch dtype conversion.
-            Called with (numpy_array,) for every numpy input, before any default
-            conversion. If it returns a torch tensor, that value is used directly
-            (overriding all default behavior). Return None to fall back to the default
-            conversion. The callback is responsible for converting numpy to torch. This
-            allows callers to preserve fp8 or other custom dtypes that the default
-            wrapper upcasts to fp32.
-        output_dtype_converter: Optional callback to customize torch->numpy dtype conversion.
-            Called with (torch_tensor,). Return a numpy array, or None to use default
-            behavior. This allows callers to handle fp8 or other custom output dtypes.
-
-    Returns:
-        Wrapped function that takes numpy arrays and returns numpy arrays
-
-    Example:
-        # Default usage:
-        @torch_ref_wrapper
-        def my_kernel_torch_ref(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-            return torch.matmul(input, weight)
-
-        # Can now call with numpy arrays:
-        result = my_kernel_torch_ref(input=np_array, weight=np_weight)
-
-        # With custom fp8 handling:
-        def fp8_input_converter(value):
-            if str(value.dtype) == 'float8_e4m3fn':
-                return torch.from_numpy(value.astype(np.float32)).to(torch.float8_e4m3fn)
-            return None  # use default
-
-        def fp8_output_converter(tensor):
-            if tensor.dtype == torch.float8_e4m3fn:
-                return ndt.static_cast(tensor.float().numpy(), 'float8_e4m3fn')
-            return None  # use default
-
-        torch_ref=torch_ref_wrapper(my_torch_ref,
-            input_dtype_converter=fp8_input_converter,
-            output_dtype_converter=fp8_output_converter)
-    """
-
-    @functools.wraps(torch_ref_func)
-    def wrapped(**kwargs):
-        # Convert numpy arrays to torch tensors (float16/bfloat16->float32 for CPU)
-        torch_kwargs = {}
-        original_dtype = None
-        for key, value in kwargs.items():
-            if isinstance(value, np.ndarray):
-                dtype_str = str(value.dtype)
-                # Try custom converter first; it overrides all default behavior
-                if input_dtype_converter is not None:
-                    converted = input_dtype_converter(value)
-                    if converted is not None:
-                        torch_kwargs[key] = converted
-                        continue
-                # Handle MX packed x4 types: pass as numpy for torch ref to handle
-                if 'x4' in dtype_str:
-                    torch_kwargs[key] = value
-                    continue
-                # Track original dtype for output cast-back
-                if original_dtype is None and (
-                    'bfloat16' in dtype_str or 'float8' in dtype_str or 'float16' in dtype_str
-                ):
-                    original_dtype = dtype_str
-                # Make value safe for torch.from_numpy (doesn't support uint32/bfloat16/fp8)
-                if value.dtype == np.uint32:
-                    value = value.astype(np.int32)
-                elif 'bfloat16' in dtype_str or 'float8' in dtype_str:
-                    value = value.astype(np.float32)
-                tensor = torch.from_numpy(value)
-                # Default dtype conversions
-                if tensor.dtype == torch.float16:
-                    tensor = tensor.float()
-                elif preserve_lower_precision and 'bfloat16' in dtype_str:
-                    tensor = tensor.to(torch.bfloat16)
-                torch_kwargs[key] = tensor
-            else:
-                torch_kwargs[key] = value
-
-        # Call torch reference
-        result = torch_ref_func(**torch_kwargs)
-
-        # Convert result back to numpy
-        def _tensor_to_numpy(t):
-            if isinstance(t, torch.Tensor):
-                # Try custom output converter first
-                if output_dtype_converter is not None:
-                    converted = output_dtype_converter(t)
-                    if converted is not None:
-                        return converted
-                if t.dtype == torch.bfloat16:
-                    t = t.float()
-                np_val = t.numpy()
-                if preserve_lower_precision and original_dtype is not None:
-                    np_val = ndt.static_cast(np_val, original_dtype)
-                return np_val
-            return t
-
-        if isinstance(result, torch.Tensor):
-            return {"out": _tensor_to_numpy(result)}
-        elif isinstance(result, dict):
-            return {k: _tensor_to_numpy(v) for k, v in result.items()}
-        else:
-            return result
-
-    return wrapped

@@ -23,13 +23,11 @@ import pytest
 from typing_extensions import override
 
 from nkilib_src.nkilib.core.topk.rotational_topk import (
-    cleanup_rotational_constants,
     create_rotational_topk_config,
     create_topk_config,
-    prepare_rotational_constants,
     rotational_topk,
 )
-from nkilib_src.nkilib.core.topk.torch_ref import topk_torch_ref
+from nkilib_src.nkilib.core.topk.rotational_topk_torch import rotational_topk_torch_ref
 
 try:
     from test.integration.nkilib.core.topk.test_topk_model_config import rotational_topk_model_configs
@@ -80,6 +78,8 @@ class TopkEdgeCaseValidator:
         if k < 1:
             return FilterResult.INVALID
         if BxS < 1:
+            return FilterResult.INVALID
+        if vocab_size == k:
             return FilterResult.INVALID
 
         n_prgs = 1 if BxS == 1 else lnc_degree
@@ -201,18 +201,12 @@ class TestTopKKernel:
             inp_reshaped = inp_3d.reshape((topk_config.BxS, topk_config.vocab_size))
             config = create_rotational_topk_config(inp_shape=inp_reshaped.shape, topk_config=topk_config)
 
-            # Setup constants before kernel execution (pure numpy, no nl calls)
-            config = prepare_rotational_constants(config)
             config.log_strategy()
 
             # When k == vocab_size, the kernel returns inp directly (trivial case),
             # creating a must-alias relationship that Beta 3 runtime requires.
             inp_key = "inp.must_alias_input" if k == vocab else "inp"
             return {inp_key: inp_reshaped, "config": config}
-
-        def cleanup_fn():
-            """Cleanup function called after test execution."""
-            cleanup_rotational_constants()
 
         inputs = input_generator(test_config=None)
 
@@ -227,12 +221,30 @@ class TestTopKKernel:
                     k = inputs["config"].topk_config.k
                     output = np.frombuffer(actual_raw_output, dtype=input_tensor.dtype).reshape(BxS, k)
                     self._print_with_log("Results for topk_values:")
-                    return maxAllClose(
+                    values_correct = maxAllClose(
                         np.sort(output, axis=-1),
                         np.sort(golden_values, axis=-1),
                         verbose=1,
                         logfile=self.logfile,
                     )
+                    if not values_correct:
+                        return False
+                    vocab_size = inputs["config"].vocab_size
+                    if sorted and k > 1 and k < vocab_size:
+                        output_f32 = output.astype(np.float32)
+                        diffs = np.diff(output_f32, axis=-1)
+                        # diffs > 0 means value increased (violates descending).
+                        # Allow ties (diffs == 0) — only flag strict increases.
+                        non_descending = int(np.sum(diffs > 0))
+                        if non_descending > 0:
+                            worst_row = int(np.argmax(np.sum(diffs > 0, axis=-1)))
+                            self._print_with_log(
+                                f"FAIL: output not in descending order. "
+                                f"{non_descending} violations. "
+                                f"Worst row {worst_row}: {output_f32[worst_row, :8]}..."
+                            )
+                            return False
+                    return True
 
             class IndicesValidator(CustomValidator):
                 @override
@@ -263,7 +275,7 @@ class TestTopKKernel:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=rotational_topk,
-            torch_ref=torch_ref_wrapper(topk_torch_ref),
+            torch_ref=torch_ref_wrapper(rotational_topk_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=self.output_tensors,
         )
@@ -273,28 +285,25 @@ class TestTopKKernel:
             compiler_args=CompilerArgs(
                 logical_nc_config=lnc_degree,
                 platform_target=platform_target,
-                # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
-                additional_cmd_args=["--internal-backend-options=--skip-pass=address_rotation_sb"],
             ),
             rtol=1e-3,
             atol=1e-5,
             custom_comparator=topk_comparator,
         )
-        cleanup_fn()
 
     # fmt: off
     topk_unit_params = "lnc_degree, batch, seqlen, vocab_size, K, dtype"
     _ABBREVS = {"lnc_degree": "lnc", "batch": "b", "seqlen": "s", "vocab_size": "v", "K": "K", "dtype": "dt"}
 
     large_batch_perms  = [
-            [2, 150, 1, 1000, 50, nl.float32],
+            pytest.param(2, 150, 1, 1000, 50, nl.float32, marks=pytest.mark.fast),
             [2, 200, 1, 2000, 64, nl.float32],
             [2, 1024, 1, 5000, 128, nl.float32],
         ]
 
     topk_unit_perms = [
         # Llama 3 76B before global gather
-        [2, 8, 5, 4058, 256, nl.float32],
+        pytest.param(2, 8, 5, 4058, 256, nl.float32, marks=pytest.mark.fast),
         [2, 5, 5, 4058, 256, nl.float32],
 
         # Llama 3 76B after global gather
@@ -328,7 +337,7 @@ class TestTopKKernel:
 
         # High batch and vocab
         [2, 256, 1, 16384, 256, nl.float32],
-        [2, 256, 1, 2374, 256, nl.float32],
+        pytest.param(2, 256, 1, 2374, 256, nl.float32, marks=pytest.mark.fast),
 
         # K generalization nominal
         [2, 1, 1, 3168, 8, nl.float32],
@@ -336,7 +345,7 @@ class TestTopKKernel:
         [2, 1, 1, 3168, 192, nl.float32],
 
         # K generalization hard
-        [2, 1, 1, 3168, 1, nl.float32],
+        pytest.param(2, 1, 1, 3168, 1, nl.float32, marks=pytest.mark.fast),
         [2, 1, 1, 3168, 7, nl.float32],
         [2, 1, 1, 3168, 60, nl.float32],
         [2, 1, 1, 3168, 99, nl.float32],
@@ -344,7 +353,7 @@ class TestTopKKernel:
         # Mixed tests
         [1, 1, 7, 3999, 256, nl.float32],
         [1, 1, 63, 3999, 20, nl.float32],
-        [2, 1, 127, 3999, 256, nl.float32],
+        pytest.param(2, 1, 127, 3999, 256, nl.float32, marks=pytest.mark.fast),
         [2, 1, 127, 3999, 1, nl.float32],
         [1, 1, 127, 3999, 20, nl.float32],
 
@@ -373,7 +382,11 @@ class TestTopKKernel:
     # fmt: on
     topk_unit_perms.extend(large_batch_perms)
 
-    @pytest.mark.fast
+    # Full-only: large batch + large vocab (>30s compile)
+    topk_full_only_perms = [
+        [2, 1024, 1, 8192, 2048, nl.float32],
+    ]
+
     @pytest_parametrize(topk_unit_params, topk_unit_perms, abbrevs=_ABBREVS)
     def test_topk_unit(
         self,
@@ -400,14 +413,28 @@ class TestTopKKernel:
                 dtype=dtype,
             )
 
+    @pytest_parametrize(topk_unit_params, topk_full_only_perms, abbrevs=_ABBREVS)
+    def test_topk_unit_slow(
+        self,
+        test_manager: Orchestrator,
+        collector: MetricsCollector,
+        platform_target: Platforms,
+        lnc_degree,
+        batch,
+        seqlen,
+        vocab_size,
+        K,
+        dtype,
+    ):
+        self.test_topk_unit(test_manager, collector, platform_target, lnc_degree, batch, seqlen, vocab_size, K, dtype)
+
     topk_unsorted_params = "lnc_degree, batch, seqlen, vocab_size, K, dtype"
     topk_unsorted_perms = [
         [2, 1, 1, 25136, 256, nl.float32],
         [2, 8, 5, 4058, 256, nl.float32],
-        [2, 5, 5, 4058, 256, nl.float32],
+        pytest.param(2, 5, 5, 4058, 256, nl.float32, marks=pytest.mark.fast),
     ]
 
-    @pytest.mark.fast
     @pytest_parametrize(topk_unsorted_params, topk_unsorted_perms, abbrevs=_ABBREVS)
     def test_topk_unsorted(
         self,

@@ -21,7 +21,6 @@ import nki.language as nl
 import numpy as np
 import pytest
 
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from nkilib_src.nkilib.core.utils.tp_broadcast import tp_broadcast
 from test.integration.nkilib.utils.tensor_generators import np_random_sample
 from test.utils.common_dataclasses import CompilerArgs, Platforms
@@ -41,7 +40,7 @@ def tp_broadcast_hbm(src_hbm, src_offset, broadcast_count, src_select_index):
 
     # check that some modification to the tensor to make it 2d works
     if src_select_index != None:
-        src_in = TensorView(src_sbuf).select(1, src_select_index)
+        src_in = src_sbuf.select(1, src_select_index)
     else:
         src_in = src_sbuf
 
@@ -59,13 +58,12 @@ def tp_broadcast_torch(src_hbm, src_offset, broadcast_count, src_select_index):
 _ABBREVS = {"src_shape": "shape", "src_dim_to_broadcast": "dim", "broadcast_count": "bc", "src_select_index": "sel"}
 
 
-@pytest.mark.fast
 @pytest_parametrize(
     "src_shape,src_dim_to_broadcast,broadcast_count,src_select_index",
     [
         ((5, 7), 0, 1, None),
         ((3, 8, 11), 1, 2, 4),
-        ((8, 6), 5, 7, None),
+        pytest.param((8, 6), 5, 7, None, marks=pytest.mark.fast),
         ((13, 3, 13), 9, 12, 2),
     ],
     abbrevs=_ABBREVS,

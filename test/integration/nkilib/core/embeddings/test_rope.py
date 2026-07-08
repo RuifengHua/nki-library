@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 import nkilib_src.nkilib.core.embeddings.rope as rope
-from nkilib_src.nkilib.core.embeddings.rope_torch import rope_torch_ref
+from nkilib_src.nkilib.core.embeddings.rope_torch import RoPE_torch_ref
 from test.integration.nkilib.utils.tensor_generators import gaussian_tensor_generator
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
@@ -96,7 +96,7 @@ class TestRopeKernel:
         framework = UnitTestFramework(
             test_manager=test_manager,
             kernel_entry=rope.RoPE,
-            torch_ref=torch_ref_wrapper(rope_torch_ref),
+            torch_ref=torch_ref_wrapper(RoPE_torch_ref),
             kernel_input_generator=input_generator,
             output_tensor_descriptor=self._output_tensors,
         )

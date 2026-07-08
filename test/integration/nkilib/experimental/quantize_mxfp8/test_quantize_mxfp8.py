@@ -24,7 +24,7 @@ from test.integration.nkilib.experimental.quantize_mxfp8.test_quantize_mxfp8_uti
     build_custom_validation_args,
     build_output_tensors,
     generate_quantize_mxfp8_inputs,
-    quantize_mxfp8_torch_ref,
+    quantize_block_mxfp8_torch_ref,
 )
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import BoundedRange, FilterResult
@@ -60,7 +60,7 @@ SCALE_PACKING_PARAMS = [
     ("bfloat16", -1, 1, 2048, 2048, "float8_e4m3fn", True),
     ("bfloat16", -1, 1, 3072, 2048, "float8_e4m3fn", True),
     ("bfloat16", -1, 1, 1024, 520, "float8_e4m3fn", True),
-    ("bfloat16", -1, 1, 1024, 1024, "float8_e4m3fn", True),
+    pytest.param("bfloat16", -1, 1, 1024, 1024, "float8_e4m3fn", True, marks=pytest.mark.fast),
 ]
 
 INPUT_RANGE_PARAMS = [
@@ -103,7 +103,7 @@ NON_DIVISIBLE_K_PARAMS = [
     ("bfloat16", -1, 1, 256, 512, "float8_e4m3fn"),
     ("bfloat16", -1, 1, 384, 512, "float8_e4m3fn"),
     ("bfloat16", -1, 1, 640, 512, "float8_e4m3fn"),
-    ("bfloat16", -5, 5, 768, 512, "float8_e5m2"),
+    pytest.param("bfloat16", -5, 5, 768, 512, "float8_e5m2", marks=pytest.mark.fast),
     ("bfloat16", -1, 1, 896, 1024, "float8_e4m3fn"),
     ("bfloat16", -1, 1, 1152, 512, "float8_e4m3fn"),
     ("bfloat16", -5, 5, 1280, 1024, "float8_e4m3fn"),
@@ -119,11 +119,11 @@ NON_DIVISIBLE_K_PARAMS = [
 
 # Todo add back in K%512=384 tests when bug is fixed
 NON_DIVISIBLE_K_SCALE_PACKING_PARAMS = [
-    ("bfloat16", -1, 1, 128, 512, "float8_e4m3fn"),
+    pytest.param("bfloat16", -1, 1, 128, 512, "float8_e4m3fn", marks=pytest.mark.fast),
     ("bfloat16", -1, 1, 256, 512, "float8_e4m3fn"),
     ("bfloat16", -1, 1, 384, 512, "float8_e4m3fn"),
-    ("bfloat16", -1, 1, 640, 512, "float8_e4m3fn"),
-    ("bfloat16", -5, 5, 768, 512, "float8_e5m2"),
+    pytest.param("bfloat16", -1, 1, 640, 512, "float8_e4m3fn", marks=pytest.mark.fast),
+    pytest.param("bfloat16", -5, 5, 768, 512, "float8_e5m2", marks=pytest.mark.fast),
     ("bfloat16", -1, 1, 896, 1024, "float8_e4m3fn"),
     ("bfloat16", -1, 1, 1152, 512, "float8_e4m3fn"),
     ("bfloat16", -5, 5, 1280, 1024, "float8_e4m3fn"),
@@ -172,7 +172,7 @@ def _run_test(
     framework = UnitTestFramework(
         test_manager=test_manager,
         kernel_entry=quantize_block_mxfp8_kernel,
-        torch_ref=quantize_mxfp8_torch_ref,
+        torch_ref=quantize_block_mxfp8_torch_ref,
         kernel_input_generator=input_generator,
         output_tensor_descriptor=build_output_tensors,
     )
@@ -180,11 +180,6 @@ def _run_test(
     compiler_args = CompilerArgs(
         logical_nc_config=lnc_degree,
         platform_target=platform_target,
-        # Skipping address_rotation_sb is a temporary workaround as we switch to latest nki, remove once KTK-151 resolved
-        additional_cmd_args=[
-            "--internal-backend-options=--enable-mx-alternative-emax",
-            "--internal-backend-options=--skip-pass=address_rotation_sb",
-        ],
     )
 
     custom_val = None if is_negative_test else build_custom_validation_args(captured_input)
@@ -208,7 +203,6 @@ def _run_test(
 class TestQuantizeMxfp8Kernel:
     """Test suite for quantize_mxfp8 kernel with comprehensive parameter coverage."""
 
-    @pytest.mark.fast
     @pytest_parametrize(_BASE_PARAM_NAMES, SINGLE_TEST_PARAMS, abbrevs=_BASE_ABBREVS)
     def test_quantize_mxfp8_single(
         self, test_manager, platform_target, input_dtype, input_range_low, input_range_high, K, F, return_fp8_dtype
@@ -226,7 +220,6 @@ class TestQuantizeMxfp8Kernel:
             platform_target,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(_BASE_PARAM_NAMES, QUICK_TEST_PARAMS, abbrevs=_BASE_ABBREVS)
     def test_quantize_mxfp8_quick(
         self, test_manager, platform_target, input_dtype, input_range_low, input_range_high, K, F, return_fp8_dtype
@@ -244,7 +237,6 @@ class TestQuantizeMxfp8Kernel:
             platform_target,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(SCALE_PACKING_PARAM_NAMES, SCALE_PACKING_PARAMS, abbrevs=SCALE_PACKING_ABBREVS)
     def test_quantize_mxfp8_scale_packing(
         self,
@@ -306,7 +298,6 @@ class TestQuantizeMxfp8Kernel:
             platform_target,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(_BASE_PARAM_NAMES, NON_DIVISIBLE_F_PARAMS, abbrevs=_BASE_ABBREVS)
     def test_quantize_mxfp8_non_divisible_f(
         self, test_manager, platform_target, input_dtype, input_range_low, input_range_high, K, F, return_fp8_dtype
@@ -324,7 +315,6 @@ class TestQuantizeMxfp8Kernel:
             platform_target,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(_BASE_PARAM_NAMES, NON_DIVISIBLE_K_PARAMS, abbrevs=_BASE_ABBREVS)
     def test_quantize_mxfp8_non_divisible_k(
         self, test_manager, platform_target, input_dtype, input_range_low, input_range_high, K, F, return_fp8_dtype
@@ -342,7 +332,6 @@ class TestQuantizeMxfp8Kernel:
             platform_target,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(_BASE_PARAM_NAMES, NON_DIVISIBLE_K_SCALE_PACKING_PARAMS, abbrevs=_BASE_ABBREVS)
     def test_quantize_mxfp8_non_divisible_k_scale_packing(
         self, test_manager, platform_target, input_dtype, input_range_low, input_range_high, K, F, return_fp8_dtype

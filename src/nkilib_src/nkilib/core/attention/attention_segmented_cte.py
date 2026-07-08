@@ -30,14 +30,16 @@ from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
 from ..utils.modular_allocator import ModularAllocator
 from .attention_cte import (
+    _D_TILE_SZ,
     _K_TILE_SZ,
+    _V_D_TILE_SZ,
     _V_TILE_SZ,
     _attention_cte,
 )
 from .fused_segmented_attention import fused_segmented_attention_impl
 
 
-def floor_nisa_kernel(src_t: nl.ndarray, dst_t: nl.ndarray, p_size: int, f_size: int, allocator: ModularAllocator):
+def floor_nisa_kernel(src_t: nl.NkiTensor, dst_t: nl.NkiTensor, p_size: int, f_size: int, allocator: ModularAllocator):
     """
     NISA implementation for floor operation using integer casting.
 
@@ -81,7 +83,7 @@ def floor_nisa_kernel(src_t: nl.ndarray, dst_t: nl.ndarray, p_size: int, f_size:
     allocator.set_current_address(address=orig_addr)
 
 
-def ceil_nisa_kernel(src_t: nl.ndarray, dst_t: nl.ndarray, p_size: int, f_size: int, allocator: ModularAllocator):
+def ceil_nisa_kernel(src_t: nl.NkiTensor, dst_t: nl.NkiTensor, p_size: int, f_size: int, allocator: ModularAllocator):
     """
     NISA implementation for ceil operation using floor.
 
@@ -123,14 +125,16 @@ def load_kv_cache(
     num_blocks,
     allocator: ModularAllocator,
     k_pre_transposed: bool = False,
+    fp8_packed: bool = False,
 ):
     """
     Load KV cache from block tables to SBUF for a single KV head.
 
     Args:
-        k_cache: K cache in HBM. Shape depends on k_pre_transposed:
-            - False: (num_blocks_total, num_kv_head, block_size, head_dim)
-            - True:  (num_blocks_total * num_kv_head, head_dim, block_size)
+        k_cache: K cache in HBM. Shape depends on k_pre_transposed and fp8_packed:
+            - k_pre_transposed=False, fp8_packed=False: (num_blocks_total, num_kv_head, block_size, head_dim)
+            - k_pre_transposed=True:  (num_blocks_total * num_kv_head, head_dim, block_size)
+            - fp8_packed=True: (num_blocks_total, num_kv_head, block_size // 2, head_dim, 2) fp8
         v_cache: V cache in HBM with shape (num_blocks_total, num_kv_head, block_size, head_dim)
         block_tables: Block table tensor with shape (batch_size, max_blocks_per_seq)
         k_sbuf: K SBUF tiles to load into
@@ -142,15 +146,29 @@ def load_kv_cache(
         allocator: SBUF allocator for temporary tensor allocation
         k_pre_transposed: If True, K cache is already stored in transposed layout
             (head_dim, block_size) per block, so no transpose is needed during loading.
+        fp8_packed: If True, K cache uses packed FP8 layout where 2 consecutive
+            sequence positions are packed into one bf16-width element. Enables
+            dma_transpose on FP8 data by viewing as bf16 during transport.
     """
     num_kv_head = v_cache.shape[1]
     block_size = v_cache.shape[2]
     head_dim = v_cache.shape[3]
     bs, max_blocks_per_seq = block_tables.shape
 
-    # Get K_TILE_SIZE and V_TILE_SIZE from k_sbuf and v_sbuf shapes
-    K_TILE_SIZE = k_sbuf[0].shape[1]
-    V_TILE_SIZE = v_sbuf[0].shape[0]
+    # k_sbuf/v_sbuf are 2D lists: [seq_tile][d_tile]
+    num_d_tiles_k = len(k_sbuf[0])
+    num_d_tiles_v = len(v_sbuf[0])
+    d_tile_size_k = k_sbuf[0][0].shape[0]
+    d_tile_size_v = v_sbuf[0][0].shape[1]
+    K_TILE_SIZE = k_sbuf[0][0].shape[1]
+    V_TILE_SIZE = v_sbuf[0][0].shape[0]
+
+    k_needs_cast = k_cache.dtype != k_sbuf[0][0].dtype
+    v_needs_cast = v_cache.dtype != v_sbuf[0][0].dtype
+    kernel_assert(
+        not (k_needs_cast or v_needs_cast) or k_pre_transposed or fp8_packed,
+        "FP8 KV cache (dtype mismatch) requires k_pre_transposed=True",
+    )
 
     # Store the original sbuf address
     orig_sbuf_addr = allocator.get_current_address()
@@ -196,13 +214,154 @@ def load_kv_cache(
                 indirect_dim=1,
             ),
             dst=block_table_idx_before_tp,
+            oob_mode=nisa.oob_mode.skip,
         )
 
         chunk_num_k_tiles = chunk_num_blocks // num_blocks_per_k_tile
         chunk_k_tile_start = chunk_start // num_blocks_per_k_tile
 
-        # Load K cache: transposed path (already head_dim x block_size) or original path (needs transpose)
-        if k_pre_transposed:
+        # Load K cache: packed FP8, pre-transposed, or original path
+        if fp8_packed:
+            # Head-major packed K cache: (num_blocks, num_kv_head, block_size // 2, head_dim, 2) fp8.
+            # Reshape to (num_blocks * num_kv_head, block_size // 2, head_dim, 2) so the head folds
+            # into the leading block dimension, then flatten + view as bf16 to get
+            # (num_blocks * num_kv_head * block_size // 2, head_dim) bf16. This is structurally the
+            # same per-head as the original packed layout, but with head_dim row width (instead of
+            # kv_dim) and the head selected via the row index rather than a column offset.
+            # Load per-block with dma_transpose (bf16 is 2-byte, so dma_transpose works),
+            # then reinterpret back as fp8 to get [d_head, block_size] per block.
+            block_size_half = block_size // 2
+
+            # Flatten to (num_blocks * num_kv_head * block_size_half, head_dim * 2) fp8, then
+            # reinterpret as bf16 to get (num_blocks * num_kv_head * block_size_half, head_dim) bf16.
+            total_packed_rows = k_cache.shape[0] * num_kv_head * block_size_half
+            k_cache_flat = k_cache.reshape((total_packed_rows, head_dim * 2))
+            k_cache_bf16_view = k_cache_flat.view(nl.bfloat16)
+
+            use_xbar_transpose = (head_dim % d_tile_size_k == 0) and (chunk_num_blocks % 16 == 0)
+
+            if use_xbar_transpose:
+                # bf16 temp for extracting non-contiguous blocks before reinterpret_cast.
+                k_blk_bf16 = allocator.alloc_sbuf_tensor(
+                    shape=(d_tile_size_k, block_size_half), dtype=nl.bfloat16, align_to=32
+                )
+                k_tp_bf16 = allocator.alloc_sbuf_tensor(
+                    shape=(d_tile_size_k, 1, block_size_half, chunk_num_blocks),
+                    dtype=nl.bfloat16,
+                    align_to=32,
+                )
+
+                # Load block indices as (chunk_num_blocks, 1) for vector_offset
+                block_table_idx_col = allocator.alloc_sbuf_tensor(shape=(chunk_num_blocks, 1), dtype=nl.uint32)
+                nisa.dma_copy(
+                    dst=block_table_idx_col,
+                    src=block_tables.ap(
+                        pattern=[[1, chunk_num_blocks], [1, 1]],
+                        offset=b_i * max_blocks_per_seq,
+                        scalar_offset=chunk_block_table_offset,
+                        indirect_dim=1,
+                    ),
+                    oob_mode=nisa.oob_mode.skip,
+                )
+                # Head-major packed addressing: the row base for (block b, head h_i) is
+                # (b * num_kv_head + h_i) * block_size_half. block_table_idx_col holds b, so
+                # scale by num_kv_head * block_size_half; the h_i term is added via the static
+                # offset below. Per-row stride is head_dim (not kv_dim) and there is no column
+                # head offset.
+                nisa.tensor_scalar(
+                    dst=block_table_idx_col,
+                    data=block_table_idx_col,
+                    op0=nl.multiply,
+                    operand0=num_kv_head * block_size_half,
+                )
+
+                free_dim_size = block_size_half * chunk_num_blocks
+
+                for d_idx in range(num_d_tiles_k):
+                    d_offset = d_idx * d_tile_size_k
+                    nisa.dma_transpose(
+                        src=k_cache_bf16_view.ap(
+                            pattern=[
+                                [head_dim * block_size_half, chunk_num_blocks],
+                                [1, 1],
+                                [head_dim, block_size_half],
+                                [1, d_tile_size_k],
+                            ],
+                            offset=h_i * block_size_half * head_dim + d_offset,
+                            vector_offset=block_table_idx_col,
+                        ),
+                        dst=k_tp_bf16,
+                        axes=(3, 1, 2, 0),
+                        oob_mode=nisa.oob_mode.skip,
+                    )
+
+                    for blk_idx in range(chunk_num_blocks):
+                        i = blk_idx // num_blocks_per_k_tile
+                        j = blk_idx % num_blocks_per_k_tile
+                        nisa.tensor_copy(
+                            dst=k_blk_bf16,
+                            src=k_tp_bf16.ap(
+                                pattern=[
+                                    [free_dim_size, d_tile_size_k],
+                                    [chunk_num_blocks, block_size_half],
+                                ],
+                                offset=blk_idx,
+                            ),
+                        )
+                        nisa.tensor_copy(
+                            dst=k_sbuf[chunk_k_tile_start + i][d_idx].ap(
+                                pattern=[[K_TILE_SIZE, d_tile_size_k], [1, block_size]], offset=j * block_size
+                            ),
+                            src=k_blk_bf16.view(k_cache.dtype),
+                        )
+            else:
+                # Per-block fallback: dma_copy + nc_transpose (no alignment needed).
+                # vector_offset requires chunk_num_blocks divisible by 64 (SBUF partition),
+                # so we use scalar_offset per block instead.
+                # Head-major packed addressing: row base for (block b, head h_i) is
+                # (b * num_kv_head + h_i) * block_size_half. Scale block idx by
+                # num_kv_head * block_size_half; the h_i term is the static offset below.
+                block_table_idx_packed = allocator.alloc_sbuf_tensor(shape=(1, chunk_num_blocks), dtype=nl.uint32)
+                nisa.tensor_scalar(
+                    dst=block_table_idx_packed,
+                    data=block_table_idx_before_tp,
+                    op0=nl.multiply,
+                    operand0=num_kv_head * block_size_half,
+                )
+
+                k_blk_no_tp = allocator.alloc_sbuf_tensor(
+                    shape=(block_size_half, d_tile_size_k), dtype=nl.bfloat16, align_to=32
+                )
+                k_blk_psum_tp = nl.ndarray(
+                    (d_tile_size_k, block_size_half), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0)
+                )
+
+                for blk_idx in range(chunk_num_blocks):
+                    i = blk_idx // num_blocks_per_k_tile
+                    j = blk_idx % num_blocks_per_k_tile
+
+                    for d_idx in range(num_d_tiles_k):
+                        d_offset = d_idx * d_tile_size_k
+                        nisa.dma_copy(
+                            dst=k_blk_no_tp,
+                            src=k_cache_bf16_view.ap(
+                                pattern=[[head_dim, block_size_half], [1, d_tile_size_k]],
+                                offset=h_i * block_size_half * head_dim + d_offset,
+                                scalar_offset=block_table_idx_packed.ap(
+                                    pattern=[[chunk_num_blocks, 1], [1, 1]], offset=blk_idx
+                                ),
+                            ),
+                            dge_mode=nisa.dge_mode.hwdge,
+                        )
+                        nisa.nc_transpose(dst=k_blk_psum_tp, data=k_blk_no_tp)
+                        nisa.tensor_copy(
+                            dst=k_sbuf[chunk_k_tile_start + i][d_idx].ap(
+                                pattern=[[K_TILE_SIZE, d_tile_size_k], [1, block_size]], offset=j * block_size
+                            ),
+                            src=k_blk_psum_tp.view(k_cache.dtype),
+                        )
+
+        elif k_pre_transposed:
             # K cache is (num_blocks_total * num_kv_head, head_dim, block_size) — already transposed.
             # Per-block dma_copy with scalar_offset.
             # For block b and head h, the index into dim-0 is b * num_kv_head + h.
@@ -213,30 +372,55 @@ def load_kv_cache(
                 op0=nl.multiply,
                 operand0=num_kv_head,
             )
+            if k_needs_cast:
+                k_tp_tmp = allocator.alloc_sbuf_tensor(
+                    shape=(d_tile_size_k, block_size), dtype=k_cache.dtype, align_to=32
+                )
             for i in range(chunk_num_k_tiles):
                 for j in range(num_blocks_per_k_tile):
                     blk_idx = i * num_blocks_per_k_tile + j
 
-                    nisa.dma_copy(
-                        dst=k_sbuf[chunk_k_tile_start + i].ap(
-                            pattern=[[K_TILE_SIZE, head_dim], [1, block_size]], offset=j * block_size
-                        ),
-                        src=k_cache.ap(
-                            pattern=[[block_size, head_dim], [1, block_size]],
-                            offset=h_i * head_dim * block_size,
-                            scalar_offset=block_table_idx_tp.ap(
-                                pattern=[[chunk_num_blocks, 1], [1, 1]], offset=blk_idx
-                            ),
-                        ),
-                        dge_mode=nisa.dge_mode.hwdge,
-                    )
+                    for d_idx in range(num_d_tiles_k):
+                        d_offset = d_idx * d_tile_size_k
+                        if k_needs_cast:
+                            nisa.dma_copy(
+                                dst=k_tp_tmp,
+                                src=k_cache.ap(
+                                    pattern=[[block_size, d_tile_size_k], [1, block_size]],
+                                    offset=h_i * head_dim * block_size + d_offset * block_size,
+                                    scalar_offset=block_table_idx_tp.ap(
+                                        pattern=[[chunk_num_blocks, 1], [1, 1]], offset=blk_idx
+                                    ),
+                                ),
+                                dge_mode=nisa.dge_mode.hwdge,
+                            )
+                            nisa.tensor_copy(
+                                dst=k_sbuf[chunk_k_tile_start + i][d_idx].ap(
+                                    pattern=[[K_TILE_SIZE, d_tile_size_k], [1, block_size]], offset=j * block_size
+                                ),
+                                src=k_tp_tmp,
+                            )
+                        else:
+                            nisa.dma_copy(
+                                dst=k_sbuf[chunk_k_tile_start + i][d_idx].ap(
+                                    pattern=[[K_TILE_SIZE, d_tile_size_k], [1, block_size]], offset=j * block_size
+                                ),
+                                src=k_cache.ap(
+                                    pattern=[[block_size, d_tile_size_k], [1, block_size]],
+                                    offset=h_i * head_dim * block_size + d_offset * block_size,
+                                    scalar_offset=block_table_idx_tp.ap(
+                                        pattern=[[chunk_num_blocks, 1], [1, 1]], offset=blk_idx
+                                    ),
+                                ),
+                                dge_mode=nisa.dge_mode.hwdge,
+                            )
         else:
             # Load K cache with dma_transpose when possible (original non-transposed layout).
             # HW DGE indirect dma_transpose requires src.shape[-1] % 128 == 0, so
             # head_dim must be a multiple of 128 (observed 87.9% rel diff with
             # head_dim=64). Fall back to the per-block dma_copy + nc_transpose
             # path otherwise.
-            use_dma_transpose = head_dim == 128 and (chunk_num_blocks % 16 == 0)
+            use_dma_transpose = (head_dim % d_tile_size_k == 0) and (chunk_num_blocks % 16 == 0)
 
             if use_dma_transpose:
                 # Load block indices directly as (chunk_num_blocks, 1)
@@ -249,49 +433,55 @@ def load_kv_cache(
                         indirect_dim=1,
                     ),
                     dst=block_table_idx,
-                )
-
-                # Single dma_transpose for this chunk's blocks
-                k_sbuf_tmp = allocator.alloc_sbuf_tensor(
-                    shape=(head_dim, 1, block_size, chunk_num_blocks), dtype=k_cache.dtype, align_to=32
-                )
-                nisa.dma_transpose(
-                    src=k_cache.ap(
-                        pattern=[
-                            [num_kv_head * block_size * head_dim, chunk_num_blocks],
-                            [1, 1],
-                            [head_dim, block_size],
-                            [1, head_dim],
-                        ],
-                        offset=h_i * block_size * head_dim,
-                        vector_offset=block_table_idx,
-                    ),
-                    dst=k_sbuf_tmp,
-                    axes=(3, 1, 2, 0),
                     oob_mode=nisa.oob_mode.skip,
                 )
 
-                # Rearrange from interleaved to contiguous layout in k_sbuf tiles.
-                # Iterate per-block (flat) so chunk_num_blocks < num_blocks_per_k_tile
-                # (partial tile) still fills the first chunk_num_blocks slots of the
-                # first tile rather than silently skipping (the old nested form
-                # `for i in range(chunk_num_k_tiles)` gave 0 iterations when
-                # chunk_num_k_tiles = chunk_num_blocks // num_blocks_per_k_tile = 0).
-                # Any unwritten K-tile tail is handled by the MM1 num_f bound and
-                # the upstream memset that zeroes k_cache_sbuf.
-                for blk_idx in range(chunk_num_blocks):
-                    i = blk_idx // num_blocks_per_k_tile
-                    j = blk_idx % num_blocks_per_k_tile
-                    nisa.tensor_copy(
-                        src=k_sbuf_tmp.ap(
-                            pattern=[[block_size * chunk_num_blocks, head_dim], [chunk_num_blocks, block_size]],
-                            offset=blk_idx,
+                # dma_transpose per d-tile chunk (partition dim must be <= 128)
+                k_sbuf_tmp = allocator.alloc_sbuf_tensor(
+                    shape=(d_tile_size_k, 1, block_size, chunk_num_blocks), dtype=k_cache.dtype, align_to=32
+                )
+                for d_idx in range(num_d_tiles_k):
+                    d_offset = d_idx * d_tile_size_k
+                    nisa.dma_transpose(
+                        src=k_cache.ap(
+                            pattern=[
+                                [num_kv_head * block_size * head_dim, chunk_num_blocks],
+                                [1, 1],
+                                [head_dim, block_size],
+                                [1, d_tile_size_k],
+                            ],
+                            offset=h_i * block_size * head_dim + d_offset,
+                            vector_offset=block_table_idx,
                         ),
-                        dst=k_sbuf[chunk_k_tile_start + i].ap(
-                            pattern=[[K_TILE_SIZE, head_dim], [1, block_size]],
-                            offset=j * block_size,
-                        ),
+                        dst=k_sbuf_tmp,
+                        axes=(3, 1, 2, 0),
+                        oob_mode=nisa.oob_mode.skip,
                     )
+
+                    # Rearrange from interleaved to contiguous layout in k_sbuf tiles.
+                    # Iterate per-block (flat) so chunk_num_blocks < num_blocks_per_k_tile
+                    # (partial tile) still fills the first chunk_num_blocks slots of the
+                    # first tile rather than silently skipping (the old nested form
+                    # `for i in range(chunk_num_k_tiles)` gave 0 iterations when
+                    # chunk_num_k_tiles = chunk_num_blocks // num_blocks_per_k_tile = 0).
+                    # Any unwritten K-tile tail is handled by the MM1 num_f bound and
+                    # the upstream memset that zeroes k_cache_sbuf.
+                    for blk_idx in range(chunk_num_blocks):
+                        i = blk_idx // num_blocks_per_k_tile
+                        j = blk_idx % num_blocks_per_k_tile
+                        nisa.tensor_copy(
+                            src=k_sbuf_tmp.ap(
+                                pattern=[
+                                    [block_size * chunk_num_blocks, d_tile_size_k],
+                                    [chunk_num_blocks, block_size],
+                                ],
+                                offset=blk_idx,
+                            ),
+                            dst=k_sbuf[chunk_k_tile_start + i][d_idx].ap(
+                                pattern=[[K_TILE_SIZE, d_tile_size_k], [1, block_size]],
+                                offset=j * block_size,
+                            ),
+                        )
             else:
                 if head_dim <= 128:
                     print(
@@ -308,39 +498,44 @@ def load_kv_cache(
                 # < num_blocks_per_k_tile. The unwritten K-tile tail is handled by
                 # the MM1 `num_f = min(seqlen_k, _K_TILE_SZ)` bound and the
                 # up-front memset of the K cache (leaves padding zeroed).
+                # For d>128, loads per d-tile chunk and writes to 2D k_sbuf.
                 k_sbuf_no_tp = allocator.alloc_sbuf_tensor(
-                    shape=(block_size, head_dim),
+                    shape=(block_size, d_tile_size_k),
                     dtype=k_cache.dtype,
                     align_to=32,
                 )
                 k_psum_transposed = nl.ndarray(
-                    (head_dim, block_size), dtype=k_cache.dtype, buffer=nl.psum, address=(0, 0)
+                    (d_tile_size_k, block_size), dtype=k_cache.dtype, buffer=nl.psum, address=(0, 0)
                 )
 
                 for blk_idx in range(chunk_num_blocks):
                     i = blk_idx // num_blocks_per_k_tile
                     j = blk_idx % num_blocks_per_k_tile
 
-                    nisa.dma_copy(
-                        dst=k_sbuf_no_tp,
-                        src=k_cache.ap(
-                            pattern=[[head_dim, block_size], [1, head_dim]],
-                            offset=h_i * block_size * head_dim,
-                            scalar_offset=block_table_idx_before_tp.ap(
-                                pattern=[[chunk_num_blocks, 1], [1, 1]], offset=blk_idx
+                    for d_idx in range(num_d_tiles_k):
+                        d_offset = d_idx * d_tile_size_k
+                        nisa.dma_copy(
+                            dst=k_sbuf_no_tp,
+                            src=k_cache.ap(
+                                pattern=[[head_dim, block_size], [1, d_tile_size_k]],
+                                offset=h_i * block_size * head_dim + d_offset,
+                                scalar_offset=block_table_idx_before_tp.ap(
+                                    pattern=[[chunk_num_blocks, 1], [1, 1]], offset=blk_idx
+                                ),
                             ),
-                        ),
-                        dge_mode=nisa.dge_mode.hwdge,
-                    )
-                    nisa.nc_transpose(dst=k_psum_transposed, data=k_sbuf_no_tp)
-                    nisa.tensor_copy(
-                        dst=k_sbuf[chunk_k_tile_start + i].ap(
-                            pattern=[[K_TILE_SIZE, head_dim], [1, block_size]], offset=j * block_size
-                        ),
-                        src=k_psum_transposed,
-                    )
+                            dge_mode=nisa.dge_mode.hwdge,
+                        )
+                        nisa.nc_transpose(dst=k_psum_transposed, data=k_sbuf_no_tp)
+                        nisa.tensor_copy(
+                            dst=k_sbuf[chunk_k_tile_start + i][d_idx].ap(
+                                pattern=[[K_TILE_SIZE, d_tile_size_k], [1, block_size]], offset=j * block_size
+                            ),
+                            src=k_psum_transposed,
+                        )
 
         # Load V cache without transpose
+        if v_needs_cast:
+            v_tmp = allocator.alloc_sbuf_tensor(shape=(V_TILE_SIZE, d_tile_size_v), dtype=v_cache.dtype, align_to=32)
         if block_size >= V_TILE_SIZE:
             # Original path: each block has one or more V tiles
             kernel_assert(
@@ -351,19 +546,40 @@ def load_kv_cache(
 
             for i in range(chunk_num_blocks):
                 for j in range(num_v_tiles_per_block):
-                    nisa.dma_copy(
-                        dst=v_sbuf[(chunk_start + i) * num_v_tiles_per_block + j].ap(
-                            pattern=[[head_dim, V_TILE_SIZE], [1, head_dim]], offset=0
-                        ),
-                        src=v_cache.ap(
-                            pattern=[[head_dim, V_TILE_SIZE], [1, head_dim]],
-                            offset=h_i * block_size * head_dim + j * V_TILE_SIZE * head_dim,
-                            scalar_offset=block_table_idx_before_tp.ap(
-                                pattern=[[chunk_num_blocks, 1], [1, 1]], offset=i
-                            ),
-                        ),
-                        dge_mode=nisa.dge_mode.hwdge,
-                    )
+                    for d_idx in range(num_d_tiles_v):
+                        d_offset = d_idx * d_tile_size_v
+                        if v_needs_cast:
+                            nisa.dma_copy(
+                                dst=v_tmp,
+                                src=v_cache.ap(
+                                    pattern=[[d_tile_size_v, V_TILE_SIZE], [1, head_dim]],
+                                    offset=h_i * block_size * head_dim + j * V_TILE_SIZE * head_dim + d_offset,
+                                    scalar_offset=block_table_idx_before_tp.ap(
+                                        pattern=[[chunk_num_blocks, 1], [1, 1]], offset=i
+                                    ),
+                                ),
+                                dge_mode=nisa.dge_mode.hwdge,
+                            )
+                            nisa.tensor_copy(
+                                dst=v_sbuf[(chunk_start + i) * num_v_tiles_per_block + j][d_idx].ap(
+                                    pattern=[[d_tile_size_v, V_TILE_SIZE], [1, d_tile_size_v]], offset=0
+                                ),
+                                src=v_tmp,
+                            )
+                        else:
+                            nisa.dma_copy(
+                                dst=v_sbuf[(chunk_start + i) * num_v_tiles_per_block + j][d_idx].ap(
+                                    pattern=[[d_tile_size_v, V_TILE_SIZE], [1, d_tile_size_v]], offset=0
+                                ),
+                                src=v_cache.ap(
+                                    pattern=[[d_tile_size_v, V_TILE_SIZE], [1, head_dim]],
+                                    offset=h_i * block_size * head_dim + j * V_TILE_SIZE * head_dim + d_offset,
+                                    scalar_offset=block_table_idx_before_tp.ap(
+                                        pattern=[[chunk_num_blocks, 1], [1, 1]], offset=i
+                                    ),
+                                ),
+                                dge_mode=nisa.dge_mode.hwdge,
+                            )
         else:
             # Small block path: each V tile spans multiple blocks
             kernel_assert(
@@ -377,20 +593,42 @@ def load_kv_cache(
             for v_tile_idx in range(chunk_num_v_tiles):
                 for blk_in_tile in range(num_blocks_per_v_tile):
                     block_idx = v_tile_idx * num_blocks_per_v_tile + blk_in_tile
-                    nisa.dma_copy(
-                        dst=v_sbuf[chunk_v_tile_start + v_tile_idx].ap(
-                            pattern=[[head_dim, block_size], [1, head_dim]],
-                            offset=blk_in_tile * block_size * head_dim,
-                        ),
-                        src=v_cache.ap(
-                            pattern=[[head_dim, block_size], [1, head_dim]],
-                            offset=h_i * block_size * head_dim,
-                            scalar_offset=block_table_idx_before_tp.ap(
-                                pattern=[[chunk_num_blocks, 1], [1, 1]], offset=block_idx
-                            ),
-                        ),
-                        dge_mode=nisa.dge_mode.hwdge,
-                    )
+                    for d_idx in range(num_d_tiles_v):
+                        d_offset = d_idx * d_tile_size_v
+                        if v_needs_cast:
+                            nisa.dma_copy(
+                                dst=v_tmp[:block_size, :d_tile_size_v],
+                                src=v_cache.ap(
+                                    pattern=[[d_tile_size_v, block_size], [1, head_dim]],
+                                    offset=h_i * block_size * head_dim + d_offset,
+                                    scalar_offset=block_table_idx_before_tp.ap(
+                                        pattern=[[chunk_num_blocks, 1], [1, 1]], offset=block_idx
+                                    ),
+                                ),
+                                dge_mode=nisa.dge_mode.hwdge,
+                            )
+                            nisa.tensor_copy(
+                                dst=v_sbuf[chunk_v_tile_start + v_tile_idx][d_idx].ap(
+                                    pattern=[[d_tile_size_v, block_size], [1, d_tile_size_v]],
+                                    offset=blk_in_tile * block_size * d_tile_size_v,
+                                ),
+                                src=v_tmp[:block_size, :d_tile_size_v],
+                            )
+                        else:
+                            nisa.dma_copy(
+                                dst=v_sbuf[chunk_v_tile_start + v_tile_idx][d_idx].ap(
+                                    pattern=[[d_tile_size_v, block_size], [1, d_tile_size_v]],
+                                    offset=blk_in_tile * block_size * d_tile_size_v,
+                                ),
+                                src=v_cache.ap(
+                                    pattern=[[d_tile_size_v, block_size], [1, head_dim]],
+                                    offset=h_i * block_size * head_dim + d_offset,
+                                    scalar_offset=block_table_idx_before_tp.ap(
+                                        pattern=[[chunk_num_blocks, 1], [1, 1]], offset=block_idx
+                                    ),
+                                ),
+                                dge_mode=nisa.dge_mode.hwdge,
+                            )
 
         # Free this chunk's temp allocations
         allocator.set_current_address(address=chunk_sbuf_addr)
@@ -401,22 +639,23 @@ def load_kv_cache(
 
 
 def _attention_segmented_cte_swa_impl(
-    q: nl.ndarray,
-    k_cache: nl.ndarray,
-    v_cache: nl.ndarray,
-    block_tables: nl.ndarray,
-    prior_tokens: nl.ndarray,
+    q: nl.NkiTensor,
+    k_cache: nl.NkiTensor,
+    v_cache: nl.NkiTensor,
+    block_tables: nl.NkiTensor,
+    prior_tokens: nl.NkiTensor,
     block_size: int,
     prior_seg_size: int,
     scale: float,
     tp_q: bool,
     tp_out: bool,
     sliding_window: int,
-    sink: Optional[nl.ndarray],
+    sink: Optional[nl.NkiTensor],
     num_q_heads: int = 1,
     k_pre_transposed: bool = False,
-    k_scale: Optional[nl.ndarray] = None,
-    v_scale: Optional[nl.ndarray] = None,
+    fp8_packed: bool = False,
+    k_scale: Optional[nl.NkiTensor] = None,
+    v_scale: Optional[nl.NkiTensor] = None,
 ):
     """
     Simplified sliding window attention implementation with single-iteration processing.
@@ -456,6 +695,12 @@ def _attention_segmented_cte_swa_impl(
         bs_q, head_dim, seqlen_q = q.shape
 
     kernel_assert(seqlen_q % 128 == 0, f"Query seqlen {seqlen_q} must be a multiple of 128")
+
+    # D-tile parameters for 2D K/V SBUF layout
+    num_d_tiles = math.ceil(head_dim / _D_TILE_SZ)
+    d_tile_size_par_dim = min(head_dim, _D_TILE_SZ)
+    num_d_tiles_free_dim = math.ceil(head_dim / (_V_D_TILE_SZ))
+    d_tile_size_free_dim = min(head_dim, _V_D_TILE_SZ)
 
     # Derive num_kv_heads from v_cache shape for GQA mapping (v_cache's
     # layout is independent of k_pre_transposed).
@@ -535,8 +780,11 @@ def _attention_segmented_cte_swa_impl(
         nisa.register_load(dst=no_prior_reg, src=no_prior_sbuf)
         sink_reload_sbuf = allocator.alloc_sbuf_tensor(shape=sink.shape, dtype=sink.dtype, align_to=4)
         nisa.dma_copy(dst=sink_reload_sbuf, src=sink)
-        for _ in nl.dynamic_range(0, no_prior_reg):
+
+        def _mask_sink_prior(_):
             nisa.dma_copy(dst=sink_masked, src=sink_reload_sbuf)
+
+        nl.fori_loop(0, no_prior_reg, _mask_sink_prior)
         sink = sink_masked
 
     # prior_block_offset = max(0, active_block_offset - num_prior_blocks_to_load) (dynamic)
@@ -556,18 +804,19 @@ def _attention_segmented_cte_swa_impl(
     num_v_tiles_active_swa = num_k_tiles_active_swa * (_K_TILE_SZ // _V_TILE_SZ)
     num_grps = math.ceil(seqlen_q / 128)
 
+    k_sbuf_dtype = k_cache.dtype
     k_cache_sbuf = allocator.alloc_sbuf_tensor(
-        shape=(head_dim, _K_TILE_SZ),
-        dtype=nl.bfloat16,
-        block_dim=[num_k_tiles_active_swa],
-        num_free_tiles=[num_k_tiles_active_swa],
+        shape=(d_tile_size_par_dim, _K_TILE_SZ),
+        dtype=k_sbuf_dtype,
+        block_dim=[num_k_tiles_active_swa, num_d_tiles],
+        num_free_tiles=[num_k_tiles_active_swa, num_d_tiles],
         align_to=32,
     )
     v_cache_sbuf = allocator.alloc_sbuf_tensor(
-        shape=(_V_TILE_SZ, head_dim),
+        shape=(_V_TILE_SZ, d_tile_size_free_dim),
         dtype=nl.bfloat16,
-        block_dim=[num_v_tiles_active_swa],
-        num_free_tiles=[num_v_tiles_active_swa],
+        block_dim=[num_v_tiles_active_swa, num_d_tiles_free_dim],
+        num_free_tiles=[num_v_tiles_active_swa, num_d_tiles_free_dim],
     )
 
     # Allocate HBM buffers for unnormalized output and softmax stats (single batch, reused)
@@ -601,17 +850,17 @@ def _attention_segmented_cte_swa_impl(
 
     # Allocate prior KV SBUF once outside the loop (reused across iterations)
     k_prior_sbuf_swa = allocator.alloc_sbuf_tensor(
-        shape=(head_dim, _K_TILE_SZ),
+        shape=(d_tile_size_par_dim, _K_TILE_SZ),
         dtype=nl.bfloat16,
-        block_dim=[num_prior_k_tiles],
-        num_free_tiles=[num_prior_k_tiles],
+        block_dim=[num_prior_k_tiles, num_d_tiles],
+        num_free_tiles=[num_prior_k_tiles, num_d_tiles],
         align_to=32,
     )
     v_prior_sbuf_swa = allocator.alloc_sbuf_tensor(
-        shape=(_V_TILE_SZ, head_dim),
+        shape=(_V_TILE_SZ, d_tile_size_free_dim),
         dtype=nl.bfloat16,
-        block_dim=[num_prior_v_tiles],
-        num_free_tiles=[num_prior_v_tiles],
+        block_dim=[num_prior_v_tiles, num_d_tiles_free_dim],
+        num_free_tiles=[num_prior_v_tiles, num_d_tiles_free_dim],
     )
 
     # Process primary batches (one at a time)
@@ -653,6 +902,7 @@ def _attention_segmented_cte_swa_impl(
             num_active_blocks_swa,
             allocator,
             k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
         )
 
         # Load at most window-sized prior KV; prior_used_len dynamically masks
@@ -669,6 +919,7 @@ def _attention_segmented_cte_swa_impl(
             num_prior_blocks_to_load,
             allocator,
             k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
         )
 
         init_sbuf_addr = allocator.get_current_address()
@@ -685,7 +936,7 @@ def _attention_segmented_cte_swa_impl(
             cache_softmax=True,
             skip_output_normalization=True,
             sliding_window=sliding_window,
-            sink=sink,
+            sink=sink[batch_id : batch_id + 1] if sink is not None else None,
             k_cache_sbuf=k_cache_sbuf,
             v_cache_sbuf=v_cache_sbuf,
             k_prior_sbuf=k_prior_sbuf_swa,
@@ -712,48 +963,59 @@ def _attention_segmented_cte_swa_impl(
 
         num_free = min(num_grps, _MAX_FREE_TILES)
         o_sb = allocator.alloc_sbuf_tensor(
-            shape=(sb_p, head_dim),
+            shape=(sb_p, d_tile_size_par_dim),
             dtype=nl.bfloat16,
-            block_dim=[num_grps],
-            num_free_tiles=[num_free],
+            block_dim=[num_grps, num_d_tiles],
+            num_free_tiles=[num_free, num_d_tiles],
         )
         if tp_out:
-            o_tp_psum = nl.ndarray((head_dim, sb_p), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0))
-            o_tp_sb = allocator.alloc_sbuf_tensor(shape=(head_dim, sb_p), dtype=nl.bfloat16)
+            o_tp_psum = nl.ndarray((d_tile_size_par_dim, sb_p), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0))
+            o_tp_sb = allocator.alloc_sbuf_tensor(shape=(d_tile_size_par_dim, sb_p), dtype=nl.bfloat16)
         for grp_i in range(num_grps):
-            grp_o_offset = grp_i * sb_p * head_dim
-            nisa.dma_copy(dst=o_sb[grp_i], src=out_o_hbm_swa.ap(pattern=o_tile_pat, offset=grp_o_offset))
-            # Delayed V dequant: fold v_scale multiply into normalization tensor_scalar
-            if v_scale_sb is not None:
-                nisa.tensor_scalar(
-                    dst=o_sb[grp_i],
-                    data=o_sb[grp_i],
-                    op0=nl.multiply,
-                    operand0=sum_recip_sb[:, grp_i],
-                    op1=nl.multiply,
-                    operand1=v_scale_sb,
-                )
-            else:
-                nisa.tensor_scalar(
-                    dst=o_sb[grp_i],
-                    data=o_sb[grp_i],
-                    op0=nl.multiply,
-                    operand0=sum_recip_sb[:, grp_i],
-                )
-            if tp_out:
-                # nc_transpose (128, head_dim) → (head_dim, 128), then write with transposed AP
-                nisa.nc_transpose(dst=o_tp_psum, data=o_sb[grp_i])
-                nisa.tensor_copy(dst=o_tp_sb, src=o_tp_psum)
+            for d_idx in range(num_d_tiles):
+                d_offset = d_idx * d_tile_size_par_dim
                 nisa.dma_copy(
-                    dst=result.ap(
-                        pattern=[[seqlen_q, head_dim], [1, sb_p]],
-                        offset=batch_id * head_dim * seqlen_q + grp_i * sb_p,
+                    dst=o_sb[grp_i][d_idx],
+                    src=out_o_hbm_swa.ap(
+                        pattern=[[head_dim, sb_p], [1, d_tile_size_par_dim]],
+                        offset=grp_i * sb_p * head_dim + d_offset,
                     ),
-                    src=o_tp_sb,
                 )
-            else:
-                dst_o_offset = batch_id * num_grps * sb_p * head_dim + grp_o_offset
-                nisa.dma_copy(dst=result.ap(pattern=o_tile_pat, offset=dst_o_offset), src=o_sb[grp_i])
+                # Delayed V dequant: fold v_scale multiply into normalization tensor_scalar
+                if v_scale_sb is not None:
+                    nisa.tensor_scalar(
+                        dst=o_sb[grp_i][d_idx],
+                        data=o_sb[grp_i][d_idx],
+                        op0=nl.multiply,
+                        operand0=sum_recip_sb[:, grp_i],
+                        op1=nl.multiply,
+                        operand1=v_scale_sb,
+                    )
+                else:
+                    nisa.tensor_scalar(
+                        dst=o_sb[grp_i][d_idx],
+                        data=o_sb[grp_i][d_idx],
+                        op0=nl.multiply,
+                        operand0=sum_recip_sb[:, grp_i],
+                    )
+                if tp_out:
+                    nisa.nc_transpose(dst=o_tp_psum, data=o_sb[grp_i][d_idx])
+                    nisa.tensor_copy(dst=o_tp_sb, src=o_tp_psum)
+                    nisa.dma_copy(
+                        dst=result.ap(
+                            pattern=[[seqlen_q, d_tile_size_par_dim], [1, sb_p]],
+                            offset=batch_id * head_dim * seqlen_q + d_offset * seqlen_q + grp_i * sb_p,
+                        ),
+                        src=o_tp_sb,
+                    )
+                else:
+                    nisa.dma_copy(
+                        dst=result.ap(
+                            pattern=[[head_dim, sb_p], [1, d_tile_size_par_dim]],
+                            offset=batch_id * num_grps * sb_p * head_dim + grp_i * sb_p * head_dim + d_offset,
+                        ),
+                        src=o_sb[grp_i][d_idx],
+                    )
         allocator.set_current_address(norm_addr)
 
     # Handle remainder batch (if bs_q is odd) with asymmetric sequence sharding.
@@ -813,17 +1075,17 @@ def _attention_segmented_cte_swa_impl(
 
         # Allocate K/V sbuf for effective segment
         k_cache_sbuf_rem = allocator.alloc_sbuf_tensor(
-            shape=(head_dim, _K_TILE_SZ),
-            dtype=nl.bfloat16,
-            block_dim=[num_k_tiles_per_effective_seg],
-            num_free_tiles=[num_k_tiles_per_effective_seg],
+            shape=(d_tile_size_par_dim, _K_TILE_SZ),
+            dtype=k_sbuf_dtype,
+            block_dim=[num_k_tiles_per_effective_seg, num_d_tiles],
+            num_free_tiles=[num_k_tiles_per_effective_seg, num_d_tiles],
             align_to=32,
         )
         v_cache_sbuf_rem = allocator.alloc_sbuf_tensor(
-            shape=(_V_TILE_SZ, head_dim),
+            shape=(_V_TILE_SZ, d_tile_size_free_dim),
             dtype=nl.bfloat16,
-            block_dim=[num_v_tiles_per_effective_seg],
-            num_free_tiles=[num_v_tiles_per_effective_seg],
+            block_dim=[num_v_tiles_per_effective_seg, num_d_tiles_free_dim],
+            num_free_tiles=[num_v_tiles_per_effective_seg, num_d_tiles_free_dim],
         )
         # Allocate HBM buffers for remainder batch (per-shard Q length)
         rem_softmax_shape_swa = (1, 128, num_grps_effective)
@@ -891,22 +1153,23 @@ def _attention_segmented_cte_swa_impl(
             num_blocks_per_effective_seg,
             allocator,
             k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
         )
 
         # Load at most window-sized prior KV for remainder; prior_used_len dynamically masks
         # (0 when no prior tokens, clamped to actual prior otherwise).
         k_prior_sbuf_rem = allocator.alloc_sbuf_tensor(
-            shape=(head_dim, _K_TILE_SZ),
+            shape=(d_tile_size_par_dim, _K_TILE_SZ),
             dtype=nl.bfloat16,
-            block_dim=[num_prior_k_tiles],
-            num_free_tiles=[num_prior_k_tiles],
+            block_dim=[num_prior_k_tiles, num_d_tiles],
+            num_free_tiles=[num_prior_k_tiles, num_d_tiles],
             align_to=32,
         )
         v_prior_sbuf_rem = allocator.alloc_sbuf_tensor(
-            shape=(_V_TILE_SZ, head_dim),
+            shape=(_V_TILE_SZ, d_tile_size_free_dim),
             dtype=nl.bfloat16,
-            block_dim=[num_prior_v_tiles],
-            num_free_tiles=[num_prior_v_tiles],
+            block_dim=[num_prior_v_tiles, num_d_tiles_free_dim],
+            num_free_tiles=[num_prior_v_tiles, num_d_tiles_free_dim],
         )
         load_kv_cache(
             k_cache,
@@ -920,6 +1183,7 @@ def _attention_segmented_cte_swa_impl(
             num_prior_blocks_to_load,
             allocator,
             k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
         )
 
         init_sbuf_addr = allocator.get_current_address()
@@ -936,7 +1200,7 @@ def _attention_segmented_cte_swa_impl(
             cache_softmax=True,
             skip_output_normalization=True,
             sliding_window=sliding_window,
-            sink=sink,
+            sink=sink[last_batch : last_batch + 1] if sink is not None else None,
             k_cache_sbuf=k_cache_sbuf_rem,
             v_cache_sbuf=v_cache_sbuf_rem,
             k_prior_sbuf=k_prior_sbuf_rem,
@@ -963,73 +1227,96 @@ def _attention_segmented_cte_swa_impl(
 
         rem_num_free = min(num_grps_effective, _MAX_FREE_TILES)
         rem_o_sb = allocator.alloc_sbuf_tensor(
-            shape=(rem_sb_p, head_dim),
+            shape=(rem_sb_p, d_tile_size_par_dim),
             dtype=nl.bfloat16,
-            block_dim=[num_grps_effective],
-            num_free_tiles=[rem_num_free],
+            block_dim=[num_grps_effective, num_d_tiles],
+            num_free_tiles=[rem_num_free, num_d_tiles],
         )
         if tp_out:
-            rem_o_tp_psum = nl.ndarray((head_dim, rem_sb_p), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0))
-            rem_o_tp_sb = allocator.alloc_sbuf_tensor(shape=(head_dim, rem_sb_p), dtype=nl.bfloat16)
+            rem_o_tp_psum = nl.ndarray(
+                (d_tile_size_par_dim, rem_sb_p), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0)
+            )
+            rem_o_tp_sb = allocator.alloc_sbuf_tensor(shape=(d_tile_size_par_dim, rem_sb_p), dtype=nl.bfloat16)
         for local_grp_i in range(num_grps_effective):
             global_grp_i = grp_start + local_grp_i
             grp_start_pos = global_grp_i * 128
 
-            src_o_offset = local_grp_i * rem_sb_p * head_dim
-            nisa.dma_copy(dst=rem_o_sb[local_grp_i], src=out_o_hbm_rem.ap(pattern=rem_o_tile_pat, offset=src_o_offset))
-            # Delayed V dequant: fold v_scale multiply into normalization tensor_scalar
-            if v_scale_sb is not None:
-                nisa.tensor_scalar(
-                    dst=rem_o_sb[local_grp_i],
-                    data=rem_o_sb[local_grp_i],
-                    op0=nl.multiply,
-                    operand0=rem_sum_recip_sb[:, local_grp_i],
-                    op1=nl.multiply,
-                    operand1=v_scale_sb,
-                )
-            else:
-                nisa.tensor_scalar(
-                    dst=rem_o_sb[local_grp_i],
-                    data=rem_o_sb[local_grp_i],
-                    op0=nl.multiply,
-                    operand0=rem_sum_recip_sb[:, local_grp_i],
-                )
-            if tp_out:
-                nisa.nc_transpose(dst=rem_o_tp_psum, data=rem_o_sb[local_grp_i])
-                nisa.tensor_copy(dst=rem_o_tp_sb, src=rem_o_tp_psum)
+            for d_idx in range(num_d_tiles):
+                d_offset = d_idx * d_tile_size_par_dim
                 nisa.dma_copy(
-                    dst=result.ap(
-                        pattern=[[seqlen_q, head_dim], [1, rem_sb_p]],
-                        offset=last_batch * head_dim * seqlen_q + grp_start_pos,
+                    dst=rem_o_sb[local_grp_i][d_idx],
+                    src=out_o_hbm_rem.ap(
+                        pattern=[[head_dim, rem_sb_p], [1, d_tile_size_par_dim]],
+                        offset=local_grp_i * rem_sb_p * head_dim + d_offset,
                     ),
-                    src=rem_o_tp_sb,
                 )
-            else:
-                dst_o_offset = last_batch * num_grps * rem_sb_p * head_dim + global_grp_i * rem_sb_p * head_dim
-                nisa.dma_copy(dst=result.ap(pattern=rem_o_tile_pat, offset=dst_o_offset), src=rem_o_sb[local_grp_i])
+                # Delayed V dequant: fold v_scale multiply into normalization tensor_scalar
+                if v_scale_sb is not None:
+                    nisa.tensor_scalar(
+                        dst=rem_o_sb[local_grp_i][d_idx],
+                        data=rem_o_sb[local_grp_i][d_idx],
+                        op0=nl.multiply,
+                        operand0=rem_sum_recip_sb[:, local_grp_i],
+                        op1=nl.multiply,
+                        operand1=v_scale_sb,
+                    )
+                else:
+                    nisa.tensor_scalar(
+                        dst=rem_o_sb[local_grp_i][d_idx],
+                        data=rem_o_sb[local_grp_i][d_idx],
+                        op0=nl.multiply,
+                        operand0=rem_sum_recip_sb[:, local_grp_i],
+                    )
+                if tp_out:
+                    nisa.nc_transpose(dst=rem_o_tp_psum, data=rem_o_sb[local_grp_i][d_idx])
+                    nisa.tensor_copy(dst=rem_o_tp_sb, src=rem_o_tp_psum)
+                    nisa.dma_copy(
+                        dst=result.ap(
+                            pattern=[[seqlen_q, d_tile_size_par_dim], [1, rem_sb_p]],
+                            offset=last_batch * head_dim * seqlen_q + d_offset * seqlen_q + grp_start_pos,
+                        ),
+                        src=rem_o_tp_sb,
+                    )
+                else:
+                    nisa.dma_copy(
+                        dst=result.ap(
+                            pattern=[[head_dim, rem_sb_p], [1, d_tile_size_par_dim]],
+                            offset=last_batch * num_grps * rem_sb_p * head_dim
+                            + global_grp_i * rem_sb_p * head_dim
+                            + d_offset,
+                        ),
+                        src=rem_o_sb[local_grp_i][d_idx],
+                    )
         allocator.set_current_address(rem_norm_addr)
 
     return result
 
 
 def attention_segmented_cte(
-    q: nl.ndarray,
-    k_cache: nl.ndarray,
-    v_cache: nl.ndarray,
-    block_tables: nl.ndarray,
-    prior_tokens: nl.ndarray,
+    q: nl.NkiTensor,
+    k_cache: nl.NkiTensor,
+    v_cache: nl.NkiTensor,
+    block_tables: nl.NkiTensor,
+    prior_tokens: nl.NkiTensor,
     block_size: int,
     prior_seg_size: int,
     scale: float = 1.0,
     tp_q: bool = True,
     tp_out: bool = False,
     sliding_window: Optional[int] = None,
-    sink: Optional[nl.ndarray] = None,
+    sink: Optional[nl.NkiTensor] = None,
     num_q_heads: int = 1,
-    kvp_offset: Optional[nl.ndarray] = None,
     k_pre_transposed: bool = False,
-    k_scale: Optional[nl.ndarray] = None,
-    v_scale: Optional[nl.ndarray] = None,
+    fp8_packed: bool = False,
+    k_scale: Optional[nl.NkiTensor] = None,
+    v_scale: Optional[nl.NkiTensor] = None,
+    kvp_q_offset: Optional[nl.NkiTensor] = None,
+    kvp_rank_id: Optional[nl.NkiTensor] = None,
+    kvp_group_size: int = 0,
+    kvp_cp_offset_int: int = 0,
+    kvp_seg_block_offset_int: int = 0,
+    kvp_prior_load_blocks: int = 0,
+    kvp_prior_fully_visible: bool = False,
 ):
     """
     Segmented attention computation with block-based KV cache and prefix caching.
@@ -1161,10 +1448,29 @@ def attention_segmented_cte(
         scale: Scaling factor for attention scores (default 1.0)
         tp_q: Query tensor transpose flag (default True)
         tp_out: Output tensor transpose flag (default False)
+        k_pre_transposed: If True, K cache is already stored in transposed layout
+            (head_dim, block_size) per block, written by _quantize_and_store_k_transposed in qkv_cte.
+        k_scale: Optional per-head-dim dequantization scale for K cache, shape (128, 1).
+            When provided, Q is scaled by k_scale before QK^T matmul (delayed dequant).
+        v_scale: Optional per-head-dim dequantization scale for V cache, shape (128, 1).
+            When provided, the output is scaled by v_scale after PV matmul normalization.
+        sliding_window: Optional sliding window size for attention (default None = disabled).
+        sink: Optional sink token tensor (default None).
+        num_q_heads: Number of query heads per batch item (default 1).
+        kvp_q_offset: Optional [1, 1] int32, causal mask offset for KV-parallel mode.
+            When set, enables KV-parallel mode and returns softmax stats for merging.
+        kvp_rank_id: Optional [1, 1] int32, this rank's index within the KV-parallel group.
+            Required when kvp_group_size > 0 for interleaved KV distribution.
+        kvp_group_size: Number of ranks sharing KV cache in round-robin fashion (0 = disabled).
+            When > 0, enables interleaved mode where rank r holds global blocks r, r+R, r+2R, ...
+        kvp_cp_offset_int: Compile-time Q global offset for tile visibility checks (default 0).
+        kvp_seg_block_offset_int: Compile-time segment block offset for tile visibility checks (default 0).
+        kvp_prior_load_blocks: Number of blocks to load for partial prior in boundary-aligned mode (default 0).
+        kvp_prior_fully_visible: If True, prior segments are fully visible and skip causal masking (default False).
 
     Returns:
-        If kvp_offset is None: output tensor with attention results. Shape depends on tp_out parameter.
-        If kvp_offset is set: tuple of (output, out_neg_max_hbm, out_sum_recip_hbm) for softmax stat
+        If kvp_q_offset is None: output tensor with attention results. Shape depends on tp_out parameter.
+        If kvp_q_offset is set: tuple of (output, out_neg_max_hbm, out_sum_recip_hbm) for softmax stat
             reduction by the caller.
 
     Example calculations:
@@ -1184,15 +1490,22 @@ def attention_segmented_cte(
     head_dim = v_cache.shape[3]
     bs, max_blocks_per_seq = block_tables.shape
 
+    # D-tile parameters for 2D K/V SBUF layout
+    num_d_tiles = math.ceil(head_dim / _D_TILE_SZ)
+    d_tile_size_par_dim = min(head_dim, _D_TILE_SZ)
+    num_d_tiles_free_dim = math.ceil(head_dim / (_V_D_TILE_SZ))
+    d_tile_size_free_dim = min(head_dim, _V_D_TILE_SZ)
+
     # Get sharding info for multi-core parallelization
     grid_ndim, num_shard, shard_id = get_verified_program_sharding_info("attention_segmented_cte", max_sharding=2)
 
-    # When kvp_offset is set (KV-parallel mode), the KVP kernel already handles LNC sharding
-    # externally. Override to single-core mode and use private nl.hbm to avoid buffer collisions.
-    if kvp_offset is not None:
+    # When kvp_q_offset is set (KV-parallel mode), the KVP kernel already handles LNC sharding
+    # externally. Override to single-core mode.
+    if kvp_q_offset is not None:
         num_shard = 1
         shard_id = 0
-    result_buffer = nl.hbm if kvp_offset is not None else nl.shared_hbm
+    internal_buffer = nl.private_hbm
+    result_buffer = nl.hbm if kvp_q_offset != None else nl.shared_hbm
 
     # Primary sharding: divide bs_q (batch_size * num_q_heads) evenly across shards
     num_bs_per_shard = bs_q // num_shard
@@ -1210,7 +1523,13 @@ def attention_segmented_cte(
         prior_seg_size % block_size == 0,
         f"prior_seg_size {prior_seg_size} must be divisible by block_size {block_size}",
     )
-    kernel_assert(head_dim <= 128, f"head_dim must be <= 128 (got {head_dim}). Larger head_dim not yet supported.")
+    kernel_assert(head_dim <= 512, f"head_dim must be <= 512 (got {head_dim}). Larger head_dim not yet supported.")
+    # TODO: Fix d>256 + large prior_seg_size
+    kernel_assert(
+        not (head_dim > 256 and prior_seg_size > 2048),
+        f"head_dim > 256 with prior_seg_size > 2048 is not supported. "
+        f"Got head_dim={head_dim}, prior_seg_size={prior_seg_size}.",
+    )
 
     num_blocks_per_seg = prior_seg_size // block_size
 
@@ -1239,8 +1558,9 @@ def attention_segmented_cte(
         block_tables = block_tables_internal
         max_blocks_per_seq = padded_width
 
-    # Sliding window attention: use simplified single-iteration path
-    if sliding_window is not None and sliding_window > 0:
+    # Sliding window attention: use simplified single-iteration path (contiguous only).
+    # For round-robin KV distribution, the normal segmented path with bound conversion handles SWA.
+    if sliding_window is not None and sliding_window > 0 and kvp_group_size == 0:
         kernel_assert(
             sliding_window % block_size == 0,
             f"sliding_window {sliding_window} must be divisible by block_size {block_size}",
@@ -1260,6 +1580,7 @@ def attention_segmented_cte(
             sink=sink,
             num_q_heads=num_q_heads,
             k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
             k_scale=k_scale,
             v_scale=v_scale,
         )
@@ -1333,29 +1654,32 @@ def attention_segmented_cte(
     # fused_segmented_attention_impl aliases k_prior_sbuf / v_prior_sbuf onto
     # these buffers via list slicing, saving ~48 KB per partition on the hot
     # non-KVP path.
+    # When K cache is fp8 with k_pre_transposed, allocate as fp8 so dma_copy
+    # loads directly without tensor_copy widening. nc_matmul accepts fp8 natively.
+    k_sbuf_dtype = k_cache.dtype
     k_cache_sbuf = allocator.alloc_sbuf_tensor(
-        shape=(head_dim, _K_TILE_SZ),
-        dtype=nl.bfloat16,
-        block_dim=[num_k_tiles_sbuf],
-        num_free_tiles=[num_k_tiles_sbuf],
+        shape=(d_tile_size_par_dim, _K_TILE_SZ),
+        dtype=k_sbuf_dtype,
+        block_dim=[num_k_tiles_sbuf, num_d_tiles],
+        num_free_tiles=[num_k_tiles_sbuf, num_d_tiles],
         align_to=32,
     )
     v_cache_sbuf = allocator.alloc_sbuf_tensor(
-        shape=(_V_TILE_SZ, head_dim),
+        shape=(_V_TILE_SZ, d_tile_size_free_dim),
         dtype=nl.bfloat16,
-        block_dim=[num_v_tiles_sbuf],
-        num_free_tiles=[num_v_tiles_sbuf],
+        block_dim=[num_v_tiles_sbuf, num_d_tiles_free_dim],
+        num_free_tiles=[num_v_tiles_sbuf, num_d_tiles_free_dim],
     )
 
     # Allocate HBM buffers for unnormalized output and softmax stats (single batch, reused)
     # Uses tp_out=False for intermediate HBM (matches reduce_one_batch layout)
     softmax_shape = (1, 128, num_grps)
-    o_prev_hbm = nl.ndarray(shape=(1, seqlen_q, head_dim), dtype=nl.float32, buffer=nl.private_hbm)
-    neg_max_prev_hbm = nl.ndarray(shape=softmax_shape, dtype=nl.float32, buffer=nl.private_hbm)
-    sum_prev_hbm = nl.ndarray(shape=softmax_shape, dtype=nl.float32, buffer=nl.private_hbm)
-    o_curr_hbm = nl.ndarray(shape=(1, seqlen_q, head_dim), dtype=nl.float32, buffer=nl.private_hbm)
-    neg_max_curr_hbm = nl.ndarray(shape=softmax_shape, dtype=nl.float32, buffer=nl.private_hbm)
-    sum_curr_hbm = nl.ndarray(shape=softmax_shape, dtype=nl.float32, buffer=nl.private_hbm)
+    o_prev_hbm = nl.ndarray(shape=(1, seqlen_q, head_dim), dtype=nl.float32, buffer=internal_buffer)
+    neg_max_prev_hbm = nl.ndarray(shape=softmax_shape, dtype=nl.float32, buffer=internal_buffer)
+    sum_prev_hbm = nl.ndarray(shape=softmax_shape, dtype=nl.float32, buffer=internal_buffer)
+    o_curr_hbm = nl.ndarray(shape=(1, seqlen_q, head_dim), dtype=nl.float32, buffer=internal_buffer)
+    neg_max_curr_hbm = nl.ndarray(shape=softmax_shape, dtype=nl.float32, buffer=internal_buffer)
+    sum_curr_hbm = nl.ndarray(shape=softmax_shape, dtype=nl.float32, buffer=internal_buffer)
 
     # Copy final results to HBM (allocate for full bs_q, write only assigned portion)
     # Intermediates always use non-transposed layout (tp_out=False) for reduce_one_batch compatibility.
@@ -1366,22 +1690,22 @@ def attention_segmented_cte(
         result = nl.ndarray(shape=(bs_q, seqlen_q, head_dim), dtype=q.dtype, buffer=result_buffer)
 
     # Allocate softmax stats tensors for KV-parallel mode
-    if kvp_offset is not None:
+    if kvp_q_offset != None:
         out_neg_max_hbm = nl.ndarray(shape=(bs_q, seqlen_q), dtype=nl.float32, buffer=result_buffer)
         out_sum_recip_hbm = nl.ndarray(shape=(bs_q, seqlen_q), dtype=nl.float32, buffer=result_buffer)
 
-    # Load kvp_offset into SBUF once (reused per batch)
+    # Load kvp_q_offset into SBUF once (reused per batch)
     kvp_offset_sbuf = None
-    if kvp_offset is not None:
+    if kvp_q_offset != None:
         kvp_offset_sbuf = allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.int32)
-        nisa.dma_copy(dst=kvp_offset_sbuf, src=kvp_offset)
+        nisa.dma_copy(dst=kvp_offset_sbuf, src=kvp_q_offset)
 
     # Workaround for NCC_IBIR251: Allocate Q buffer once for single batch
     # Makes Q "internal" so dma_transpose/access patterns work in dynamic loops (LNC2)
     if tp_q:
-        q_internal = nl.ndarray(shape=(1, seqlen_q, head_dim), dtype=q.dtype, buffer=nl.private_hbm)
+        q_internal = nl.ndarray(shape=(1, seqlen_q, head_dim), dtype=q.dtype, buffer=internal_buffer)
     else:
-        q_internal = nl.ndarray(shape=(1, head_dim, seqlen_q), dtype=q.dtype, buffer=nl.private_hbm)
+        q_internal = nl.ndarray(shape=(1, head_dim, seqlen_q), dtype=q.dtype, buffer=internal_buffer)
 
     # Process primary batches one at a time using helper function (skip if no primary batches)
     for b_idx in range(num_bs_per_shard):
@@ -1423,7 +1747,7 @@ def attention_segmented_cte(
         )
 
         # Process this single batch
-        # fused_segmented_attention_impl handles both KVP and non-KVP via kvp_offset parameter.
+        # fused_segmented_attention_impl handles both KVP and non-KVP via kvp_q_offset parameter.
         # Note: fused_segmented_attention_impl handles allocator reset internally
         fused_segmented_attention_impl(
             q_hbm=q_internal,
@@ -1464,10 +1788,18 @@ def attention_segmented_cte(
             tp_out=tp_out,
             load_kv_cache_fn=load_kv_cache,
             attention_cte_fn=_attention_cte,
-            sink=sink,
-            kvp_offset=kvp_offset_sbuf,
+            sink=sink[batch_id : batch_id + 1] if sink is not None else None,
             k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
             k_scale_sb=k_scale_sb,
+            kvp_q_offset=kvp_offset_sbuf,
+            kvp_rank_id=kvp_rank_id,
+            kvp_group_size=kvp_group_size,
+            sliding_window=sliding_window if sliding_window != None else 0,
+            kvp_cp_offset_int=kvp_cp_offset_int,
+            kvp_seg_block_offset_int=kvp_seg_block_offset_int,
+            kvp_prior_load_blocks=kvp_prior_load_blocks,
+            kvp_prior_fully_visible=kvp_prior_fully_visible,
         )
 
         # Normalize and write results to final output for this batch
@@ -1484,53 +1816,65 @@ def attention_segmented_cte(
 
         num_free = min(num_grps, _MAX_FREE_TILES)
         o_sb = allocator.alloc_sbuf_tensor(
-            shape=(sb_p, head_dim),
+            shape=(sb_p, d_tile_size_par_dim),
             dtype=nl.bfloat16,
-            block_dim=[num_grps],
-            num_free_tiles=[num_free],
+            block_dim=[num_grps, num_d_tiles],
+            num_free_tiles=[num_free, num_d_tiles],
         )
         if tp_out:
-            o_tp_psum = nl.ndarray((head_dim, sb_p), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0))
-            o_tp_sb = allocator.alloc_sbuf_tensor(shape=(head_dim, sb_p), dtype=nl.bfloat16)
+            o_tp_psum = nl.ndarray((d_tile_size_par_dim, sb_p), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0))
+            o_tp_sb = allocator.alloc_sbuf_tensor(shape=(d_tile_size_par_dim, sb_p), dtype=nl.bfloat16)
         for grp_i in range(num_grps):
-            grp_o_offset = grp_i * sb_p * head_dim
-            nisa.dma_copy(dst=o_sb[grp_i], src=o_prev_hbm.ap(pattern=o_tile_pat, offset=grp_o_offset))
-            # Delayed V dequant: fold v_scale multiply into normalization tensor_scalar
-            if v_scale_sb is not None:
-                nisa.tensor_scalar(
-                    dst=o_sb[grp_i],
-                    data=o_sb[grp_i],
-                    op0=nl.multiply,
-                    operand0=sum_recip_sb[:, grp_i],
-                    op1=nl.multiply,
-                    operand1=v_scale_sb,
-                )
-            else:
-                nisa.tensor_scalar(
-                    dst=o_sb[grp_i],
-                    data=o_sb[grp_i],
-                    op0=nl.multiply,
-                    operand0=sum_recip_sb[:, grp_i],
-                )
-            # Write to result[batch_id]
-            if tp_out:
-                # nc_transpose (128, head_dim) → (head_dim, 128), then write with transposed AP
-                nisa.nc_transpose(dst=o_tp_psum, data=o_sb[grp_i])
-                nisa.tensor_copy(dst=o_tp_sb, src=o_tp_psum)
+            for d_idx in range(num_d_tiles):
+                d_offset = d_idx * d_tile_size_par_dim
                 nisa.dma_copy(
-                    dst=result.ap(
-                        pattern=[[seqlen_q, head_dim], [1, sb_p]],
-                        offset=batch_id * head_dim * seqlen_q + grp_i * sb_p,
+                    dst=o_sb[grp_i][d_idx],
+                    src=o_prev_hbm.ap(
+                        pattern=[[head_dim, sb_p], [1, d_tile_size_par_dim]],
+                        offset=grp_i * sb_p * head_dim + d_offset,
                     ),
-                    src=o_tp_sb,
                 )
-            else:
-                dst_o_offset = batch_id * num_grps * sb_p * head_dim + grp_o_offset
-                nisa.dma_copy(dst=result.ap(pattern=o_tile_pat, offset=dst_o_offset), src=o_sb[grp_i])
+                # Delayed V dequant: fold v_scale multiply into normalization tensor_scalar
+                if v_scale_sb is not None:
+                    nisa.tensor_scalar(
+                        dst=o_sb[grp_i][d_idx],
+                        data=o_sb[grp_i][d_idx],
+                        op0=nl.multiply,
+                        operand0=sum_recip_sb[:, grp_i],
+                        op1=nl.multiply,
+                        operand1=v_scale_sb,
+                    )
+                else:
+                    nisa.tensor_scalar(
+                        dst=o_sb[grp_i][d_idx],
+                        data=o_sb[grp_i][d_idx],
+                        op0=nl.multiply,
+                        operand0=sum_recip_sb[:, grp_i],
+                    )
+                # Write to result[batch_id]
+                if tp_out:
+                    # nc_transpose (128, head_dim) → (head_dim, 128), then write with transposed AP
+                    nisa.nc_transpose(dst=o_tp_psum, data=o_sb[grp_i][d_idx])
+                    nisa.tensor_copy(dst=o_tp_sb, src=o_tp_psum)
+                    nisa.dma_copy(
+                        dst=result.ap(
+                            pattern=[[seqlen_q, d_tile_size_par_dim], [1, sb_p]],
+                            offset=batch_id * head_dim * seqlen_q + d_offset * seqlen_q + grp_i * sb_p,
+                        ),
+                        src=o_tp_sb,
+                    )
+                else:
+                    nisa.dma_copy(
+                        dst=result.ap(
+                            pattern=[[head_dim, sb_p], [1, d_tile_size_par_dim]],
+                            offset=batch_id * num_grps * sb_p * head_dim + grp_i * sb_p * head_dim + d_offset,
+                        ),
+                        src=o_sb[grp_i][d_idx],
+                    )
         allocator.set_current_address(norm_addr)
 
         # Write softmax stats for KV-parallel mode
-        if kvp_offset is not None:
+        if kvp_q_offset is not None:
             stats_addr = allocator.get_current_address()
             neg_max_sb_kvp = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
             sum_sb_kvp = allocator.alloc_sbuf_tensor(shape=(sb_p, num_grps), dtype=nl.float32)
@@ -1757,7 +2101,7 @@ def attention_segmented_cte(
         # fused_impl can address num_k_tiles_per_seg_shared tiles during the
         # prior loop and num_k_tiles_per_effective_seg tiles during the
         # per-shard active segment.
-        # fused_segmented_attention_impl handles both KVP and non-KVP via kvp_offset parameter.
+        # fused_segmented_attention_impl handles both KVP and non-KVP via kvp_q_offset parameter.
         fused_segmented_attention_impl(
             q_hbm=q_internal_remainder,
             num_batches=1,
@@ -1801,10 +2145,18 @@ def attention_segmented_cte(
             tp_out=tp_out,
             load_kv_cache_fn=load_kv_cache,
             attention_cte_fn=_attention_cte,
-            sink=sink,
-            kvp_offset=kvp_offset_sbuf,
+            sink=sink[last_batch : last_batch + 1] if sink is not None else None,
             k_pre_transposed=k_pre_transposed,
+            fp8_packed=fp8_packed,
             k_scale_sb=k_scale_sb,
+            kvp_q_offset=kvp_offset_sbuf,
+            kvp_rank_id=kvp_rank_id,
+            kvp_group_size=kvp_group_size,
+            sliding_window=sliding_window if sliding_window != None else 0,
+            kvp_cp_offset_int=kvp_cp_offset_int,
+            kvp_seg_block_offset_int=kvp_seg_block_offset_int,
+            kvp_prior_load_blocks=kvp_prior_load_blocks,
+            kvp_prior_fully_visible=kvp_prior_fully_visible,
         )
 
         # Core 1 does one extra iteration to process Core 0's active segment.
@@ -1822,18 +2174,18 @@ def attention_segmented_cte(
             extra_offset = allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.uint32)
             nisa.tensor_copy(dst=extra_offset, src=active_block_offset)
 
-            # Zero the LAST K/V tile that the extra iteration will read.
+            # Zero ALL K/V tiles that the extra iteration will read.
             # k_cache_sbuf / v_cache_sbuf still hold data from the prior-segment
             # loop. load_kv_cache writes core0_num_blocks_per_effective_seg blocks
-            # starting at tile 0 — any preceding tile is fully overwritten, and
-            # tiles beyond the consumed range (k_cache_sbuf[:core0_num_k_tiles_per_effective_seg])
-            # are sliced away. The only stale region the matmul can see is the
-            # PARTIAL tail of the last consumed tile when
-            # core0_num_blocks_per_effective_seg % num_blocks_per_k_tile != 0.
-            # Zeroing just that one tile is sufficient to bound the spurious
-            # contribution (Q·0 = 0 scores → zero numerator contribution).
-            nisa.memset(k_cache_sbuf[core0_num_k_tiles_per_effective_seg - 1][...], value=0.0)
-            nisa.memset(v_cache_sbuf[core0_num_v_tiles_per_effective_seg - 1][...], value=0.0)
+            # starting at tile 0 — when this doesn't fill all tiles (e.g. 1 block
+            # into a 4-block K tile), the unwritten portions remain stale.
+            # Zero all consumed tiles so any unwritten tail is 0, not NaN/stale.
+            for k_idx in range(core0_num_k_tiles_per_effective_seg):
+                for d_idx in range(len(k_cache_sbuf[0])):
+                    nisa.memset(k_cache_sbuf[k_idx][d_idx][...], value=0.0)
+            for v_idx in range(core0_num_v_tiles_per_effective_seg):
+                for d_idx in range(len(v_cache_sbuf[0])):
+                    nisa.memset(v_cache_sbuf[v_idx][d_idx][...], value=0.0)
 
             # Load Core 0's active KV segment.
             load_kv_cache(
@@ -1848,8 +2200,13 @@ def attention_segmented_cte(
                 core0_num_blocks_per_effective_seg,
                 allocator,
                 k_pre_transposed=k_pre_transposed,
+                fp8_packed=fp8_packed,
             )
             allocator.set_current_address(init_sbuf_addr)
+
+            extra_kv_used_len = allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.float32)
+            nisa.memset(extra_kv_used_len, value=float(core0_q_tokens))
+            inner_init_sbuf_addr = allocator.get_current_address()
 
             # Compute attention for this extra segment
             _attention_cte(
@@ -1865,10 +2222,11 @@ def attention_segmented_cte(
                 skip_output_normalization=True,
                 k_cache_sbuf=k_cache_sbuf[:core0_num_k_tiles_per_effective_seg],
                 v_cache_sbuf=v_cache_sbuf[:core0_num_v_tiles_per_effective_seg],
+                kv_used_len=extra_kv_used_len,
                 out_o_hbm=o_rem_curr_hbm,
                 out_neg_max_hbm=neg_max_rem_curr_hbm,
                 out_sum_hbm=sum_rem_curr_hbm,
-                init_sbuf_addr=init_sbuf_addr,
+                init_sbuf_addr=inner_init_sbuf_addr,
                 k_scale_sb=k_scale_sb,
             )
             allocator.set_current_address(init_sbuf_addr)
@@ -1962,62 +2320,72 @@ def attention_segmented_cte(
 
         rem_num_free2 = min(effective_grp_length, _MAX_FREE_TILES)
         rem_o_sb2 = allocator.alloc_sbuf_tensor(
-            shape=(rem_sb_p2, head_dim),
+            shape=(rem_sb_p2, d_tile_size_par_dim),
             dtype=nl.bfloat16,
-            block_dim=[effective_grp_length],
-            num_free_tiles=[rem_num_free2],
+            block_dim=[effective_grp_length, num_d_tiles],
+            num_free_tiles=[rem_num_free2, num_d_tiles],
         )
         if tp_out:
-            rem_o_tp_psum2 = nl.ndarray((head_dim, rem_sb_p2), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0))
-            rem_o_tp_sb2 = allocator.alloc_sbuf_tensor(shape=(head_dim, rem_sb_p2), dtype=nl.bfloat16)
+            rem_o_tp_psum2 = nl.ndarray(
+                (d_tile_size_par_dim, rem_sb_p2), dtype=nl.bfloat16, buffer=nl.psum, address=(0, 0)
+            )
+            rem_o_tp_sb2 = allocator.alloc_sbuf_tensor(shape=(d_tile_size_par_dim, rem_sb_p2), dtype=nl.bfloat16)
         for local_grp_i in range(effective_grp_length):
             global_grp_i = effective_grp_start + local_grp_i
             grp_start_pos = global_grp_i * 128
 
-            # Read from o_rem_prev_hbm[0] at local group offset
-            src_o_offset = local_grp_i * rem_sb_p2 * head_dim
-            nisa.dma_copy(
-                dst=rem_o_sb2[local_grp_i], src=o_rem_prev_hbm.ap(pattern=rem_o_tile_pat, offset=src_o_offset)
-            )
-            # Delayed V dequant: fold v_scale multiply into normalization tensor_scalar
-            if v_scale_sb is not None:
-                nisa.tensor_scalar(
-                    dst=rem_o_sb2[local_grp_i],
-                    data=rem_o_sb2[local_grp_i],
-                    op0=nl.multiply,
-                    operand0=rem_sum_recip_sb2[:, local_grp_i],
-                    op1=nl.multiply,
-                    operand1=v_scale_sb,
-                )
-            else:
-                nisa.tensor_scalar(
-                    dst=rem_o_sb2[local_grp_i],
-                    data=rem_o_sb2[local_grp_i],
-                    op0=nl.multiply,
-                    operand0=rem_sum_recip_sb2[:, local_grp_i],
-                )
-            # Write to result[last_batch] at global group position (or scratch
-            # on Core 1's dummy path). For Core 1's dummy path, grp_start=0
-            # and local_grp_i=0, so grp_start_pos=0 — writes to the scratch
-            # buffer's beginning, which is safe.
-            if tp_out:
-                nisa.nc_transpose(dst=rem_o_tp_psum2, data=rem_o_sb2[local_grp_i])
-                nisa.tensor_copy(dst=rem_o_tp_sb2, src=rem_o_tp_psum2)
+            for d_idx in range(num_d_tiles):
+                d_offset = d_idx * d_tile_size_par_dim
                 nisa.dma_copy(
-                    dst=result_write_target.ap(
-                        pattern=[[seqlen_q, head_dim], [1, rem_sb_p2]],
-                        offset=last_batch * head_dim * seqlen_q + grp_start_pos,
+                    dst=rem_o_sb2[local_grp_i][d_idx],
+                    src=o_rem_prev_hbm.ap(
+                        pattern=[[head_dim, rem_sb_p2], [1, d_tile_size_par_dim]],
+                        offset=local_grp_i * rem_sb_p2 * head_dim + d_offset,
                     ),
-                    src=rem_o_tp_sb2,
                 )
-            else:
-                dst_o_offset = last_batch * num_grps * rem_sb_p2 * head_dim + global_grp_i * rem_sb_p2 * head_dim
-                nisa.dma_copy(
-                    dst=result_write_target.ap(pattern=rem_o_tile_pat, offset=dst_o_offset),
-                    src=rem_o_sb2[local_grp_i],
-                )
+                # Delayed V dequant: fold v_scale multiply into normalization tensor_scalar
+                if v_scale_sb is not None:
+                    nisa.tensor_scalar(
+                        dst=rem_o_sb2[local_grp_i][d_idx],
+                        data=rem_o_sb2[local_grp_i][d_idx],
+                        op0=nl.multiply,
+                        operand0=rem_sum_recip_sb2[:, local_grp_i],
+                        op1=nl.multiply,
+                        operand1=v_scale_sb,
+                    )
+                else:
+                    nisa.tensor_scalar(
+                        dst=rem_o_sb2[local_grp_i][d_idx],
+                        data=rem_o_sb2[local_grp_i][d_idx],
+                        op0=nl.multiply,
+                        operand0=rem_sum_recip_sb2[:, local_grp_i],
+                    )
+                # Write to result[last_batch] at global group position (or scratch
+                # on Core 1's dummy path). For Core 1's dummy path, grp_start=0
+                # and local_grp_i=0, so grp_start_pos=0 — writes to the scratch
+                # buffer's beginning, which is safe.
+                if tp_out:
+                    nisa.nc_transpose(dst=rem_o_tp_psum2, data=rem_o_sb2[local_grp_i][d_idx])
+                    nisa.tensor_copy(dst=rem_o_tp_sb2, src=rem_o_tp_psum2)
+                    nisa.dma_copy(
+                        dst=result_write_target.ap(
+                            pattern=[[seqlen_q, d_tile_size_par_dim], [1, rem_sb_p2]],
+                            offset=last_batch * head_dim * seqlen_q + d_offset * seqlen_q + grp_start_pos,
+                        ),
+                        src=rem_o_tp_sb2,
+                    )
+                else:
+                    nisa.dma_copy(
+                        dst=result_write_target.ap(
+                            pattern=[[head_dim, rem_sb_p2], [1, d_tile_size_par_dim]],
+                            offset=last_batch * num_grps * rem_sb_p2 * head_dim
+                            + global_grp_i * rem_sb_p2 * head_dim
+                            + d_offset,
+                        ),
+                        src=rem_o_sb2[local_grp_i][d_idx],
+                    )
         allocator.set_current_address(rem_norm_addr)
 
-    if kvp_offset is not None:
+    if kvp_q_offset is not None:
         return result, out_neg_max_hbm, out_sum_recip_hbm
     return result
