@@ -19,6 +19,8 @@ PyTorch reference for MLP kernel.
 import math
 from typing import Optional, Protocol
 
+import neuron_dtypes as dt
+
 # nki.language is needed for the nl.float8_e4m3 custom dtype used in FP8 round-trip
 # simulation. There is no pure-PyTorch equivalent for this dtype on CPU — the numpy
 # golden reference (golden_quant_mlp) uses the same approach:
@@ -27,12 +29,21 @@ import nki.language as nl
 import numpy as np
 import torch
 
-from test.integration.nkilib.utils.test_kernel_common import norm_name2func_torch
-
-from ..utils.common_types import ActFnType, ComputationMode, NormType, QuantizationType
+from ..subkernels.norm_torch_dispatch import norm_name2func_torch
+from ..utils.common_types import (
+    ActFnType,
+    ComputationMode,
+    DtypeMode,
+    MLPGateUpWeightLayout,
+    NormType,
+    QuantizationType,
+)
 from ..utils.kernel_helpers import get_max_positive_value_for_dtype
 from ..utils.lnc_subscriptable import LncSubscriptable
 from ..utils.mx_torch_common import (
+    get_float32_exp,
+    get_mx_fp_max,
+    nc_matmul_mx_golden,
     quantize_to_mx,
     unpack_float4_x4,
     unpack_float8_e4m3fn_x4,
@@ -45,8 +56,10 @@ from .mlp_tkg.mlp_proj_mx_torch import (
 )
 from .mlp_tkg.projection_mx_constants import _pmax, _psum_fmax, _q_height, _q_width
 
-# FP8 e4m3 max representable value, derived from the canonical dtype map in kernel_helpers.
+# FP8 E4M3 max. Tests pick via ``dtype_mode`` so goldens clip to the
+# same range as the kernel.
 _FP8_E4M3_MAX = get_max_positive_value_for_dtype(nl.float8_e4m3)
+_FP8_E4M3FN_MAX = get_max_positive_value_for_dtype(nl.float8_e4m3fn)
 
 
 # Forward declaration for the module-level docstring (assigned at end of file).
@@ -183,59 +196,18 @@ def _apply_clamp(
     return x
 
 
-def _scale_with_broadcast(
-    tensor: torch.Tensor, scale: torch.Tensor, mode: ComputationMode = ComputationMode.AUTO
-) -> torch.Tensor:
-    """Multiply tensor by scale with broadcasting, matching the numpy reference's scale_with_broadcast.
-
-    Handles the dimension mismatch between 3D tensors [B, S, I] and 2D scales [128, I].
-    For TKG mode (B*S < threshold or mode==1), the scale is sliced. For CTE mode, the scale is tiled.
-
-    Args:
-        mode: ComputationMode.AUTO, ComputationMode.PREFILL or ComputationMode.DECODE
-    """
-    if tensor.dim() == 3 and scale.dim() == 2:
-        B, S, I = tensor.shape
-        if mode == ComputationMode.DECODE or (mode != ComputationMode.PREFILL and B * S <= TKG_BS_SEQLEN_THRESHOLD):
-            # TKG: scale tensor is bigger than needed, just slice
-            return tensor * scale[:S, :]
-        # CTE: tile scale to match tensor dimensions
-        tile_s = math.ceil(S / scale.shape[0])
-        tile_i = math.ceil(I / scale.shape[1])
-        tiled = scale.repeat(tile_s, tile_i)[:S, :I]
-        return tensor * tiled.unsqueeze(0)  # broadcast over batch
-    elif tensor.dim() == 3 and scale.dim() == 3:
-        return tensor * scale
-    else:
-        # 2D tensor, 2D scale
-        tile_0 = math.ceil(tensor.shape[0] / scale.shape[0])
-        tile_1 = math.ceil(tensor.shape[1] / scale.shape[1])
-        tiled = scale.repeat(tile_0, tile_1)[: tensor.shape[0], : tensor.shape[1]]
-        return tensor * tiled
-
-
-def _row_quantize(x: torch.Tensor, clip_bound: float) -> tuple:
-    """Per-row FP8 quantization: compute scale and quantize.
-
-    Returns (quantized_tensor, per_row_scale) where scale shape is [..., 1].
-    """
-    abs_max = x.abs().max(dim=-1, keepdim=True).values
-    if clip_bound is not None and clip_bound > 0:
-        abs_max = abs_max.clamp(max=clip_bound)
-        x = x.clamp(-clip_bound, clip_bound)
-    min_scale = torch.tensor(1e-5, dtype=x.dtype)
-    quant_scale = torch.max(abs_max / _FP8_E4M3_MAX, min_scale)
-    return x / quant_scale, quant_scale
-
-
-def _fp8_round_trip(tensor: torch.Tensor) -> torch.Tensor:
+def _fp8_round_trip(tensor: torch.Tensor, quant_dtype=nl.float8_e4m3) -> torch.Tensor:
     """Simulate FP8 e4m3 round-trip: cast to fp8 then back to float32.
 
-    This uses nl.float8_e4m3 (a Neuron SDK custom numpy dtype) because there is no
-    pure-PyTorch CPU equivalent. The numpy golden reference uses the same approach:
+    ``quant_dtype`` selects the FP8 variant (``nl.float8_e4m3`` for NON_OCP,
+    ``nl.float8_e4m3fn`` for OCP); using the wrong one hides real discrepancies
+    under loose tolerances.
+
+    This uses Neuron SDK custom numpy dtypes because there is no pure-PyTorch CPU
+    equivalent. The numpy golden reference uses the same approach:
         quantized.astype(quant_dtype).astype(nl.float32)
     """
-    return torch.from_numpy(tensor.numpy().astype(nl.float8_e4m3).astype(np.float32))
+    return torch.from_numpy(tensor.numpy().astype(quant_dtype).astype(np.float32))
 
 
 def _extract_precomputed_row_scale(hidden_tensor: torch.Tensor, H: int) -> tuple:
@@ -252,70 +224,162 @@ def _extract_precomputed_row_scale(hidden_tensor: torch.Tensor, H: int) -> tuple
     scale_cols = hidden_tensor[..., H:]  # [B, S, 4]
 
     # Convert float32 -> fp8 bytes -> view as float32 to reconstruct the original scale
-    scale_np = scale_cols.numpy().astype(nl.float8_e4m3)
+    scale_np = scale_cols.numpy().astype(nl.float8_e4m3fn)
     input_quant_scale = scale_np.view(np.float32)  # [B, S, 1]
     input_quant_scale = torch.from_numpy(input_quant_scale.astype(np.float32))
 
-    return quantized_input, input_quant_scale
+    return quantized_input, input_quant_scale.flatten().unsqueeze(1)
 
 
-def _static_quantize(x: torch.Tensor, quant_scale: torch.Tensor) -> torch.Tensor:
-    """Static FP8 quantization: scale input by 1/quant_scale, clamp to FP8 range."""
-    scaled = _scale_with_broadcast(x, 1.0 / quant_scale)
-    return torch.clamp(scaled, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+def _row_quantize(x: torch.Tensor, clip_bound: float, fp8_max: float = _FP8_E4M3_MAX) -> tuple:
+    """Per-row FP8 quantization: compute scale and quantize.
+
+    ``fp8_max`` selects the FP8 range (240 for NON_OCP, 448 for OCP) to match
+    the kernel's per-row scale.
+
+    Returns (quantized_tensor, per_row_scale) where scale shape is [..., 1].
+    """
+    abs_max = x.abs().max(dim=-1, keepdim=True).values
+    if clip_bound is not None and clip_bound > 0:
+        abs_max = abs_max.clamp(max=clip_bound)
+        x = x.clamp(-clip_bound, clip_bound)
+    min_scale = torch.tensor(1e-5, dtype=x.dtype)
+    quant_scale = torch.max(abs_max / fp8_max, min_scale)
+    quant_scale = quant_scale.broadcast_to(x.shape)
+    return (x / quant_scale).to(torch.float32), quant_scale.to(torch.float32)
 
 
-def _undo_mx_gate_up_w_reshape(weight: torch.Tensor) -> torch.Tensor:
-    """Undo MX gate/up weight swizzle for STATIC_MX quant."""
-    H, I = weight.shape
-    if I < _psum_fmax:
-        # Small-I path: no I-dimension swizzle was applied
+def _static_quantize(x: torch.Tensor, quant_scale: torch.Tensor, fp8_max: float = _FP8_E4M3_MAX) -> torch.Tensor:
+    """Static FP8 quantization: scale input by 1/quant_scale, clamp to FP8 range.
+
+    ``fp8_max`` selects the FP8 range (240 for NON_OCP, 448 for OCP) to match
+    the kernel's clip.
+    """
+    scaled = x / quant_scale
+    return torch.clamp(scaled, -fp8_max, fp8_max).to(torch.float32)
+
+
+def _mx_quantize(x: torch.Tensor) -> tuple:
+    """MX FP8 quantization following the trn3 microscaling speculation.
+    The MX quantization block is a 32-element subsection of the final dim of x.
+    """
+    Q_AREA = _q_height * _q_width
+    FP32_EXP_BIAS = 127
+    fp8_max = get_mx_fp_max(nl.float8_e4m3fn_x4)
+
+    # exp = get_float32_exp(x.numpy())
+    exp = get_float32_exp(x.numpy()).view(np.int32)
+    q_area_shape = x.shape[:-1] + (x.shape[-1] // Q_AREA, Q_AREA)
+    exp = exp.reshape(q_area_shape)
+    # choose 7 instead of get_mx_max_exp(nl.float8_e4m3fn_x4) because 7 is default
+    exp_max = exp.max(axis=-1) - 7
+    scale = 2.0 ** (exp_max.astype(np.int32) - FP32_EXP_BIAS)
+    scale = np.broadcast_to(np.expand_dims(scale, axis=-1), q_area_shape).reshape(x.shape)
+    scale = torch.from_numpy(scale)
+
+    q_x = torch.clamp(x / scale, -fp8_max, fp8_max)
+    return q_x.to(torch.float32), scale.to(torch.float32)
+
+
+def _undo_mx_gate_up_w_reshape(weight: torch.Tensor, layout: MLPGateUpWeightLayout) -> torch.Tensor:
+    """Undo MX gate/up weight swizzle for MX quant."""
+    if layout == MLPGateUpWeightLayout.H_X4_INNERMOST:
+        # fp8[128_H, H/512, I/512, 4_I, 128_I, 4_H]
+        shape = list(weight.shape)
+        H = shape[0] * shape[1] * shape[5]
+        I = shape[2] * shape[3] * shape[4]
+        weight = weight.reshape(shape).permute(1, 0, 5, 2, 4, 3).reshape((H, I))
         return weight
-    H_OVER_512 = H // _psum_fmax
-    H_128 = (H // H_OVER_512) // 4
-    H_2 = 2
-    I_OVER_512 = I // _psum_fmax
-    I_128 = (I // I_OVER_512) // 4
-    I_4 = 4
-    return (
-        weight.reshape(H_128, H_OVER_512, I_OVER_512, I_4, I_128, H_2, H_2).permute(5, 1, 0, 6, 2, 4, 3).reshape(H, I)
-    )
+    elif layout == MLPGateUpWeightLayout.H_X4_MIDDLE:
+        shape = list(weight.shape)
+        H = shape[0] * shape[1] * shape[5]
+        I = shape[2] * shape[3] * shape[4]
+        weight = weight.reshape(shape).permute(1, 5, 0, 2, 4, 3).reshape((H, I))
+        return weight
+    elif layout == MLPGateUpWeightLayout.CONTIGUOUS:
+        return weight.to(torch.float32)
 
 
 def _undo_mx_down_w_reshape(weight: torch.Tensor) -> torch.Tensor:
-    """Undo MX down weight swizzle for STATIC_MX quant."""
-    I, H = weight.shape
-    if I < _psum_fmax:
-        # Small-I path: no I-dimension swizzle was applied
-        return weight
-    I_OVER_512 = I // _psum_fmax
-    I_128 = (I // I_OVER_512) // 4
-    I_4 = 4
-    return weight.reshape(I_128, I_OVER_512, H, I_4).permute(1, 0, 3, 2).reshape(I, H)
+    """Undo MX down weight swizzle for MX quant."""
+    # fp8[128_I, I/512, H, 4_I]
+    shape = list(weight.shape)
+    H = shape[2]
+    I = shape[0] * shape[1] * shape[3]
+    weight = weight.reshape(shape).permute(1, 0, 3, 2).reshape((I, H))
+    return weight
+
+
+def _undo_mx_gate_up_sc_reshape(scale: torch.Tensor, layout: MLPGateUpWeightLayout, H: int, I: int) -> torch.Tensor:
+    """Undo MX gate/up scale swizzle for MX quant and broadcast to full [H, I]."""
+    # Gate/up scale shape: [16, H/512, I/512, 4, 128] (physical I order)
+    # Undo the transpose to recover logical I order: (4, 128) -> (128, 4) -> flatten to 512 per tile
+    FP32_EXP_BIAS = 127.0
+    Q_AREA = _q_height * _q_width
+    n_H_scales = scale.shape[0]  # 16
+    n_H512 = scale.shape[1]  # H/512
+    if layout == MLPGateUpWeightLayout.H_X4_INNERMOST:
+        scale_unswizzled = (
+            scale.permute(1, 0, 2, 4, 3)
+            .reshape(n_H512, n_H_scales, 1, -1)
+            .broadcast_to((n_H512, n_H_scales, Q_AREA, I))
+            .reshape(H, I)
+            .float()
+        )
+    elif layout == MLPGateUpWeightLayout.H_X4_MIDDLE:
+        scale_unswizzled = (
+            scale.permute(1, 0, 2, 4, 3)
+            .reshape(n_H512, 1, n_H_scales, 1, -1)
+            .broadcast_to((n_H512, _q_width, n_H_scales, _q_height, I))
+            .reshape(H, I)
+            .float()
+        )
+    return torch.pow(2.0, scale_unswizzled - FP32_EXP_BIAS)
+
+
+def _undo_mx_down_sc_reshape(scale: torch.Tensor, H: int, I: int) -> torch.Tensor:
+    """Broadcase MX down scale to full [I, H]."""
+    FP32_EXP_BIAS = 127.0
+    n_I_scales, n_I512_down, _ = scale.shape  # [16, I/512, H]
+    Q_AREA = _q_height * _q_width
+    scale_broadcasted = (
+        scale.permute((1, 0, 2)).unsqueeze(2).broadcast_to((n_I512_down, n_I_scales, Q_AREA, H)).reshape(I, H).float()
+    )
+    return torch.pow(2.0, scale_broadcasted - FP32_EXP_BIAS)
+
+
+def _is_tkg(bxs: int, mode: ComputationMode):
+    if mode == ComputationMode.AUTO:
+        return bxs <= TKG_BS_SEQLEN_THRESHOLD
+    else:
+        return mode == ComputationMode.DECODE
 
 
 def _mlp_ref_standard(
-    hidden,
-    gate_w,
-    up_w,
-    down_w,
-    quantization_type,
-    gate_w_scale,
-    up_w_scale,
-    down_w_scale,
-    gate_up_in_scale,
-    down_in_scale,
-    quant_clipping_bound,
-    gate_proj_bias_tensor,
-    up_proj_bias_tensor,
-    down_proj_bias_tensor,
-    skip_gate_proj,
-    activation_fn,
-    gate_clamp_upper_limit,
-    gate_clamp_lower_limit,
-    up_clamp_upper_limit,
-    up_clamp_lower_limit,
-    mode=ComputationMode.AUTO,
+    hidden: torch.Tensor,
+    gate_w: torch.Tensor,
+    up_w: torch.Tensor,
+    down_w: torch.Tensor,
+    quantization_type: QuantizationType,
+    gate_w_scale: Optional[torch.Tensor],
+    up_w_scale: Optional[torch.Tensor],
+    down_w_scale: Optional[torch.Tensor],
+    gate_up_in_scale: Optional[torch.Tensor],
+    down_in_scale: Optional[torch.Tensor],
+    quant_clipping_bound: Optional[float],
+    gate_proj_bias_tensor: Optional[torch.Tensor],
+    up_proj_bias_tensor: Optional[torch.Tensor],
+    down_proj_bias_tensor: Optional[torch.Tensor],
+    skip_gate_proj: bool,
+    activation_fn: ActFnType,
+    gate_clamp_upper_limit: Optional[float],
+    gate_clamp_lower_limit: Optional[float],
+    up_clamp_upper_limit: Optional[float],
+    up_clamp_lower_limit: Optional[float],
+    gate_up_w_layout: MLPGateUpWeightLayout,
+    mode: ComputationMode = ComputationMode.AUTO,
+    fp8_max: float = _FP8_E4M3_MAX,
+    fp8_round_trip_dtype=nl.float8_e4m3,
 ):
     """Standard MLP projection path for NONE / ROW / STATIC / STATIC_MX quantization.
 
@@ -326,121 +390,143 @@ def _mlp_ref_standard(
     Args:
         mode: ComputationMode.AUTO, ComputationMode.PREFILL or ComputationMode.DECODE.
     """
-    # For CTE STATIC_MX: undo MX weight swizzle before matmul
+    # For CTE STATIC_MX and ROW_MX: undo MX weight swizzle before matmul
     # (CTE receives swizzled 2D weights that need to be unswizzled for the golden ref)
-    if quantization_type == QuantizationType.STATIC_MX:
-        gate_w = _undo_mx_gate_up_w_reshape(gate_w)
-        up_w = _undo_mx_gate_up_w_reshape(up_w)
+    if quantization_type.is_mx():
+        gate_w = _undo_mx_gate_up_w_reshape(gate_w, gate_up_w_layout)
+        up_w = _undo_mx_gate_up_w_reshape(up_w, gate_up_w_layout)
         down_w = _undo_mx_down_w_reshape(down_w)
 
     # --- Determine whether to quantize activations ---
     # ROW quant always quantizes activations (both TKG and CTE).
     # STATIC/STATIC_MX only quantize in CTE mode (large BxS or mode==2).
     # NONE quant never quantizes.
-    is_static_quant = quantization_type in (QuantizationType.STATIC, QuantizationType.STATIC_MX)
     B, S = hidden.shape[0], hidden.shape[1]
-    is_tkg = mode == ComputationMode.DECODE or (mode != ComputationMode.PREFILL and B * S <= TKG_BS_SEQLEN_THRESHOLD)
-    quantize_activations = not (quantization_type == QuantizationType.NONE or (is_static_quant and is_tkg))
-
-    gate_w_scale_t = gate_w_scale.to(torch.float32) if gate_w_scale is not None else None
-    up_w_scale_t = up_w_scale.to(torch.float32) if up_w_scale is not None else None
-    down_w_scale_t = down_w_scale.to(torch.float32) if down_w_scale is not None else None
-    gate_up_in_scale_t = gate_up_in_scale.to(torch.float32) if gate_up_in_scale is not None else None
-    down_in_scale_t = down_in_scale.to(torch.float32) if down_in_scale is not None else None
+    H, I = up_w.shape[0], up_w.shape[1]
+    BxS = B * S
+    is_tkg = _is_tkg(BxS, mode)
+    is_llama3_70b_specialized_config = all(
+        [
+            B == 256,
+            S == 1,
+            H == 8192,
+            I == 3584,
+            quantization_type == QuantizationType.STATIC,
+        ]
+    )
+    quantize_activations = quantization_type != QuantizationType.NONE and (
+        not is_tkg or quantization_type.is_logical_row() or is_llama3_70b_specialized_config
+    )
 
     # Prepare input and per-row scale (ROW quant only)
-    if quantization_type == QuantizationType.ROW:
-        H_gate = gate_w.shape[0]
+    if quantization_type.is_logical_row():
+        H_up = up_w.shape[0]
         # Note: we detect pre-quantized input via shape, not dtype, because
         # torch_ref_wrapper converts fp8 inputs to float32 before they reach here.
         # Pre-quantized ROW input has shape [B, S, H+4] (4 extra fp8 bytes encoding
         # a per-row fp32 scale); non-pre-quantized input has shape [B, S, H].
-        is_input_prequantized = hidden.shape[-1] > H_gate
+        is_input_prequantized = hidden.shape[-1] > H_up
         if is_input_prequantized:
-            if hidden.shape[-1] != H_gate + 4:
+            if hidden.shape[-1] != H_up + 4:
                 raise ValueError(
-                    f"Pre-quantized ROW input must include 4 scale bytes: expected {H_gate + 4}, got {hidden.shape[-1]}"
+                    f"Pre-quantized ROW input must include 4 scale bytes: expected {H_up + 4}, got {hidden.shape[-1]}"
                 )
             # Pre-quantized input: extract quantized values and embedded per-row scale
-            proj_input, row_in_scale = _extract_precomputed_row_scale(hidden, H_gate)
+            hidden, gate_up_in_scale = _extract_precomputed_row_scale(hidden, H_up)
         else:
-            proj_input, row_in_scale = _row_quantize(hidden, quant_clipping_bound)
-    else:
-        proj_input = hidden
-        row_in_scale = None
-
-    def _project(inp, weight, w_scale, in_scale):
-        """Perform projection with optional quantization scaling.
-
-        Args:
-            inp: Input tensor
-            weight: Weight matrix
-            w_scale: Weight dequantization scale (None for NONE quant)
-            in_scale: Input scale — per-row scale for ROW quant, static input
-                scale for STATIC/STATIC_MX CTE mode, None otherwise.
-
-        Scaling behavior:
-        - No scales (NONE or TKG STATIC): inp @ weight
-        - Weight scale only (TKG with quant): (inp @ weight) * w_scale
-        - ROW: (inp @ weight) * w_scale * in_scale
-        - STATIC CTE: (inp @ weight) * (w_scale * in_scale)
-        """
-        if w_scale is None and in_scale is None:
-            return inp @ weight
-        if in_scale is None:
-            return _scale_with_broadcast(inp @ weight, w_scale, mode)
+            hidden, gate_up_in_scale = _row_quantize(hidden.reshape(BxS, H), quant_clipping_bound, fp8_max=fp8_max)
+            gate_up_in_scale = gate_up_in_scale.reshape(BxS, H)
         if quantization_type == QuantizationType.ROW:
-            return _scale_with_broadcast(
-                _scale_with_broadcast(inp @ weight, w_scale, mode),
-                in_scale,
-                mode,
-            )
-        return _scale_with_broadcast(inp @ weight, w_scale * in_scale, mode)
+            gate_w_scale = gate_w_scale[0] if not skip_gate_proj else None
+            up_w_scale = up_w_scale[0]
+        elif quantization_type == QuantizationType.ROW_MX:
+            # Undo MX row weight scale transpose
+            gate_w_scale = gate_w_scale.permute((1, 0, 2)).flatten() if not skip_gate_proj else None
+            up_w_scale = up_w_scale.permute((1, 0, 2)).flatten()
+        down_w_scale = down_w_scale[0]
 
-    # Determine input scale for gate/up projections
-    if not quantize_activations:
-        gate_up_in = None
-    elif quantization_type == QuantizationType.ROW:
-        gate_up_in = row_in_scale
-    elif is_static_quant:
-        gate_up_in = gate_up_in_scale_t
+        gate_w_scale = gate_w_scale.broadcast_to((H, I)).to(torch.float32) if not skip_gate_proj else None
+        up_w_scale = up_w_scale.broadcast_to((H, I)).to(torch.float32)
+        down_w_scale = down_w_scale.broadcast_to((I, H)).to(torch.float32)
+        gate_up_in_scale = gate_up_in_scale.broadcast_to((BxS, H)).to(torch.float32)
+    elif quantization_type.is_logical_static():
+        gate_w_scale = torch.full(size=(H, I), fill_value=gate_w_scale[0, 0]) if not skip_gate_proj else None
+        up_w_scale = torch.full(size=(H, I), fill_value=up_w_scale[0, 0])
+        down_w_scale = torch.full(size=(I, H), fill_value=down_w_scale[0, 0])
+        gate_up_in_scale_fill_value = gate_up_in_scale[0, 0] if quantize_activations else 1
+        gate_up_in_scale = torch.full(size=(BxS, H), fill_value=gate_up_in_scale_fill_value)
+        down_in_scale_fill_value = down_in_scale[0, 0] if quantize_activations else 1
+        down_in_scale = torch.full(size=(BxS, I), fill_value=down_in_scale_fill_value)
+        if quantize_activations and is_tkg:
+            hidden = _fp8_round_trip(
+                _static_quantize(hidden.reshape(BxS, H), gate_up_in_scale, fp8_max=fp8_max),
+                quant_dtype=fp8_round_trip_dtype,
+            )
+    elif quantization_type == QuantizationType.MX:
+        gate_w_scale = _undo_mx_gate_up_sc_reshape(gate_w_scale, gate_up_w_layout, H, I) if not skip_gate_proj else None
+        up_w_scale = _undo_mx_gate_up_sc_reshape(up_w_scale, gate_up_w_layout, H, I)
+        down_w_scale = _undo_mx_down_sc_reshape(down_w_scale, H, I)
+        H_up = up_w.shape[0]
+        is_input_prequantized = hidden.shape[-1] > H_up
+        if is_input_prequantized:
+            if hidden.shape[-1] != H_up + 4:
+                raise ValueError(
+                    f"Pre-quantized ROW input must include 4 scale bytes: expected {H_up + 4}, got {hidden.shape[-1]}"
+                )
+            hidden, gate_up_in_scale = _extract_precomputed_row_scale(hidden, H_up)
+            gate_up_in_scale = gate_up_in_scale.broadcast_to((BxS, H)).to(torch.float32)
     else:
-        gate_up_in = None
+        gate_w_scale = torch.ones(H, I)
+        up_w_scale = torch.ones(H, I)
+        down_w_scale = torch.ones(I, H)
+        gate_up_in_scale = torch.ones(BxS, H)
+        down_in_scale = torch.ones(BxS, I)
+
+    hidden = hidden.reshape(BxS, H)
+
+    gate_b = (
+        gate_proj_bias_tensor.broadcast_to((BxS, I)).to(torch.float32)
+        if gate_proj_bias_tensor is not None
+        else torch.zeros(BxS, I)
+    )
+    up_b = (
+        up_proj_bias_tensor.broadcast_to((BxS, I)).to(torch.float32)
+        if up_proj_bias_tensor is not None
+        else torch.zeros(BxS, I)
+    )
+    down_b = (
+        down_proj_bias_tensor.broadcast_to((BxS, H)).to(torch.float32)
+        if down_proj_bias_tensor is not None
+        else torch.zeros(BxS, H)
+    )
 
     # --- Gate/Up projections ---
     if not skip_gate_proj:
-        gate_out = _project(proj_input, gate_w, gate_w_scale_t, gate_up_in)
-        if gate_proj_bias_tensor is not None:
-            gate_out = gate_out + gate_proj_bias_tensor.to(torch.float32)
+        gate_out = (hidden * gate_up_in_scale) @ (gate_w * gate_w_scale) + gate_b
         gate_out = _apply_clamp(gate_out, gate_clamp_upper_limit, gate_clamp_lower_limit)
 
-        up_out = _project(proj_input, up_w, up_w_scale_t, gate_up_in)
-        if up_proj_bias_tensor is not None:
-            up_out = up_out + up_proj_bias_tensor.to(torch.float32)
+        up_out = (hidden * gate_up_in_scale) @ (up_w * up_w_scale) + up_b
         up_out = _apply_clamp(up_out, up_clamp_upper_limit, up_clamp_lower_limit)
 
         intermediate = _apply_activation(gate_out, activation_fn) * up_out
     else:
-        up_out = _project(proj_input, up_w, up_w_scale_t, gate_up_in)
-        if up_proj_bias_tensor is not None:
-            up_out = up_out + up_proj_bias_tensor.to(torch.float32)
+        up_out = (hidden * gate_up_in_scale) @ (up_w * up_w_scale) + up_b
         up_out = _apply_clamp(up_out, up_clamp_upper_limit, up_clamp_lower_limit)
         intermediate = _apply_activation(up_out, activation_fn)
 
-    # --- Down projection ---
-    if not quantize_activations:
-        output = _project(intermediate, down_w, down_w_scale_t, None)
-    else:
-        if quantization_type == QuantizationType.ROW:
-            quantized_inter, inter_quant_scale = _row_quantize(intermediate, quant_clipping_bound)
-            quantized_inter = _fp8_round_trip(quantized_inter)
-            output = _project(quantized_inter, down_w, down_w_scale_t, inter_quant_scale)
-        else:
-            quantized_inter = _fp8_round_trip(_static_quantize(intermediate, down_in_scale_t))
-            output = _project(quantized_inter, down_w, down_w_scale_t, down_in_scale_t)
+    # --- Quantization ---
+    if quantize_activations:
+        if quantization_type == QuantizationType.MX or (quantization_type == QuantizationType.ROW_MX and not is_tkg):
+            intermediate, down_in_scale = _mx_quantize(intermediate)
+            fp8_round_trip_dtype = nl.float8_e4m3fn
+        elif quantization_type.is_logical_row():
+            intermediate, down_in_scale = _row_quantize(intermediate, quant_clipping_bound, fp8_max=fp8_max)
+        elif quantization_type.is_logical_static():
+            intermediate = _static_quantize(intermediate, down_in_scale, fp8_max=fp8_max)
+        intermediate = _fp8_round_trip(intermediate, quant_dtype=fp8_round_trip_dtype)
 
-    if down_proj_bias_tensor is not None:
-        output = output + down_proj_bias_tensor.to(torch.float32)
+    # --- Down projection ---
+    output = (intermediate * down_in_scale) @ (down_w * down_w_scale) + down_b
 
     return output
 
@@ -523,12 +609,70 @@ def _mx_reshape_hidden_4d_consecutive(hidden_flat, H):
     return hidden_4d, T_padded, n_H512
 
 
+def _mx_reshape_hidden_4d_contiguous(hidden_flat, H):
+    """Reshape hidden to 4D layout with contiguous-4 H packing.
+
+    Uses the contiguous-4 H packing convention where 4 adjacent H values are
+    packed into one x4 element:
+        H index at (p, h512, t, q) = 512*h512 + 4*p + q   (stride-1)
+
+    From [BxS, H]:
+        reshape(BxS, n_H512, _pmax, _q_width).transpose(2, 1, 0, 3)
+        → [_pmax, n_H512, BxS, _q_width]
+    where q at (p, h512, t, q) gives H index 512*h512 + 4*p + q.
+
+    This matches _fp8_to_gate_up_x4(contiguous_x4=True) weight packing.
+    """
+    BxS = hidden_flat.shape[0]
+    n_H512 = H // (_pmax * _q_width)
+    T_padded = math.ceil(BxS / 4) * 4
+
+    hidden_np = hidden_flat.numpy()
+    # [BxS, H] → [BxS, n_H512, 128, 4] → transpose → [128, n_H512, BxS, 4]
+    hidden_4d = hidden_np.reshape(BxS, n_H512, _pmax, _q_width).transpose(2, 1, 0, 3)
+    if T_padded > BxS:
+        padded = np.zeros((_pmax, n_H512, T_padded, _q_width), dtype=hidden_4d.dtype)
+        padded[:, :, :BxS, :] = hidden_4d
+        hidden_4d = padded
+
+    return hidden_4d, T_padded, n_H512
+
+
+def _convert_6d_weight_to_x4(weight_6d, I):
+    """Convert 6D scalar fp8 weight [128, n_H512, n_I512, 4, 128, 4] to 3D x4 [128, n_H512, I_padded].
+
+    Mirrors the kernel's reshape+view conversion. The trailing dim-4 becomes the x4 pack.
+    I_padded is derived from the shape (may be larger than I due to 512-alignment padding).
+    """
+    import neuron_dtypes as dt
+
+    n_H512 = weight_6d.shape[1]
+    I_padded = weight_6d.shape[2] * weight_6d.shape[3] * weight_6d.shape[4]
+    # [128, n_H512, n_I512, 4, 128, 4] → [128, n_H512, I_padded*4]
+    flat = weight_6d.reshape(_pmax, n_H512, I_padded * _q_width)
+    # Pack trailing 4 into x4: reshape to [..., I_padded, 4] then static_cast
+    grouped = flat.reshape(_pmax, n_H512, I_padded, _q_width)
+    return dt.static_cast(grouped.astype(np.float32), nl.float8_e4m3fn_x4).reshape(_pmax, n_H512, I_padded)
+
+
+def _convert_4d_down_weight_to_x4(weight_4d, I, H):
+    """Convert 4D scalar fp8 down weight [128_I, n_I512, H, 4] to 3D x4 [128_I, n_I512, H].
+
+    Mirrors the kernel's reshape+view conversion. The trailing dim-4 becomes the x4 pack.
+    """
+    import neuron_dtypes as dt
+
+    p_I = weight_4d.shape[0]
+    n_I512 = weight_4d.shape[1]
+    # [p_I, n_I512, H, 4] → pack trailing 4 into x4
+    return dt.static_cast(weight_4d.astype(np.float32), nl.float8_e4m3fn_x4).reshape(p_I, n_I512, H)
+
+
 def _mx_gate_up_matmul_and_shuffle(hidden_x4, hidden_dummy_scale, weight_x4, H, I, T_padded):
     """Shared: gate/up matmul with nc_matmul_mx_golden + I-tile shuffle.
 
     Returns raw result in tiled layout [_pmax, n_I512, T_padded, 4] BEFORE dequant.
     """
-    from test.utils.mx_utils import nc_matmul_mx_golden
 
     n_H512 = H // (_pmax * _q_width)
     w = weight_x4.transpose(1, 0, 2).reshape((H // _q_width, I))
@@ -568,7 +712,6 @@ def _mx_add_bias(res_shfl, bias, I):
 
 def _mx_down_proj_matmul(inter_x4, down_proj_weights_tensor, H, I, T_padded):
     """Shared: down projection tile loop with nc_matmul_mx_golden. Returns raw result BEFORE dequant."""
-    from test.utils.mx_utils import nc_matmul_mx_golden
 
     n_I512 = math.ceil(I / _psum_fmax)
     H1 = H // _pmax
@@ -633,20 +776,33 @@ def _mlp_ref_row_mx(
     gate_clamp_lower_limit,
     up_clamp_upper_limit,
     up_clamp_lower_limit,
+    use_contiguous_x4_gate_up=False,
 ):
     """ROW_MX quantization path: per-token row-wise dynamic quantization with dummy MX scales."""
     import ml_dtypes
-    import neuron_dtypes as dt
 
     B, S, H = hidden_tensor.shape
     I = gate_proj_weights_tensor.shape[-1]
+    # For 6D scalar fp8 weights, derive real I from down weight shape
+    if hasattr(gate_proj_weights_tensor, 'ndim') and gate_proj_weights_tensor.ndim == 6:
+        p_I = down_proj_weights_tensor.shape[0]
+        I = (
+            p_I * _q_width
+            if p_I < _pmax
+            else gate_proj_weights_tensor.shape[2]
+            * gate_proj_weights_tensor.shape[3]
+            * gate_proj_weights_tensor.shape[4]
+        )
     BxS = B * S
     fp8_max = 448.0  # max for float8_e4m3fn (OCP, no NaN — matches kernel's row_quantization dtype)
     bf16 = ml_dtypes.bfloat16
     MINVAL = 1e-5
 
     hidden_flat = _mx_fused_add_and_norm(hidden_tensor, fused_add_tensor, gamma, normalization_type, norm_bias, eps)
-    hidden_4d, T_padded, n_H512 = _mx_reshape_hidden_4d_consecutive(hidden_flat, H)
+    if use_contiguous_x4_gate_up:
+        hidden_4d, T_padded, n_H512 = _mx_reshape_hidden_4d_contiguous(hidden_flat, H)
+    else:
+        hidden_4d, T_padded, n_H512 = _mx_reshape_hidden_4d_consecutive(hidden_flat, H)
 
     def row_quant_to_x4(data_4d):
         P, n_tiles, T, Q = data_4d.shape
@@ -662,6 +818,28 @@ def _mlp_ref_row_mx(
 
     hidden_x4, input_dequant_scale = row_quant_to_x4(hidden_4d)
     hidden_dummy_scale = np.full((_pmax // _q_height, hidden_x4.shape[1]), 127, dtype=np.uint8)
+
+    # Convert 6D scalar fp8 weights to 3D x4 if needed (slice to real I after padding)
+    if hasattr(gate_proj_weights_tensor, 'ndim') and gate_proj_weights_tensor.ndim == 6:
+        gate_np = (
+            gate_proj_weights_tensor.numpy()
+            if isinstance(gate_proj_weights_tensor, torch.Tensor)
+            else np.asarray(gate_proj_weights_tensor)
+        )
+        up_np = (
+            up_proj_weights_tensor.numpy()
+            if isinstance(up_proj_weights_tensor, torch.Tensor)
+            else np.asarray(up_proj_weights_tensor)
+        )
+        gate_proj_weights_tensor = _convert_6d_weight_to_x4(gate_np, I)[:, :, :I]
+        up_proj_weights_tensor = _convert_6d_weight_to_x4(up_np, I)[:, :, :I]
+    if hasattr(down_proj_weights_tensor, 'ndim') and down_proj_weights_tensor.ndim == 4:
+        down_np = (
+            down_proj_weights_tensor.numpy()
+            if isinstance(down_proj_weights_tensor, torch.Tensor)
+            else np.asarray(down_proj_weights_tensor)
+        )
+        down_proj_weights_tensor = _convert_4d_down_weight_to_x4(down_np, I, H)
 
     def gate_up_proj_row_mx(weight_x4, w_dequant_scale, bias):
         res_shfl = _mx_gate_up_matmul_and_shuffle(hidden_x4, hidden_dummy_scale, weight_x4, H, I, T_padded)
@@ -726,6 +904,7 @@ def _mlp_ref_static_mx(
     gate_clamp_lower_limit,
     up_clamp_upper_limit,
     up_clamp_lower_limit,
+    use_contiguous_x4_gate_up=False,
 ):
     """STATIC_MX quantization path for MLP torch reference.
 
@@ -741,12 +920,25 @@ def _mlp_ref_static_mx(
 
     B, S, H = hidden_tensor.shape
     I = gate_proj_weights_tensor.shape[-1]
+    # For 6D scalar fp8 weights, derive real I from down weight shape
+    if hasattr(gate_proj_weights_tensor, 'ndim') and gate_proj_weights_tensor.ndim == 6:
+        p_I = down_proj_weights_tensor.shape[0]
+        I = (
+            p_I * _q_width
+            if p_I < _pmax
+            else gate_proj_weights_tensor.shape[2]
+            * gate_proj_weights_tensor.shape[3]
+            * gate_proj_weights_tensor.shape[4]
+        )
     BxS = B * S
     fp8_max = 448.0  # max for float8_e4m3fn_x4
     bf16 = ml_dtypes.bfloat16
 
     hidden_flat = _mx_fused_add_and_norm(hidden_tensor, fused_add_tensor, gamma, normalization_type, norm_bias, eps)
-    hidden_4d, T_padded, n_H512 = _mx_reshape_hidden_4d_consecutive(hidden_flat, H)
+    if use_contiguous_x4_gate_up:
+        hidden_4d, T_padded, n_H512 = _mx_reshape_hidden_4d_contiguous(hidden_flat, H)
+    else:
+        hidden_4d, T_padded, n_H512 = _mx_reshape_hidden_4d_consecutive(hidden_flat, H)
     hidden_mx_flat = hidden_4d.reshape(_pmax, -1)
 
     if isinstance(gate_up_in_scale, torch.Tensor):
@@ -759,10 +951,31 @@ def _mlp_ref_static_mx(
     data_bf16 = hidden_mx_flat.astype(bf16)
     scaled = (data_bf16.astype(np.float32) * quant_scale).astype(bf16)
     scaled = np.clip(scaled, bf16(-fp8_max), bf16(fp8_max))
-    import neuron_dtypes as dt
 
     hidden_x4 = dt.static_cast(scaled.astype(np.float32), nl.float8_e4m3fn_x4)
     hidden_dummy_scale = np.full((_pmax // _q_height, hidden_x4.shape[1]), 127, dtype=np.uint8)
+
+    # Convert 6D scalar fp8 weights to 3D x4 if needed (slice to real I after padding)
+    if hasattr(gate_proj_weights_tensor, 'ndim') and gate_proj_weights_tensor.ndim == 6:
+        gate_np = (
+            gate_proj_weights_tensor.numpy()
+            if isinstance(gate_proj_weights_tensor, torch.Tensor)
+            else np.asarray(gate_proj_weights_tensor)
+        )
+        up_np = (
+            up_proj_weights_tensor.numpy()
+            if isinstance(up_proj_weights_tensor, torch.Tensor)
+            else np.asarray(up_proj_weights_tensor)
+        )
+        gate_proj_weights_tensor = _convert_6d_weight_to_x4(gate_np, I)[:, :, :I]
+        up_proj_weights_tensor = _convert_6d_weight_to_x4(up_np, I)[:, :, :I]
+    if hasattr(down_proj_weights_tensor, 'ndim') and down_proj_weights_tensor.ndim == 4:
+        down_np = (
+            down_proj_weights_tensor.numpy()
+            if isinstance(down_proj_weights_tensor, torch.Tensor)
+            else np.asarray(down_proj_weights_tensor)
+        )
+        down_proj_weights_tensor = _convert_4d_down_weight_to_x4(down_np, I, H)
 
     def _gate_up_proj_static_mx(weight_x4, w_dequant_scale, bias, in_dequant_scale):
         res_shfl = _mx_gate_up_matmul_and_shuffle(hidden_x4, hidden_dummy_scale, weight_x4, H, I, T_padded)
@@ -1003,6 +1216,7 @@ def _mlp_torch_ref_impl(
     use_tkg_gate_up_proj_column_tiling=True,
     use_tkg_down_proj_column_tiling=True,
     use_tkg_down_proj_optimized_layout=False,
+    use_contiguous_x4_gate_up=False,
     gate_clamp_upper_limit=None,
     gate_clamp_lower_limit=None,
     up_clamp_upper_limit=None,
@@ -1010,32 +1224,27 @@ def _mlp_torch_ref_impl(
     force_cte_mode=False,
     mode=ComputationMode.AUTO,
     sbm=None,
+    mx_dummy_scale_hbm=None,  # noqa: ARG001 — hardware-only buffer, kernel-side parity
     transposed_in=False,
     transposed_out=False,
-    **kwargs,
+    # FP8 E4M3 dtype for STATIC / ROW quant ref (matches kernel's allocation).
+    # NON_OCP (default) → 240 clip, OCP → 448.
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
 ) -> dict:
     # --- Input validation ---
+    is_tkg = _is_tkg(hidden_tensor.shape[0] * hidden_tensor.shape[1], mode)
     if normalization_type in (NormType.RMS_NORM, NormType.LAYER_NORM):
         if normalization_weights_tensor is None:
             raise ValueError(f"normalization_weights_tensor required when normalization_type is {normalization_type}")
-    if quantization_type in (
-        QuantizationType.ROW,
-        QuantizationType.STATIC,
-        QuantizationType.STATIC_MX,
-        QuantizationType.ROW_MX,
-    ):
+    if quantization_type.is_logical_static() or quantization_type.is_logical_row():
         if gate_w_scale is None:
             raise ValueError(f"gate_w_scale required for {quantization_type} quantization")
         if up_w_scale is None:
             raise ValueError(f"up_w_scale required for {quantization_type} quantization")
         if down_w_scale is None:
             raise ValueError(f"down_w_scale required for {quantization_type} quantization")
-    if quantization_type in (QuantizationType.STATIC, QuantizationType.STATIC_MX):
-        B_val, S_val = hidden_tensor.shape[0], hidden_tensor.shape[1]
-        if mode != ComputationMode.DECODE and (
-            mode == ComputationMode.PREFILL or B_val * S_val > TKG_BS_SEQLEN_THRESHOLD
-        ):
-            # CTE mode requires input scales
+        if quantization_type.is_logical_static():
             if gate_up_in_scale is None:
                 raise ValueError(f"gate_up_in_scale required for {quantization_type} in CTE mode")
             if down_in_scale is None:
@@ -1056,28 +1265,24 @@ def _mlp_torch_ref_impl(
     else:
         hidden = hidden_tensor.to(torch.float32)
     # Detect STATIC_MX mode: TKG uses 3D x4-packed numpy weights, CTE uses 2D torch weights
-    _is_static_mx_tkg = (
-        quantization_type == QuantizationType.STATIC_MX
-        and hasattr(gate_proj_weights_tensor, 'ndim')
-        and gate_proj_weights_tensor.ndim == 3
-    )
-    _is_row_mx_tkg = quantization_type == QuantizationType.ROW_MX
-    if quantization_type == QuantizationType.MX or _is_static_mx_tkg or _is_row_mx_tkg:
-        gate_w = None  # MX/TKG-STATIC_MX path uses gate_proj_weights_tensor directly (x4-packed numpy)
-        up_w = None
-        down_w = None
-    else:
-        gate_w = gate_proj_weights_tensor.to(torch.float32)
-        up_w = up_proj_weights_tensor.to(torch.float32)
-        down_w = down_proj_weights_tensor.to(torch.float32)
+    _is_mx_tkg = quantization_type == QuantizationType.MX and is_tkg
+    _is_static_mx_tkg = quantization_type == QuantizationType.STATIC_MX and is_tkg
+    _is_row_mx_tkg = quantization_type == QuantizationType.ROW_MX and is_tkg
+    if quantization_type.is_mx() and not is_tkg:
+        # MX/TKG-STATIC_MX path uses gate_proj_weights_tensor directly (x4-packed numpy)
+        gate_proj_weights_tensor = gate_proj_weights_tensor.to(torch.float32)
+        up_proj_weights_tensor = up_proj_weights_tensor.to(torch.float32)
+        down_proj_weights_tensor = down_proj_weights_tensor.to(torch.float32)
     gamma = normalization_weights_tensor.to(torch.float32) if normalization_weights_tensor is not None else None
     norm_bias = normalization_bias_tensor.to(torch.float32) if normalization_bias_tensor is not None else None
 
     # Undo optimized down weight layout if needed
     if use_tkg_down_proj_optimized_layout:
         LNC = mlp_torch_ref.lnc
-        I, H = down_w.shape
-        down_w = down_w.reshape((I, LNC, H // 128 // LNC, 128)).permute(0, 1, 3, 2).reshape((I, H))
+        I, H = down_proj_weights_tensor.shape
+        down_proj_weights_tensor = (
+            down_proj_weights_tensor.reshape((I, LNC, H // 128 // LNC, 128)).permute(0, 1, 3, 2).reshape((I, H))
+        )
 
     # Fused add: add residual to hidden before normalization
     add_out = None
@@ -1089,7 +1294,7 @@ def _mlp_torch_ref_impl(
 
     # Normalization (non-MX paths use norm_name2func_torch from test_kernel_common;
     # MX/TKG-STATIC_MX path handles normalization separately due to special layout requirements)
-    if quantization_type not in (QuantizationType.MX,) and not _is_static_mx_tkg and not _is_row_mx_tkg:
+    if not (_is_mx_tkg or _is_static_mx_tkg or _is_row_mx_tkg):
         # For RMS_NORM_SKIP_GAMMA, pass gamma=None so rms_norm_torch_ref skips the
         # gamma multiply (norm_name2func_torch maps SKIP_GAMMA to rms_norm_torch_ref).
         norm_gamma = None if normalization_type == NormType.RMS_NORM_SKIP_GAMMA else gamma
@@ -1099,6 +1304,9 @@ def _mlp_torch_ref_impl(
             eps=eps,
             norm_b=norm_bias,
         )
+
+    # H_X4_INNERMOST uses contiguous hidden reshape (4 adjacent H values packed)
+    _cx4 = gate_up_w_layout == MLPGateUpWeightLayout.H_X4_INNERMOST
 
     if _is_row_mx_tkg:
         output = _mlp_ref_row_mx(
@@ -1123,6 +1331,7 @@ def _mlp_torch_ref_impl(
             gate_clamp_lower_limit=gate_clamp_lower_limit,
             up_clamp_upper_limit=up_clamp_upper_limit,
             up_clamp_lower_limit=up_clamp_lower_limit,
+            use_contiguous_x4_gate_up=_cx4,
         )
     elif _is_static_mx_tkg:
         output = _mlp_ref_static_mx(
@@ -1149,13 +1358,22 @@ def _mlp_torch_ref_impl(
             gate_clamp_lower_limit=gate_clamp_lower_limit,
             up_clamp_upper_limit=up_clamp_upper_limit,
             up_clamp_lower_limit=up_clamp_lower_limit,
+            use_contiguous_x4_gate_up=_cx4,
         )
-    elif quantization_type not in (QuantizationType.MX,):
+    elif not _is_mx_tkg:
+        # Callers pre-resolve AUTO (see ``resolve_dtype_mode_for_torch_ref``);
+        # the torch ref runs on CPU and can't query hardware directly.
+        assert dtype_mode != DtypeMode.AUTO, (  # noqa: S101
+            "mlp_torch_ref requires DtypeMode.AUTO to be pre-resolved by the caller."
+        )
+        # OCP → 448, NON_OCP → 240. Must match the kernel's chosen FP8 range.
+        _fp8_max = _FP8_E4M3FN_MAX if dtype_mode == DtypeMode.OCP else _FP8_E4M3_MAX
+        _fp8_round_trip_dtype = nl.float8_e4m3fn if dtype_mode == DtypeMode.OCP else nl.float8_e4m3
         output = _mlp_ref_standard(
             hidden=hidden,
-            gate_w=gate_w,
-            up_w=up_w,
-            down_w=down_w,
+            gate_w=gate_proj_weights_tensor,
+            up_w=up_proj_weights_tensor,
+            down_w=down_proj_weights_tensor,
             quantization_type=quantization_type,
             gate_w_scale=gate_w_scale,
             up_w_scale=up_w_scale,
@@ -1172,7 +1390,10 @@ def _mlp_torch_ref_impl(
             gate_clamp_lower_limit=gate_clamp_lower_limit,
             up_clamp_upper_limit=up_clamp_upper_limit,
             up_clamp_lower_limit=up_clamp_lower_limit,
+            gate_up_w_layout=gate_up_w_layout,
             mode=mode,
+            fp8_max=_fp8_max,
+            fp8_round_trip_dtype=_fp8_round_trip_dtype,
         )
     else:
         output = _mlp_ref_mx(
@@ -1199,8 +1420,13 @@ def _mlp_torch_ref_impl(
             up_clamp_lower_limit=up_clamp_lower_limit,
         )
 
+    if output_dtype is None:
+        output_dtype = torch.bfloat16
+    elif isinstance(output_dtype, str):
+        output_dtype = getattr(torch, output_dtype)
+
     # Build result dict
-    result = {"out": output}
+    result = {"out": output.to(output_dtype)}
     if fused_add_tensor is not None and store_fused_add_result:
         result["add_out"] = add_out
 
@@ -1239,6 +1465,7 @@ class _MlpTorchRefFn(Protocol):
         use_tkg_gate_up_proj_column_tiling=True,
         use_tkg_down_proj_column_tiling=True,
         use_tkg_down_proj_optimized_layout=False,
+        use_contiguous_x4_gate_up=False,
         gate_clamp_upper_limit=None,
         gate_clamp_lower_limit=None,
         up_clamp_upper_limit=None,
@@ -1246,9 +1473,11 @@ class _MlpTorchRefFn(Protocol):
         force_cte_mode=False,
         mode=ComputationMode.AUTO,
         sbm=None,
+        mx_dummy_scale_hbm=None,
         transposed_in=False,
         transposed_out=False,
-        **kwargs,
+        dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+        gate_up_w_layout=MLPGateUpWeightLayout.CONTIGUOUS,
     ) -> dict:
         """
         PyTorch reference implementation for the MLP kernel (mlp.mlp.mlp).

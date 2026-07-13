@@ -19,7 +19,7 @@ from typing import Optional
 import nki
 import nki.language as nl
 
-from ...utils.common_types import QuantizationType
+from ...utils.common_types import DtypeMode, QuantizationType
 from ...utils.kernel_assert import kernel_assert
 from ...utils.kernel_helpers import get_program_sharding_info
 from .output_projection_cte_float import perform_float_projection
@@ -41,14 +41,16 @@ from .output_projection_cte_quantization import (
 
 @nki.jit
 def output_projection_cte(
-    attention: nl.ndarray,
-    weight: nl.ndarray,
-    bias: Optional[nl.ndarray] = None,
+    attention: nl.NkiTensor,
+    weight: nl.NkiTensor,
+    bias: Optional[nl.NkiTensor] = None,
     quantization_type: QuantizationType = QuantizationType.NONE,
-    input_scales: Optional[nl.ndarray] = None,
-    weight_scales: Optional[nl.ndarray] = None,
+    input_scales: Optional[nl.NkiTensor] = None,
+    weight_scales: Optional[nl.NkiTensor] = None,
     output_dtype: Optional[type] = None,
-) -> nl.ndarray:
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    compact_weight_scales: bool = False,
+) -> nl.NkiTensor:
     """
     Output projection kernel optimized for Context Encoding (CTE/Prefill) scenarios.
 
@@ -64,17 +66,27 @@ def output_projection_cte(
         D: Head dimension size
 
     Args:
-        attention (nl.ndarray): [B, N, D, S], Input tensor in HBM from attention block.
-        weight (nl.ndarray): [N * D, H], Weight tensor in HBM.
-        bias (Optional[nl.ndarray]): [1, H], Optional bias tensor in HBM.
+        attention (nl.NkiTensor): [B, N, D, S], Input tensor in HBM from attention block.
+        weight (nl.NkiTensor): [N * D, H], Weight tensor in HBM.
+        bias (Optional[nl.NkiTensor]): [1, H], Optional bias tensor in HBM.
         quantization_type (QuantizationType): Type of quantization (NONE, STATIC for FP8, or MX).
-        input_scales (Optional[nl.ndarray]): [128, 1], Input scale tensor for FP8 quantization.
-        weight_scales (Optional[nl.ndarray]): [128, 1], Weight scale tensor for FP8 quantization.
+        input_scales (Optional[nl.NkiTensor]): [128, 1], Input scale tensor for FP8 quantization.
+        weight_scales (Optional[nl.NkiTensor]): [128, 1], Weight scale tensor for FP8 quantization.
         output_dtype (Optional[type]): Output data type. Defaults to attention.dtype for non-MX,
             or nl.bfloat16 for MX quantization. Can be set to nl.float16 for higher precision.
+        dtype_mode (DtypeMode): Quantization dtype policy for STATIC/ROW
+            attention and weight-tile allocation.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, else ``nl.float8_e4m3``.
+        compact_weight_scales (bool): When True (and quantization_type is MX),
+            ``weight_scales`` is interpreted as the block-128 compact
+            layout ``[N*D // 128, H // 128]`` uint8, with one scale per 128x128
+            weight block. The kernel expands the compact scales to the hardware
+            MX layout on-device. Defaults to False (block-32 dense layout).
 
     Returns:
-        out (nl.ndarray): [B, S, H], Output tensor in HBM.
+        out (nl.NkiTensor): [B, S, H], Output tensor in HBM.
 
     Notes:
         - Product B * S must not exceed 131072.
@@ -133,6 +145,7 @@ def output_projection_cte(
         quantization_type=quantization_type,
         input_scales=input_scales,
         weight_scales=weight_scales,
+        compact_weight_scales=compact_weight_scales,
     )
 
     # Configuration
@@ -142,6 +155,8 @@ def output_projection_cte(
         weight_scales=weight_scales,
         input_data_type=attention.dtype,
         weight_data_type=weight.dtype,
+        dtype_mode=dtype_mode,
+        compact_weight_scales=compact_weight_scales,
     )
 
     tiling_config = build_tiling_config(

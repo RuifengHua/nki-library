@@ -1,0 +1,16 @@
+{
+    "vocab_size": 201088,
+    "max_seq_len": 4096,
+    "head_dim": 64,
+    "dim": 2880,
+    "n_layers": 24,
+    "n_heads": 64,
+    "n_kv_heads": 8,
+    "hidden_dim": 2880,
+    "rope_theta": 150000,
+    "moe_enabled": "True",
+    "moe_inter_dim": 2880,
+    "moe_args.num_experts": 32,
+    "moe_args.num_shared_experts": 0,
+    "moe_args.top_k": 4
+}

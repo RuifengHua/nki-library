@@ -26,13 +26,13 @@ from ..utils.kernel_helpers import div_ceil
 
 @nki.jit
 def indexed_flatten(
-    input_tensor: nl.ndarray,
+    input_tensor: nl.NkiTensor,
     f_len: int,
     output_len: int,
-    row_offsets: nl.ndarray,
-    row_offsets_start: Optional[nl.ndarray] = None,
+    row_offsets: nl.NkiTensor,
+    row_offsets_start: Optional[nl.NkiTensor] = None,
     padding_val: int = -1,
-) -> nl.ndarray:
+) -> nl.NkiTensor:
     """
     Indexed flatten kernel for MoE blockwise matmul operations.
 
@@ -51,15 +51,15 @@ def indexed_flatten(
         f_len: Block size in free dimension for DMA copies
 
     Args:
-        input_tensor (nl.ndarray): [E, T], Input tensor on HBM
+        input_tensor (nl.NkiTensor): [E, T], Input tensor on HBM
         f_len (int): Number of elements in each DMA copy in the free dimension
         output_len (int): Length of the output array
-        row_offsets (nl.ndarray): [N,], Block offsets for each row on HBM
-        row_offsets_start (Optional[nl.ndarray]): Optional start index for row_offsets
+        row_offsets (nl.NkiTensor): [N,], Block offsets for each row on HBM
+        row_offsets_start (Optional[nl.NkiTensor]): Optional start index for row_offsets
         padding_val (int): Value to fill unwritten positions (default: -1)
 
     Returns:
-        flattened_array (nl.ndarray): [output_len,], Flattened output array on shared HBM
+        flattened_array (nl.NkiTensor): [output_len,], Flattened output array on shared HBM
 
     Notes:
         - Requires LNC2 (2 NeuronCores)
@@ -119,8 +119,15 @@ def indexed_flatten(
     partitions_per_row = T // f_len
     partition_tile_count = div_ceil(partitions_per_row, P_MAX)
 
-    # Each NC has its own private HBM buffer for partial results
-    flattened_array_partial = nl.ndarray((num_output_blocks, f_len), dtype=index_dtype, buffer=nl.private_hbm)
+    # Each NC has its own private HBM buffer for partial results, over-allocated by
+    # partitions_per_row blocks. Each expert writes a fused partitions_per_row-block tile at a
+    # dynamic offset; if that tile straddles the buffer end, the LNC2 oob_mode.skip drops the
+    # WHOLE tile (not just the OOB lanes), losing the last expert's in-bounds blocks. The extra
+    # blocks guarantee no in-range write straddles; only the real region is read back.
+    num_padded_blocks = num_output_blocks + partitions_per_row
+    flattened_array_partial = nl.ndarray((num_padded_blocks, f_len), dtype=index_dtype, buffer=nl.private_hbm)
+    # Real (non-padding) region, used for the init and all-reduce whole-buffer ops.
+    flattened_array_real = flattened_array_partial[0:num_output_blocks, :]
 
     """
     Tiling Strategy:
@@ -134,7 +141,7 @@ def indexed_flatten(
     # Initialize output with padding
     sbuf_init = nl.ndarray((P_MAX, output_len // P_MAX), dtype=index_dtype, buffer=nl.sbuf)
     nisa.memset(dst=sbuf_init, value=padding_val)
-    nisa.dma_copy(dst=flattened_array_partial.reshape((P_MAX, output_len // P_MAX)), src=sbuf_init)
+    nisa.dma_copy(dst=flattened_array_real.reshape((P_MAX, output_len // P_MAX)), src=sbuf_init)
 
     input_tensor_reshape = input_tensor.reshape((E, partitions_per_row, f_len))
     row_offsets_2d = row_offsets.reshape((1, N))
@@ -197,8 +204,8 @@ def indexed_flatten(
                     oob_mode=nisa.oob_mode.skip,
                 )
 
-    # All-reduce max between the two NCs
-    reshaped_reload = flattened_array_partial.reshape((P_MAX, output_len // P_MAX))
+    # All-reduce max between the two NCs (only the real region is read back; padding is discarded).
+    reshaped_reload = flattened_array_real.reshape((P_MAX, output_len // P_MAX))
     reshaped_reload_local = nl.ndarray((P_MAX, output_len // P_MAX), dtype=index_dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=reshaped_reload_local, src=reshaped_reload)
 

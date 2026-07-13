@@ -20,8 +20,9 @@ import nki.isa as nisa
 import nki.language as nl
 import numpy as np
 
+from ..utils.common_types import DtypeMode
 from ..utils.kernel_assert import kernel_assert
-from ..utils.kernel_helpers import get_max_positive_value_for_dtype, resolve_dtype_to_nki
+from ..utils.kernel_helpers import get_max_positive_value_for_dtype, resolve_fp8_e4m3_dtype
 from .rmsnorm_quant_tile_info import RMSNormQuantTileInfo
 
 
@@ -34,7 +35,7 @@ class RMSNormQuantConstants(nl.NKIObject):
         num_hw_psum_banks (int): Number of hardware PSUM banks
         compute_data_type (np.dtype): Data type for matmuls and compute
         quant_data_type (np.dtype): Data type for quantized output
-        quant_data_type_range (float): Maximum representable value in quant dtype (240.0 for legacy fp8_e4m3, 448.0 for OCP fp8_e4m3fn on gen4)
+        quant_data_type_range (float): Maximum representable value in quant dtype (240.0 for ``nl.float8_e4m3``, 448.0 for ``nl.float8_e4m3fn``)
         dequant_scale_size (int): Number of output elements for dequant scale
         min_dequant_scale_value (float): Minimum dequant scale for numerical stability
         outer_dim_tile_zero_bias_vector_sbuf (nl.ndarray): Zero bias vector in SBUF
@@ -67,7 +68,7 @@ def build_rms_norm_quant_constants(
     tile_info: RMSNormQuantTileInfo,
     eps: float,
     processing_shape: tuple[int, int],
-    auto_resolve_fp8_dtype: bool = False,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ) -> RMSNormQuantConstants:
     """
     Factory method to construct RMSNormQuantConstants.
@@ -76,12 +77,12 @@ def build_rms_norm_quant_constants(
         tile_info (RMSNormQuantTileInfo): Tile configuration info
         eps (float): Epsilon value for numerical stability
         processing_shape (tuple[int, int]): (outer_dim_size, proc_dim_size)
-        auto_resolve_fp8_dtype (bool): When False (default), the kernel is
-            identical to the pre-fix codebase where quant dtype is hardcoded ``nl.float8_e4m3``
-            (legacy, max=240). When True, the dtype is resolved via ``resolve_dtype_to_nki
-            ('float8_e4m3fn')`` so TRN3/gen4 uses OCP ``nl.float8_e4m3fn`` (max=448) and
-            TRN2/TRN1 still falls back to legacy. Opt-in so downstream E2E models keep
-            producing identical bits until every kernel in the pipeline has migrated.
+        dtype_mode (DtypeMode): Explicit FP8 E4M3 dtype selection for the
+            quantized output.
+            - ``DtypeMode.NON_OCP`` (default): ``nl.float8_e4m3`` (max=240).
+            - ``DtypeMode.OCP``: ``nl.float8_e4m3fn`` (max=448). TRN3 only.
+            - ``DtypeMode.AUTO``: ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3``
+              elsewhere (resolved at kernel trace time).
 
     Returns:
         RMSNormQuantConstants: Initialized constants for the kernel
@@ -90,12 +91,7 @@ def build_rms_norm_quant_constants(
     num_hw_psum_banks = 8
     # Data types
     compute_data_type = nl.bfloat16
-    # Opt-in hardware-aware FP8 E4M3: when False, behave like the unfixed codebase on every
-    # hardware gen; when True, TRN3/gen4 gets OCP float8_e4m3fn (max=448), TRN2 stays legacy.
-    if auto_resolve_fp8_dtype:
-        quant_data_type = resolve_dtype_to_nki('float8_e4m3fn')
-    else:
-        quant_data_type = nl.float8_e4m3
+    quant_data_type = resolve_fp8_e4m3_dtype(dtype_mode)
     quant_data_type_range = get_max_positive_value_for_dtype(quant_data_type)
     # The dequantizing scale factors are added to the end of each processed dimension.  The unit of this constant
     # is in output tensor elements.  Each dequantizing scale factor is a 32-bit float and the element size of

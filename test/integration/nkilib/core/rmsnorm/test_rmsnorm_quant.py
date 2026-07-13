@@ -26,7 +26,7 @@ from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant import (
     rmsnorm_quant_kernel,
 )
 from nkilib_src.nkilib.core.rmsnorm.rmsnorm_quant_torch import rmsnorm_quant_torch_ref
-from nkilib_src.nkilib.core.utils.common_types import NormType, QuantizationType
+from nkilib_src.nkilib.core.utils.common_types import DtypeMode, NormType, QuantizationType
 from nkilib_src.nkilib.core.utils.kernel_assert import kernel_assert
 
 try:
@@ -41,6 +41,7 @@ from test.integration.nkilib.utils.tensor_generators import (
     duplicate_row_rmsnorm_inp_generator,
     gaussian_tensor_generator,
 )
+from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
 from test.utils.common_dataclasses import (
     CompilerArgs,
     CustomValidator,
@@ -113,7 +114,7 @@ def _build_kernel_input(
     quant_only: bool = False,
     pre_norm_gamma_flag: bool = False,
     residual_flag: bool = False,
-    auto_resolve_fp8_dtype: bool = False,
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,
 ):
     kernel_assert(batch > 0, f"Batch size must be positive but got {batch}")
     gamma_shape = [1, hidden_dim] if lnc_degree > 1 else [hidden_dim]
@@ -140,7 +141,7 @@ def _build_kernel_input(
         "ln_w": gamma,
         "kargs": kargs,
         "input_dequant_scale": scale,
-        "auto_resolve_fp8_dtype": auto_resolve_fp8_dtype,
+        "dtype_mode": dtype_mode,
     }
 
 
@@ -186,18 +187,45 @@ _LNC_TEST_PARAMS = [
     (160, True, QuantizationType.STATIC, gaussian_tensor_generator(), 0.0, 2, 1, 16384),
 ]
 
+
+def _lnc_with_fast_keys(fast_keys):
+    """Return _LNC_TEST_PARAMS with marks=fast on rows whose
+    (seqlen, quant_only, quant_type) tuple matches one in fast_keys.
+    """
+    fk = frozenset(fast_keys)
+    out = []
+    for c in _LNC_TEST_PARAMS:
+        if (c[0], c[1], c[2]) in fk:
+            out.append(pytest.param(*c, marks=pytest.mark.fast))
+        else:
+            out.append(pytest.param(*c))
+    return out
+
+
+_LNC_TEST_PARAMS_LNC_UNIT_FAST = _lnc_with_fast_keys(
+    {
+        (128 // 64, True, QuantizationType.ROW),
+    }
+)
+_LNC_TEST_PARAMS_FUSED_RESIDUAL_FAST = _lnc_with_fast_keys(
+    {
+        (160, False, QuantizationType.STATIC),
+    }
+)
+_LNC_TEST_PARAMS_LNC_ONLY_FAST = _lnc_with_fast_keys(set())
+
 _VNC_PARAM_NAMES = \
     "seqlen, lower_bound, lnc_degree, batch, hidden, quant_type"
 
 _VNC_TEST_PARAMS = [
-    pytest.param(128, 0.0, 1, 1, 16384, QuantizationType.ROW, marks=pytest.mark.fast),
+    (128, 0.0, 1, 1, 16384, QuantizationType.ROW),
     pytest.param(128, 0.5, 1, 1, 16384, QuantizationType.ROW, marks=pytest.mark.fast),
-    pytest.param(128, 0.0, 2, 1, 16384, QuantizationType.ROW, marks=pytest.mark.fast),
-    pytest.param(128, 0.5, 2, 1, 16384, QuantizationType.ROW, marks=pytest.mark.fast),
-    pytest.param(256, 0.0, 2, 1, 8192, QuantizationType.ROW, marks=pytest.mark.fast),
+    (128, 0.0, 2, 1, 16384, QuantizationType.ROW),
+    (128, 0.5, 2, 1, 16384, QuantizationType.ROW),
+    (256, 0.0, 2, 1, 8192, QuantizationType.ROW),
     # Llama models
-    pytest.param(2048, 0.0, 2, 1, 8192, QuantizationType.ROW, marks=pytest.mark.fast),
-    pytest.param(2048, 0.0, 2, 1, 16384, QuantizationType.ROW, marks=pytest.mark.fast),
+    (2048, 0.0, 2, 1, 8192, QuantizationType.ROW),
+    (2048, 0.0, 2, 1, 16384, QuantizationType.ROW),
     (32768, 0.0, 2, 1, 8192, QuantizationType.ROW),
     (32768, 0.0, 2, 1, 16384, QuantizationType.ROW),
 ]
@@ -237,17 +265,19 @@ class TestRmsNormQuantKernel:
         is_negative_test: bool = False,
         pre_norm_gamma_flag: bool = False,
         residual_flag: bool = False,
-        auto_resolve_fp8_dtype: Optional[bool] = None,
+        dtype_mode: Optional[DtypeMode] = None,
     ):
         is_fused = residual_flag
-        # Flag controls opt-in hardware-aware FP8 E4M3. Defaults to False (legacy) so existing
-        # tests and models are byte-for-byte unchanged on every hardware generation. The
-        # dedicated ``test_rmsnorm_quant_auto_resolve_fp8_dtype_true`` below is the only
-        # caller that passes True today; models will migrate during Phase 3 of the rollout.
-        if auto_resolve_fp8_dtype is None:
-            auto_resolve_fp8_dtype = False
-        quant_nki_dtype = nl.float8_e4m3fn if auto_resolve_fp8_dtype else nl.float8_e4m3
-        quant_np_dtype = dt.float8_e4m3fn if auto_resolve_fp8_dtype else dt.float8_e4m3
+        # Defaults to DtypeMode.NON_OCP so existing tests stay unchanged.
+        # ``test_rmsnorm_quant_dtype_mode`` below sweeps OCP / AUTO / NON_OCP.
+        if dtype_mode is None:
+            dtype_mode = DtypeMode.NON_OCP
+        # Pre-resolve AUTO here — the torch ref runs on CPU and needs the
+        # concrete dtype. The kernel receives the original mode and resolves
+        # at trace time.
+        resolved_dtype_mode = resolve_dtype_mode_for_torch_ref(dtype_mode, platform_target)
+        quant_nki_dtype = nl.float8_e4m3fn if resolved_dtype_mode == DtypeMode.OCP else nl.float8_e4m3
+        quant_np_dtype = dt.float8_e4m3fn if resolved_dtype_mode == DtypeMode.OCP else dt.float8_e4m3
 
         def input_generator(_):
             return _build_kernel_input(
@@ -262,7 +292,7 @@ class TestRmsNormQuantKernel:
                 quant_only=quant_only,
                 pre_norm_gamma_flag=pre_norm_gamma_flag,
                 residual_flag=residual_flag,
-                auto_resolve_fp8_dtype=auto_resolve_fp8_dtype,
+                dtype_mode=dtype_mode,
             )
 
         # Wrap torch_ref to return {"out": norm_quant} and stash dequant_scale for the comparator
@@ -276,7 +306,7 @@ class TestRmsNormQuantKernel:
             input_dequant_scale=None,
             pre_norm_gamma=None,
             residual=None,
-            auto_resolve_fp8_dtype=False,  # noqa: ARG001 — accepted to satisfy framework signature check; dtype is picked from quant_nki_dtype above
+            dtype_mode=DtypeMode.NON_OCP,  # noqa: ARG001 — accepted to satisfy framework signature check; dtype is picked from quant_nki_dtype above
         ):
             result = rmsnorm_quant_torch_ref(
                 hidden=hidden,
@@ -285,7 +315,7 @@ class TestRmsNormQuantKernel:
                 input_dequant_scale=input_dequant_scale,
                 pre_norm_gamma=pre_norm_gamma,
                 residual=residual,
-                quant_dtype=quant_nki_dtype,
+                dtype_mode=resolved_dtype_mode,
             )
             ref_extras["dequant_scale"] = result["dequant_scale"]
             out = {"out": result["norm_quant"]}
@@ -381,8 +411,7 @@ class TestRmsNormQuantKernel:
             custom_comparator=_comparator,
         )
 
-    @pytest.mark.fast
-    @pytest_parametrize(_LNC_PARAM_NAMES, _LNC_TEST_PARAMS, abbrevs=_ABBREVS)
+    @pytest_parametrize(_LNC_PARAM_NAMES, _LNC_TEST_PARAMS_LNC_UNIT_FAST, abbrevs=_ABBREVS)
     def test_rmsnorm_quant_lnc_unit(
         self,
         test_manager: Orchestrator,
@@ -413,22 +442,25 @@ class TestRmsNormQuantKernel:
             quant_only=quant_only,
         )
 
-    @pytest.mark.fast
+    @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
     @pytest.mark.parametrize("quant_type", [QuantizationType.STATIC, QuantizationType.ROW])
-    def test_rmsnorm_quant_auto_resolve_fp8_dtype_true(
+    def test_rmsnorm_quant_by_dtype_mode(
         self,
         test_manager: Orchestrator,
         platform_target: Platforms,
         collector: IMetricsCollector,
         quant_type: QuantizationType,
+        dtype_mode: DtypeMode,
     ):
-        """Canary for the opt-in auto_resolve_fp8_dtype=True path.
+        """Canary for the opt-in dtype_mode path.
 
-        Forces the flag on regardless of platform to exercise the OCP float8_e4m3fn branch.
-        Only runs on TRN3/gen4 since earlier hardware does not support OCP FP8 E4M3.
+        Sweeps every DtypeMode against the rmsnorm_quant kernel:
+            NON_OCP → ``nl.float8_e4m3`` (240), any platform.
+            OCP     → ``nl.float8_e4m3fn`` (448), TRN3 only.
+            AUTO    → ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3`` elsewhere.
         """
-        if not platform_target.is_trn3():
-            pytest.skip("auto_resolve_fp8_dtype=True only meaningful on TRN3/gen4")
+        if dtype_mode == DtypeMode.OCP and not platform_target.is_trn3():
+            pytest.skip("dtype_mode=DtypeMode.OCP only exercises the OCP path on TRN3")
         tensor_gen = (
             static_scale_wrapper(gaussian_tensor_generator())
             if quant_type == QuantizationType.STATIC
@@ -447,7 +479,7 @@ class TestRmsNormQuantKernel:
             tensor_gen=tensor_gen,
             quant_type=quant_type,
             quant_only=False,
-            auto_resolve_fp8_dtype=True,
+            dtype_mode=dtype_mode,
         )
 
     @pytest_parametrize(_VNC_PARAM_NAMES, _VNC_TEST_PARAMS, abbrevs=_ABBREVS)
@@ -517,8 +549,7 @@ class TestRmsNormQuantKernel:
             is_negative_test=is_negative_test_case,
         )
 
-    @pytest.mark.fast
-    @pytest_parametrize(_LNC_PARAM_NAMES, _LNC_TEST_PARAMS, abbrevs=_ABBREVS)
+    @pytest_parametrize(_LNC_PARAM_NAMES, _LNC_TEST_PARAMS_FUSED_RESIDUAL_FAST, abbrevs=_ABBREVS)
     def test_fused_rmsnorm_residual_add_rmsnorm_quant(
         self,
         test_manager: Orchestrator,
@@ -551,8 +582,7 @@ class TestRmsNormQuantKernel:
             residual_flag=True,
         )
 
-    @pytest.mark.fast
-    @pytest_parametrize(_LNC_PARAM_NAMES, _LNC_TEST_PARAMS, abbrevs=_ABBREVS)
+    @pytest_parametrize(_LNC_PARAM_NAMES, _LNC_TEST_PARAMS_LNC_ONLY_FAST, abbrevs=_ABBREVS)
     def test_residual_add_rmsnorm_quant(
         self,
         test_manager: Orchestrator,

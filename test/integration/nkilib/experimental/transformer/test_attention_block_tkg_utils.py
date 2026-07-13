@@ -14,7 +14,7 @@
 
 import enum
 from dataclasses import MISSING, dataclass, fields
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
 
 import nki.language as nl
 
@@ -73,15 +73,25 @@ class AttnBlkTestConfig:
     enable_fa_s_prior_tiling: bool = True
     kv_quant: bool = False
     kv_quant_dtype: str = nl.float8_e4m3
+    # When True, block-KV cache includes a kv_heads dim at axis 1.
+    # E.g. [blocks, kv_heads, block_len, d_head] instead of [blocks, block_len, d_head].
+    cache_has_kv_head_dim: bool = False
     kv_scale: Optional[Union[KVScaleTest, float]] = None
     KVDP: int = 1
     DCP: int = 1
     KVDP_collective_mode: KVDPCollectiveMode = KVDPCollectiveMode.ALL_TO_ALL
+    # KVDP collective replica group. None = consecutive [[0..KVDP-1]].
+    kvdp_replica_group: Optional[List[List[int]]] = None
     skip_attention: bool = False
+    # When True, generate a per-q-head attention sink tensor ([q_heads_attn, 1] @ HBM).
+    test_sink: bool = False
+    kv_heads: int = 1
     use_pos_id: bool = False
+    max_context_len: Optional[int] = None
     sliding_window: int = 0
     cache_lens_mean: Optional[float] = None
     cache_lens_stddev: Optional[float] = None
+    fp8_packed: bool = False
 
     # Platform restrictions for this test config. Set to a set of Platforms values
     # to restrict which hardware this config runs on. None means all platforms.
@@ -94,7 +104,8 @@ class AttnBlkTestConfig:
 
     def is_high_rank(self) -> bool:
         """Whether this config requires more NeuronCores than a standard shared-fleet instance."""
-        return max(self.KVDP, self.DCP) > self._HIGH_RANK_THRESHOLD
+        kvdp_collective_ranks = sum(len(g) for g in self.kvdp_replica_group) if self.kvdp_replica_group else self.KVDP
+        return max(kvdp_collective_ranks, self.DCP) > self._HIGH_RANK_THRESHOLD
 
     def __post_init__(self):
         if self.kv_quant and self.kv_scale is None:

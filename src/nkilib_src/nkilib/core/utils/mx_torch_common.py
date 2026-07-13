@@ -131,6 +131,21 @@ def unpack_float8_e4m3fn_x4(packed_np):
     return torch.where(sign == 1, -val, val)
 
 
+def get_float32_exp(float_data):
+    man_nbits, exp_nbits = 23, 8
+    return (float_data.astype(np.float32).view(np.uint32) >> man_nbits) & ((1 << exp_nbits) - 1)
+
+
+def get_mx_fp_max(dst_dtype):
+    max_values = {nl.float8_e5m2_x4: 57344, nl.float8_e4m3fn_x4: 448, nl.float4_e2m1fn_x4: 6}
+    return max_values.get(dst_dtype)
+
+
+def get_mx_max_exp(dst_dtype):
+    max_exp_values = {nl.float8_e5m2_x4: 15, nl.float8_e4m3fn_x4: 8, nl.float4_e2m1fn_x4: 2}
+    return max_exp_values.get(dst_dtype)
+
+
 def mx_matmul(stationary, moving, stationary_scale, moving_scale):
     """Hardware-accurate MX block-scaled matmul. All inputs are torch tensors.
 
@@ -286,3 +301,102 @@ def quantize_mx_golden(src_hbm, out_data_hbm, out_scale_hbm):
         "out_data_hbm": packed,
         "out_scale_hbm": scale_hw,
     }
+
+
+def get_p_contiguous_scale(hw_scale, data_p_size, p_offset=0):
+    """Re-pack a hardware-layout scale tensor so it is contiguous along the partition axis."""
+    if data_p_size <= 32:
+        return hw_scale[p_offset : p_offset + data_p_size]
+
+    scale = np.zeros((data_p_size // 8,) + tuple(hw_scale.shape[1:]), hw_scale.dtype)
+    for i in range(data_p_size // 8):
+        scale[i] = hw_scale[i // 4 * 32 + i % 4 + p_offset]
+
+    return scale
+
+
+def nc_matmul_mx_golden(
+    stationary_x4,
+    moving_x4,
+    stationary_scale,
+    moving_scale,
+    use_contiguous_scale=True,
+    stationary_scale_p_offset=0,
+    moving_scale_p_offset=0,
+):
+    """Numpy reference for the MX-quantized matmul produced by ``nc_matmul``.
+
+    Mirrors the contraction performed by the hardware: dequantizes both
+    operands using their per-block scales and reduces over the partition
+    and 4-wide groups. Numpy variant of :func:`mx_matmul`, with extra
+    options for hardware-layout scale tensors.
+
+    Args:
+        stationary_x4: Stationary operand in MX-x4 layout, shape ``[SP, SF0*4]``.
+        moving_x4: Moving operand in MX-x4 layout, shape ``[MP, MF0*4]``.
+        stationary_scale: Per-block exponent scales for ``stationary_x4``.
+        moving_scale: Per-block exponent scales for ``moving_x4``.
+        use_contiguous_scale: If False, the scale tensors are in hardware
+            layout and are re-packed via :func:`get_p_contiguous_scale`.
+        stationary_scale_p_offset: Partition offset when re-packing the
+            stationary scale.
+        moving_scale_p_offset: Partition offset when re-packing the moving
+            scale.
+
+    Returns:
+        ``np.ndarray`` of shape ``[SF0, MF0]`` containing the float32
+        contraction.
+    """
+    # Process moving tensor
+    moving = dt.static_cast(moving_x4, np.float32)
+    new_shape = moving.shape[:-1] + (moving.shape[-1] // 4, 4)
+    moving = moving.reshape(new_shape)
+    MP, MF0, MF1 = moving.shape
+    if MF1 != 4:
+        raise ValueError(f"moving_x4 last dim must be a multiple of 4, got {moving_x4.shape[-1]}")
+    moving_scale = moving_scale.astype(np.float32)
+    if not use_contiguous_scale:
+        # if scale follows hw layout, make it contiguous at partition dimension
+        moving_scale = get_p_contiguous_scale(moving_scale, MP, moving_scale_p_offset)
+
+    MSP, MSF0 = moving_scale.shape
+
+    # The scale tensor may have more columns than needed (e.g., when stationary and moving scales are packed together).
+    moving_scale_relevant = moving_scale[:, :MF0]
+
+    # Convert scale exponents to scale factors and apply via broadcasting
+    # Each scale factor applies to an 8x1x4 block: [MSP, 1, MF0, 1] broadcasts to [MSP, 8, MF0, 4]
+    moving_scale_factors = 2.0 ** (moving_scale_relevant - 127)  # Shape: [MSP, MF0]
+    moving = moving.reshape(MSP, 8, MF0, 4)
+    moving *= moving_scale_factors[:, np.newaxis, :, np.newaxis]
+    moving = moving.reshape(MP, MF0, 4)
+
+    # Process stationary tensor
+    stationary = dt.static_cast(stationary_x4, np.float32)
+    new_shape = stationary.shape[:-1] + (stationary.shape[-1] // 4, 4)
+    stationary = stationary.reshape(new_shape)
+    SP, SF0, SF1 = stationary.shape
+    if SF1 != 4:
+        raise ValueError(f"stationary_x4 last dim must be a multiple of 4, got {stationary_x4.shape[-1]}")
+    stationary = stationary.astype(np.float32)
+    stationary_scale = stationary_scale.astype(np.float32)
+    if not use_contiguous_scale:
+        # if scale follows hw layout, make it contiguous at partition dimension
+        stationary_scale = get_p_contiguous_scale(stationary_scale, SP, stationary_scale_p_offset)
+
+    SSP, SSF0 = stationary_scale.shape
+
+    # The scale tensor may have more columns than needed (e.g., when stationary and moving scales are packed together).
+    stationary_scale_relevant = stationary_scale[:, :SF0]
+
+    # Convert scale exponents to scale factors and apply via broadcasting
+    # Each scale factor applies to an 8x1x4 block: [SSP, 1, SF0, 1] broadcasts to [SSP, 8, SF0, 4]
+    stationary_scale_factors = 2.0 ** (stationary_scale_relevant - 127)  # Shape: [SSP, SF0]
+    stationary = stationary.reshape(SSP, 8, SF0, 4)
+    stationary *= stationary_scale_factors[:, np.newaxis, :, np.newaxis]
+    stationary = stationary.reshape(SP, SF0, 4)
+
+    # Contract over k (partition) and q (4-wide): einsum("kiq,kjq->ij") = [SF0, MF0]
+    # Reshape to [SF0, SP*4] and [MF0, MP*4], then matmul
+    golden = stationary.transpose(1, 0, 2).reshape(SF0, -1) @ moving.transpose(1, 0, 2).reshape(MF0, -1).T
+    return golden

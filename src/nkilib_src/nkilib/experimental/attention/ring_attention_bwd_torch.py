@@ -13,17 +13,22 @@
 # limitations under the License.
 """PyTorch reference implementation for ring attention backward pass."""
 
+import numpy as np
 import torch
+import torch.distributed as dist
+from nki.collectives import ReplicaGroup
 
-from ...core.attention.attention_bwd_torch import attention_bwd_torch_ref, compute_o_lse
+from ...core.attention.attention_bwd_torch import compute_o_lse
+from ..collectives.distributed_adapter import get_pg, get_rank
 
 
-def _full_attention_bwd(q, k, v, dy, scale, causal=False):
+def _full_attention_bwd(q, k, v, dy, scale, causal=False, extra_mask=None):
     """
-    Run attention_bwd_torch_ref on full (concatenated) tensors.
+    Run attention backward on full (concatenated) tensors using chunked computation.
 
-    Converts from (bs, seqlen, d) layout to kernel layout (bs, 1, d, seqlen),
-    calls the existing torch ref, and converts back.
+    Processes Q in chunks along the sequence dimension to avoid materializing
+    the full (B, Hq, S, S) score matrix. Peak memory is O(S * chunk_size)
+    instead of O(S^2).
 
     Args:
         q (torch.Tensor): (bs, seqlen_q, d)
@@ -32,42 +37,94 @@ def _full_attention_bwd(q, k, v, dy, scale, causal=False):
         dy (torch.Tensor): (bs, seqlen_q, d)
         scale (float): Softmax scale factor.
         causal (bool): Whether to apply causal masking.
-
-    Returns:
-        tuple: (dq, dk, dv) each (bs, seqlen, d)
+        extra_mask (np.ndarray, optional): (seqlen_q, seqlen_k) bool, True = attend.
     """
     bs, seqlen_q, d = q.shape
     seqlen_k = k.shape[1]
 
-    # Convert to kernel layout: (bs, 1, d, seqlen)
-    q_k = q.permute(0, 2, 1).unsqueeze(1)
-    k_k = k.permute(0, 2, 1).unsqueeze(1)
-    v_k = v.permute(0, 2, 1).unsqueeze(1)
-    dy_k = dy.permute(0, 2, 1).unsqueeze(1)
+    # Choose chunk size: 2048 keeps peak at ~2GB instead of ~30GB for S=32K
+    chunk_size = min(2048, seqlen_q)
 
-    # Compute O and LSE via existing torch ref
-    o_k, lse_k, _ = compute_o_lse(q_k, k_k, v_k, False, True, softmax_scale=scale)
+    # Build bound_min/bound_max from extra_mask without materializing (S, S) int64
+    bound_min = None
+    bound_max = None
+    if extra_mask is not None:
+        bmin = np.empty(seqlen_q, dtype=np.int64)
+        bmax = np.empty(seqlen_q, dtype=np.int64)
+        for i in range(seqlen_q):
+            row = extra_mask[i]
+            nonzero = np.flatnonzero(row)
+            if len(nonzero) > 0:
+                bmin[i] = nonzero[0]
+                bmax[i] = nonzero[-1] + 1
+            else:
+                bmin[i] = 0
+                bmax[i] = 0
+        bound_min = torch.from_numpy(bmin)
+        bound_max = torch.from_numpy(bmax)
 
-    result = attention_bwd_torch_ref(
-        q_ref=q_k,
-        k_ref=k_k,
-        v_ref=v_k,
-        o_ref=o_k,
-        dy_ref=dy_k,
-        lse_ref=lse_k,
-        use_causal_mask=causal,
-        mixed_precision=True,
-        softmax_scale=scale,
-    )
+    # Precompute: k_t and v_t in (bs, d, seqlen_k) for matmul
+    k_t = k.transpose(1, 2).float()  # (bs, d, S_k)
+    v_f = v.float()  # (bs, S_k, d)
 
-    # Convert back to (bs, seqlen, d)
-    dq = result["out_dq_ref"].squeeze(1).permute(0, 2, 1)
-    dk = result["out_dk_ref"].squeeze(1).permute(0, 2, 1)
-    dv = result["out_dv_ref"].squeeze(1).permute(0, 2, 1)
-    return dq, dk, dv
+    dq = torch.zeros_like(q, dtype=torch.float32)
+    dk = torch.zeros(bs, seqlen_k, d, dtype=torch.float32)
+    dv = torch.zeros(bs, seqlen_k, d, dtype=torch.float32)
+
+    for q_start in range(0, seqlen_q, chunk_size):
+        q_end = min(q_start + chunk_size, seqlen_q)
+        clen = q_end - q_start
+
+        q_chunk = q[:, q_start:q_end, :]  # (bs, clen, d)
+        dy_chunk = dy[:, q_start:q_end, :]  # (bs, clen, d)
+
+        # scores: (bs, clen, S_k)
+        scores = torch.bmm(q_chunk.float(), k_t) * scale
+
+        # Build mask for this chunk
+        if causal or bound_min is not None:
+            # Start with causal mask
+            if causal:
+                q_pos = torch.arange(q_start, q_end).unsqueeze(1)  # (clen, 1)
+                k_pos = torch.arange(seqlen_k).unsqueeze(0)  # (1, S_k)
+                chunk_mask = q_pos < k_pos  # (clen, S_k)
+            else:
+                chunk_mask = torch.zeros(clen, seqlen_k, dtype=torch.bool)
+
+            # Sequence packing mask
+            if bound_min is not None:
+                k_idx = torch.arange(seqlen_k)
+                bmin_chunk = bound_min[q_start:q_end].unsqueeze(1)  # (clen, 1)
+                bmax_chunk = bound_max[q_start:q_end].unsqueeze(1)  # (clen, 1)
+                pack_mask = (k_idx.unsqueeze(0) < bmin_chunk) | (k_idx.unsqueeze(0) >= bmax_chunk)
+                chunk_mask = chunk_mask | pack_mask
+
+            # Apply mask: broadcast (clen, S_k) -> (bs, clen, S_k)
+            scores = scores.masked_fill(chunk_mask.unsqueeze(0), -float("inf"))
+
+        # Softmax: (bs, clen, S_k)
+        probs = torch.softmax(scores, dim=-1)
+        probs = torch.where(torch.isnan(probs), torch.zeros_like(probs), probs)
+
+        # dV += probs^T @ dy_chunk: (bs, S_k, clen) @ (bs, clen, d) -> (bs, S_k, d)
+        dv += torch.bmm(probs.transpose(1, 2), dy_chunk.float())
+
+        # dp = dy_chunk @ v^T: (bs, clen, d) @ (bs, d, S_k) -> (bs, clen, S_k)
+        dp = torch.bmm(dy_chunk.float(), v_f.transpose(1, 2))
+
+        # ds = probs * (dp - (dp * probs).sum(-1, keepdim=True))
+        ds = probs * (dp - (dp * probs).sum(dim=-1, keepdim=True))
+
+        # dQ chunk: ds @ k -> (bs, clen, d)
+        dq[:, q_start:q_end, :] = torch.bmm(ds, k.float()) * scale
+
+        # dK += ds^T @ q_chunk: (bs, S_k, clen) @ (bs, clen, d) -> (bs, S_k, d)
+        dk += torch.bmm(ds.transpose(1, 2), q_chunk.float()) * scale
+
+    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
 
 
-def ring_attention_spmd_bwd_torch_ref(
+def _ring_attention_spmd_bwd_full(
     q_shards,
     k_shards,
     v_shards,
@@ -76,6 +133,7 @@ def ring_attention_spmd_bwd_torch_ref(
     tp_degree,
     causal=False,
     striped=False,
+    extra_mask=None,
 ):
     """
     PyTorch reference for ring attention backward.
@@ -112,7 +170,9 @@ def ring_attention_spmd_bwd_torch_ref(
             v_full[:, rank::tp_degree, :] = v_shards[rank]
             dy_full[:, rank::tp_degree, :] = dy_shards[rank]
 
-        dq_full, dk_full, dv_full = _full_attention_bwd(q_full, k_full, v_full, dy_full, scale, causal=True)
+        dq_full, dk_full, dv_full = _full_attention_bwd(
+            q_full, k_full, v_full, dy_full, scale, causal=True, extra_mask=extra_mask
+        )
 
         dq_shards = [dq_full[:, rank::tp_degree, :] for rank in range(tp_degree)]
         dk_shards = [dk_full[:, rank::tp_degree, :] for rank in range(tp_degree)]
@@ -183,3 +243,108 @@ def compute_per_rank_o_lse(q_shards, k_shards, v_shards, scale, tp_degree, causa
         lse_per_rank.append(lse.numpy())
 
     return o_per_rank, lse_per_rank
+
+
+def ring_attention_spmd_bwd_torch_ref(
+    q_ref: np.ndarray,
+    k_ref: np.ndarray,
+    v_ref: np.ndarray,
+    o_ref: np.ndarray,
+    dy_ref: np.ndarray,
+    lse_ref: np.ndarray,
+    use_causal_mask: bool = False,
+    mixed_precision: bool = True,
+    softmax_scale: float = None,
+    num_workers: int = 1,
+    lnc_size: int = 1,
+    replica_groups: tuple = None,
+    striped_attention: bool = False,
+    bound_min: np.ndarray = None,
+    bound_max: np.ndarray = None,
+) -> dict:
+    """Per-rank PyTorch reference for ring_attention_spmd_bwd. Same signature as the kernel.
+
+    Uses get_rank() and get_pg() to gather all ranks' data via all_gather,
+    then computes full-context attention backward and returns this rank's gradient slice.
+    """
+    rank_id = get_rank()
+
+    if isinstance(replica_groups, ReplicaGroup):
+        groups = [list(g) for g in replica_groups._value]
+    else:
+        groups = [list(g) for g in replica_groups]
+
+    my_group = next(g for g in groups if rank_id in g)
+    my_worker_idx = my_group.index(rank_id)
+    nw = len(my_group)
+
+    rg = replica_groups if isinstance(replica_groups, ReplicaGroup) else ReplicaGroup(groups)
+    pg = get_pg(rg)
+
+    # Kernel layout: (bs, nheads, d, seqlen_per_rank) -> ref layout: (bs*nheads, seqlen_per_rank, d)
+    def _to_ref_3d(arr):
+        bs, nheads, d, spr = arr.shape
+        return arr.transpose(0, 1, 3, 2).reshape(bs * nheads, spr, d).astype(np.float32)
+
+    def _gather_all(local_3d):
+        t = torch.from_numpy(local_3d)
+        gathered = [torch.zeros_like(t) for _ in range(pg.size())]
+        dist.all_gather(gathered, t, group=pg)
+        return [g.numpy() for g in gathered]
+
+    q_3d = _to_ref_3d(q_ref)
+    k_3d = _to_ref_3d(k_ref)
+    v_3d = _to_ref_3d(v_ref)
+    dy_3d = _to_ref_3d(dy_ref)
+
+    # Gather all ranks' data
+    q_all = _gather_all(q_3d)
+    k_all = _gather_all(k_3d)
+    v_all = _gather_all(v_3d)
+    dy_all = _gather_all(dy_3d)
+
+    # Convert to torch tensors
+    q_shards = [torch.from_numpy(s) for s in q_all]
+    k_shards = [torch.from_numpy(s) for s in k_all]
+    v_shards = [torch.from_numpy(s) for s in v_all]
+    dy_shards = [torch.from_numpy(s) for s in dy_all]
+
+    # Compute full backward using existing reference
+    # Build same-document mask for packed attention
+    extra_mask = None
+    if bound_min is not None and striped_attention:
+        # In striped packed mode, all ranks have identical bounds (broadcast from test).
+        # Reconstruct global bounds by interleaving local bounds in striped order.
+        spr = q_3d.shape[1]
+        seqlen = spr * nw
+        bmin_local = bound_min.reshape(q_3d.shape[0], spr).astype(np.float32)
+        bmin_global = np.empty((q_3d.shape[0], seqlen), dtype=np.float32)
+        for w in range(nw):
+            bmin_global[:, w::nw] = bmin_local
+        # Same-doc mask: tokens attend iff they have the same bound_min (vectorized)
+        bmin_row = bmin_global[0]
+        extra_mask = bmin_row[:, None] == bmin_row[None, :]
+
+    dq_shards, dk_shards, dv_shards = _ring_attention_spmd_bwd_full(
+        q_shards,
+        k_shards,
+        v_shards,
+        dy_shards,
+        softmax_scale,
+        nw,
+        causal=use_causal_mask,
+        striped=striped_attention,
+        extra_mask=extra_mask,
+    )
+
+    # Return this rank's slice in kernel layout: (bs, nheads, d, seqlen_per_rank)
+    bs, nheads, d, spr = q_ref.shape
+    dq_rank = dq_shards[my_worker_idx].numpy().reshape(bs, nheads, spr, d).transpose(0, 1, 3, 2)
+    dk_rank = dk_shards[my_worker_idx].numpy().reshape(bs, nheads, spr, d).transpose(0, 1, 3, 2)
+    dv_rank = dv_shards[my_worker_idx].numpy().reshape(bs, nheads, spr, d).transpose(0, 1, 3, 2)
+
+    return {
+        "out_dq_ref": dq_rank.astype(np.float32),
+        "out_dk_ref": dk_rank.astype(np.float32),
+        "out_dv_ref": dv_rank.astype(np.float32),
+    }

@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""This kernel implements rotational top-k algorithm to find the k largest elements along a dimension using multi-stage rotation and reduction optimized for NeuronCore architecture."""
+"""Rotational top-k kernel finding the k largest elements along a dimension.
+
+Uses multi-stage rotation and reduction optimized for NeuronCore architecture.
+"""
 
 from enum import Enum
 from typing import Optional, Tuple
@@ -20,15 +23,16 @@ from typing import Optional, Tuple
 import nki
 import nki.isa as nisa
 import nki.language as nl
-import numpy as np
 
 from ..max.cascaded_max_utils import predicated_folded_load, unfolded_store
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info
+from ..utils.rotation_matrix import build_rotation_matrix
 from .rotational_topk_utils import (
-    RotationalConstants,
+    HW_PARAMS,
     RotationalTopkConfig,
     TopkConfig,
+    build_stage_offsets,
     create_rotational_topk_config,
     create_topk_config,
     insert,
@@ -51,7 +55,7 @@ class SupportedTopkMethods(Enum):
 
 
 @nki.jit
-def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.ndarray, nl.ndarray]:
+def rotational_topk(inp: nl.NkiTensor, config: RotationalTopkConfig) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Find the k largest elements along the last dimension using rotational algorithm.
 
@@ -66,11 +70,11 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
         k: Number of top elements to retrieve
 
     Args:
-        inp (nl.ndarray): [B, S, V] or [BxS, V], Input tensor in HBM
+        inp (nl.NkiTensor): [B, S, V] or [BxS, V], Input tensor in HBM
         config (RotationalTopkConfig): Configuration object containing algorithm parameters
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - topk_values: [B, S, k], Top-k values with original shape preserved
             - topk_indices: [B, S, k], Global indices of top-k elements
 
@@ -130,8 +134,12 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
     index_dtype = config.topk_config.index_dtype
     output_shape = (BxS, true_k)
 
-    # Trivial case: k == vocab_size, return input as-is with sequential indices
+    # Trivial case: k == vocab_size, return input as-is with sequential indices.
     if true_k == config.vocab_size:
+        kernel_assert(
+            not sorted_flag,
+            f"sorted=True is not supported when k == vocab_size ({true_k}). Use k < vocab_size for sorted output.",
+        )
         P_MAX = nl.tile_size.pmax
         topk_indices = nl.ndarray(output_shape, dtype=index_dtype, buffer=nl.shared_hbm)
 
@@ -141,8 +149,8 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
 
         n_full_tiles = BxS // tile_rows
         remainder = BxS % tile_rows
-        for t in nl.affine_range(n_full_tiles):
-            nisa.dma_copy(dst=topk_indices[nl.ds(t * tile_rows, tile_rows), :], src=idx_sb)
+        for tile_idx in nl.affine_range(n_full_tiles):
+            nisa.dma_copy(dst=topk_indices[nl.ds(tile_idx * tile_rows, tile_rows), :], src=idx_sb)
         if remainder > 0:
             nisa.dma_copy(
                 dst=topk_indices[nl.ds(n_full_tiles * tile_rows, remainder), :], src=idx_sb[nl.ds(0, remainder), :]
@@ -178,6 +186,33 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
     n_bxs_tiles = config.n_bxs_tiles
     lnc_batch_start = prg_id * config.per_lnc_BxS
 
+    # Hoist tile-invariant constants out of the loop
+    n_stages = config.n_stages
+    stage_free_size = config.stage_free_size
+    total_partition_dim = n_stages * tile_size
+    concatenated_stage_free_dim = stage_free_size + (n_stages * config.local_top_k_per_stage)
+
+    indices = nl.ndarray((total_partition_dim, concatenated_stage_free_dim), dtype=nl.float32)
+    nisa.iota(
+        dst=indices[:, nl.ds(0, stage_free_size)],
+        pattern=[[1, stage_free_size]],
+        offset=0,
+    )
+
+    stage_offsets = build_stage_offsets(n_stages, tile_size, stage_free_size)
+
+    rotation = build_rotation_matrix(n_stages, tile_size, dtype=inp.dtype)
+    rotation_f32 = nl.ndarray((total_partition_dim, total_partition_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=rotation_f32, src=rotation, engine=nisa.vector_engine)
+
+    nisa.tensor_scalar(
+        dst=indices[:, nl.ds(0, stage_free_size)],
+        data=indices[:, nl.ds(0, stage_free_size)],
+        op0=nl.add,
+        operand0=stage_offsets,
+        engine=nisa.vector_engine,
+    )
+
     for tile_idx in nl.sequential_range(n_bxs_tiles):
         tile_batch_start = lnc_batch_start + tile_idx * tile_size
         tile_batch_end = min(tile_batch_start + tile_size, min(lnc_batch_start + config.per_lnc_BxS, BxS))
@@ -187,6 +222,9 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
             config=config,
             batch_start=tile_batch_start,
             batch_end=tile_batch_end,
+            rotation=rotation,
+            rotation_f32=rotation_f32,
+            indices=indices,
         )
 
         tile_bxs = tile_batch_end - tile_batch_start
@@ -197,9 +235,9 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
             flat_value = reshape_with_dma(value, config.n_stages, dtype=inp.dtype)
             flat_index = reshape_with_dma(global_index, config.n_stages, dtype=index_dtype)
 
-            sorted_val, sorted_global_idx = sort(flat_value, indices=flat_index)
-            nisa.dma_copy(dst=topk_indices[hbm_slice, :true_k], src=sorted_global_idx[sbuf_slice, :true_k])
-            nisa.dma_copy(dst=topk_values[hbm_slice, :true_k], src=sorted_val[sbuf_slice, :true_k])
+            trimmed_val, trimmed_idx = sort(flat_value, flat_index, true_k)
+            nisa.dma_copy(dst=topk_indices[hbm_slice, :true_k], src=trimmed_idx[sbuf_slice, :true_k])
+            nisa.dma_copy(dst=topk_values[hbm_slice, :true_k], src=trimmed_val[sbuf_slice, :true_k])
         else:
             global_index_int = nl.ndarray(global_index.shape, dtype=index_dtype, buffer=nl.sbuf)
             nisa.tensor_copy(dst=global_index_int, src=global_index)
@@ -223,55 +261,49 @@ def rotational_topk(inp: nl.ndarray, config: RotationalTopkConfig) -> Tuple[nl.n
 
 
 def _topk_rotated_core(
-    inp: nl.ndarray,
+    inp: nl.NkiTensor,
     config: RotationalTopkConfig,
     batch_start: int,
     batch_end: int,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+    rotation: nl.ndarray,
+    rotation_f32: nl.ndarray,
+    indices: nl.ndarray,
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Core rotational top-k algorithm implementation.
 
     Performs multi-stage rotation and reduction to find top-k elements efficiently
     by rotating local maxima across stages and accumulating results.
+    Uses on-chip index generation via nisa.iota + nisa.tensor_scalar,
+    fast_folded_load with targeted padding, and skips rotation on the last stage.
 
     Args:
-        inp (nl.ndarray): [BxS, V], Input tensor in HBM
+        inp (nl.NkiTensor): [BxS, V], Input tensor in HBM
         config (RotationalTopkConfig): Configuration with algorithm parameters
-        n_programs (int): Total number of parallel programs
-        program_id (int): Current program ID
+        batch_start (int): Start index for batch tile
+        batch_end (int): End index for batch tile
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - value: [total_partition_dim, local_top_k_per_stage], Top-k values
             - global_index: [total_partition_dim, local_top_k_per_stage], Global indices
 
-    Notes:
-        - This is a hidden helper function for internal use
-        - Assumes input is already validated and properly shaped
-
     Pseudocode:
-        # Initialize buffers
-        values = folded_load(inp, n_stages)  # [n_stages * BxS, stage_free_size]
-        indices = iota(0..padded_vocab_size)  # Global index tracking
+        # Initialize buffers with on-chip index generation
+        values = folded_load(inp, n_stages)
+        indices = iota(0..stage_free_size) + stage_offsets
         rotation_matrix = load_circulant_permutation(n_stages, BxS)
 
         # Iterative rotation and top-k
         for stage_idx in range(n_stages):
             offset = stage_free_size + (local_top_k * stage_idx)
-
-            # Find local top-k from current values
             local_vals, local_idx = topk_core(values[:, :offset], k=local_top_k)
-
-            # Gather global indices corresponding to local top-k
             global_idx = gather(indices, local_idx)
-
-            # Rotate values and indices across partitions
-            rotated_vals = matmul(rotation_matrix, local_vals)
-            rotated_idx = matmul(rotation_matrix, global_idx)
-
-            # Append rotated results for next stage
-            values[:, offset:offset+local_top_k] = rotated_vals
-            indices[:, offset:offset+local_top_k] = rotated_idx
+            if stage_idx < n_stages - 1:
+                rotated_vals = matmul(rotation_matrix, local_vals)
+                rotated_idx = matmul(rotation_matrix, global_idx)
+                values[:, offset:offset+local_top_k] = rotated_vals
+                indices[:, offset:offset+local_top_k] = rotated_idx
 
         return local_vals, global_idx
     """
@@ -279,68 +311,19 @@ def _topk_rotated_core(
     local_top_k_per_stage = config.local_top_k_per_stage
     stage_free_size = config.stage_free_size
     BxS_size = config.tile_size
-    padded_vocab_size = config.padded_vocab_size
 
     total_partition_dim = n_stages * BxS_size
     concatenated_stage_free_dim = stage_free_size + (n_stages * local_top_k_per_stage)
 
-    rotation_matrix_file = config._shared_const_cache[f"{n_stages}_{BxS_size}"]
-    rotate_hbm = nl.shared_constant(rotation_matrix_file)
-
-    values = nl.ndarray(
-        (
-            total_partition_dim,
-            concatenated_stage_free_dim,
-        ),
-        dtype=inp.dtype,
-    )
-    indices = nl.ndarray(
-        (
-            total_partition_dim,
-            concatenated_stage_free_dim,
-        ),
-        dtype=nl.float32,
-    )
-    nisa.memset(dst=indices, value=0)
-    nisa.dma_copy(
-        dst=indices[:, :stage_free_size],
-        src=nl.shared_constant(
-            config._shared_const_cache[f"{padded_vocab_size}_{n_stages}_{stage_free_size}_{BxS_size}"]
-        ),
-    )
-
-    partition_slice = nl.ds(0, total_partition_dim)
-    free_slice = nl.ds(0, stage_free_size)
+    values = nl.ndarray((total_partition_dim, concatenated_stage_free_dim), dtype=inp.dtype)
 
     predicated_folded_load(
         data_hbm=inp,
         fold_factor=n_stages,
-        n_programs=1,
-        program_id=0,
         data_sb=values,
         batch_start=batch_start,
         batch_end=batch_end,
     )
-    kernel_assert(
-        values.shape == (total_partition_dim, concatenated_stage_free_dim),
-        f"shape mismatch expected {(total_partition_dim, stage_free_size)} but got {values.shape}",
-    )
-    kernel_assert(
-        indices.shape == (total_partition_dim, concatenated_stage_free_dim),
-        f"shape mismatch expected {(total_partition_dim, stage_free_size)} but got {indices.shape}",
-    )
-    free_slice = nl.ds(0, total_partition_dim)
-    rotation = nl.ndarray(rotate_hbm.shape, dtype=inp.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=rotation, src=rotate_hbm[partition_slice, free_slice])
-
-    # Create float32 rotation matrix for indices when input is not float32
-    rotation_f32 = nl.ndarray(rotate_hbm.shape, dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=rotation_f32, src=rotation)
-
-    local_index = nl.ndarray(
-        shape=(total_partition_dim, local_top_k_per_stage), dtype=config.index_dtype, buffer=nl.sbuf
-    )
-    nisa.memset(dst=local_index, value=0)
 
     for stage_idx in nl.static_range(n_stages):
         offset = stage_free_size + (local_top_k_per_stage * stage_idx)
@@ -348,16 +331,32 @@ def _topk_rotated_core(
         value, local_index = topk_core(data=values[:, :offset], k=local_top_k_per_stage)
 
         global_index = nl.ndarray(local_index.shape, dtype=indices.dtype, buffer=nl.sbuf)
-        nisa.nc_n_gather(dst=global_index, data=indices, indices=local_index)
+        # Tile the gather into chunks no wider than the nc_n_gather ISA group size. A
+        # single gather wider than this splits into multiple internal ISA groups, and
+        # that multi-group form corrupts the tail elements of the last BxS tile on
+        # hardware while the simulator (which executes the gather atomically) stays
+        # correct (NKILIB-1592).
+        gather_group_size = HW_PARAMS.gather_group_size
+        gather_width = local_index.shape[1]
+        n_gather_tiles = (gather_width + gather_group_size - 1) // gather_group_size
+        for gather_tile in nl.static_range(n_gather_tiles):
+            chunk = min(gather_group_size, gather_width - gather_tile * gather_group_size)
+            chunk_slice = nl.ds(gather_tile * gather_group_size, chunk)
+            nisa.nc_n_gather(
+                dst=global_index[:, chunk_slice],
+                data=indices[:, :offset],
+                indices=local_index[:, chunk_slice],
+            )
 
-        rotated_index = nl.ndarray(global_index.shape, dtype=nl.float32, buffer=nl.psum)
-        rotated = nl.ndarray(value.shape, dtype=nl.float32, buffer=nl.psum)
+        if stage_idx < n_stages - 1:
+            rotated_index = nl.ndarray(global_index.shape, dtype=nl.float32, buffer=nl.psum)
+            rotated = nl.ndarray(value.shape, dtype=nl.float32, buffer=nl.psum)
 
-        rotate(dst=rotated_index, tensor=global_index, rotation_matrix=rotation_f32)
-        rotate(dst=rotated, tensor=value, rotation_matrix=rotation)
+            rotate(dst=rotated_index, tensor=global_index, rotation_matrix=rotation_f32)
+            rotate(dst=rotated, tensor=value, rotation_matrix=rotation)
 
-        insert(tensor=values, values=rotated, offset=offset)
-        insert(tensor=indices, values=rotated_index, offset=offset)
+            insert(tensor=values, values=rotated, offset=offset)
+            insert(tensor=indices, values=rotated_index, offset=offset)
 
     return value, global_index
 
@@ -396,12 +395,12 @@ def _kernel(fn):
 
 @_kernel
 def topk(
-    inp: nl.ndarray,
+    inp: nl.NkiTensor,
     k: int,
     sorted_flag: bool = True,
     method: SupportedTopkMethods = SupportedTopkMethods.ROTATIONAL,
     lnc: Optional[int] = None,
-) -> Tuple[nl.ndarray, nl.ndarray]:
+) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Find the k largest elements along the last dimension of input tensor.
 
@@ -416,14 +415,14 @@ def topk(
         k: Number of top elements to retrieve
 
     Args:
-        inp (nl.ndarray): [B, S, V], Input tensor in HBM
+        inp (nl.NkiTensor): [B, S, V], Input tensor in HBM
         k (int): Number of top elements to retrieve
         sorted_flag (bool): Whether to sort the output (default: True)
         method (SupportedTopkMethods): Algorithm to use (default: ROTATIONAL)
         lnc (Optional[int]): Number of logical cores to use (default: None, auto-detect)
 
     Returns:
-        Tuple[nl.ndarray, nl.ndarray]: A tuple containing:
+        Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - topk_values: [B, S, k], Top-k values
             - topk_indices: [B, S, k], Indices of top-k elements
 
@@ -474,47 +473,11 @@ def topk(
     selected_topk_method = SUPPORTED_TOPK_METHOD_MAPPING[method]
 
     config = create_rotational_topk_config(inp_shape=inp.shape, topk_config=topk_config)
-    config = prepare_rotational_constants(config)
     config.log_strategy()
     grid = config.n_prgs
     topk_values, topk_indices = selected_topk_method[grid](inp=inp, config=config)
 
     topk_values = topk_values.reshape(topk_config.out_shape)
     topk_indices = topk_indices.reshape(topk_config.out_shape)
-    cleanup_rotational_constants()
 
     return topk_values, topk_indices
-
-
-def prepare_rotational_constants(config: RotationalTopkConfig) -> RotationalTopkConfig:
-    """Prepare rotational constants and return the config with the shared cache populated.
-
-    Since RotationalTopkConfig is frozen, this uses object.__setattr__ to set the
-    _shared_const_cache field directly. This is safe because _shared_const_cache is
-    excluded from __hash__ and __eq__.
-
-    Args:
-        config: RotationalTopkConfig with kernel parameters
-
-    Returns:
-        RotationalTopkConfig: Same config with _shared_const_cache populated
-    """
-    # Use float32 for constants - indices need precision for large values
-    const_dtype = np.float32
-    RotationalConstants._get_permutation_matrix(config.n_stages, config.tile_size, const_dtype)
-    RotationalConstants._get_global_indices(
-        config.n_stages,
-        config.stage_free_size,
-        config.tile_size,
-        config.padded_vocab_size,
-        const_dtype,
-    )
-    # Set the cache directly on the frozen instance — safe because this field
-    # is excluded from __hash__ and __eq__
-    object.__setattr__(config, '_shared_const_cache', dict(RotationalConstants._shared_const_cache))
-    return config
-
-
-def cleanup_rotational_constants() -> None:
-    """Cleanup rotational constants after topk kernel execution."""
-    RotationalConstants.cleanup()

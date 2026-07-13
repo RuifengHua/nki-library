@@ -27,7 +27,25 @@ from pathlib import Path
 
 import fabric2
 
-from .scripts.remote_lock_scripts import LockResult, LockStatus
+# Redundant aliases on the timing constants mark them as intentional re-exports
+# so the client reads identical values without redefining them. The deployed
+# helper remains the single source of truth for these timings.
+from .scripts.remote_lock_scripts import (  # noqa: F401
+    COMMIT_WINDOW as COMMIT_WINDOW,
+)
+from .scripts.remote_lock_scripts import (  # noqa: F401
+    POLL_JITTER_MAX as POLL_JITTER_MAX,
+)
+from .scripts.remote_lock_scripts import (  # noqa: F401
+    POLL_PERIOD as POLL_PERIOD,
+)
+from .scripts.remote_lock_scripts import (  # noqa: F401
+    STALE_THRESHOLD as STALE_THRESHOLD,
+)
+from .scripts.remote_lock_scripts import (  # noqa: F401
+    LockResult,
+    LockStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +57,21 @@ REMOTE_FLOCK_FILE = f"{REMOTE_LOCK_DIR}/atomic_lock"
 REMOTE_LOCK_HELPERS = f"{REMOTE_LOCK_DIR}/lock_helpers.py"
 
 # Default locking protocol version for hosts without version file
-DEFAULT_LOCKING_PROTOCOL_VERSION = 2
+DEFAULT_LOCKING_PROTOCOL_VERSION = 4
+
+# Build-time guard: this constant and the deployed v4 queue verbs must move
+# together. Fail fast at import if the constant drifts from the protocol the
+# verbs implement, rather than silently regressing hosts.
+assert DEFAULT_LOCKING_PROTOCOL_VERSION == 4, "locking protocol constant must stay pinned to v4"
 
 # JSON key in version file
 MIN_CLIENT_VERSION_KEY = "minClientLockingVersion"
 
 # Default timeouts
+# Uniform hard-cap hold window: a lock is never renewed, so this
+# doubles as the truthful worst-case release time. The on-core capture is wrapped
+# in a shorter shell ``timeout`` so the cap never truncates a real in-progress
+# capture.
 DEFAULT_LOCK_TIMEOUT_SECONDS = 60
 
 # Path to the local helper script that gets deployed to remote hosts
@@ -77,7 +104,13 @@ def _remote_initialize(
     import json
     import os
     import random
+    import re
     import time
+
+    def _parse_script_version(text):
+        # Best-effort parse of SCRIPT_VERSION from helper source; None if absent.
+        m = re.search(r"SCRIPT_VERSION\s*=\s*(\d+)", text)
+        return int(m.group(1)) if m else None
 
     os.makedirs(lock_dir, mode=0o777, exist_ok=True)
     open(lock_file, "a").close()
@@ -103,8 +136,23 @@ def _remote_initialize(
                     raise TimeoutError(f"flock timed out after {flock_timeout}s")
                 time.sleep(0.1 + random.uniform(0, 0.025))
         try:
-            with open(helpers_file, "w") as hf:
-                hf.write(helpers_content)
+            # Version-gate the deploy under the held flock (read + decide + write
+            # atomically, no new TOCTOU). Only a strictly-newer client may
+            # overwrite; an equal-or-newer deployed helper is preserved so a
+            # stale client cannot downgrade verbs out from under newer clients.
+            client_version = _parse_script_version(helpers_content)
+            deployed_version = None
+            try:
+                with open(helpers_file) as hf:
+                    deployed_version = _parse_script_version(hf.read())
+            except (FileNotFoundError, OSError):
+                deployed_version = None
+            should_write = deployed_version is None or (
+                client_version is not None and client_version > deployed_version
+            )
+            if should_write:
+                with open(helpers_file, "w") as hf:
+                    hf.write(helpers_content)
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
     return version_data
@@ -146,6 +194,10 @@ def _remote_lock_operation(lock_file, helpers_file, command, args, kwargs=None, 
         "message": lr.message,
         "expiry": lr.expiry,
         "max_lock_expiry": lr.max_lock_expiry,
+        "position": lr.position,
+        "worst_case_eta": lr.worst_case_eta,
+        "bumped": lr.bumped,
+        "re_enqueued": lr.re_enqueued,
     }
     return result
 
@@ -183,7 +235,11 @@ def get_host_locking_version(conn: fabric2.Connection) -> int:
         except json.JSONDecodeError:
             logger.warning(f"[{conn.host}] Corrupted infra_version.json, will recreate")
 
-    logger.info(f"[{conn.host}] Creating infra_version.json with version {DEFAULT_LOCKING_PROTOCOL_VERSION}")
+    # Recreating the version file is a silent-regression risk: a wiped /tmp could
+    # otherwise be rebuilt at an unexpected version. The downgrade race is accepted
+    # as-is -- a concurrent recreate by another client is logged,
+    # not prevented. Log at warning so the recreate is observable in test output.
+    logger.warning(f"[{conn.host}] Recreating infra_version.json with version {DEFAULT_LOCKING_PROTOCOL_VERSION}")
     data = json.dumps({MIN_CLIENT_VERSION_KEY: DEFAULT_LOCKING_PROTOCOL_VERSION})
     write_result = conn.run(
         f"mkdir -p {REMOTE_LOCK_DIR} && echo '{data}' > {REMOTE_VERSION_JSON}", warn=True, hide=True
@@ -239,27 +295,10 @@ def _run_lock_helper(executor, command: str, *args, **kwargs) -> LockResult:
         message=resp.get("message"),
         expiry=resp.get("expiry"),
         max_lock_expiry=resp.get("max_lock_expiry"),
-    )
-
-
-def acquire(
-    executor,
-    total_physical_cores: int,
-    num_physical_cores: int,
-    timeout_seconds: int,
-    version: int,
-    caller_id: str | None = None,
-) -> LockResult:
-    """Acquire physical cores on a remote host."""
-    return _run_lock_helper(
-        executor,
-        "acquire",
-        REMOTE_LOCKS_JSON,
-        total_physical_cores,
-        num_physical_cores,
-        timeout_seconds,
-        version,
-        caller_id=caller_id,
+        position=resp.get("position"),
+        worst_case_eta=resp.get("worst_case_eta"),
+        bumped=resp.get("bumped", False),
+        re_enqueued=resp.get("re_enqueued", False),
     )
 
 
@@ -275,6 +314,69 @@ def release(
         version,
         caller_id=caller_id,
         expected_expiry=expected_expiry,
+    )
+
+
+def poll(
+    executor,
+    total_physical_cores: int,
+    num_physical_cores: int,
+    timeout_seconds: int,
+    version: int,
+    entry_id: str,
+    ready: bool,
+    caller_id: str | None = None,
+) -> LockResult:
+    """Poll the FIFO core-allocation queue (fast-path / enqueue / commit)."""
+    return _run_lock_helper(
+        executor,
+        "poll",
+        REMOTE_LOCKS_JSON,
+        total_physical_cores,
+        num_physical_cores,
+        timeout_seconds,
+        version,
+        entry_id,
+        ready,
+        caller_id=caller_id,
+    )
+
+
+def dequeue(
+    executor,
+    total_physical_cores: int,
+    version: int,
+    entry_id: str,
+    caller_id: str | None = None,
+) -> LockResult:
+    """Gracefully remove an entry from the FIFO core-allocation queue."""
+    return _run_lock_helper(
+        executor,
+        "dequeue",
+        REMOTE_LOCKS_JSON,
+        total_physical_cores,
+        version,
+        entry_id,
+        caller_id=caller_id,
+    )
+
+
+def probe(
+    executor,
+    total_physical_cores: int,
+    num_physical_cores: int,
+    timeout_seconds: int,
+    version: int,
+) -> LockResult:
+    """Read-only worst-case ETA peek (no enqueue / no mutation)."""
+    return _run_lock_helper(
+        executor,
+        "probe",
+        REMOTE_LOCKS_JSON,
+        total_physical_cores,
+        num_physical_cores,
+        timeout_seconds,
+        version,
     )
 
 

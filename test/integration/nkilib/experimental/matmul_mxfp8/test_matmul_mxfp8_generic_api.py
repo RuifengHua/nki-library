@@ -30,12 +30,19 @@ import nki.language as nl
 import numpy as np
 import pytest
 
+from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_config import (
+    MatmulMxfp8KernelConfig,
+    auto_generate_default,
+    validate_shapes,
+)
+from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_constants import (
+    PRECISION_BFLOAT16,
+    PRECISION_FP32,
+    PRECISION_MXFP8,
+    PRECISION_MXFP8_X4,
+)
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_generic_api import (
     generic_matmul_mxfp8_api,
-)
-from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_generic_kernel import (
-    _auto_generate_config,
-    _validate_and_calculate_shapes,
 )
 from nkilib_src.nkilib.experimental.matmul_mxfp8.matmul_mxfp8_torch import matmul_mxfp8_torch_ref
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils import (
@@ -48,6 +55,7 @@ from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_dataclasses im
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.common_utils import (
     create_and_set_active_sbm,
     get_active_sbm,
+    with_active_sbm,
 )
 from nkilib_src.nkilib.experimental.mxfp_utils.mxfp8_utils.quantize_mxfp8_utils import (
     get_fp8_dtype_x4,
@@ -92,46 +100,70 @@ def _setup(
     use_scale_packing,
     block_loop_order=None,
     spill_reload=False,
+    lhs_load_with_PE_swizzle=False,
+    rhs_load_with_PE_swizzle=False,
+    lhs_is_f_by_k=None,
+    rhs_is_f_by_k=None,
 ):
-    lhs_td = TensorDescriptor(data=lhs, scales=lhs_scales, is_swizzled=lhs_is_swizzled)
+    lhs_td = TensorDescriptor(
+        data=lhs,
+        scales=lhs_scales,
+        is_swizzled=lhs_is_swizzled,
+        load_with_PE_swizzle=lhs_load_with_PE_swizzle if not lhs_is_swizzled else False,
+        is_f_by_k=lhs_is_f_by_k,
+    )
     rhs_td = TensorDescriptor(
         data=rhs,
         scales=rhs_scales,
         is_swizzled=rhs_is_swizzled,
         is_col_parallel_sharded=run_with_lnc2,
+        load_with_PE_swizzle=rhs_load_with_PE_swizzle if not rhs_is_swizzled else False,
+        is_f_by_k=rhs_is_f_by_k,
     )
-    (
-        TILES_IN_BLOCK_M,
-        TILES_IN_BLOCK_N,
-        TILES_IN_BLOCK_K,
-        TILES_IN_LOAD_M,
-        TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical,
-    ) = _auto_generate_config(
-        lhs_td=lhs_td,
-        rhs_td=rhs_td,
+
+    K_logical, M_logical = lhs_td.sharded_logical_shape
+    _, N_logical = rhs_td.sharded_logical_shape
+    lhs_precision = (
+        PRECISION_BFLOAT16 if not lhs_td.is_quantized else (PRECISION_MXFP8_X4 if lhs_td.is_x4 else PRECISION_MXFP8)
+    )
+    rhs_precision = (
+        PRECISION_BFLOAT16 if not rhs_td.is_quantized else (PRECISION_MXFP8_X4 if rhs_td.is_x4 else PRECISION_MXFP8)
+    )
+
+    config = MatmulMxfp8KernelConfig(
+        M=M_logical,
+        K=K_logical,
+        N=N_logical,
+        tile_m=lhs_matmul_tile_shape_logical[1] if lhs_matmul_tile_shape_logical else None,
+        tile_k=lhs_matmul_tile_shape_logical[0] if lhs_matmul_tile_shape_logical else None,
+        tile_n=rhs_matmul_tile_shape_logical[1] if rhs_matmul_tile_shape_logical else None,
         TILES_IN_BLOCK_M=TILES_IN_BLOCK_M,
         TILES_IN_BLOCK_N=TILES_IN_BLOCK_N,
         TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical=lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
+        enable_scale_packing=use_scale_packing,
+        run_with_lnc2=run_with_lnc2,
+        lnc_2_shard_rhs=True,
+        lhs_is_swizzled=lhs_is_swizzled,
+        rhs_is_swizzled=rhs_is_swizzled,
     )
-    shapes = _validate_and_calculate_shapes(
-        lhs_td=lhs_td,
-        rhs_td=rhs_td,
-        TILES_IN_BLOCK_M=TILES_IN_BLOCK_M,
-        TILES_IN_BLOCK_N=TILES_IN_BLOCK_N,
-        TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
-        TILES_IN_LOAD_M=TILES_IN_LOAD_M,
-        TILES_IN_LOAD_N=TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical=lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
-        use_scale_packing=use_scale_packing,
-    )
-    return lhs_td, rhs_td, shapes, TILES_IN_LOAD_M, TILES_IN_LOAD_N
+    auto_generate_default(config, lhs_precision, rhs_precision, PRECISION_FP32)
+    validate_shapes(config, lhs_td, rhs_td)
+
+    shapes = {
+        'bd': config.bd,
+        'BLOCKS_IN_M': config.BLOCKS_IN_M,
+        'BLOCKS_IN_N': config.BLOCKS_IN_N,
+        'BLOCKS_IN_K': config.BLOCKS_IN_K,
+        'lhs_matmul_tile_shape_physical': config.lhs_matmul_tile_shape_physical,
+        'rhs_matmul_tile_shape_physical': config.rhs_matmul_tile_shape_physical,
+        'lhs_load_tile_shape': config.lhs_load_tile_shape,
+        'rhs_load_tile_shape': config.rhs_load_tile_shape,
+        'lhs_quantize_tile_shape': config.lhs_quantize_tile_shape,
+        'rhs_quantize_tile_shape': config.rhs_quantize_tile_shape,
+    }
+    return lhs_td, rhs_td, shapes, config.TILES_IN_LOAD_M, config.TILES_IN_LOAD_N
 
 
 def _alloc_output_and_lnc(lhs_td, rhs_td, shapes, run_with_lnc2, output_dtype):
@@ -179,6 +211,7 @@ def _store_sbuf_to_hbm(output_sbuf, output_hbm, bd, LHS_MATMUL_TILE_M):
 # ---------------------------------------------------------------------------
 
 
+@with_active_sbm
 def _kernel_hbm_k_loop(
     lhs,
     rhs,
@@ -201,6 +234,12 @@ def _kernel_hbm_k_loop(
     block_loop_order=None,
     spill_reload=False,
     output_to_sbuf=False,
+    lhs_load_with_PE_swizzle=False,
+    rhs_load_with_PE_swizzle=False,
+    lhs_is_f_by_k=None,
+    rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     create_and_set_active_sbm()
     sbm = get_active_sbm()
@@ -222,6 +261,10 @@ def _kernel_hbm_k_loop(
         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
         lhs_matmul_tile_shape_logical=lhs_matmul_tile_shape_logical,
         rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
+        lhs_load_with_PE_swizzle=lhs_load_with_PE_swizzle,
+        rhs_load_with_PE_swizzle=rhs_load_with_PE_swizzle,
+        lhs_is_f_by_k=lhs_is_f_by_k,
+        rhs_is_f_by_k=rhs_is_f_by_k,
     )
     bd = shapes['bd']
     LHS_MATMUL_TILE_M = shapes['lhs_matmul_tile_shape_physical'][1]
@@ -248,7 +291,7 @@ def _kernel_hbm_k_loop(
                 ),
                 scales=nl.ndarray(
                     (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, shapes['BLOCKS_IN_M'] * bd.BLOCK_M_LOGICAL),
-                    dtype=nl.uint8,
+                    dtype=nl.float8_e8m0fnu,
                     buffer=data_buffer,
                 ),
                 is_swizzled=True,
@@ -263,7 +306,7 @@ def _kernel_hbm_k_loop(
                 ),
                 scales=nl.ndarray(
                     (shapes['BLOCKS_IN_K'] * BLOCK_K_SIZE, BLOCKS_IN_N_sharded * bd.BLOCK_N_LOGICAL),
-                    dtype=nl.uint8,
+                    dtype=nl.float8_e8m0fnu,
                     buffer=data_buffer,
                 ),
                 is_swizzled=True,
@@ -321,6 +364,7 @@ def _kernel_hbm_k_loop(
 # ---------------------------------------------------------------------------
 
 
+@with_active_sbm
 def _kernel_sbuf_preloaded(
     lhs,
     rhs,
@@ -343,6 +387,12 @@ def _kernel_sbuf_preloaded(
     block_loop_order=None,
     spill_reload=False,
     output_to_sbuf=False,
+    lhs_load_with_PE_swizzle=False,
+    rhs_load_with_PE_swizzle=False,
+    lhs_is_f_by_k=None,
+    rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     create_and_set_active_sbm()
     sbm = get_active_sbm()
@@ -473,6 +523,7 @@ def _kernel_sbuf_preloaded(
 # ---------------------------------------------------------------------------
 
 
+@with_active_sbm
 def _kernel_sbuf_empty_td_fill(
     lhs,
     rhs,
@@ -495,6 +546,12 @@ def _kernel_sbuf_empty_td_fill(
     block_loop_order=None,
     spill_reload=False,
     output_to_sbuf=False,
+    lhs_load_with_PE_swizzle=False,
+    rhs_load_with_PE_swizzle=False,
+    lhs_is_f_by_k=None,
+    rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     """Pass empty TDs, API loads and fills them. Then use the filled TDs
     in a second API call (which skips loading). If the second call produces
@@ -610,6 +667,7 @@ def _kernel_sbuf_empty_td_fill(
 # ---------------------------------------------------------------------------
 
 
+@with_active_sbm
 def _kernel_lhs_m_sharded(
     lhs,
     rhs,
@@ -632,6 +690,12 @@ def _kernel_lhs_m_sharded(
     block_loop_order=None,
     spill_reload=False,
     output_to_sbuf=False,
+    lhs_load_with_PE_swizzle=False,
+    rhs_load_with_PE_swizzle=False,
+    lhs_is_f_by_k=None,
+    rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     """M-sharded LNC2: LHS is col_parallel_sharded (halves M), RHS is full."""
     create_and_set_active_sbm()
@@ -642,38 +706,51 @@ def _kernel_lhs_m_sharded(
     lhs_td = TensorDescriptor(data=lhs, scales=lhs_scales, is_swizzled=lhs_is_swizzled, is_col_parallel_sharded=True)
     rhs_td = TensorDescriptor(data=rhs, scales=rhs_scales, is_swizzled=rhs_is_swizzled, is_col_parallel_sharded=False)
 
-    (
-        TILES_IN_BLOCK_M,
-        TILES_IN_BLOCK_N,
-        TILES_IN_BLOCK_K,
-        TILES_IN_LOAD_M,
-        TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical,
-    ) = _auto_generate_config(
-        lhs_td=lhs_td,
-        rhs_td=rhs_td,
+    K_logical, M_logical = lhs_td.sharded_logical_shape
+    _, N_logical = rhs_td.sharded_logical_shape
+    lhs_precision = (
+        PRECISION_BFLOAT16 if not lhs_td.is_quantized else (PRECISION_MXFP8_X4 if lhs_td.is_x4 else PRECISION_MXFP8)
+    )
+    rhs_precision = (
+        PRECISION_BFLOAT16 if not rhs_td.is_quantized else (PRECISION_MXFP8_X4 if rhs_td.is_x4 else PRECISION_MXFP8)
+    )
+
+    config = MatmulMxfp8KernelConfig(
+        M=M_logical,
+        K=K_logical,
+        N=N_logical,
+        tile_m=lhs_matmul_tile_shape_logical[1] if lhs_matmul_tile_shape_logical else None,
+        tile_k=lhs_matmul_tile_shape_logical[0] if lhs_matmul_tile_shape_logical else None,
+        tile_n=rhs_matmul_tile_shape_logical[1] if rhs_matmul_tile_shape_logical else None,
         TILES_IN_BLOCK_M=TILES_IN_BLOCK_M,
         TILES_IN_BLOCK_N=TILES_IN_BLOCK_N,
         TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
         TILES_IN_LOAD_M=TILES_IN_LOAD_M,
         TILES_IN_LOAD_N=TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical=lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
+        enable_scale_packing=use_scale_packing,
+        run_with_lnc2=True,
+        lnc_2_shard_rhs=False,
+        lhs_is_swizzled=lhs_is_swizzled,
+        rhs_is_swizzled=rhs_is_swizzled,
     )
-    shapes = _validate_and_calculate_shapes(
-        lhs_td=lhs_td,
-        rhs_td=rhs_td,
-        TILES_IN_BLOCK_M=TILES_IN_BLOCK_M,
-        TILES_IN_BLOCK_N=TILES_IN_BLOCK_N,
-        TILES_IN_BLOCK_K=TILES_IN_BLOCK_K,
-        TILES_IN_LOAD_M=TILES_IN_LOAD_M,
-        TILES_IN_LOAD_N=TILES_IN_LOAD_N,
-        lhs_matmul_tile_shape_logical=lhs_matmul_tile_shape_logical,
-        rhs_matmul_tile_shape_logical=rhs_matmul_tile_shape_logical,
-        use_scale_packing=use_scale_packing,
-    )
+    auto_generate_default(config, lhs_precision, rhs_precision, PRECISION_FP32)
+    validate_shapes(config, lhs_td, rhs_td)
+
+    shapes = {
+        'bd': config.bd,
+        'BLOCKS_IN_M': config.BLOCKS_IN_M,
+        'BLOCKS_IN_N': config.BLOCKS_IN_N,
+        'BLOCKS_IN_K': config.BLOCKS_IN_K,
+        'lhs_matmul_tile_shape_physical': config.lhs_matmul_tile_shape_physical,
+        'rhs_matmul_tile_shape_physical': config.rhs_matmul_tile_shape_physical,
+        'lhs_load_tile_shape': config.lhs_load_tile_shape,
+        'rhs_load_tile_shape': config.rhs_load_tile_shape,
+        'lhs_quantize_tile_shape': config.lhs_quantize_tile_shape,
+        'rhs_quantize_tile_shape': config.rhs_quantize_tile_shape,
+    }
     bd = shapes['bd']
+    TILES_IN_LOAD_M = config.TILES_IN_LOAD_M
+    TILES_IN_LOAD_N = config.TILES_IN_LOAD_N
 
     # Output: shared HBM, full [M, N]
     M_LOGICAL = lhs_td.logical_shape[1]
@@ -801,6 +878,85 @@ GRID_LHS_M_SHARDED = [
 ]
 
 
+# PE swizzle mixed: LHS uses PE swizzle, RHS uses DGT (both unswizzled)
+GRID_PE_SWIZZLE_MIXED = [
+    config_helper.TestConfig(
+        M=512,
+        K=1024,
+        N=512,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        run_with_lnc2=False,
+        output_dtype=constants.MatrixPrecision.FP32,
+        float8_dtype="float8_e4m3fn",
+        dists=["normal", "normal"],
+        params=[{"mean": 0, "std": 1}, {"mean": 0, "std": 1}],
+        description="LHS PE swizzle, RHS DGT (both unswizzled)",
+        seed=52,
+    ),
+]
+
+# K-by-F: LHS in [K, M] layout (PE swizzle auto-forced)
+GRID_K_BY_F_API = [
+    config_helper.TestConfig(
+        M=512,
+        K=1024,
+        N=512,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        run_with_lnc2=False,
+        output_dtype=constants.MatrixPrecision.FP32,
+        float8_dtype="float8_e4m3fn",
+        dists=["normal", "normal"],
+        params=[{"mean": 0, "std": 1}, {"mean": 0, "std": 1}],
+        description="K-by-F: both sides via API",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+    # K-by-F with LNC2 (RHS col-parallel sharded on N). N=1024 -> 2 N-blocks, shardable.
+    config_helper.TestConfig(
+        M=512,
+        K=1024,
+        N=1024,
+        tile_m=128,
+        tile_n=512,
+        tile_k=512,
+        TILES_IN_BLOCK_M=4,
+        TILES_IN_BLOCK_N=1,
+        TILES_IN_BLOCK_K=2,
+        TILES_IN_LOAD_M=4,
+        TILES_IN_LOAD_N=1,
+        lhs_is_swizzled=False,
+        rhs_is_swizzled=False,
+        run_with_lnc2=True,
+        output_dtype=constants.MatrixPrecision.FP32,
+        float8_dtype="float8_e4m3fn",
+        dists=["normal", "normal"],
+        params=[{"mean": 0, "std": 1}, {"mean": 0, "std": 1}],
+        description="K-by-F: both sides via API, LNC2",
+        seed=52,
+        lhs_is_f_by_k=False,
+        rhs_is_f_by_k=False,
+    ),
+]
+
 # ---------------------------------------------------------------------------
 # Test class
 # ---------------------------------------------------------------------------
@@ -828,6 +984,12 @@ def _api_torch_ref(
     block_loop_order=None,
     spill_reload=False,
     output_to_sbuf=False,
+    lhs_load_with_PE_swizzle=False,
+    rhs_load_with_PE_swizzle=False,
+    lhs_is_f_by_k=None,
+    rhs_is_f_by_k=None,
+    enable_psum_copy_in=None,
+    quant_scheme="wrapX",
 ):
     """Torch ref for API test kernels — delegates to matmul_mxfp8_torch_ref."""
     return matmul_mxfp8_torch_ref(
@@ -851,6 +1013,8 @@ def _api_torch_ref(
         spill_reload=spill_reload,
         lhs_is_swizzled=lhs_is_swizzled,
         rhs_is_swizzled=rhs_is_swizzled,
+        lhs_is_f_by_k=lhs_is_f_by_k,
+        rhs_is_f_by_k=rhs_is_f_by_k,
     )
 
 
@@ -867,6 +1031,7 @@ class TestGenericMatmulMxfp8Api:
         if not platform_target.is_trn3():
             pytest.skip("MX is only supported on TRN3.")
 
+        test_manager.collector.set_kernel_params(conf.to_metrics_dict())
         output_dtype = get_output_dtype(conf)
         kernel_input = build_matmul_inputs(conf)
         if extra_kernel_args:
@@ -875,7 +1040,6 @@ class TestGenericMatmulMxfp8Api:
         compiler_args = common_dataclasses.CompilerArgs(
             logical_nc_config=2 if conf.run_with_lnc2 else 1,
             platform_target=platform_target,
-            additional_cmd_args=["--internal-backend-options=--enable-mx-alternative-emax"],
         )
 
         custom_validation_args = _mxfp8_comparator(conf, output_dtype)
@@ -931,3 +1095,27 @@ class TestGenericMatmulMxfp8Api:
     @pytest.mark.parametrize("conf", GRID_LHS_M_SHARDED)
     def test_lhs_m_sharded(self, test_manager, conf, platform_target):
         self._run(test_manager, platform_target, conf, _kernel_lhs_m_sharded)
+
+    # --- PE swizzle mixed: LHS PE swizzle, RHS DGT (both unswizzled) ---
+    @pytest.mark.fast
+    @pytest.mark.parametrize("conf", GRID_PE_SWIZZLE_MIXED)
+    def test_pe_swizzle_mixed(self, test_manager, conf, platform_target):
+        self._run(
+            test_manager,
+            platform_target,
+            conf,
+            _kernel_hbm_k_loop,
+            extra_kernel_args={"lhs_load_with_PE_swizzle": True, "rhs_load_with_PE_swizzle": False},
+        )
+
+    # --- K-by-F: Input in [K, F] layout, PE swizzle auto-forced ---
+    @pytest.mark.fast
+    @pytest.mark.parametrize("conf", GRID_K_BY_F_API)
+    def test_k_by_f(self, test_manager, conf, platform_target):
+        self._run(
+            test_manager,
+            platform_target,
+            conf,
+            _kernel_hbm_k_loop,
+            extra_kernel_args={"lhs_is_f_by_k": False, "rhs_is_f_by_k": False},
+        )

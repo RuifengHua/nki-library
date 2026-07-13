@@ -13,7 +13,6 @@
 # limitations under the License.
 import logging
 import os
-import pathlib
 import shutil
 import subprocess
 from abc import ABC
@@ -34,6 +33,20 @@ from .s3_utils import (
     generate_s3_key,
     get_s3_client_and_session,
 )
+
+
+def cleanup_input_bins(local_path: str) -> None:
+    """Delete input ``*.bin`` tensors from a local artifact directory to free disk.
+
+    Call this ONLY after inference has fully succeeded. Deleting inputs while a
+    host rotation could still re-upload the directory makes the retry ship an
+    incomplete archive (missing ``inp-*.bin``), which neuron-explorer reports as
+    "open inp-*.bin: no such file or directory".
+    """
+    import pathlib
+
+    for bin_file in pathlib.Path(local_path).glob("*.bin"):
+        bin_file.unlink(missing_ok=True)
 
 
 def create_archive_command(source_path: str, destination_path: str, files_to_include: list[str] | None = None) -> str:
@@ -322,9 +335,12 @@ class RemoteDirectory(ABC):
         with collector.timer(MetricName.SFTP_UPLOAD_TIME):
             self._send_compressed(local_path, self.remote_path)
 
-        if force_local_cleanup:
-            for bin_file in pathlib.Path(local_path).glob("*.bin"):
-                bin_file.unlink(missing_ok=True)
+        # NOTE: input .bin files are intentionally NOT deleted here. A host
+        # rotation re-enters prepare_host and re-uploads this same directory; if
+        # the inputs were deleted after the first upload, the retry would ship an
+        # archive missing them and neuron-explorer on the new host would fail with
+        # "open inp-*.bin: no such file or directory". Local cleanup happens once,
+        # after inference succeeds (see Orchestrator._run_inference).
 
     def upload_s3(
         self,
@@ -337,7 +353,6 @@ class RemoteDirectory(ABC):
         s3_client, session = get_s3_client_and_session(s3_config.profile)
 
         assert os.path.exists(local_path), f"Local path {local_path} does not exist"
-        original_source_path = local_path  # Save for cleanup
 
         s3_key = generate_s3_key(s3_config, S3TransferDirection.INPUTS)
         archive_name = os.path.basename(s3_key)
@@ -352,10 +367,12 @@ class RemoteDirectory(ABC):
                 raise LocalExecutionException(f"Unable to create tarball of {local_path}", command_result)
             local_path = local_archive_location
 
-            # Delete .bin files immediately after tarball creation to free disk space
-            if force_local_cleanup:
-                for bin_file in pathlib.Path(original_source_path).glob("*.bin"):
-                    bin_file.unlink(missing_ok=True)
+            # NOTE: input .bin files are intentionally NOT deleted here. A host
+            # rotation re-enters prepare_host and re-uploads original_source_path;
+            # deleting the inputs after the first upload would make the retry ship
+            # an archive missing them, and neuron-explorer on the new host would
+            # fail with "open inp-*.bin: no such file or directory". Local cleanup
+            # happens once, after inference succeeds (see Orchestrator._run_inference).
 
         try:
             self.logger.info(f"Uploading {local_path} to s3://{s3_config.bucket}/{s3_key}...")

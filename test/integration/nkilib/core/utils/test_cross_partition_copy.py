@@ -120,7 +120,6 @@ class TestCrossPartitionCopy:
         "total_partitions": "tp",
     }
 
-    @pytest.mark.fast
     @pytest_parametrize(
         "src_start,dst_start,num_partitions,free_dim_size,total_partitions",
         [
@@ -130,13 +129,13 @@ class TestCrossPartitionCopy:
             (0, 0, 64, 8, 64),
             # --- Aligned src, unaligned dst within quadrant (Case 2: shuffle) ---
             (0, 5, 10, 8, 128),
-            (0, 16, 8, 8, 64),
+            pytest.param(0, 16, 8, 8, 64, marks=pytest.mark.fast),
             # --- Aligned src, unaligned dst cross-quadrant (Case 3) ---
             (0, 28, 20, 8, 128),
             (0, 60, 10, 8, 96),
             (0, 1, 63, 8, 64),
             # --- Unaligned src + aligned dst (src normalization + Case 1) ---
-            (5, 0, 16, 8, 128),
+            pytest.param(5, 0, 16, 8, 128, marks=pytest.mark.fast),
             (33, 64, 16, 8, 128),
             (17, 0, 15, 8, 32),
             # --- Unaligned src + unaligned dst within quadrant ---
@@ -144,7 +143,7 @@ class TestCrossPartitionCopy:
             (3, 2, 4, 8, 32),
             # --- Unaligned src + unaligned dst cross-quadrant ---
             (5, 28, 20, 8, 128),
-            (10, 55, 30, 8, 96),
+            pytest.param(10, 55, 30, 8, 96, marks=pytest.mark.fast),
             # --- Unaligned src spanning two src quadrants ---
             (28, 64, 32, 8, 128),
             (25, 5, 20, 8, 64),

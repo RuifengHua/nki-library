@@ -109,6 +109,10 @@ def _k_inner_loop_helper(
     RHS_F: int,
     enable_scale_packing: bool = False,
     global_block_tile_k_idx: int = 0,
+    psum_dtype=nl.float32,
+    tile_iter_idx: int = 0,
+    enable_psum_copy_in: bool = False,
+    inputs_were_prequantized: bool = False,
 ) -> None:
     """
     Process a single output tile by accumulating across K dimension using BIR AP.
@@ -129,6 +133,17 @@ def _k_inner_loop_helper(
         RHS_F (int): Total RHS F dimension size
         enable_scale_packing (bool): Whether scale packing is enabled (default: False)
         global_block_tile_k_idx (int): Global K tile index at start of block (default: 0)
+        tile_iter_idx (int): Sequential index of this M/N output tile within the block.
+            Used to cycle the copy method — only applied every 3rd tile
+            (tile_iter_idx % 3 == 1) to avoid oversubscribing the scalar engine
+            (default: 0).
+        enable_psum_copy_in (bool): Whether to use the PSUM copy-in method for
+            cross-block accumulation. Skipped when inputs_were_prequantized is True.
+            (default: False).
+        inputs_were_prequantized (bool): Whether the original HBM inputs were
+            pre-quantized (i.e. no online BF16->MXFP8 quantization). When True,
+            the copy method is skipped since there is no online quant to overlap.
+            (default: False).
 
     Returns:
         None
@@ -143,11 +158,39 @@ def _k_inner_loop_helper(
     if n_log_end != None and rhs_f_start >= n_log_end:
         return
 
-    out_psum = nl.ndarray((num_m, num_n), nl.float32, buffer=nl.psum)
+    out_psum = nl.ndarray((num_m, num_n), psum_dtype, buffer=nl.psum)
 
     P = lhs_td.data.shape[0]
 
-    # First K iteration without accumulation
+    # Output access pattern into the running SBUF accumulator.
+    out_pattern = [[NUM_LHS_F_TILES * RHS_F, num_m], [1, num_n]]
+    out_offset = lhs_f_idx * RHS_F + rhs_f_start
+    out_ap = output_tensor.ap(pattern=out_pattern, offset=out_offset)
+
+    # Copy the running SBUF accumulator into PSUM before matmul to avoid tensor-tensor
+    # adds on the vector engine. Conditions:
+    #   1. accumulate_output: multiple K-blocks require cross-block accumulation
+    #   2. not inputs_were_prequantized: only useful when online quantization loads the
+    #      vector engine (pre-quantized inputs have no quant work to overlap with)
+    #   3. enable_psum_copy_in: caller opted in to the copy-in method
+    #   4. tile_iter_idx % 3 == 1: amortize scalar engine load (tuned hyper-parameter)
+    #   5. psum_dtype == nl.float32: TensorCopy into PSUM requires 4-byte aligned dtype
+    #      on core_v4 (trn3); bfloat16 PSUM writes are only legal from matmult instructions
+    use_copy_method = (
+        accumulate_output
+        and not inputs_were_prequantized
+        and enable_psum_copy_in
+        and (tile_iter_idx % 3 == 1)
+        and psum_dtype == nl.float32
+    )
+
+    if use_copy_method:
+        # Copy-in: load the running accumulator into PSUM so the matmuls below
+        # can accumulate on top of it.
+        nisa.tensor_copy(dst=out_psum, src=out_ap)
+
+    # First K iteration. Accumulate onto the copied-in accumulator when the copy
+    # method pre-loaded PSUM, otherwise start fresh.
     k_idx = 0
 
     lhs_data_pattern, lhs_data_offset = _get_bir_ap_params(lhs_td.data.shape, k_idx, lhs_f_start, num_m)
@@ -177,7 +220,7 @@ def _k_inner_loop_helper(
         stationary_scale=lhs_td.scales.ap(pattern=lhs_scale_pattern, offset=lhs_scale_offset),
         moving_data=rhs_td.data.ap(pattern=rhs_data_pattern, offset=rhs_data_offset),
         moving_scale=rhs_td.scales.ap(pattern=rhs_scale_pattern, offset=rhs_scale_offset),
-        accumulate=False,
+        accumulate=use_copy_method,
         P=P,
         F_m=num_m,
         F_n=num_n,
@@ -218,13 +261,14 @@ def _k_inner_loop_helper(
             F_n=num_n,
         )
 
-    out_pattern = [[NUM_LHS_F_TILES * RHS_F, num_m], [1, num_n]]
-    out_offset = lhs_f_idx * RHS_F + rhs_f_start
-    out_ap = output_tensor.ap(pattern=out_pattern, offset=out_offset)
-
-    if accumulate_output:
+    if accumulate_output and not use_copy_method:
+        # Default path: Vector-engine add of the PSUM partial product into the
+        # running accumulator.
         nisa.tensor_tensor(out_ap, out_psum, out_ap, op=nl.add)
     else:
+        # Either a fresh write (accumulate_output=False) or the copy method has
+        # already folded the previous accumulator into PSUM, so PSUM holds the
+        # complete result.
         nisa.tensor_copy(dst=out_ap, src=out_psum)
 
 
@@ -240,6 +284,9 @@ def matmul_mxfp8_blocks(
     n_log_end: int = None,
     enable_scale_packing: bool = False,
     global_block_tile_k_idx: int = 0,
+    psum_dtype=nl.float32,
+    enable_psum_copy_in: bool = False,
+    inputs_were_prequantized: bool = False,
 ) -> None:
     """
     Perform blocked matmul between quantized tensors and store result in SBUF.
@@ -319,6 +366,7 @@ def matmul_mxfp8_blocks(
     NUM_RHS_F_TILES = RHS_F // RHS_TILE_F
 
     if loop_order == 'nmk' or loop_order == 'NMK':
+        tile_iter_idx = 0
         for rhs_f_idx in range(NUM_RHS_F_TILES):
             for lhs_f_idx in range(NUM_LHS_F_TILES):
                 _k_inner_loop_helper(
@@ -337,8 +385,14 @@ def matmul_mxfp8_blocks(
                     RHS_F,
                     enable_scale_packing,
                     global_block_tile_k_idx,
+                    psum_dtype,
+                    tile_iter_idx,
+                    enable_psum_copy_in,
+                    inputs_were_prequantized,
                 )
+                tile_iter_idx += 1
     elif loop_order == 'mnk' or loop_order == 'MNK':
+        tile_iter_idx = 0
         for lhs_f_idx in range(NUM_LHS_F_TILES):
             for rhs_f_idx in range(NUM_RHS_F_TILES):
                 _k_inner_loop_helper(
@@ -357,6 +411,11 @@ def matmul_mxfp8_blocks(
                     RHS_F,
                     enable_scale_packing,
                     global_block_tile_k_idx,
+                    psum_dtype,
+                    tile_iter_idx,
+                    enable_psum_copy_in,
+                    inputs_were_prequantized,
                 )
+                tile_iter_idx += 1
     else:
         kernel_assert(False, f"Unsupported loop_order '{loop_order}'. Supported loop orders are: 'mnk', 'nmk'.")

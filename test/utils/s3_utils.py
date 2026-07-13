@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
+from urllib.parse import urlparse
 
 import boto3
 from botocore.credentials import EnvProvider
@@ -33,6 +34,40 @@ from botocore.exceptions import ClientError
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_DELAY = 1.0  # seconds
 DEFAULT_MAX_DELAY = 30.0  # seconds
+
+
+@dataclass(frozen=True)
+class S3Uri:
+    """Parsed S3 URI with bucket and key prefix."""
+
+    bucket: str
+    prefix: str
+
+    @property
+    def uri(self) -> str:
+        if self.prefix:
+            return f"s3://{self.bucket}/{self.prefix}"
+        return f"s3://{self.bucket}"
+
+
+def parse_s3_uri(uri: str) -> S3Uri:
+    """Parse an S3 URI into bucket and prefix components.
+
+    Args:
+        uri: S3 URI (e.g. 's3://my-bucket/path/to/prefix/')
+
+    Returns:
+        S3Uri with bucket and prefix (trailing slashes stripped from prefix).
+
+    Raises:
+        ValueError: If the URI scheme is not 's3'.
+    """
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"Expected s3:// URI, got: {uri}")
+    bucket = parsed.netloc
+    prefix = parsed.path.lstrip("/").rstrip("/")
+    return S3Uri(bucket=bucket, prefix=prefix)
 
 
 class S3TransferDirection(Enum):

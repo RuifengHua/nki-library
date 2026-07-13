@@ -20,8 +20,6 @@ from typing import Optional
 import nki.isa as nisa
 import nki.language as nl
 
-from ...subkernels.layernorm_tkg import SHARDING_THRESHOLD as LAYERNORM_THRESHOLD
-from ...subkernels.rmsnorm_tkg import SHARDING_THRESHOLD as RMSNORM_THRESHOLD
 from ...utils.allocator import SbufManager, sizeinbytes
 from ...utils.common_types import HiddenLayout
 from ...utils.kernel_assert import kernel_assert
@@ -30,8 +28,6 @@ from ..mlp_parameters import (
     _Q_HEIGHT,
     _Q_WIDTH,
     MLPParameters,
-    mlpp_has_layer_normalization,
-    mlpp_has_rms_normalization,
 )
 
 
@@ -64,7 +60,6 @@ class MLPTKGConstantsDimensionSizes(nl.NKIObject):
     column_tiling_dim: int
     column_tiling_factor: int
     max_I_shard_size: int
-    do_norm_batch_sharding: int
     hidden_layout: HiddenLayout
     K: Optional[int] = None
     E: Optional[int] = None
@@ -207,23 +202,6 @@ class MLPTKGConstants(nl.NKIObject):
 
         column_tiling_factor = 128 // column_tiling_dim
 
-        # --- Check if normalization will use batch-sharding ---
-        # Layout when sharded: (num_shards, T/num_shards, H)
-        # Required to ensure deterministic fused-add and prevent non-determinism errors
-        is_T_evenly_divisible = T % num_shards == 0
-        do_norm_batch_sharding = (
-            mlpp_has_rms_normalization(params) and T > RMSNORM_THRESHOLD and is_T_evenly_divisible
-        ) or (mlpp_has_layer_normalization(params) and T > LAYERNORM_THRESHOLD and is_T_evenly_divisible)
-        do_norm_batch_sharding = do_norm_batch_sharding and (not params.shard_on_h_disabled)
-        hidden_layout = HiddenLayout.H0_T_H1
-
-        # TODO: update the conditions here for the hidden layout when
-        # we sort out the rmsnorm layout issue for low latency cases
-        # Currently, we only use (H0, H1, T) when applying rmsnorm on
-        # HBM input of shape (T, H)
-        if mlpp_has_rms_normalization(params) and not params.input_in_sbuf and not params.transposed_in and T >= _pmax:
-            hidden_layout = HiddenLayout.H0_H1_T
-
         return MLPTKGConstantsDimensionSizes(
             _pmax=_pmax,
             _psum_fmax=_psum_fmax,
@@ -245,8 +223,7 @@ class MLPTKGConstants(nl.NKIObject):
             column_tiling_dim=column_tiling_dim,
             column_tiling_factor=column_tiling_factor,
             max_I_shard_size=max_I_shard_size,
-            do_norm_batch_sharding=do_norm_batch_sharding,
-            hidden_layout=hidden_layout,
+            hidden_layout=None,  # Set by input_norm_load based on norm kernel output layout
             K=K,
             E=local_E,
         )

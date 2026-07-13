@@ -17,15 +17,22 @@
 from enum import Enum
 
 # ---------------------------------------------------------------------------
-# MatrixPrecision enum (str enum so values work as plain strings)
+# Precision string constants (NKI-compatible, used in kernel code)
 # ---------------------------------------------------------------------------
+PRECISION_MXFP8 = "mxfp8"
+PRECISION_MXFP8_X4 = "mxfp8_x4"
+PRECISION_BFLOAT16 = "bfloat16"
+PRECISION_FP32 = "fp32"
 
 
+# ---------------------------------------------------------------------------
+# MatrixPrecision enum (used in test infrastructure)
+# ---------------------------------------------------------------------------
 class MatrixPrecision(str, Enum):
-    MXFP8 = "mxfp8"
-    MXFP8_X4 = "mxfp8_x4"
-    BFLOAT16 = "bfloat16"
-    FP32 = "fp32"
+    MXFP8 = PRECISION_MXFP8
+    MXFP8_X4 = PRECISION_MXFP8_X4
+    BFLOAT16 = PRECISION_BFLOAT16
+    FP32 = PRECISION_FP32
 
 
 # ---------------------------------------------------------------------------
@@ -35,10 +42,13 @@ TILE_SIZE_P_MAX_LOGICAL = 512
 INTERLEAVE_FACTOR = 4
 
 # ---------------------------------------------------------------------------
-# Dtype byte sizes
+# Dtype byte sizes (keyed by both PRECISION_* constants and MatrixPrecision enum)
 # ---------------------------------------------------------------------------
-
 BYTES_PER_DTYPE = {
+    PRECISION_MXFP8: 1,
+    PRECISION_MXFP8_X4: 1,
+    PRECISION_BFLOAT16: 2,
+    PRECISION_FP32: 4,
     MatrixPrecision.MXFP8: 1,
     MatrixPrecision.MXFP8_X4: 1,
     MatrixPrecision.BFLOAT16: 2,

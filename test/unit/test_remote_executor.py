@@ -149,3 +149,76 @@ class TestRemoteExecutor:
         executor, _ = _make_executor()
         with pytest.raises(RemoteExecutorError, match="unknown method"):
             executor.call("nonexistent")
+
+    def test_call_reconnects_after_channel_crash(self):
+        """A crashed channel (set to None by a prior I/O failure, NOT close()) is
+        transparently re-established on the next call()."""
+        conn = MagicMock()
+        transport = MagicMock()
+        channel1 = FakeChannel()
+        channel2 = FakeChannel()
+        conn.transport = transport
+        transport.is_active.return_value = True
+        # First open_session builds the initial channel (during __init__/_start);
+        # the second is the fresh channel after the simulated crash.
+        transport.open_session.side_effect = [channel1, channel2]
+        executor = RemoteExecutor(conn)
+        assert executor.call("ping") == "ok"
+        open_session_calls_before = transport.open_session.call_count
+
+        # Simulate a transient reset: prior call's I/O failure set _channel = None
+        # WITHOUT an explicit close().
+        executor._channel = None
+
+        # Next call should self-heal by opening a fresh session and serving the request.
+        assert executor.call("ping") == "ok"
+        assert transport.open_session.call_count > open_session_calls_before
+
+    def test_call_after_close_does_not_reconnect(self):
+        """Regression: explicit close() keeps call() raising; no self-heal."""
+        executor, _ = _make_executor()
+        executor.close()
+        with pytest.raises(RemoteExecutorError, match="closed"):
+            executor.call("ping")
+
+    def test_close_on_crashed_channel_marks_explicitly_closed(self):
+        """A crashed executor (channel nulled by a prior I/O failure) that is then
+        close()d must stay closed: a later call() raises and does NOT resurrect a
+        session. Guards the contract that close() marks _explicitly_closed even when
+        the channel was already gone."""
+        conn = MagicMock()
+        transport = MagicMock()
+        conn.transport = transport
+        transport.is_active.return_value = True
+        transport.open_session.side_effect = [FakeChannel(), FakeChannel()]
+        executor = RemoteExecutor(conn)
+        open_session_calls_after_init = transport.open_session.call_count
+
+        # Simulate a transient reset (channel nulled), then dispose via close().
+        executor._channel = None
+        executor.close()
+
+        with pytest.raises(RemoteExecutorError, match="closed"):
+            executor.call("ping")
+        # No fresh session was opened -- the closed executor did not self-heal.
+        assert transport.open_session.call_count == open_session_calls_after_init
+
+    def test_start_nulls_channel_when_ping_fails(self):
+        """If the freshly opened channel's server answers ping with a non-\"ok\"
+        payload, _start() must null the channel before raising so the NEXT call can
+        re-heal cleanly rather than reusing a half-started (live socket, bad server)
+        channel."""
+
+        class _BadPingChannel(FakeChannel):
+            def _handle(self, req):
+                if req["method"] == "ping":
+                    return {"id": req["id"], "result": "not-ok"}
+                return super()._handle(req)
+
+        conn = MagicMock()
+        transport = MagicMock()
+        conn.transport = transport
+        transport.is_active.return_value = True
+        transport.open_session.return_value = _BadPingChannel()
+        with pytest.raises(RemoteExecutorError, match="ping failed"):
+            RemoteExecutor(conn)

@@ -32,6 +32,7 @@ from nkilib_src.nkilib.core.subkernels.rmsnorm_tkg import (
 )
 from nkilib_src.nkilib.core.utils.allocator import SbufManager
 from nkilib_src.nkilib.core.utils.common_types import (
+    DtypeMode,
     NormType,
     QKVOutputLayout,
     QKVWeightLayout,
@@ -39,7 +40,6 @@ from nkilib_src.nkilib.core.utils.common_types import (
 )
 from nkilib_src.nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 from nkilib_src.nkilib.core.utils.logging import Logger
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from test.integration.nkilib.core.qkv.test_qkv_common import build_qkv_input, run_qkv_test
 from test.utils.common_dataclasses import (
     TKG_INFERENCE_ARGS,
@@ -116,6 +116,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     transpose_k_cache: bool = False,
     # --- Block KV Cache Related (unused, accepted for signature match with qkv)
     use_block_kv: bool = False,
+    fp8_packed: bool = False,
     block_size: Optional[int] = None,
     slot_mapping: Optional[nl.ndarray] = None,
     # -----------------------------------------
@@ -146,6 +147,12 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     # --- Strided Input / Output (unused, accepted for signature match with qkv / qkv_torch_ref)
     strided_input_config=None,
     output_hbm: Optional[nl.ndarray] = None,
+    # --- Squared-sum outputs (unused here; accepted for signature match with qkv / qkv_torch_ref)
+    q_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
+    k_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
+    v_squared_sum_out: Optional[nl.ndarray] = None,  # noqa: ARG001
+    # Signature parity with qkv_torch_ref; unused in wrapper (qkv_tkg is dtype-passing).
+    dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001
 ) -> nl.ndarray:
     hidden = input
     qkv_w = fused_qkv_weights
@@ -194,15 +201,14 @@ def qkv_tkg_sb2sb_wrapper_kernel(
         name="hidden_sb",
     )
     input_view = (
-        TensorView(hidden)
-        .flatten_dims(start_dim=0, end_dim=1)  # (BxS, H)
+        hidden.flatten_dims(start_dim=0, end_dim=1)  # (BxS, H)
         .reshape_dim(dim=1, shape=[num_shards, H0, H1_shard])  # (BxS, num_shards, H0, H1_shard)
         .permute(dims=[2, 0, 1, 3])  # (H0, BxS, num_shards, H1_shard)
     )
-    dst_view = TensorView(hidden_sb).reshape_dim(dim=2, shape=[num_shards, H1_shard])  # (H0, BxS, num_shards, H1_shard)
+    dst_view = hidden_sb.reshape_dim(dim=2, shape=[num_shards, H1_shard])  # (H0, BxS, num_shards, H1_shard)
     nisa.dma_copy(
-        dst=dst_view.get_view(),
-        src=input_view.get_view(),
+        dst=dst_view,
+        src=input_view,
     )
 
     output_sb = qkv_tkg(
@@ -473,6 +479,8 @@ class TestQkvTkgKernel:
         d_head: int | None = None,
         is_negative_test: bool = False,
         transposed_in: bool = False,
+        dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+        inference_args=TKG_INFERENCE_ARGS,
     ):
         run_qkv_test(
             test_manager=test_manager,
@@ -499,8 +507,9 @@ class TestQkvTkgKernel:
             rtol=2e-2 if quantization_type == QuantizationType.NONE else 4e-2,
             atol=1e-5,
             is_negative_test=is_negative_test,
-            inference_args=TKG_INFERENCE_ARGS,
+            inference_args=inference_args,
             expect_fused_hidden_output=True,
+            dtype_mode=dtype_mode,
         )
 
     # fmt: off
@@ -512,21 +521,21 @@ class TestQkvTkgKernel:
         [1, 4, 1, 32768, None, 384, 1, 1, 128, NormType.NO_NORM, QuantizationType.NONE, True, False, False, 1e-6, QKVOutputLayout.BSD],
         [1, 1, 4, 4096, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.NONE, True, False, False, 1e-6, QKVOutputLayout.BSD],
         [1, 4, 1, 4096, None, 896, 5, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, 1e-6, QKVOutputLayout.BSD],
-        [1, 4, 1, 4096, 4096, 896, 5, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, 1e-6, QKVOutputLayout.BSD],
+        pytest.param(1, 4, 1, 4096, 4096, 896, 5, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
         [1, 4, 1, 4096, 3072, 896, 5, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, 1e-6, QKVOutputLayout.BSD],
         # H remainder tile only test
         [2, 2, 1, 3840, None, 10240, 64, 8, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.BSD],
-        [1, 1, 1, 128, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        pytest.param(1, 1, 1, 128, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
         # EPS test
         [1, 1, 7, 8192, None, 384, 1, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, False, False, False, 1e-5, QKVOutputLayout.BSD],
         # LayerNorm bias test
         [1, 1, 5, 8192, None, 384, 1, 1, 128, NormType.LAYER_NORM, QuantizationType.NONE, False, True, False, 1e-6, QKVOutputLayout.BSD],
-        [1, 1, 5, 8192, None, 384, 1, 1, 128, NormType.LAYER_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        pytest.param(1, 1, 5, 8192, None, 384, 1, 1, 128, NormType.LAYER_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
         # QKV bias test
         [1, 1, 3, 16384, None, 896, 5, 1, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, True, 1e-6, QKVOutputLayout.BSD],
-        [2, 8, 5, 3072, None, 640, 8, 1, 64, NormType.RMS_NORM, QuantizationType.NONE, False, False, True, 1e-6, QKVOutputLayout.BSD],
+        pytest.param(2, 8, 5, 3072, None, 640, 8, 1, 64, NormType.RMS_NORM, QuantizationType.NONE, False, False, True, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
         # NBSD test: 405B
-        [2, 1, 1, 16384, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.NBSd],
+        pytest.param(2, 1, 1, 16384, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.NBSd, marks=pytest.mark.fast),
         # NBSD test: 70B
         [2, 1, 1, 8192, None, 768, 2, 2, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.NBSd],
         [2, 1, 1, 8448, None, 4352, 24, 5, 128, NormType.NO_NORM, QuantizationType.NONE, False, False, False, 1e-6, QKVOutputLayout.NBSd],
@@ -538,21 +547,20 @@ class TestQkvTkgKernel:
         [2, 1, 1, 8192, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, True, False, False, 77.0, QKVOutputLayout.BSD],
         # static quantization
         [2, 1, 5, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC, False, False, False, 1e-6, QKVOutputLayout.BSD],
-        [2, 4, 1, 16384, None, 4352, 24, 5, 128, NormType.NO_NORM, QuantizationType.STATIC, False, False, True, 1e-6, QKVOutputLayout.NBSd],
-        [1, 1, 1, 8192, None, 5120, 32, 4, 128, NormType.RMS_NORM, QuantizationType.STATIC, False, False, False, 1e-6, QKVOutputLayout.NBSd],
+        pytest.param(2, 4, 1, 16384, None, 4352, 24, 5, 128, NormType.NO_NORM, QuantizationType.STATIC, False, False, True, 1e-6, QKVOutputLayout.NBSd, marks=pytest.mark.fast),
+        pytest.param(1, 1, 1, 8192, None, 5120, 32, 4, 128, NormType.RMS_NORM, QuantizationType.STATIC, False, False, False, 1e-6, QKVOutputLayout.NBSd, marks=pytest.mark.fast),
     ]
     # ROW quantization tests
     qkv_tkg_kernel_accuracy_test_perms += [
         [2, 1, 5, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 4, 1, 16384, None, 4352, 24, 5, 128, NormType.NO_NORM, QuantizationType.ROW, False, False, True, 1e-6, QKVOutputLayout.NBSd],
         [1, 1, 1, 8192, None, 5120, 32, 4, 128, NormType.RMS_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.NBSd],
-        [2, 1, 3, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.ROW, True, False, False, 1e-6, QKVOutputLayout.BSD],
-        [2, 2, 1, 16384, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        pytest.param(2, 1, 3, 8192, None, 1280, 8, 1, 128, NormType.RMS_NORM, QuantizationType.ROW, True, False, False, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
+        pytest.param(2, 2, 1, 16384, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
         [2, 1, 1, 8192, None, 10240, 64, 8, 128, NormType.RMS_NORM, QuantizationType.ROW, False, False, False, 1e-6, QKVOutputLayout.BSD],
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest_parametrize(
         qkv_tkg_kernel_accuracy_test_params,
         qkv_tkg_kernel_accuracy_test_perms,
@@ -607,17 +615,16 @@ class TestQkvTkgKernel:
         "lnc_degree, batch, seqlen, hidden_dim, hidden_actual, fused_qkv_dim, n_q_heads, n_kv_heads, d_head, norm_type, quantization_type"
     qkv_tkg_transposed_in_test_perms = [
         # llama3_70b: RMSNorm enabled
-        [2, 1, 1, 8192, None, 768, 4, 1, 128, NormType.RMS_NORM, QuantizationType.NONE],
+        pytest.param(2, 1, 1, 8192, None, 768, 4, 1, 128, NormType.RMS_NORM, QuantizationType.NONE, marks=pytest.mark.fast),
         # llama3_70b: RMSNorm enabled, larger batch
         [2, 16, 1, 8192, None, 768, 4, 1, 128, NormType.RMS_NORM, QuantizationType.NONE],
         # qwen3_32b: NO_NORM (rmsnorm_X=False in model)
-        [2, 1, 1, 5120, None, 384, 1, 1, 128, NormType.NO_NORM, QuantizationType.NONE],
+        pytest.param(2, 1, 1, 5120, None, 384, 1, 1, 128, NormType.NO_NORM, QuantizationType.NONE, marks=pytest.mark.fast),
         # STATIC quant with RMSNorm
-        [2, 8, 1, 8192, None, 768, 4, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC],
+        pytest.param(2, 8, 1, 8192, None, 768, 4, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC, marks=pytest.mark.fast),
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest_parametrize(
         qkv_tkg_transposed_in_test_params,
         qkv_tkg_transposed_in_test_perms,
@@ -765,13 +772,13 @@ class TestQkvTkgKernel:
     qkv_tkg_kernel_mxfp_test_perms = [
         # is_h_dim_4h_transposed = True required for now.
         # NO_NORM,
-        [2, 12, 1, 512, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        pytest.param(2, 12, 1, 512, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
         [2, 12, 1, 1024, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 12, 1, 2048, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 8, 1, 2048, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 8, 1, 2048*2, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 8, 1, 2048*8, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
-        [2, 4, 1, 1024, None, (2 +2*5)*128, 2, 5, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
+        pytest.param(2, 4, 1, 1024, None, (2 +2*5)*128, 2, 5, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
         [2, 4, 1, 1024, None, (6 +2*3)*128, 6, 3, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
         [2, 4, 1, 1024, None, (2 +2*8)*128, 2, 8, 128, NormType.NO_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
         # RMS_NORM
@@ -784,6 +791,13 @@ class TestQkvTkgKernel:
         [2, 4, 1, 1024, None, (2 +2*5)*128, 2, 5, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
         [2, 4, 1, 1024, None, (6 +2*3)*128, 6, 3, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
         [2, 4, 1, 1024, None, (2 +2*8)*128, 2, 8, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
+        [2, 128, 1, 6144, None, 2176, 32, 1, 64, NormType.RMS_NORM, QuantizationType.MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
+        # BxS not divisible by 4
+        [2, 1, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 2, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 3, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 1, 5, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 3, 6, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
     ]
     # fmt: on
 
@@ -795,16 +809,21 @@ class TestQkvTkgKernel:
         [2, 12, 1, 512, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 12, 1, 4096, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 8, 1, 2048, None, 512, 2, 1, 128, NormType.NO_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
-        [2, 4, 1, 4096, None, (2 +2*5)*128, 2, 5, 128, NormType.NO_NORM, QuantizationType.STATIC_MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
+        pytest.param(2, 4, 1, 4096, None, (2 +2*5)*128, 2, 5, 128, NormType.NO_NORM, QuantizationType.STATIC_MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD, marks=pytest.mark.fast),
         # RMS_NORM
         [2, 12, 1, 512, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 12, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 8, 1, 2048, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 4, 1, 4096, None, (2 +2*5)*128, 2, 5, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
+        # BxS not divisible by 4
+        [2, 1, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 2, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 3, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 1, 5, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 3, 6, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.STATIC_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
     ]
     # fmt: on
 
-    @pytest.mark.fast
     @pytest_parametrize(
         qkv_tkg_kernel_mxfp_test_params,
         qkv_tkg_kernel_mxfp_test_perms,
@@ -856,7 +875,6 @@ class TestQkvTkgKernel:
             d_head=d_head,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(
         qkv_tkg_kernel_static_mxfp_test_params,
         qkv_tkg_kernel_static_mxfp_test_perms,
@@ -922,6 +940,12 @@ class TestQkvTkgKernel:
         [2, 12, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.ROW_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 8, 1, 2048, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.ROW_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
         [2, 4, 1, 4096, None, (2 +2*5)*128, 2, 5, 128, NormType.RMS_NORM, QuantizationType.ROW_MX, True, False, False, True, 1e-6, QKVOutputLayout.BSD],
+        # BxS not divisible by 4
+        [2, 1, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.ROW_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 2, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.ROW_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 3, 1, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.ROW_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 1, 5, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.ROW_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
+        [2, 3, 6, 4096, None, 512, 2, 1, 128, NormType.RMS_NORM, QuantizationType.ROW_MX, True, False, False, False, 1e-6, QKVOutputLayout.BSD],
     ]
     # fmt: on
 
@@ -1014,12 +1038,12 @@ class TestQkvTkgKernel:
     ):
         # Pre-existing kernel bug: fused_hidden output is incorrect when
         # fused_add=True + NO_NORM + STATIC quantization.
-        # Tracked in https://aws-neuron.atlassian.net/browse/NKILIB-561
+        # Tracked in NKILIB-561
         if fused_add and norm_type is NormType.NO_NORM and quantization_type is QuantizationType.STATIC:
             pytest.xfail("Known kernel bug: fused_hidden accuracy with fused_add+NO_NORM+STATIC quantization")
 
         # Pre-existing hardware non-determinism on large hidden_dim=32768 with LAYER_NORM + STATIC quantization.
-        # Tracked in https://aws-neuron.atlassian.net/browse/NKILIB-849
+        # Tracked in NKILIB-849
         if H == 32768 and norm_type is NormType.LAYER_NORM and quantization_type is QuantizationType.STATIC:
             pytest.xfail("Hardware non-determinism on large hidden_dim=32768 with LAYER_NORM+STATIC (NKILIB-849)")
 
@@ -1043,4 +1067,57 @@ class TestQkvTkgKernel:
             n_q_heads=n_q_heads,
             d_head=d_head,
             is_negative_test=is_negative_test_case,
+        )
+
+    ####################################################################################################################
+    # FP8 quant mode canary for QKV TKG.
+    # Tests NON_OCP, OCP, AUTO across STATIC and ROW.
+    ####################################################################################################################
+    _QKV_TKG_BY_DTYPE_MODE_CONFIG = dict(
+        B=1,
+        H=8192,
+        S=1,
+        dtype=nl.bfloat16,
+        eps=1e-6,
+        fused_add=False,
+        lnc_degree=2,
+        norm_type=NormType.RMS_NORM,
+        output_layout=QKVOutputLayout.BSD,
+        n_q_heads=8,
+        n_kv_heads=1,
+        d_head=128,
+    )
+
+    @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
+    @pytest.mark.parametrize(
+        "quantization_type",
+        [QuantizationType.STATIC, QuantizationType.ROW],
+    )
+    def test_qkv_tkg_by_dtype_mode(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        quantization_type: QuantizationType,
+        dtype_mode: DtypeMode,
+    ):
+        """Smoke-test QKV TKG STATIC/ROW quant with explicit dtype_mode.
+
+        NON_OCP → ``nl.float8_e4m3`` (240), any platform.
+        OCP     → ``nl.float8_e4m3fn`` (448), TRN3 only.
+        AUTO    → ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3`` elsewhere.
+        """
+        if dtype_mode == DtypeMode.OCP and not platform_target.is_trn3():
+            pytest.skip("OCP dtype_mode requires TRN3")
+        compiler_args = CompilerArgs(logical_nc_config=2, platform_target=platform_target)
+        cfg = self._QKV_TKG_BY_DTYPE_MODE_CONFIG
+        n_q_heads, n_kv_heads, d_head = cfg["n_q_heads"], cfg["n_kv_heads"], cfg["d_head"]
+        fused_qkv_dim = (n_q_heads + 2 * n_kv_heads) * d_head
+        self.run_qkv_tkg_test(
+            test_manager=test_manager,
+            compiler_args=compiler_args,
+            fused_qkv_dim=fused_qkv_dim,
+            quantization_type=quantization_type,
+            dtype_mode=dtype_mode,
+            inference_args=None,
+            **cfg,
         )

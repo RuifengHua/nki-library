@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import nki.language as nl
 import numpy as np
 import pytest
@@ -21,12 +23,14 @@ from nkilib_src.nkilib.core.moe.moe_tkg.all_expert_mx_utils import BF16_PER_INT3
 from nkilib_src.nkilib.core.moe.moe_tkg.moe_tkg_torch import moe_tkg_torch_ref
 from nkilib_src.nkilib.core.utils.common_types import (
     ActFnType,
+    DtypeMode,
     ExpertAffinityScaleMode,
     MoEAllToAllVStrategy,
     QuantizationType,
 )
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_utils import build_moe_tkg, get_expert_affinity_dtype
 from test.integration.nkilib.core.moe.moe_tkg.test_moe_tkg_wrapper import moe_tkg_sbuf_io_wrapper
+from test.integration.nkilib.utils.test_kernel_common import resolve_dtype_mode_for_torch_ref
 from test.utils.common_dataclasses import MODEL_TEST_TYPE, TKG_INFERENCE_ARGS, CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
 from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
@@ -100,6 +104,7 @@ def _run_moe_tkg_test(
     block_size: int | None = None,
     all_to_all_v_strategy: MoEAllToAllVStrategy = MoEAllToAllVStrategy.DISABLED,
     torch_ref: callable = None,
+    dtype_mode=None,
     **_ignored,
 ):
     """Common test runner for moe_tkg kernel tests."""
@@ -129,6 +134,8 @@ def _run_moe_tkg_test(
         build_kw["routed_token_ratio"] = routed_token_ratio
         build_kw["block_size"] = block_size
         build_kw["all_to_all_v_strategy"] = all_to_all_v_strategy
+    if dtype_mode is not None:
+        build_kw["dtype_mode"] = dtype_mode
 
     # Non-A2Av I/O shapes match
     if all_to_all_v_strategy == MoEAllToAllVStrategy.DISABLED:
@@ -145,8 +152,19 @@ def _run_moe_tkg_test(
             )
         }
 
-    # Default to moe_tkg_ref, which does not use custom dtype converters
-    test_torch_ref = torch_ref if torch_ref is not None else moe_tkg_ref
+    # Wrap the torch ref to pre-resolve DtypeMode.AUTO using platform_target.
+    # The torch ref runs on CPU and can't query hardware; without this the
+    # ref would always clip at 240 regardless of target.
+    base_torch_ref = torch_ref if torch_ref is not None else moe_tkg_ref
+
+    @functools.wraps(base_torch_ref)
+    def _torch_ref_with_resolved_dtype_mode(**kwargs):
+        kernel_dtype_mode = kwargs.get("dtype_mode")
+        if kernel_dtype_mode is not None:
+            kwargs["dtype_mode"] = resolve_dtype_mode_for_torch_ref(kernel_dtype_mode, platform_target)
+        return base_torch_ref(**kwargs)
+
+    test_torch_ref = _torch_ref_with_resolved_dtype_mode
 
     framework = UnitTestFramework(
         test_manager=test_manager,
@@ -155,7 +173,11 @@ def _run_moe_tkg_test(
         kernel_input_generator=lambda _: build_moe_tkg(**build_kw),
         output_tensor_descriptor=output_tensor_descriptor,
     )
-    compiler_args = CompilerArgs(logical_nc_config=vnc, platform_target=platform_target)
+    compiler_args = CompilerArgs(
+        logical_nc_config=vnc,
+        platform_target=platform_target,
+        additional_cmd_args=["--enable-ocp-compliant-scale-computation"],
+    )
     framework.run_test(
         test_config=None,
         compiler_args=compiler_args,
@@ -190,7 +212,7 @@ _ABBREVS = {
     "block_size": "bs",
     "in_dtype": "in_dtype",
     "out_dtype": "out_dtype",
-    "a2av": "a2av",
+    "a2av_strategy": "a2av",
 }
 
 # fmt: off
@@ -204,6 +226,7 @@ MOE_TKG_TEST_PARAMS = [
     # With bias
     (2, 4,  3072,  64,   4,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  None,            QuantizationType.NONE, nl.float16, True,  True),
     (2, 4,  3072,  192,  4,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  None,            QuantizationType.NONE, nl.float16, True,  True),
+    (2, 8,  640,   160,  8,   None, ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, True,  None,            QuantizationType.NONE, nl.float16, True,  True),
     (2, 32, 3072,  768,  8,   None, ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, True,  None,            QuantizationType.NONE, nl.float16, True,  True),
     (2, 32, 3072,  768,  128, None, ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, True,  None,            QuantizationType.NONE, nl.float16, True,  True),
     (2, 32, 3072,  1536, 4,   None, ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, True,  None,            QuantizationType.NONE, nl.float16, True,  True),
@@ -286,22 +309,25 @@ MOE_TKG_TEST_PARAMS = [
 ]
 # fmt: on
 
-# (vnc, tokens, hidden, intermediate, expert) keys for full-only tests (excluded from fast suite)
-_FULL_ONLY_KEYS = {
-    (2, 32, 3072, 1024, 128),
-    (2, 32, 3072, 1536, 128),
-    (2, 32, 3072, 768, 128),
-    (2, 16, 3072, 512, 128),
-    (2, 512, 5120, 128, 128),
-    (2, 2, 5120, 128, 128),
-    (2, 1024, 3072, 3072, 8),
-    (2, 1, 3072, 384, 128),
-    (2, 4, 3072, 384, 128),
-    (2, 1024, 4096, 1536, 8),
-}
+# (vnc, tokens, hidden, intermediate, expert) keys for fast tests
+_FAST_BFLOAT16_KEYS = frozenset(
+    {
+        (2, 4, 378, 128, 4),
+        (2, 32, 3072, 192, 4),
+        (2, 300, 256, 128, 2),
+        (2, 4, 512, 64, 4),
+        (2, 2, 5120, 128, 16),
+        (2, 32, 3072, 512, 1),
+        (2, 4, 384, 128, 4),
+        (2, 4, 512, 64, 2),
+        (2, 1024, 256, 128, 2),
+        (2, 256, 5120, 128, 16),
+    }
+)
 
 MOE_TKG_ALL_PARAMS = [
-    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:5]) not in _FULL_ONLY_KEYS else c for c in MOE_TKG_TEST_PARAMS
+    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:5]) in _FAST_BFLOAT16_KEYS else pytest.param(*c)
+    for c in MOE_TKG_TEST_PARAMS
 ]
 
 # fmt: off
@@ -323,6 +349,11 @@ MOE_TKG_MX_PARAMS = [
     (2, 1024, 3072, 3072, 1,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
     (2, 2048, 3072, 3072, 1,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
     (2, 640,  3072, 3072, 1,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
+    # T-tiling configs (all-expert only): tile_limit=256 for H=3072/vnc=2, so T>256 triggers tiling
+    (2, 384,  3072, 3072, 1,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
+    (2, 320,  3072, 3072, 1,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
+    (2, 768,  3072, 3072, 1,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
+    (2, 384,  3072, 1536, 1,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
     (2, 32,   3072, 3072, 2,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
     (2, 32,   3072, 3072, 4,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
     (2, 32,   3072, 3072, 8,   None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True,  nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True),
@@ -340,58 +371,192 @@ MOE_TKG_MX_PARAMS = [
 ]
 # fmt: on
 
-# (vnc, tokens, hidden, intermediate, expert) keys for MX full-only tests (excluded from fast suite, memory >2500 MB)
-_MX_FULL_ONLY_KEYS = {
-    (2, 2, 3072, 1536, 128),
-}
+# (vnc, tokens, hidden, intermediate, expert) keys for MX fast tests
+_FAST_MX_KEYS = frozenset(
+    {
+        (2, 128, 3072, 96, 1),
+        (2, 1, 512, 64, 128),
+        (2, 128, 3072, 768, 1),
+        (2, 1, 3072, 192, 128),
+        (2, 2048, 3072, 3072, 1),
+        (2, 128, 3072, 180, 1),
+        (2, 4, 3072, 192, 128),
+        (2, 32, 3072, 3072, 2),
+    }
+)
 
 MOE_TKG_MX_ALL_PARAMS = [
-    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:5]) not in _MX_FULL_ONLY_KEYS else c for c in MOE_TKG_MX_PARAMS
+    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:5]) in _FAST_MX_KEYS else pytest.param(*c)
+    for c in MOE_TKG_MX_PARAMS
 ]
 
 # fmt: off
-MOE_TKG_DYNAMIC_PARAM_NAMES = (
-    "vnc, tokens, hidden, intermediate, expert, top_k, act_fn, scale_mode, "
-    "all_expert, q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size, a2av"
-)
-MOE_TKG_DYNAMIC_PARAMS = [
-    # vnc, tokens, hidden, intermediate, expert, top_k, act_fn, scale_mode, all_expert, q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size, a2av
-    # MXFP4 large T, E=128, K=4 — average skew (T*K/E)
-    (2, 128,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 16,  False),
-    (2, 256,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 32,  False),
-    (2, 512,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 64,  False),
-    (2, 1024, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 128, False),
-    (2, 2048, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 256, False),
-    # Worst case skew (all tokens routed)
-    (2, 128,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      16,  False),
-    (2, 256,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      32,  False),
-    (2, 512,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  False),
-    (2, 1024, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, False),
-    (2, 2048, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, False),
-    # Block size sweep (functionality)
-    (2, 32,   3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      8,   False),
-    (2, 96,   3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      24,  False),
-    (2, 192,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      96,  False),
-    # MXFP8 large T, E=128, K=8 — average skew
-    (2, 256,  4096, 3072, 1, None, ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, True, nl.float8_e4m3fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  64,  False),
-    # MXFP8 worst case skew
-    (2, 256,  4096, 3072, 1, None, ActFnType.SiLU,  ExpertAffinityScaleMode.POST_SCALE, True, nl.float8_e4m3fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  False),
-    # A2A-v
-    # MXFP4 large T, E=128, K=4 — average skew (T*K/E)
-    (2, 128,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 16,  True),
-    (2, 256,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 32,  True),
-    (2, 512,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 64,  True),
-    (2, 1024, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 128, True),
-    (2, 2048, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 256, True),
-    # Worst case skew (all tokens routed)
-    (2, 128,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      16,  True),
-    (2, 256,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      32,  True),
-    (2, 512,  3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  True),
-    (2, 1024, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, True),
-    (2, 2048, 3072, 3072, 1, None, ActFnType.Swish, ExpertAffinityScaleMode.POST_SCALE, True, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, True),
+_DYNAMIC_DEFAULTS = {
+    "top_k": None,
+    "scale_mode": ExpertAffinityScaleMode.POST_SCALE,
+    "all_expert": True,
+}
 
+MOE_TKG_DYNAMISM_PARAM_NAMES = (
+    "vnc, tokens, hidden, intermediate, expert, act_fn, "
+    "q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size"
+)
+MOE_TKG_DYNAMISM_PARAMS = [
+    # vnc, tokens, hidden, intermediate, expert, act_fn, q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size
+    # MXFP4 large T, E=128, K=4 — average skew (T*K/E)
+    (2, 128,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 16),
+    (2, 256,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 32),
+    (2, 512,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 64),
+    (2, 1024, 3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 128),
+    (2, 2048, 3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 256),
+    # Worst case skew (all tokens routed)
+    (2, 128,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      16),
+    (2, 256,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      32),
+    (2, 512,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64),
+    (2, 1024, 3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128),
+    (2, 2048, 3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256),
+    (2, 128,  3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      16),
+    (2, 128,  3072, 3072, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      16),
+    (2, 128,  3072, 3072, 8,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      16),
+    # Block size sweep (functionality)
+    (2, 32,   3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      8),
+    (2, 96,   3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      24),
+    (2, 192,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      96),
+    # E_L>1
+    (2, 256,  3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 32),
+    (2, 256,  3072, 3072, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      32),
+    (2, 256,  3072, 3072, 8,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 32),
+    (2, 256,  3072, 3072, 10, ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      32),
+    # MXFP8 large T, E=128, K=8 — average skew
+    (2, 256,  4096, 3072, 1,  ActFnType.SiLU,  nl.float8_e4m3fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  64),
+    # MXFP8 worst case skew
+    (2, 256,  4096, 3072, 1,  ActFnType.SiLU,  nl.float8_e4m3fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64),
+    # Non-MX (bfloat16) dynamic
+    (2, 128,  3072, 384,  1,  ActFnType.SiLU,  None,                QuantizationType.NONE, nl.float16, True, True,  1.0,      32),
+    (2, 256,  3072, 384,  1,  ActFnType.SiLU,  None,                QuantizationType.NONE, nl.float16, True, True,  3.125e-2, 64),
+    (2, 512,  3072, 384,  1,  ActFnType.SiLU,  None,                QuantizationType.NONE, nl.float16, True, False, 1.0,      128),
+]
+
+MOE_TKG_A2AV_PARAM_NAMES = (
+    "vnc, tokens, hidden, intermediate, expert, act_fn, "
+    "q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size, a2av_strategy"
+)
+MOE_TKG_A2AV_PARAMS = [
+    # vnc, tokens, hidden, intermediate, expert, act_fn, q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size, a2av_strategy
+    # MXFP4 large T, E=128, K=4 — average skew (T*K/E)
+    (2, 8,    3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 4,   MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 128,  3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 16,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 256,  3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 32,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 2048, 3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 3072, 3072, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 3072, 3072, 8,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    # Worst case skew (all tokens routed)
+    (2, 8,    3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      4,   MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 128,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      16,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 256,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      32,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 2048, 3072, 3072, 1,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 128,  3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      16,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  3072, 3072, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 3072, 3072, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 3072, 1536, 8,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    # Generality configs, average and worst case skew
+    # H=4K, I/TP=4K, K=4, E_L=2
+    (2, 512,  4096, 4096, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  4096, 4096, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    # H=5K, I/TP=5K, K=8, E_L=2
+    (2, 256,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  32,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 320,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 384,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 448,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 640,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 768,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 896,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1280, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1536, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1792, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 2048, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 2560, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 3072, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 3584, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 4096, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 256,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      32,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 320,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 384,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 448,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 640,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 768,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 896,  5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1280, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1536, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1792, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 2048, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 2560, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 3072, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 3584, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 4096, 5120, 5120, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      256, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    # H=5K, I/TP=2.5K, K=8, E_L=4
+    # No fused unpermute
+    (2, 512,  5120, 2560, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 5120, 2560, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  5120, 2560, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 1024, 5120, 2560, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    # Fused unpermute
+    (2, 512,  4096, 4096, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 512,  5120, 2560, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 1024, 5120, 2560, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 6.25e-2,  128, MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 512,  4096, 4096, 2,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 512,  5120, 2560, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 1024, 5120, 2560, 4,  ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      128, MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    # E_L not divisible by 4
+    (2, 512,  3072, 1536, 10, ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  3072, 1536, 10, ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  3072, 1536, 10, ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 3.125e-2, 64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 512,  3072, 1536, 10, ActFnType.Swish, nl.float4_e2m1fn_x4, QuantizationType.MX, nl.bfloat16, True, True, 1.0,      64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
 ]
 # fmt: on
+# =============================================================================
+
+# fmt: off
+MOE_TKG_A2AV_NON_MX_PARAM_NAMES = (
+    "vnc, tokens, hidden, intermediate, expert, act_fn, "
+    "q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size, a2av_strategy"
+)
+MOE_TKG_A2AV_NON_MX_PARAMS = [
+    # vnc, tokens, hidden, intermediate, expert, act_fn, q_dtype, q_type, dtype, clamp, bias, routed_token_ratio, block_size, a2av_strategy
+    # Non-MX (bf16/fp16) DLoC A2AV — PRESERVE_ROW_ORDER
+    (2, 128,  3072, 384,  1,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  1.0,      32,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 256,  3072, 384,  1,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  3.125e-2, 64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 512,  3072, 384,  1,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, False, 1.0,      128, MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    # Non-MX (bf16/fp16) DLoC A2AV — PACK_OUTPUT_ROWS
+    (2, 128,  3072, 384,  1,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  1.0,      32,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 256,  3072, 384,  1,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  3.125e-2, 64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 512,  3072, 384,  1,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, False, 1.0,      128, MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    # More aggressive dimension test
+    (2, 8,    8192, 2048, 1,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  1.0,      8,   MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    # E_L > 1 test
+    (2, 64,  3072, 384,  8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,   1e-1, 64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 64,  3072, 384,  8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,   1e-1, 64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    # E2E-matching dims: T=16, H=8192, E=8, partial routing
+    (2, 16,  8192, 2048, 8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,   1.25e-1, 16,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 16,  8192, 2048, 8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,   1.25e-1, 16,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 256,  3072, 384,  8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  3.125e-2, 64,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 256,  3072, 384,  8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  3.125e-2, 64,  MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 8,    8192, 2048, 8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  1.0,      8,   MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 8,    8192, 2048, 8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  1.0,      8,   MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    # Small dimension config: H=640 (hidden/TP), I=160 (intermediate/TP), E_L=8
+    (2, 8,    640,  160,  8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  1.0,      8,   MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+    (2, 8,    640,  160,  8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  1.0,      8,   MoEAllToAllVStrategy.PRESERVE_ROW_ORDER),
+    (2, 16,   640,  160,  8,  ActFnType.SiLU,  None, QuantizationType.NONE, nl.float16, True, True,  1.25e-1, 16,  MoEAllToAllVStrategy.PACK_OUTPUT_ROWS),
+]
 # fmt: on
 # =============================================================================
 
@@ -418,8 +583,17 @@ MOE_TKG_SBUF_IO_PARAMS = [
 ]
 # fmt: on
 
+# Compile-time-weighted minimum set for SBUF IO. See nki-fast-test-minimum-set skill.
+_FAST_SBUF_IO_KEYS = frozenset(
+    {
+        (2, 4, 3072, 128, 2),
+        (2, 4, 3072, 128, 4),
+        (2, 300, 3072, 128, 2),
+    }
+)
+
 MOE_TKG_SBUF_IO_ALL_PARAMS = [
-    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:5]) not in _FULL_ONLY_KEYS else c
+    pytest.param(*c, marks=pytest.mark.fast) if tuple(c[:5]) in _FAST_SBUF_IO_KEYS else pytest.param(*c)
     for c in MOE_TKG_SBUF_IO_PARAMS
 ]
 
@@ -574,6 +748,7 @@ class TestMoeTkgKernel:
         kwargs["is_negative"] = _is_negative_test(vnc, hidden, all_expert, tokens)
         _run_moe_tkg_test(**kwargs)
 
+    @pytest_marks(["mx"])
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     @pytest_parametrize(MOE_TKG_PARAM_NAMES, MOE_TKG_MX_ALL_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_mx(
@@ -599,9 +774,9 @@ class TestMoeTkgKernel:
         kwargs["rtol"] = 5e-2
         _run_moe_tkg_test(**kwargs)
 
-    @pytest.mark.fast
-    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
-    @pytest_parametrize(MOE_TKG_DYNAMIC_PARAM_NAMES, MOE_TKG_DYNAMIC_PARAMS, abbrevs=_ABBREVS)
+    @pytest_marks(["mx"])
+    @pytest.mark.platforms(exclude=[Platforms.TRN1])
+    @pytest_parametrize(MOE_TKG_DYNAMISM_PARAM_NAMES, MOE_TKG_DYNAMISM_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_dynamic(
         self,
         test_manager: Orchestrator,
@@ -610,10 +785,7 @@ class TestMoeTkgKernel:
         hidden: int,
         intermediate: int,
         expert: int,
-        top_k,
         act_fn: ActFnType,
-        scale_mode: ExpertAffinityScaleMode,
-        all_expert: bool,
         q_dtype,
         q_type: QuantizationType,
         dtype,
@@ -621,23 +793,77 @@ class TestMoeTkgKernel:
         bias: bool,
         routed_token_ratio: float,
         block_size: int,
-        a2av: bool,
+        platform_target,
+    ):
+        # MX dtypes require TRN3+
+        if q_dtype in (nl.float4_e2m1fn_x4, nl.float8_e4m3fn_x4) and platform_target in (Platforms.TRN2,):
+            pytest.skip("MX weights require TRN3+")
+
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs.update(_DYNAMIC_DEFAULTS)
+        kwargs["is_all_expert_dynamic"] = True
+        # # We see a tiny number of elements just outside 5% rtol when using very large T, due to high sample size of bf16 error
+        kwargs["rtol"] = 5e-2  # if tokens <= 1024 else 5.1e-2
+        _run_moe_tkg_test(**kwargs)
+
+    @pytest_marks(["mx"])
+    @pytest.mark.tier0
+    @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
+    @pytest_parametrize(MOE_TKG_A2AV_PARAM_NAMES, MOE_TKG_A2AV_PARAMS, abbrevs=_ABBREVS)
+    def test_moe_tkg_a2av(
+        self,
+        test_manager: Orchestrator,
+        vnc: int,
+        tokens: int,
+        hidden: int,
+        intermediate: int,
+        expert: int,
+        act_fn: ActFnType,
+        q_dtype,
+        q_type: QuantizationType,
+        dtype,
+        clamp: bool,
+        bias: bool,
+        routed_token_ratio: float,
+        block_size: int,
+        a2av_strategy: MoEAllToAllVStrategy,
         platform_target,
     ):
         kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs.update(_DYNAMIC_DEFAULTS)
         kwargs["is_all_expert_dynamic"] = True
-        # We see a tiny number of elements just outside 5% rtol when using very large T, due to high sample size of bf16 error
-        kwargs["rtol"] = 5e-2 if tokens <= 1024 else 5.1e-2
+        # # We see a tiny number of elements just outside 5% rtol when using very large T, due to high sample size of bf16 error
+        kwargs["rtol"] = 5e-2  # if tokens <= 1024 else 5.1e-2
+        kwargs["all_to_all_v_strategy"] = a2av_strategy
+        kwargs["torch_ref"] = moe_tkg_ref_fp8_inp
+        _run_moe_tkg_test(**kwargs)
 
-        # Map a2av bool to strategy enum. Currently only PERMUTED_OUTPUT is a supported strategy with A2A-v enabled; expand when more strategies are added.
-        kwargs["all_to_all_v_strategy"] = (
-            MoEAllToAllVStrategy.PERMUTED_OUTPUT if a2av else MoEAllToAllVStrategy.DISABLED
-        )
-        del kwargs["a2av"]
-
-        # A2A-v requires converters for fp8 input
-        kwargs["torch_ref"] = moe_tkg_ref_fp8_inp if a2av else None
-
+    @pytest.mark.platforms(exclude=[Platforms.TRN1])
+    @pytest_parametrize(MOE_TKG_A2AV_NON_MX_PARAM_NAMES, MOE_TKG_A2AV_NON_MX_PARAMS, abbrevs=_ABBREVS)
+    def test_moe_tkg_a2av_bfloat16(
+        self,
+        test_manager: Orchestrator,
+        vnc: int,
+        tokens: int,
+        hidden: int,
+        intermediate: int,
+        expert: int,
+        act_fn: ActFnType,
+        q_dtype,
+        q_type: QuantizationType,
+        dtype,
+        clamp: bool,
+        bias: bool,
+        routed_token_ratio: float,
+        block_size: int,
+        a2av_strategy: MoEAllToAllVStrategy,
+        platform_target,
+    ):
+        kwargs = {k: v for k, v in locals().items() if k != "self"}
+        kwargs.update(_DYNAMIC_DEFAULTS)
+        kwargs["is_all_expert_dynamic"] = True
+        kwargs["rtol"] = 5e-2
+        kwargs["all_to_all_v_strategy"] = a2av_strategy
         _run_moe_tkg_test(**kwargs)
 
     @pytest_parametrize(MOE_TKG_SBUF_IO_PARAM_NAMES, MOE_TKG_SBUF_IO_ALL_PARAMS, abbrevs=_ABBREVS)
@@ -752,7 +978,6 @@ class TestMoeTkgKernel:
             inference_args=TKG_INFERENCE_ARGS,
         )
 
-    @pytest.mark.fast
     @pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2])
     @pytest_parametrize(MOE_TKG_IO_DTYPE_PARAM_NAMES, MOE_TKG_IO_DTYPE_PARAMS, abbrevs=_ABBREVS)
     def test_moe_tkg_mx_io_dtype(
@@ -830,6 +1055,63 @@ class TestMoeTkgKernel:
         assert not is_negative, "Model configs must never be marked as negative test cases"
         kwargs = {k: v for k, v in locals().items() if k != "self"}
         _run_moe_tkg_test(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Opt-in FP8 E4M3 canary (dtype_mode).
+    #
+    # This is a transient test: the flag exists only until every MoE MLP
+    # caller migrates to OCP float8_e4m3fn. Remove this test together with
+    # the ``dtype_mode`` kwarg on ``moe_tkg()`` once the flag is deleted.
+    # ------------------------------------------------------------------
+    # Params mirror an existing passing config from ``MOE_TKG_TEST_PARAMS``
+    # (row 287: fp8 ROW, all-expert + selective × STATIC, tokens=4) so any
+    # failure here is specific to the DtypeMode migration, not to the shape.
+    _MOE_TKG_BY_DTYPE_MODE_CONFIG = dict(
+        vnc=2,
+        tokens=4,
+        hidden=512,
+        intermediate=64,
+        expert=2,
+        top_k=2,
+        act_fn=ActFnType.SiLU,
+        scale_mode=ExpertAffinityScaleMode.POST_SCALE,
+        clamp=True,
+        bias=True,
+        q_dtype=nl.float8_e4m3,
+        dtype=nl.bfloat16,
+    )
+
+    @pytest.mark.fast
+    @pytest.mark.parametrize("dtype_mode", [DtypeMode.NON_OCP, DtypeMode.OCP, DtypeMode.AUTO])
+    @pytest.mark.parametrize("q_type", [QuantizationType.STATIC, QuantizationType.ROW])
+    @pytest.mark.parametrize("all_expert", [False, True])
+    def test_moe_tkg_by_dtype_mode(
+        self,
+        test_manager: Orchestrator,
+        q_type: QuantizationType,
+        all_expert: bool,
+        platform_target,
+        dtype_mode: DtypeMode,
+    ):
+        """Canary exercising every DtypeMode branch on the MoE TKG path.
+
+        Parametrized over STATIC/ROW quant and selective/all-expert dispatch
+        so every migrated tile-dtype resolver path is covered.
+
+        NON_OCP → ``nl.float8_e4m3`` (240), any platform.
+        OCP     → ``nl.float8_e4m3fn`` (448), TRN3 only.
+        AUTO    → ``nl.float8_e4m3fn`` on TRN3, ``nl.float8_e4m3`` elsewhere.
+        """
+        if dtype_mode == DtypeMode.OCP and not platform_target.is_trn3():
+            pytest.skip("dtype_mode=DtypeMode.OCP only exercises the OCP path on TRN3")
+        _run_moe_tkg_test(
+            test_manager=test_manager,
+            all_expert=all_expert,
+            q_type=q_type,
+            platform_target=platform_target,
+            dtype_mode=dtype_mode,
+            **self._MOE_TKG_BY_DTYPE_MODE_CONFIG,
+        )
 
 
 def _is_negative_test(vnc: int, hidden: int, is_all_expert: bool, tokens: int) -> bool:

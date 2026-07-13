@@ -365,12 +365,22 @@ class TestTransformerTKG:
 
         qkv_dim = d_head * (q_heads_per_core + 2 * num_kv_heads)
 
+        # First and last layers are non-quantized
+        nonquantized_layers = {0, num_layers - 1}
+
+        def mlp_w_dtype(layer):
+            if layer in nonquantized_layers:
+                return dtype
+            return nl.float8_e4m3
+
         # Generate per-layer tensors with variance-preserving distributions
         W_qkvs = [_fan_in_projection((H, qkv_dim), dtype, fan_in=H) for _ in range(num_layers)]
         W_outs = [_gaussian((q_heads_per_core * d_head, H), dtype, std=0.5) for _ in range(num_layers)]
-        W_gates = [_fan_in_projection((H, fd_per_core), dtype, fan_in=H) for _ in range(num_layers)]
-        W_ups = [_fan_in_projection((H, fd_per_core), dtype, fan_in=H) for _ in range(num_layers)]
-        W_downs = [_fan_in_projection((fd_per_core, H), dtype, fan_in=fd_per_core) for _ in range(num_layers)]
+        W_gates = [_fan_in_projection((H, fd_per_core), mlp_w_dtype(layer), fan_in=H) for layer in range(num_layers)]
+        W_ups = [_fan_in_projection((H, fd_per_core), mlp_w_dtype(layer), fan_in=H) for layer in range(num_layers)]
+        W_downs = [
+            _fan_in_projection((fd_per_core, H), mlp_w_dtype(layer), fan_in=fd_per_core) for layer in range(num_layers)
+        ]
         W_gamma_qkvs = [_near_unity((1, H), dtype) for _ in range(num_layers)]
         W_gamma_mlps = [_near_unity((1, H), dtype) for _ in range(num_layers)]
         K_caches = [_uniform_activation((B, num_kv_heads, d_head, S_ctx), dtype) for _ in range(num_layers)]
@@ -397,7 +407,6 @@ class TestTransformerTKG:
         position_ids = cache_len + np.arange(S_tkg)  # (B, S_tkg)
 
         # Generate MLP scales: first and last layers are non-quantized (no scales)
-        nonquantized_layers = {0, num_layers - 1}
         scale_rng = np.random.default_rng(0)
         W_gate_scales = []
         W_up_scales = []

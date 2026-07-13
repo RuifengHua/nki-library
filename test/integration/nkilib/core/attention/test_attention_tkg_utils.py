@@ -102,7 +102,7 @@ def gen_deterministic_active_block_table(batch, S_ctx, S_tkg, pos_id, block_len,
 
 
 def get_bqs_tile_parameters(p_max: int, cfg: AttnTKGConfig, lnc: int):
-    bs_n_prgs = lnc if is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max) else 1
+    bs_n_prgs = lnc if is_batch_sharded(cfg.bs, cfg.q_head, cfg.s_active, cfg.curr_sprior, p_max, cfg.fuse_rope) else 1
     bqs_size = cfg.bs // bs_n_prgs * cfg.q_head * cfg.s_active
     bqs_tiles = div_ceil(bqs_size, p_max)
     bqs_tile_size = p_max if bqs_tiles > 1 else bqs_size

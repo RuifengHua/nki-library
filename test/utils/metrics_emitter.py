@@ -19,7 +19,7 @@ Emits metrics in AWS EMF (Embedded Metric Format) to either:
 2. stdout for log ingestion (stdout mode)
 
 Architecture:
-- Session-level data (RunId, Target, etc.) is baked into emitters at session start.
+- Session-level data (Target, etc.) is baked into emitters at session start.
 - Per-test data (TestName, Metrics, Params) lives in a MetricsCollector created per test.
 - Emitters receive the collector at emit time: emit(collector).
 """
@@ -43,18 +43,29 @@ from .metrics_collector import IMetricsCollector
 
 
 @dataclass(frozen=True)
+class CoverageData:
+    """Coverage metrics extracted from pytest-cov's in-memory data."""
+
+    BranchRate: float
+    LineRate: float
+    CoveragePercent: float  # Combined line+branch % (same as pytest-cov terminal report)
+    BranchesCovered: int
+    BranchesValid: int
+
+
+@dataclass(frozen=True)
 class SessionContext:
     """Immutable session-level data shared across all tests in a pytest session."""
 
     target: str
     trace_mode: str
     nki_compilation_mode: str
-    run_id: str | None = None
     kernel_name: str | None = None
     run_type: str | None = None
     is_release: bool = False
     sqs_queue_url: str | None = None
     username: str | None = None
+    version_set_eid: str | None = None
 
     def to_dimensions(self) -> dict:
         """Convert to CloudWatch-style dimension dict for payloads."""
@@ -64,14 +75,14 @@ class SessionContext:
             "NkiCompilationMode": self.nki_compilation_mode,
             "IsRelease": self.is_release,
         }
-        if self.run_id is not None:
-            fields["RunId"] = self.run_id
         if self.kernel_name is not None:
             fields["KernelName"] = self.kernel_name
         if self.run_type is not None:
             fields["RunType"] = self.run_type
         if self.username is not None:
             fields["Username"] = self.username
+        if self.version_set_eid is not None:
+            fields["VersionSetEid"] = self.version_set_eid
         return fields
 
 

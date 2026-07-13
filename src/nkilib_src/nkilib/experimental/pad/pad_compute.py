@@ -21,17 +21,17 @@ strategy and can be used standalone for SBUF-to-SBUF padding.
 Padding is filled inner-to-outer (W → H → D) so that each dimension's
 padding automatically includes the already-filled padding of inner dimensions.
 
-All tensor arguments are TensorViews.
+All tensor arguments are NkiTensors.
 """
 
 import nki.isa as nisa
+import nki.language as nl
 
-from ...core.utils.tensor_view import TensorView
 from .pad_modes import PadMode
 from .pad_params import PadParams
 
 
-def _fill_dim(padded_sb: TensorView, pad_mode: PadMode, params: PadParams, dim: int) -> None:
+def _fill_dim(padded_sb: nl.NkiTensor, pad_mode: PadMode, params: PadParams, dim: int) -> None:
     """Fill the padding region along one spatial dimension in the SBUF tile.
 
     Copies data from the interior (non-padded) region of *padded_sb* into
@@ -54,7 +54,7 @@ def _fill_dim(padded_sb: TensorView, pad_mode: PadMode, params: PadParams, dim: 
         pad_mode.fill(dst, interior, dim, i)
 
 
-def pad_compute(src_sb: TensorView, padded_sb: TensorView, params: PadParams, pad_mode: PadMode) -> None:
+def pad_compute(src_sb: nl.NkiTensor, padded_sb: nl.NkiTensor, params: PadParams, pad_mode: PadMode) -> None:
     """Copy source data into padded buffer and fill all padding regions.
 
     Algorithm:
@@ -73,7 +73,7 @@ def pad_compute(src_sb: TensorView, padded_sb: TensorView, params: PadParams, pa
     interior = padded_sb.slice(1, d_before, d_before + d_count)
     interior = interior.slice(2, h_before, h_before + h_count)
     interior = interior.slice(3, w_before, w_before + w_count)
-    nisa.tensor_copy(dst=interior.get_view(), src=src_sb.get_view())
+    nisa.tensor_copy(dst=interior, src=src_sb)
 
     # Fill padding inner-to-outer: W → H → D
     _fill_dim(padded_sb, pad_mode, params, 2)

@@ -161,3 +161,30 @@ class TestAttnBlkModelHighRank:
     ):
         """GENERALITY: Broad coverage model configs."""
         self._run_model_test(test_manager, collector, platform_target, cfg)
+
+
+KVDP_REPLICA_GROUP_CFGS = [cfg for cfg in RANGE_ATTN_BLK_CFGS if cfg.kvdp_replica_group is not None]
+
+
+# Only Trn3 PDS supports collectives with this strided replica group.
+# Trn2 and Trn3pd give a runtime error:
+#   "failed to init a collective algorithm. reason: no_hier no_mesh"
+@pytest.mark.platforms(exclude=[Platforms.TRN1, Platforms.TRN2, Platforms.TRN3, Platforms.TRN3_A0])
+@pytest_marks(["attention", "tkg", "experimental"])
+@final
+@pytest.mark.high_rank
+class TestKVDPReplicaGroup:
+    """KVDP tests with explicit replica groups (requires trn3 PDS — trn2 CCOM cannot route these topologies)."""
+
+    @pytest.mark.parametrize("attn_blk_cfg", KVDP_REPLICA_GROUP_CFGS, ids=lambda p: p.test_id())
+    def test_kvdp_replica_group(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        attn_blk_cfg: AttnBlkTestConfig,
+    ):
+        _run_attention_block_test(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            cfg=attn_blk_cfg,
+        )

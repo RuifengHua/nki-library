@@ -24,13 +24,18 @@ import logging
 import os
 import shutil
 import sys
+from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest_timeout
 from _pytest.config import Config
 
 from .utils import cpu_timeout
+
+if TYPE_CHECKING:
+    from .utils.test_orchestrator import Orchestrator
 
 # Set consistent hash seed for xdist workers to ensure identical test collection
 _RNG_SEED_ENV_KEY = "NEURON_PYTHONHASHSEED"
@@ -54,13 +59,15 @@ from .utils.common_dataclasses import (
     TraceMode,
 )
 from .utils.composite_emitter import CompositeEmitter
+from .utils.coverage_utils import get_coverage_data
+from .utils.csv_monitor import DURATION_MONITOR, MEMORY_MONITOR
 from .utils.feature_flag_helper import (
     construct_test_output_directory_name,
     get_feature_flag,
     resolve_base_output_directory,
 )
 from .utils.host_management import HostManager
-from .utils.metrics_collector import IMetricsCollector
+from .utils.metrics_collector import IMetricsCollector, add_rerun_dimensions
 from .utils.metrics_emitter import IMetricsEmitter, OutputMode, SessionContext
 from .utils.pytest_plugin import (
     get_platform_targets,
@@ -68,6 +75,7 @@ from .utils.pytest_plugin import (
     make_emitter,
     make_host_manager,
     make_test_manager,
+    resolve_current_user,
     resolve_session_trace_mode,
 )
 from .utils.pytest_test_metadata import derive_labeled_kernel_name
@@ -99,12 +107,7 @@ def pytest_addoption(parser):
         default=None,
         help="SQS Standard queue URL for metrics ingestion (enables OpenSearch storage)",
     )
-    group.addoption(
-        "--run-id",
-        action="store",
-        default=None,
-        help="Pipeline run ID (auto-generated if not provided)",
-    )
+
     group.addoption(
         "--disable-no-tests-failure",
         action="store_true",
@@ -150,15 +153,25 @@ def pytest_addoption(parser):
     )
     group.addoption(
         "--monitor-memory",
-        action="store_true",
-        default=False,
-        help="Track per-test peak RSS of the process tree and write memory_monitor.csv",
+        type=int,
+        nargs="?",
+        const=20,
+        default=None,
+        help="Track per-test peak memory and print the N slowest (default 20)",
     )
     group.addoption(
         "--memory-limit",
         type=float,
         default=None,
-        help="Kill a test if its process tree RSS exceeds this many MB",
+        help="Kill a test if its process tree memory exceeds this many MB",
+    )
+    group.addoption(
+        "--monitor-durations",
+        type=int,
+        nargs="?",
+        const=20,
+        default=None,
+        help="Track per-test wall-clock duration and print the N slowest (default 20)",
     )
     group.addoption(
         "--cpu-timeout",
@@ -269,24 +282,6 @@ def host_manager(request: pytest.FixtureRequest) -> HostManager:
     return make_host_manager(request.config, target_hosts=target_hosts)
 
 
-def _resolve_run_id(config) -> str | None:
-    """Resolve the RunId: ``--run-id`` > env ``KERNEL_PERF_RUN_ID`` > None. Cached on config for xdist propagation."""
-    if hasattr(config, "_session_run_id"):
-        return config._session_run_id
-    workerinput = getattr(config, "workerinput", None)
-    if workerinput and "run_id" in workerinput:
-        run_id = workerinput["run_id"]
-    else:
-        run_id = get_feature_flag(config, "run_id") or os.environ.get("KERNEL_PERF_RUN_ID")
-    config._session_run_id = run_id
-    return run_id
-
-
-@pytest.fixture(scope="session")
-def kernel_perf_run_id(request: pytest.FixtureRequest) -> str | None:
-    return _resolve_run_id(request.config)
-
-
 @pytest.fixture(scope="session")
 def session_trace_mode(request: pytest.FixtureRequest) -> TraceMode:
     """Session-wide trace mode from CLI flags. Individual tests may override via markers."""
@@ -336,6 +331,7 @@ def test_manager(
     collector: IMetricsCollector,
     emitter: IMetricsEmitter,  # noqa: ARG001 — triggers fixture to stash on item for makereport hook
     perf_analysis_enabled: bool,
+    hw_profile_enabled: bool,
 ) -> Orchestrator:
     metadata_name = None
     if request.cls and hasattr(request.cls, "__pytest_test_metadata__"):
@@ -352,6 +348,7 @@ def test_manager(
             host_manager,
             collector,
             perf_analysis_enabled=perf_analysis_enabled,
+            hw_profile_enabled=hw_profile_enabled,
             kernel_name=kernel_name,
             dice_endpoint=dice_endpoint,
             nki_compilation_mode=NKICompilationMode[get_feature_flag(request.config, "nki_compilation_mode")],
@@ -363,6 +360,7 @@ def test_manager(
         host_manager,
         collector,
         perf_analysis_enabled=perf_analysis_enabled,
+        hw_profile_enabled=hw_profile_enabled,
         kernel_name=kernel_name,
     )
 
@@ -428,6 +426,19 @@ def pytest_runtest_makereport(item, call):
                 # (e.g. assertion in test setup, fixture error, or pre-orchestrator validation).
                 collector.add_dimension({"Status": "TEST_EXECUTION_FAILURE"})
 
+            # execution_count is set by pytest-rerunfailures (1-based attempt
+            # index). rep.failed is read here before rerunfailures flips
+            # rep.outcome to "rerun", so it accurately reflects this attempt.
+            failure_reason = None
+            if rep.failed and rep.longrepr is not None:
+                failure_reason = str(getattr(rep.longrepr, "reprcrash", None) or rep.longrepr)
+            add_rerun_dimensions(
+                collector,
+                getattr(item, "execution_count", 1),
+                rep.failed,
+                failure_reason,
+            )
+
             emitter = getattr(item, "_emitter", None)
             if emitter:
                 emitter.emit(collector)
@@ -451,53 +462,57 @@ def run_after_every_test(
         # immediately yield as there is no setup needed
         yield
     finally:
-        # regardless of the test outcome, we want to have a chance to clean up
-        # below code is executed right after test has finished running
-        test_dir_path = construct_test_output_directory_name()
-        output_directory = resolve_base_output_directory(request.config)
-        test_dir_full_path = os.path.join(output_directory, test_dir_path)
+        try:
+            # regardless of the test outcome, we want to have a chance to clean up
+            # below code is executed right after test has finished running
+            test_dir_path = construct_test_output_directory_name()
+            output_directory = resolve_base_output_directory(request.config)
+            test_dir_full_path = os.path.join(output_directory, test_dir_path)
 
-        # Collect QoR data BEFORE cleanup (only if test dir exists)
-        if os.path.isdir(test_dir_full_path):
-            # Get session ID from master or worker
-            if hasattr(request.config, "_qor_session_id"):
-                session_id = request.config._qor_session_id
-            elif hasattr(request.config, "workerinput"):
-                session_id = request.config.workerinput.get("qor_session_id")
-            else:
-                session_id = None
-            collect_qor_from_test_dir(test_dir_full_path, output_directory, session_id)
+            # Collect QoR data BEFORE cleanup (only if test dir exists)
+            if os.path.isdir(test_dir_full_path):
+                # Get session ID from master or worker
+                if hasattr(request.config, "_qor_session_id"):
+                    session_id = request.config._qor_session_id
+                elif hasattr(request.config, "workerinput"):
+                    session_id = request.config.workerinput.get("qor_session_id")
+                else:
+                    session_id = None
+                collect_qor_from_test_dir(test_dir_full_path, output_directory, session_id)
 
-        # Cleanup
-        force_cleanup: bool = get_feature_flag(request.config, "force_local_cleanup")
-        if force_cleanup:
-            preserve = set(get_feature_flag(request.config, "force_local_cleanup_keep") or [])
-            if preserve and os.path.isdir(test_dir_full_path):
-                # Selectively delete, preserving specified artifact types
-                for item in os.listdir(test_dir_full_path):
-                    if item not in preserve:
-                        item_path = os.path.join(test_dir_full_path, item)
-                        if os.path.isdir(item_path):
-                            shutil.rmtree(item_path, ignore_errors=True)
-                        else:
-                            os.remove(item_path)
-            else:
-                shutil.rmtree(test_dir_full_path, ignore_errors=True)
+            # Cleanup
+            force_cleanup: bool = get_feature_flag(request.config, "force_local_cleanup")
+
+            if force_cleanup:
+                preserve = set(get_feature_flag(request.config, "force_local_cleanup_keep") or [])
+                if preserve and os.path.isdir(test_dir_full_path):
+                    # Selectively delete, preserving specified artifact types
+                    for item in os.listdir(test_dir_full_path):
+                        if item not in preserve:
+                            item_path = os.path.join(test_dir_full_path, item)
+                            if os.path.isdir(item_path):
+                                shutil.rmtree(item_path, ignore_errors=True)
+                            else:
+                                os.remove(item_path)
+                else:
+                    shutil.rmtree(test_dir_full_path, ignore_errors=True)
+        except Exception as e:
+            logging.warning(f"Received exception during teardown, skipping re-throw.\n {e}")
 
 
 @pytest.fixture(autouse=True)
-def _memory_monitor(request):
-    """Track per-test peak RSS and enforce memory limits.
+def _memory_monitor(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Track per-test peak memory and enforce memory limits.
 
-    --monitor-memory: record peak and delta RSS per test to memory_monitor.csv
-    --memory-limit N: kill the test if its delta RSS exceeds N MB
+    --monitor-memory: record peak and delta memory per test to memory_monitor.csv
+    --memory-limit N: kill the test if its delta memory exceeds N MB
     """
     from test.utils.memory_monitor import ProcessTreeMemoryMonitor
 
-    monitor_memory = request.config.getoption("monitor_memory", default=False)
+    monitor_memory = get_feature_flag(request.config, "monitor_memory")
     memory_limit_mb = request.config.getoption("memory_limit", default=None)
 
-    if not monitor_memory and memory_limit_mb is None:
+    if monitor_memory is None and memory_limit_mb is None:
         yield
         return
 
@@ -511,10 +526,31 @@ def _memory_monitor(request):
 
         if monitor_memory:
             output_dir = Path(resolve_base_output_directory(request.config))
-            output_dir.mkdir(exist_ok=True)
-            worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
-            with open(output_dir / f"memory_monitor_{worker_id}.csv", "a") as f:
-                f.write(f"{request.node.nodeid},{snapshot.peak_rss_mb:.1f},{snapshot.delta_rss_mb:.1f}\n")
+            MEMORY_MONITOR.append(output_dir, f"{request.node.nodeid},{snapshot.peak_mb:.1f},{snapshot.delta_mb:.1f}")
+
+
+@pytest.fixture(autouse=True)
+def _duration_monitor(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Track per-test CPU time and wall-clock duration across xdist workers.
+
+    --monitor-durations N: record CPU time + wall time per test, print the N slowest
+    (sorted by CPU time) in the summary.
+    """
+    import time
+
+    top_n = get_feature_flag(request.config, "monitor_durations")
+    if top_n is None:
+        yield
+        return
+
+    start_wall = time.perf_counter()
+    start_cpu = cpu_timeout._get_total_cpu()
+    yield
+    elapsed_wall = time.perf_counter() - start_wall
+    elapsed_cpu = cpu_timeout._get_total_cpu() - start_cpu
+
+    output_dir = Path(resolve_base_output_directory(request.config))
+    DURATION_MONITOR.append(output_dir, f"{request.node.nodeid},{elapsed_cpu:.3f},{elapsed_wall:.3f}")
 
 
 def pytest_ignore_collect(collection_path, config):
@@ -562,7 +598,6 @@ def pytest_configure(config: Config):
     # Create session context (single source of truth for session-level fields).
     # Must be outside the master-only block so xdist workers also build it.
     config._session_context = SessionContext(
-        run_id=_resolve_run_id(config),
         target=",".join(p.value for p in get_platform_targets(config)),
         trace_mode=resolve_session_trace_mode(config).value,
         nki_compilation_mode=get_feature_flag(config, "nki_compilation_mode"),
@@ -570,7 +605,8 @@ def pytest_configure(config: Config):
         run_type=os.environ.get("RUN_TYPE"),
         is_release=os.environ.get("IS_RELEASE", "").lower() == "true",
         sqs_queue_url=sqs_queue_url,
-        username=os.environ.get("USERNAME"),
+        username=resolve_current_user(),
+        version_set_eid=os.environ.get("VERSION_SET_EID"),
     )
 
     # Validate S3 credentials for test output upload
@@ -611,8 +647,6 @@ def pytest_configure_node(node):
     """Pass session state from master to workers (xdist hook)."""
     if hasattr(node.config, "_qor_session_id"):
         node.workerinput["qor_session_id"] = node.config._qor_session_id
-    if hasattr(node.config, "_session_run_id"):
-        node.workerinput["run_id"] = node.config._session_run_id
     if hasattr(node.config, RELEVANT_TEST_DIRS_KEY):
         node.workerinput["relevant_test_dirs"] = (
             list(getattr(node.config, RELEVANT_TEST_DIRS_KEY))
@@ -621,8 +655,8 @@ def pytest_configure_node(node):
         )
 
 
-def pytest_sessionfinish(session, exitstatus):
-    """End of test session - emit run_complete and log QoR CSV path (master only)."""
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """End of test session - emit run_complete and log summaries (master only)."""
     # Handle --disable-no-tests-failure: convert exit code 5 (no tests collected) to 0 with warning
     if exitstatus == 5 and get_feature_flag(session.config, "disable_no_tests_failure", False):
         logging.warning("No tests were collected, but --disable-no-tests-failure is set - exiting with code 0")
@@ -647,6 +681,7 @@ def pytest_sessionfinish(session, exitstatus):
             tests_total=len(passed_ids) + len(failed_ids) + len(skipped_ids),
             tests_skipped=len(skipped_ids),
             tests_xfailed=len(xfailed_ids),
+            coverage_data=get_coverage_data(session.config),
         )
 
     # Log QoR CSV file path
@@ -657,33 +692,48 @@ def pytest_sessionfinish(session, exitstatus):
             print(f"\nQoR data collected to {filepath}")
 
     # Print memory monitoring summary
-    if session.config.getoption("monitor_memory", default=False):
+    memory_top_n = get_feature_flag(session.config, "monitor_memory")
+    if memory_top_n is not None:
         output_dir = Path(resolve_base_output_directory(session.config))
-        worker_csvs = sorted(output_dir.glob("memory_monitor_*.csv"))
-        lines: list[str] = []
-        for csv_path in worker_csvs:
-            lines.extend(csv_path.read_text().splitlines())
-        if lines:
-            rows = sorted(lines, key=lambda l: -float(l.split(",")[2]))
+        MEMORY_MONITOR.merge_and_report(output_dir, memory_top_n)
 
-            merged_path = output_dir / "memory_monitor.csv"
-            with open(merged_path, "w") as f:
-                f.write("test_id,peak_rss_mb,delta_rss_mb\n")
-                f.writelines(row + "\n" for row in rows)
-            for csv_path in worker_csvs:
-                csv_path.unlink()
-
-            print(f"\n=== Memory Monitor: Top 20 by Delta RSS ({len(rows)} tests) ===")
-            for line in rows[:20]:
-                test_id, peak_mb, delta_mb = line.split(",")
-                print(f"  {float(delta_mb):8.1f} MB delta ({float(peak_mb):8.1f} MB peak)  {test_id}")
-            print(f"  Full results: {merged_path}")
-
-
-def pytest_sessionstart(session):
-    """nkilib-internal: clean stale memory monitor CSVs."""
-    # Clean stale memory monitor CSV (master only)
-    if not hasattr(session.config, "workerinput") and session.config.getoption("monitor_memory", default=False):
+    # Print duration monitoring summary
+    top_n = get_feature_flag(session.config, "monitor_durations")
+    if top_n is not None:
         output_dir = Path(resolve_base_output_directory(session.config))
-        for csv_path in output_dir.glob("memory_monitor_*.csv"):
-            csv_path.unlink()
+        DURATION_MONITOR.merge_and_report(output_dir, top_n)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    """Inject UTC timestamp into the final summary separator line."""
+    if hasattr(config, "workerinput"):
+        return
+
+    original_summary_stats = terminalreporter.summary_stats
+
+    def patched_summary_stats():
+        original_write_sep = terminalreporter.write_sep
+
+        def write_sep_with_timestamp(sep, title="", **kw):
+            if title:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                title += f" by {ts}"
+            original_write_sep(sep, title, **kw)
+
+        terminalreporter.write_sep = write_sep_with_timestamp
+        try:
+            original_summary_stats()
+        finally:
+            terminalreporter.write_sep = original_write_sep
+
+    terminalreporter.summary_stats = patched_summary_stats
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """nkilib-internal: clean stale monitor CSVs."""
+    if not hasattr(session.config, "workerinput"):
+        output_dir = Path(resolve_base_output_directory(session.config))
+        if get_feature_flag(session.config, "monitor_memory") is not None:
+            MEMORY_MONITOR.cleanup_stale(output_dir)
+        if get_feature_flag(session.config, "monitor_durations") is not None:
+            DURATION_MONITOR.cleanup_stale(output_dir)

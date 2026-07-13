@@ -36,7 +36,6 @@ from nkilib_src.nkilib.core.mlp.mlp_tkg.mlp_proj_mx_torch import (
 )
 from nkilib_src.nkilib.core.mlp.mlp_tkg.projection_mx_constants import ProjConfig, _pmax, _q_height, _q_width
 from nkilib_src.nkilib.core.utils.kernel_helpers import div_ceil
-from nkilib_src.nkilib.core.utils.tensor_view import TensorView
 from test.integration.nkilib.utils.tensor_generators import generate_stabilized_mx_data
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.pytest_parametrize import pytest_parametrize
@@ -182,11 +181,11 @@ def gate_up_proj_mxfp4_wrapper(
 
     # Call sub-kernel
     proj_out_sb = gate_up_projection_mx_tp_shard_H(
-        hidden_qtz_sb=TensorView(hidden_sb),
-        hidden_scale_sb=TensorView(hidden_scale_sb),
-        weight_qtz=TensorView(weight_qtz),
-        weight_scale=TensorView(weight_scale),
-        bias_sb=TensorView(bias_sb),
+        hidden_qtz_sb=hidden_sb,
+        hidden_scale_sb=hidden_scale_sb,
+        weight_qtz=weight_qtz,
+        weight_scale=weight_scale,
+        bias_sb=bias_sb,
         cfg=cfg,
     )
 
@@ -274,11 +273,23 @@ MXFP4_PROJ_LNC2_TEST_VECTORS = [
 
 GATE_UP_PARAM_NAMES = "BxS, H, I"
 _GATE_UP_ABBREVS = {"BxS": "bs"}
-GATE_UP_TEST_PARAMS = [tuple(v) for v in MXFP4_PROJ_LNC2_TEST_VECTORS]
+
+_GATE_UP_FAST_KEYS = frozenset({(4, 3072, 192), (4, 3072, 1536)})
+GATE_UP_TEST_PARAMS = [
+    pytest.param(*v, marks=pytest.mark.fast) if tuple(v) in _GATE_UP_FAST_KEYS else pytest.param(*v)
+    for v in MXFP4_PROJ_LNC2_TEST_VECTORS
+]
 
 DOWN_PARAM_NAMES = "BxS, H, I, use_stream_shuffle_broadcast"
 _DOWN_ABBREVS = {"BxS": "bs", "use_stream_shuffle_broadcast": "ssb"}
-DOWN_TEST_PARAMS = [(BxS, H, I, use_ssb) for BxS, H, I in MXFP4_PROJ_LNC2_TEST_VECTORS for use_ssb in [True, False]]
+
+_DOWN_FAST_KEYS = frozenset({(256, 3072, 384, False), (4, 3072, 768, True)})
+DOWN_TEST_PARAMS = [
+    pytest.param(*p, marks=pytest.mark.fast) if p in _DOWN_FAST_KEYS else pytest.param(*p)
+    for BxS, H, I in MXFP4_PROJ_LNC2_TEST_VECTORS
+    for use_ssb in [True, False]
+    for p in [(BxS, H, I, use_ssb)]
+]
 
 
 # =============================================================================
@@ -293,7 +304,6 @@ DOWN_TEST_PARAMS = [(BxS, H, I, use_ssb) for BxS, H, I in MXFP4_PROJ_LNC2_TEST_V
 class TestMlpProjMxfp4Kernel:
     """Test suite for MXFP4 MLP projection kernels."""
 
-    @pytest.mark.fast
     @pytest_parametrize(GATE_UP_PARAM_NAMES, GATE_UP_TEST_PARAMS, abbrevs=_GATE_UP_ABBREVS)
     def test_mxfp4_gate_up_proj_unit(
         self,
@@ -324,7 +334,6 @@ class TestMlpProjMxfp4Kernel:
             atol=1e-5,
         )
 
-    @pytest.mark.fast
     @pytest_parametrize(DOWN_PARAM_NAMES, DOWN_TEST_PARAMS, abbrevs=_DOWN_ABBREVS)
     def test_mxfp4_down_proj_unit(
         self,

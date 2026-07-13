@@ -17,16 +17,38 @@
 import torch
 
 
-def topk_reduce_torch_ref(input: torch.Tensor, T: int, K: int) -> torch.Tensor:
-    """Gather scattered rows by packed global token index and reduce along K.
+def topk_reduce_torch_ref(input: torch.Tensor, T: int, K: int, token_base_index: int = 1) -> torch.Tensor:
+    """
+    Compute MoE Top-K reduction across sparse all_to_all_v() collective output buffer.
+
+    Gathers scattered rows by packed global token index and reduces along
+    the K dimension.
+
+    Token indices are 1-indexed (token 0 → index 1, token 1 → index 2, etc.),
+    and padded rows must have index -1.
+
+    Dimensions:
+        TK_padded: n_src_ranks * T, padded input row count
+        H: Hidden dimension size (must be divisible by LNC)
+        T: Total number of input tokens (up to 128)
+        K: Number of routed experts per token (up to 8)
 
     Args:
-        input: (TK_padded, H+2) tensor with hidden states and packed int32 token indices
-        T: number of output tokens
-        K: number of top-K entries per token
+        input (torch.Tensor): [TK_padded, H + 2], bf16/fp16. Sparse input buffer containing T*K
+            scattered outputs. Global token index is packed as int32 in the final 2x
+            columns of each row (1-indexed, -1 for padding).
+        T (int): Total number of input tokens.
+        K (int): Number of routed experts per token.
 
     Returns:
-        (T, H) tensor of reduced hidden states
+        torch.Tensor: [T, H], bf16/fp16. Ordered and reduced output.
+            out[t] = sum of all rows with index t+1.
+
+    Pseudocode:
+        global_token_indices = extract_int32_index(input[:, H:])
+        for token_idx in range(T):
+            matching_rows = find_rows_where(global_token_indices == token_idx + 1)
+            output[token_idx] = sum(input[matching_rows, :H])
     """
     H = input.shape[1] - 2
 
@@ -37,7 +59,7 @@ def topk_reduce_torch_ref(input: torch.Tensor, T: int, K: int) -> torch.Tensor:
     # For each token, gather matching rows and sum
     out = torch.zeros(T, H, dtype=input.dtype)
     for t in range(T):
-        mask = global_token_indices == t
+        mask = global_token_indices == token_base_index + t
         out[t] = input[mask, :H].sum(dim=0)
 
     return out
