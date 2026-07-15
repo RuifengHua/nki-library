@@ -26,6 +26,53 @@ from ...utils.tile_info import TiledDimInfo
 from ..mlp_parameters import MLPParameters
 from .mlp_cte_sharding import DimShard, ShardedDim, is_sharded_dim_bxs
 
+
+@dataclass(frozen=True)
+class SrcProjPsumGroup(NKIObject):
+    """A contiguous run of source-projection intermediate tiles that share PSUM banks.
+
+    Standard (non-quantized) source projection processes the intermediate dimension in groups so
+    that only ``bxs_subtile_count * count`` PSUM banks are live at once (<= NUM_HW_PSUM_BANKS). Each
+    group's results are drained to SBUF before the next group reuses the banks, which lets the bxs
+    subtile count grow independently of the total intermediate-tile count (the fix for wide-I PSUM
+    bank starvation). Within a group the bank for (bxs_subtile, int_tile) is
+
+        bxs_subtile.index * group.count + (int_tile.index - group.start)
+
+    ``start`` is the global index of the group's first intermediate tile; ``count`` is the number of
+    tiles in the group (the last group may be smaller than the nominal stride).
+    """
+
+    start: int
+    count: int
+
+
+def build_src_proj_psum_groups(
+    bxs_subtile_count: int,
+    src_proj_int_dim_tile_count: int,
+) -> list[SrcProjPsumGroup]:
+    """Partition the intermediate tiles into PSUM-bank-sized groups for standard source projection.
+
+    The nominal group stride is ``NUM_HW_PSUM_BANKS // bxs_subtile_count`` intermediate tiles, so a
+    fully populated group occupies ``bxs_subtile_count * stride <= NUM_HW_PSUM_BANKS`` banks. The
+    final group holds the remaining tiles when the tile count is not a multiple of the stride.
+
+    Args:
+        bxs_subtile_count: Number of batch×sequence subtiles processed together.
+        src_proj_int_dim_tile_count: Total number of source-projection intermediate tiles.
+
+    Returns:
+        Ordered list of SrcProjPsumGroup covering all intermediate tiles exactly once.
+    """
+    stride = max(1, NUM_HW_PSUM_BANKS // bxs_subtile_count)
+    groups = []
+    start = 0
+    while start < src_proj_int_dim_tile_count:
+        count = min(stride, src_proj_int_dim_tile_count - start)
+        groups.append(SrcProjPsumGroup(start=start, count=count))
+        start += count
+    return groups
+
 #
 # Local constants
 _mx_q_width = 4
@@ -102,16 +149,27 @@ def calc_batch_seqlen_dim_tile_size(
     Intended Usage:
         Called during tile info construction to determine optimal tiling strategy
     """
-    # TODO: Implement tile size calculation properly
-    # We have to ensure that the tile size not exceed the number of PSUM banks needed during up/gate
-    # projection.  It is related to the structure of the inner loops.
-
-    bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS // src_proj_int_dim_tile_count
-    if mlp_params.quant_params.is_dtype_mx():
-        # In the MX setting, during src projection, we use a wider tile size of 2*pmax.
-        # A single 2*pmax size bxs tile and a single int dim tile together fill a PSUM bank
-        # in the projection result.
-        bxs_dim_max_subtiles *= 2
+    # We have to ensure that the tile size does not exceed the number of PSUM banks needed during
+    # up/gate projection.  It is related to the structure of the inner loops.
+    #
+    # For the standard (non-quantized) path, source projection drains PSUM per int-tile GROUP
+    # (see build_src_proj_psum_groups + project_standard_source_tensor_tile): within a group we
+    # hold bxs_subtiles * group_stride <= NUM_HW_PSUM_BANKS banks, drain to SBUF, then reuse the
+    # banks for the next group.  This decouples the bxs subtile count from the int-tile count, so
+    # wide-intermediate configs are no longer starved down to a single subtile.  The subtile count
+    # is then bounded only by the 512 tile-size / token-count caps applied below.
+    #
+    # The quantized (dual-row) and MX paths do NOT group; they index a single PSUM allocation as
+    # bxs_subtile * int_tile_count + int_tile, so they must keep the original bank-fitting formula.
+    if not mlp_params.quant_params.is_quant():
+        bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS
+    else:
+        bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS // src_proj_int_dim_tile_count
+        if mlp_params.quant_params.is_dtype_mx():
+            # In the MX setting, during src projection, we use a wider tile size of 2*pmax.
+            # A single 2*pmax size bxs tile and a single int dim tile together fill a PSUM bank
+            # in the projection result.
+            bxs_dim_max_subtiles *= 2
     # This is the max tile size we can choose
     tile_size = bxs_dim_subtile_size * bxs_dim_max_subtiles
     # Special tiling optimization for LLaMA3 70B (heuristic) is to use a tile size of 384 if we can

@@ -24,7 +24,7 @@ from ...utils.kernel_helpers import get_ceil_quotient, get_nl_act_fn_from_type
 from ...utils.tiled_range import TiledRange
 from ..mlp_parameters import MLPParameters
 from .mlp_cte_constants import MLPCTEConstants
-from .mlp_cte_tile_info import MLPCTETileInfo
+from .mlp_cte_tile_info import MLPCTETileInfo, SrcProjPsumGroup
 
 #
 # ***************
@@ -105,6 +105,7 @@ def apply_source_projection_bias(
     proj_psum_list: list[nl.ndarray],
     bias_tensor_sbuf: nl.ndarray,
     bias_res_sbuf_list: list[nl.ndarray],
+    group: Optional["SrcProjPsumGroup"] = None,
 ):
     """Add bias to source projection results in PSUM and store in SBUF.
 
@@ -135,16 +136,23 @@ def apply_source_projection_bias(
     # This is the total size from the tensor that we are computing
     tensor_bxs_size = constants.get_bxs_size(mlp_params)
 
+    # Group-aware PSUM bank indexing: with a group, only that group's intermediate tiles are live
+    # in PSUM and the bank denominator is the group size (matching project_standard_source_tensor_tile).
+    # group=None reproduces the original flat "bxs_subtile * int_tile_count + int_tile" layout.
+    int_start = 0 if group is None else group.start
+    int_stop = int_dim_tile.tile_count if group is None else group.start + group.count
+    bank_denom = int_dim_tile.tile_count if group is None else group.count
+
     # Loop over all the intermediate tiles within the B x S subtiles and compute the bias addition
     for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
-        for intermediate_tile_idx in range(int_dim_tile.tile_count):
+        for intermediate_tile_idx in range(int_start, int_stop):
             p_bxs_size = bxs_dim_tile.get_subtile_bound(bxs_tile_idx, bxs_subtile_idx)
             f_int_size = int_dim_tile.get_tile_bound(intermediate_tile_idx)
 
             if p_bxs_size <= 0 or f_int_size <= 0:
                 continue
 
-            psum_bank = bxs_subtile_idx * int_dim_tile.tile_count + intermediate_tile_idx
+            psum_bank = bxs_subtile_idx * bank_denom + (intermediate_tile_idx - int_start)
             nisa.tensor_tensor(
                 dst=bias_res_sbuf_list[bxs_subtile_idx][:p_bxs_size, intermediate_tile_idx, :f_int_size],
                 data1=proj_psum_list[psum_bank][:p_bxs_size, :f_int_size],
@@ -177,6 +185,7 @@ def perform_elementwise_multiply(
     hidden_scales_sbuf_list: Optional[nl.ndarray],
     output_tile_sbuf_list: list[nl.ndarray],
     up_data_is_psum: bool = False,
+    group: Optional["SrcProjPsumGroup"] = None,
 ):
     """Perform elementwise multiplication between gate and up projection results.
 
@@ -214,9 +223,18 @@ def perform_elementwise_multiply(
     bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
     current_bxs_tile = bxs_tiles[bxs_tile_idx]
 
+    # Group-aware PSUM bank indexing for the standard path (group is only ever set there). With a
+    # group, only that group's intermediate tiles are live in PSUM and the bank denominator is the
+    # group size; group=None reproduces the original flat layout for every path.
+    int_start = 0 if group is None else group.start
+    int_stop = int_dim_tile.tile_count if group is None else group.start + group.count
+    psum_bank_denom = int_dim_tile.tile_count if group is None else group.count
+
     # Loop over all the intermediate tiles within the B x S subtiles and compute the multiply
     for bxs_subtile in TiledRange(current_bxs_tile.size, BXS_SUBTILE_SIZE):
         for int_tile in TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size):
+            if not (int_start <= int_tile.index < int_stop):
+                continue
             if mlp_params.quant_params.is_quant_static_mx():
                 int_subtiles = TiledRange(int_tile.size, MX_INT_SUBTILE_SIZE)
 
@@ -256,7 +274,7 @@ def perform_elementwise_multiply(
                 gate_data = gate_tile_sbuf_list[bxs_subtile.index][: bxs_subtile.size, int_tile.index, : int_tile.size]
 
                 if up_data_is_psum:
-                    psum_bank = bxs_subtile.index * int_dim_tile.tile_count + int_tile.index
+                    psum_bank = bxs_subtile.index * psum_bank_denom + (int_tile.index - int_start)
                     up_data = up_tile_data_list[psum_bank][: bxs_subtile.size, : int_tile.size]
                 else:
                     up_data = up_tile_data_list[bxs_subtile.index][: bxs_subtile.size, int_tile.index, : int_tile.size]
@@ -310,6 +328,7 @@ def apply_source_projection_activation(
     hidden_scales_sbuf_list: Optional[nl.ndarray],
     act_fn_res_sbuf_list: list[nl.ndarray],
     data_is_psum: bool = False,
+    group: Optional["SrcProjPsumGroup"] = None,
 ):
     """Apply activation function to source projection results.
 
@@ -346,9 +365,18 @@ def apply_source_projection_activation(
     bxs_tiles = TiledRange(tensor_bxs_size, bxs_dim_tile.tile_size)
     current_bxs_tile = bxs_tiles[bxs_tile_idx]
 
+    # Group-aware PSUM bank indexing for the standard path (group is only ever set there). With a
+    # group, only that group's intermediate tiles are live in PSUM and the bank denominator is the
+    # group size; group=None reproduces the original flat layout for every path.
+    int_start = 0 if group is None else group.start
+    int_stop = int_dim_tile.tile_count if group is None else group.start + group.count
+    psum_bank_denom = int_dim_tile.tile_count if group is None else group.count
+
     # Loop over all the intermediate tiles within the B x S subtiles and compute the activation
     for bxs_subtile in TiledRange(current_bxs_tile.size, BXS_SUBTILE_SIZE):
         for int_tile in TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size):
+            if not (int_start <= int_tile.index < int_stop):
+                continue
             if mlp_params.quant_params.is_quant_static_mx():
                 int_subtiles = TiledRange(int_tile.size, MX_INT_SUBTILE_SIZE)
 
@@ -383,7 +411,7 @@ def apply_source_projection_activation(
                 )
             else:
                 if data_is_psum:
-                    psum_bank = bxs_subtile.index * int_dim_tile.tile_count + int_tile.index
+                    psum_bank = bxs_subtile.index * psum_bank_denom + (int_tile.index - int_start)
                     proj_data = proj_data_list[psum_bank][: bxs_subtile.size, : int_tile.size]
                 else:
                     proj_data = proj_data_list[bxs_subtile.index][: bxs_subtile.size, int_tile.index, : int_tile.size]
