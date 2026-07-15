@@ -664,7 +664,7 @@ def sync_down_proj_results_across_int_dim(
         )
 
 
-def _run_grouped_standard_source_projection(
+def _alloc_and_project_standard_group(
     mlp_params: MLPParameters,
     tile_info: MLPCTETileInfo,
     constants: MLPCTEConstants,
@@ -673,50 +673,45 @@ def _run_grouped_standard_source_projection(
     weights_tensor_hbm: nl.ndarray,
     weights_sbuf_list: list[nl.ndarray],
     psum_name: str,
-    drain_fn,
+    group: SrcProjPsumGroup,
     sbm: SbufManager,
-):
-    """Run standard source projection one intermediate-tile group at a time, draining between groups.
+) -> list[nl.ndarray]:
+    """Allocate this group's PSUM banks and project the group's intermediate tiles into them.
 
-    For each group we allocate exactly ``bxs_subtile_count * group.count`` PSUM banks (<= 8),
-    project that group's intermediate tiles into them, then invoke ``drain_fn(psum_list, group)`` to
-    copy the results to SBUF before the banks are reused for the next group. This decouples the bxs
-    subtile count from the total intermediate-tile count, eliminating the wide-intermediate PSUM
-    bank starvation that otherwise forces a single bxs subtile.
+    Allocates exactly ``bxs_subtile_count * group.count`` PSUM banks (<= 8) and projects the group's
+    intermediate tiles. The caller drains the returned banks to SBUF before invoking this again for
+    the next group, so the banks are reused. Re-allocating PSUM at the same bank addresses per group
+    mirrors the established down-projection pattern (fresh allocation per hidden tile), which the NKI
+    scheduler serializes correctly via the drain dependency.
 
-    Re-allocating PSUM at the same bank addresses per group mirrors the established down-projection
-    pattern (fresh allocation per hidden tile), which the NKI scheduler serializes correctly via the
-    drain dependency.
+    Returned as a plain function (not a closure) because NKI kernels forbid nested function
+    definitions; the drain step is inlined at each call site instead.
     """
     bxs_subtile_count = tile_info.bxs_dim_tile.subtile_dim_info.tile_count
-    int_tile_count = tile_info.src_proj_intermediate_dim_tile.tile_count
-    groups = build_src_proj_psum_groups(bxs_subtile_count, int_tile_count)
-
-    for group in groups:
-        banks_needed = bxs_subtile_count * group.count
-        group_psum_list = []
-        for bank in range(banks_needed):
-            group_psum_list.append(
-                nl.ndarray(
-                    (nl.tile_size.pmax, constants.psum_fmax),
-                    dtype=constants.psum_accumulation_data_type,
-                    buffer=nl.psum,
-                    address=(0, bank * PSUM_BANK_SIZE) if sbm else None,
-                    name=indices.get_tensor_name(psum_name, f"grp{group.start}__bank{bank}"),
-                )
+    banks_needed = bxs_subtile_count * group.count
+    group_psum_list = []
+    for bank in range(banks_needed):
+        group_psum_list.append(
+            nl.ndarray(
+                (nl.tile_size.pmax, constants.psum_fmax),
+                dtype=constants.psum_accumulation_data_type,
+                buffer=nl.psum,
+                address=(0, bank * PSUM_BANK_SIZE) if sbm else None,
+                name=indices.get_tensor_name(psum_name, f"grp{group.start}__bank{bank}"),
             )
-        project_standard_source_tensor_tile(
-            mlp_params,
-            tile_info,
-            constants,
-            indices.bxs_tile_idx,
-            source_tile_sbuf,
-            weights_tensor_hbm,
-            weights_sbuf_list,
-            group_psum_list,
-            group=group,
         )
-        drain_fn(group_psum_list, group)
+    project_standard_source_tensor_tile(
+        mlp_params,
+        tile_info,
+        constants,
+        indices.bxs_tile_idx,
+        source_tile_sbuf,
+        weights_tensor_hbm,
+        weights_sbuf_list,
+        group_psum_list,
+        group=group,
+    )
+    return group_psum_list
 
 
 def perform_gate_projection_if_necessary(
@@ -761,15 +756,32 @@ def perform_gate_projection_if_necessary(
         has_bias = mlpp_has_gate_projection_bias(mlp_params)
         if not mlp_params.quant_params.is_quant():
             # Standard (non-quantized) path: project + drain one PSUM-bank group at a time so wide
-            # intermediate sizes are not starved down to a single bxs subtile.
-            def _drain_gate(psum_list, group):
+            # intermediate sizes are not starved down to a single bxs subtile. Drain is inlined per
+            # group (NKI kernels forbid nested function definitions, so no drain closure).
+            groups = build_src_proj_psum_groups(
+                tile_info.bxs_dim_tile.subtile_dim_info.tile_count,
+                tile_info.src_proj_intermediate_dim_tile.tile_count,
+            )
+            for group in groups:
+                gate_proj_psum_list = _alloc_and_project_standard_group(
+                    mlp_params,
+                    tile_info,
+                    constants,
+                    indices,
+                    source_tile_sbuf,
+                    mlp_params.gate_proj_weights_tensor,
+                    weights_sbuf_list,
+                    "gate_proj_psum",
+                    group,
+                    sbm,
+                )
                 if has_bias:
                     apply_source_projection_bias(
                         mlp_params,
                         tile_info,
                         constants,
                         indices.bxs_tile_idx,
-                        psum_list,
+                        gate_proj_psum_list,
                         bias_tensor_sbuf,
                         proj_results_sbuf,
                         group=group,
@@ -780,7 +792,7 @@ def perform_gate_projection_if_necessary(
                         tile_info,
                         constants,
                         indices.bxs_tile_idx,
-                        psum_list,
+                        gate_proj_psum_list,
                         gate_weight_row_scales_sbuf,
                         gate_static_scales_sbuf,
                         hidden_scales_sbuf_list,
@@ -788,19 +800,6 @@ def perform_gate_projection_if_necessary(
                         data_is_psum=True,
                         group=group,
                     )
-
-            _run_grouped_standard_source_projection(
-                mlp_params,
-                tile_info,
-                constants,
-                indices,
-                source_tile_sbuf,
-                mlp_params.gate_proj_weights_tensor,
-                weights_sbuf_list,
-                "gate_proj_psum",
-                _drain_gate,
-                sbm,
-            )
             if has_bias:
                 # Activation reads the bias result from SBUF (all groups already drained).
                 apply_source_projection_activation(
@@ -945,14 +944,31 @@ def perform_up_projection(
                     )
                 )
 
-        def _drain_up(psum_list, group):
+        # Drain is inlined per group (NKI kernels forbid nested function definitions).
+        groups = build_src_proj_psum_groups(
+            tile_info.bxs_dim_tile.subtile_dim_info.tile_count,
+            tile_info.src_proj_intermediate_dim_tile.tile_count,
+        )
+        for group in groups:
+            up_proj_psum_list = _alloc_and_project_standard_group(
+                mlp_params,
+                tile_info,
+                constants,
+                indices,
+                source_tile_sbuf,
+                mlp_params.up_proj_weights_tensor,
+                weights_sbuf_list,
+                "up_proj_psum",
+                group,
+                sbm,
+            )
             if has_bias:
                 apply_source_projection_bias(
                     mlp_params,
                     tile_info,
                     constants,
                     indices.bxs_tile_idx,
-                    psum_list,
+                    up_proj_psum_list,
                     bias_tensor_sbuf,
                     up_proj_res_sbuf_list,
                     group=group,
@@ -964,7 +980,7 @@ def perform_up_projection(
                     constants,
                     indices.bxs_tile_idx,
                     proj_results_sbuf,
-                    psum_list,
+                    up_proj_psum_list,
                     up_weight_row_scales_sbuf,
                     up_static_scales_sbuf,
                     hidden_scales_sbuf_list,
@@ -978,7 +994,7 @@ def perform_up_projection(
                     tile_info,
                     constants,
                     indices.bxs_tile_idx,
-                    psum_list,
+                    up_proj_psum_list,
                     up_weight_row_scales_sbuf,
                     up_static_scales_sbuf,
                     hidden_scales_sbuf_list,
@@ -986,19 +1002,6 @@ def perform_up_projection(
                     data_is_psum=True,
                     group=group,
                 )
-
-        _run_grouped_standard_source_projection(
-            mlp_params,
-            tile_info,
-            constants,
-            indices,
-            source_tile_sbuf,
-            mlp_params.up_proj_weights_tensor,
-            weights_sbuf_list,
-            "up_proj_psum",
-            _drain_up,
-            sbm,
-        )
 
         if has_bias:
             # All groups drained to up_proj_res_sbuf_list; now combine with gate (SBUF, no group).
