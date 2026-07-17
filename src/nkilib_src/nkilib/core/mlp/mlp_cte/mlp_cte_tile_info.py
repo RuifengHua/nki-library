@@ -142,17 +142,14 @@ def calc_batch_seqlen_dim_tile_size(
         Called during tile info construction to determine optimal tiling strategy
     """
     # Max bxs subtiles is limited by how many fit in the 8 PSUM banks during up/gate projection.
-    if not mlp_params.quant_params.is_quant():
-        # Standard path drains PSUM per int-tile group (see build_src_proj_psum_groups), so the
-        # subtile count is decoupled from the int-tile count and bounded only by the caps below.
-        bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS
+    if mlp_params.quant_params.is_dtype_mx():
+        # MX uses a wider 2*pmax bxs tile; one such tile + one int tile fill a bank. Not grouped.
+        bxs_dim_max_subtiles = (NUM_HW_PSUM_BANKS // src_proj_int_dim_tile_count) * 2
     else:
-        bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS // src_proj_int_dim_tile_count
-        if mlp_params.quant_params.is_dtype_mx():
-            # In the MX setting, during src projection, we use a wider tile size of 2*pmax.
-            # A single 2*pmax size bxs tile and a single int dim tile together fill a PSUM bank
-            # in the projection result.
-            bxs_dim_max_subtiles *= 2
+        # Standard and dual-row-quant paths drain PSUM per int-tile group (see
+        # build_src_proj_psum_groups), so the subtile count is decoupled from the int-tile count
+        # and bounded only by the caps below.
+        bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS
     # This is the max tile size we can choose
     tile_size = bxs_dim_subtile_size * bxs_dim_max_subtiles
     # Special tiling optimization for LLaMA3 70B (heuristic) is to use a tile size of 384 if we can

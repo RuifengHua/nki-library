@@ -664,7 +664,7 @@ def sync_down_proj_results_across_int_dim(
         )
 
 
-def _alloc_and_project_standard_group(
+def _alloc_and_project_group(
     mlp_params: MLPParameters,
     tile_info: MLPCTETileInfo,
     constants: MLPCTEConstants,
@@ -678,9 +678,11 @@ def _alloc_and_project_standard_group(
 ) -> list[nl.ndarray]:
     """Allocate this group's ``bxs_subtile_count * group.count`` PSUM banks (<= 8) and project into them.
 
-    The caller drains the returned banks to SBUF before calling again for the next group, so banks
-    are reused. Fresh allocation per group (same bank addresses each time) gives correct zero-start
-    accumulation, as in down projection; the drain dependency keeps the scheduler ordered.
+    Dispatches to the standard or quantized (dual-row) source projection by quant type; MX is never
+    grouped and does not reach here. The caller drains the returned banks to SBUF before calling
+    again for the next group, so banks are reused. Fresh allocation per group (same bank addresses
+    each time) gives correct zero-start accumulation, as in down projection; the drain dependency
+    keeps the scheduler ordered.
     """
     bxs_subtile_count = tile_info.bxs_dim_tile.subtile_dim_info.tile_count
     banks_needed = bxs_subtile_count * group.count
@@ -695,7 +697,12 @@ def _alloc_and_project_standard_group(
                 name=indices.get_tensor_name(psum_name, f"grp{group.start}__bank{bank}"),
             )
         )
-    project_standard_source_tensor_tile(
+    project_fn = (
+        project_quantized_source_tensor_tile
+        if mlp_params.quant_params.is_quant()
+        else project_standard_source_tensor_tile
+    )
+    project_fn(
         mlp_params,
         tile_info,
         constants,
@@ -748,7 +755,9 @@ def perform_gate_projection_if_necessary(
         Called to perform gate projection in gated MLP architectures
     """
     if not mlp_params.skip_gate_proj:
-        if not mlp_params.quant_params.is_quant():
+        # Standard and dual-row-quant (STATIC/ROW) paths use the grouped helper; only MX stays on
+        # the original single-shot path (it is not grouped).
+        if not mlp_params.quant_params.is_dtype_mx():
             _perform_standard_gate_projection(
                 mlp_params, tile_info, constants, indices, source_tile_sbuf, weights_sbuf_list,
                 bias_tensor_sbuf, gate_weight_row_scales_sbuf, gate_static_scales_sbuf,
@@ -756,7 +765,7 @@ def perform_gate_projection_if_necessary(
             )
             return
 
-        # Quantized / MX path (unchanged from the original single-shot implementation).
+        # MX path (unchanged from the original single-shot implementation).
         gate_proj_psum_list = []
         for bank in range(constants.required_src_proj_psum_bank_count):
             gate_proj_psum_list.append(
@@ -843,7 +852,7 @@ def _perform_standard_gate_projection(
         tile_info.src_proj_intermediate_dim_tile.tile_count,
     )
     for group in groups:
-        gate_proj_psum_list = _alloc_and_project_standard_group(
+        gate_proj_psum_list = _alloc_and_project_group(
             mlp_params,
             tile_info,
             constants,
@@ -934,7 +943,9 @@ def perform_up_projection(
     Intended Usage:
         Called to perform up projection in gated MLP architectures
     """
-    if not mlp_params.quant_params.is_quant():
+    # Standard and dual-row-quant (STATIC/ROW) paths use the grouped helper; only MX stays on the
+    # original single-shot path (it is not grouped).
+    if not mlp_params.quant_params.is_dtype_mx():
         _perform_standard_up_projection(
             mlp_params, tile_info, constants, indices, source_tile_sbuf, weights_sbuf_list,
             bias_tensor_sbuf, up_weight_row_scales_sbuf, up_static_scales_sbuf,
@@ -1136,7 +1147,7 @@ def _perform_standard_up_projection(
         tile_info.src_proj_intermediate_dim_tile.tile_count,
     )
     for group in groups:
-        up_proj_psum_list = _alloc_and_project_standard_group(
+        up_proj_psum_list = _alloc_and_project_group(
             mlp_params,
             tile_info,
             constants,
@@ -1388,7 +1399,17 @@ def project_quantized_source_tensor_tile(
     weights_tensor_hbm: nl.ndarray,
     weights_sbuf_list: list[nl.ndarray],
     proj_results_psum_list: list[nl.ndarray],
+    group: Optional["SrcProjPsumGroup"] = None,
 ):
+    """Quantized (dual-row) source projection, optionally restricted to one intermediate-tile group.
+
+    group=None projects the full intermediate range with the original flat bank layout (legacy).
+    With a group, only its tiles are projected into group-local banks so wide-intermediate configs
+    can run more than one bxs subtile within the 8-bank budget; the caller drains each group before
+    the next. Unlike the standard path the weight DMA stays full-width (the matmul moving-slice
+    offset indexes by global int_tile.index), so grouping only changes which tiles compute and the
+    bank index, not the load.
+    """
     # Alias these to cut down on the code size for tile information references
     bxs_dim_tile = tile_info.bxs_dim_tile
     hidden_dim_tile = tile_info.src_proj_hidden_dim_tile
@@ -1406,6 +1427,11 @@ def project_quantized_source_tensor_tile(
     current_bxs_tile = bxs_tiles[bxs_tile_idx]
 
     int_tiles = TiledRange(mlp_params.intermediate_size, int_dim_tile.tile_size)
+    # Select this call's intermediate tiles. group=None => full range (legacy). With a group, only
+    # its tiles compute and the PSUM bank is indexed locally as bxs_subtile * count + (tile - start).
+    active_int_start = 0 if group is None else group.start
+    active_int_count = len(int_tiles) if group is None else group.count
+    active_int_tiles = int_tiles[active_int_start : active_int_start + active_int_count]
     for hidden_tile in TiledRange(mlp_params.hidden_size, hidden_dim_tile.tile_size):
         # Do the strided load of the weights for the current H tile
         weights_buffer_idx = hidden_tile.index % len(weights_sbuf_list)
@@ -1433,9 +1459,9 @@ def project_quantized_source_tensor_tile(
         for bxs_subtile in TiledRange(current_bxs_tile, BXS_SUBTILE_SIZE):
             for hidden_subtile in hidden_doublerow_subtiles:
                 perform_doublerow_matmul = hidden_subtile.size == 2 * H_SUBTILE_SIZE
-                for int_tile in int_tiles:
-                    # Get PSUM result slice
-                    psum_bank = bxs_subtile.index * len(int_tiles) + int_tile.index
+                for int_tile in active_int_tiles:
+                    # Get PSUM result slice (group-local bank index; == flat layout when group=None)
+                    psum_bank = bxs_subtile.index * active_int_count + (int_tile.index - active_int_start)
                     dst_tile = proj_results_psum_list[psum_bank].ap(
                         pattern=[[int_dim_tile.tile_size, bxs_subtile.size], [1, int_tile.size]],
                         offset=0,
