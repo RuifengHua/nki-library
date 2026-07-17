@@ -145,10 +145,16 @@ def calc_batch_seqlen_dim_tile_size(
     if mlp_params.quant_params.is_dtype_mx():
         # MX uses a wider 2*pmax bxs tile; one such tile + one int tile fill a bank. Not grouped.
         bxs_dim_max_subtiles = (NUM_HW_PSUM_BANKS // src_proj_int_dim_tile_count) * 2
+    elif mlp_params.quant_params.is_quant():
+        # Dual-row quant drains PSUM per int-tile group like the standard path, but each bxs
+        # subtile stages two matmul rows plus dequant scales (~2x the standard SBUF footprint).
+        # With the 512 tile clamp below the standard path lands at 4 subtiles; halve that to 2
+        # here so the widest intermediate shards still fit the SBUF stack, while still doubling
+        # the arithmetic intensity of the original single-subtile wide-intermediate case.
+        bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS // 4
     else:
-        # Standard and dual-row-quant paths drain PSUM per int-tile group (see
-        # build_src_proj_psum_groups), so the subtile count is decoupled from the int-tile count
-        # and bounded only by the caps below.
+        # Standard path drains PSUM per int-tile group (see build_src_proj_psum_groups), so the
+        # subtile count is decoupled from the int-tile count and bounded only by the caps below.
         bxs_dim_max_subtiles = NUM_HW_PSUM_BANKS
     # This is the max tile size we can choose
     tile_size = bxs_dim_subtile_size * bxs_dim_max_subtiles
