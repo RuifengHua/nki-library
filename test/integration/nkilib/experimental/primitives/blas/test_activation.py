@@ -31,7 +31,7 @@ from nki.language import tile_size
 from nkilib_src.nkilib.experimental.primitives import blas, dma, tile_stream
 from nkilib_src.nkilib.experimental.primitives.iter_order import RowMajor
 from test.utils.common_dataclasses import CompilerArgs, Platforms
-from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
@@ -298,7 +298,6 @@ MULTITILE_CONFIGS = [
 # =============================================================================
 
 
-@pytest_test_metadata(name="Activation")
 @pytest_marks(["activation"])
 class TestActivationPrimitive:
     """Tests class for the activation BLAS primitive kernel."""
