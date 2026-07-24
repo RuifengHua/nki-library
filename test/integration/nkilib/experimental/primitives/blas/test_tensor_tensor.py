@@ -32,7 +32,7 @@ from nki.language import tile_size
 from nkilib_src.nkilib.experimental.primitives import blas, dma, tile_stream
 from nkilib_src.nkilib.experimental.primitives.iter_order import RowMajor
 from test.utils.common_dataclasses import CompilerArgs, Platforms
-from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
@@ -131,7 +131,6 @@ FAST_TEST_PARAMS = [
 # =============================================================================
 
 
-@pytest_test_metadata(name="TensorTensor")
 @pytest_marks(["tensor_tensor"])
 class TestTensorTensorPrimitive:
     """Tests class for the tensor_tensor BLAS primitive kernel."""
