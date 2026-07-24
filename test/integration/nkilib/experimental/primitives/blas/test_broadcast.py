@@ -31,7 +31,7 @@ from nkilib_src.nkilib.experimental.primitives import blas, dma, tile_stream
 from nkilib_src.nkilib.experimental.primitives.iter_order import RowMajor
 from test.utils.common_dataclasses import CompilerArgs, Platforms
 from test.utils.coverage_parametrized_tests import FilterResult
-from test.utils.pytest_test_metadata import pytest_marks, pytest_test_metadata
+from test.utils.pytest_test_metadata import pytest_marks
 from test.utils.test_orchestrator import Orchestrator
 from test.utils.unit_test_framework import UnitTestFramework, torch_ref_wrapper
 
@@ -162,7 +162,6 @@ CLASS_SINGLE_TILE_PARAMS = [
 # =============================================================================
 
 
-@pytest_test_metadata(name="Broadcast")
 @pytest_marks(["broadcast"])
 class TestBroadcastPrimitive:
     """Tests class for the broadcast BLAS primitive kernel."""
